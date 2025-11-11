@@ -243,14 +243,14 @@ class MemoryBlock(BaseBlock):
         if op == "set":
             store[key] = payload if params.get("value") is None else params.get("value")
             Memory.save(store)
-            return "OK", {"op": op, "key": key}
+            return payload, {"op": op, "key": key}  # <-- FIX: Return payload
         if op == "clear":
             if key == "*":
                 store.clear()
             else:
                 store.pop(key, None)
             Memory.save(store)
-            return "OK", {"op": op, "key": key}
+            return payload, {"op": op, "key": key}  # <-- FIX: Return payload
         return _json.dumps(store.get(key)), {"op": op, "key": key}
 BLOCKS.register("memory", MemoryBlock)
 
@@ -641,18 +641,23 @@ class ChatBlock(BaseBlock):
         style        = str(params.get("style", "plain"))  # "plain" | "bullets" | "outline"
 
         text = str(payload or "")
-        inline_lex: List[str] = []
-        inline_ctx = ""
 
-        if "[lexicon]\n" in text:
-            try:
-                after = text.split("[lexicon]\n", 1)[1]
-                head = after.split("\n[", 1)[0]
-                inline_lex = [w.strip() for w in head.split(",") if w.strip()]
-            except Exception:
-                inline_lex = []
-        if "[context]\n" in text:
-            inline_ctx = text.split("[context]\n", 1)[1]
+        # --- [NEW] Robust parser ---
+        try:
+            # Get the *last* context block
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        try:
+            # Get the *last* lexicon block
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            # Ensure we don't grab context that might follow
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+        # --- End new parser ---
 
         if not inline_lex:
             store = Memory.load()
@@ -662,10 +667,12 @@ class ChatBlock(BaseBlock):
 
         # remove blocks from user text
         core = text
-        for tag in ("[lexicon]\n", "[context]\n"):
-            core = core.replace(tag, "\n")
+        # Clean up the payload for the "core" text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
         if inline_lex:
-            core = core.replace(", ".join(inline_lex), "")
+            # This is tricky; we just rsplit on the tag
+            core = core.rsplit("[lexicon]\n", 1)[0]
         core = core.strip()
 
         # very small summarizer over the context:
@@ -1153,6 +1160,458 @@ class WebCorpusBlock(BaseBlock):
 
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
+
+# ---------------- WebCorpus (Playwright Hybrid) ----------------
+@dataclass
+class PlaywrightBlock(BaseBlock):
+    """
+    Playwright-powered corpus builder (Hybrid v7.1 - Corrected):
+      • Performs targeted searches on a hardcoded list AND a "learned" list from memory.
+      • Runs a general search to "discover" new high-quality domains.
+      • Filters out junk domains (pinterest, ebay, etc.).
+      • "Learns" new, good domains by saving them to memory.json for future runs.
+      • Feeds all high-quality URLs (targeted, learned, discovered) into Playwright.
+      • Uses 'trafilatura', BM25 ranking, and sentence extraction as before.
+
+    Requires:
+      pip install playwright trafilatura duckduckgo_search beautifulsoup4
+      python -m playwright install --with-deps chromium
+    """
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # --- Imports (must be inside execute for modularity) ---
+        import os, re, json, time, sys
+        from math import log
+        from typing import List, Dict, Tuple, Set
+        from urllib.parse import urlparse
+        import threading
+        from collections import defaultdict
+
+        try:
+            from playwright.sync_api import sync_playwright
+            import trafilatura
+            from ddgs import DDGS
+            from bs4 import BeautifulSoup
+            import requests
+        except ImportError:
+            print("[PlaywrightBlock] ERROR: Missing dependencies. Please run:", file=sys.stderr)
+            print("pip install playwright trafilatura duckduckgo_search beautifulsoup4 requests", file=sys.stderr)
+            print("python -m playwright install --with-deps chromium", file=sys.stderr)
+            return str(payload), {"error": "Missing dependencies. See console."}
+
+        # ---- Params ----
+        query = str(params.get("query", "") or str(payload or "")).strip()
+        num_results = int(params.get("num_results", 15))  # Max *total* links to scrape
+        headless = bool(params.get("headless", True))
+        timeout_sec = float(params.get("timeout", 15.0))  # Page load timeout
+        read_timeout = float(params.get("read_timeout", 12.0))  # For requests fallback
+        user_agent = str(params.get("user_agent",
+                                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"))
+        verbose = bool(params.get("verbose", False))
+
+        # --- Target & Learning Params ---
+        default_targets = "grailed.com,hypebeast.com,vogue.com,depop.com,poshmark.com"
+        target_sites = str(params.get("target_sites", default_targets))
+        num_per_site = int(params.get("num_per_site", 2))  # Links to grab from *each* target site
+        num_general = int(params.get("num_general", 10))  # Links to grab from general search for discovery
+
+        # --- Genetic Learning Params ---
+        learn_new_sites = bool(params.get("learn_new_sites", True))
+        learned_sites_key = str(params.get("learned_sites_key", "web_learned_sites"))
+        learn_min_hits = int(params.get("learn_min_hits", 2))  # Hits needed to learn a new site
+        default_junk = "pinterest.com,twitter.com,facebook.com,reddit.com,ebay.com,walmart.com,amazon.com,youtube.com,tiktok.com,instagram.com,linkedin.com"
+        junk_domains = str(params.get("junk_domains", default_junk))
+
+        # --- text handling ---
+        # [FIX] Re-added missing parameter definitions
+        regex_query = params.get("regex")
+        neg = [s.strip() for s in str(params.get("neg", "")).split(",") if s.strip()]
+        must_terms = [s.strip().lower() for s in str(params.get("must_terms", "")).split(",") if s.strip()]
+        # ---
+        top_k_docs = int(params.get("top_k_docs", 10))
+        top_k_sents = int(params.get("top_k_sents", 25))
+        sent_window = int(params.get("sent_window", 1))
+        max_chars = int(params.get("max_chars", 4000))
+        min_doc_chars = int(params.get("min_doc_chars", 250))  # Lower for item pages
+        site_exclude = [s.strip().lower() for s in str(params.get("site_exclude", "")).split(",") if s.strip()]
+
+        # lexicon export
+        export_lexicon = bool(params.get("export_lexicon", True))
+        lexicon_key = str(params.get("lexicon_key", "web_lexicon"))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        lexicon_top_k = int(params.get("lexicon_top_k", 40))
+        lexicon_min_len = int(params.get("lexicon_min_len", 4))
+        use_phrases = bool(params.get("lexicon_phrases", True))
+        export_context = bool(params.get("export_context", True))
+        context_key = str(params.get("context_key", "web_context"))
+        append_ctx = bool(params.get("append_context", False))
+
+        timeout_ms = int(timeout_sec * 1000)
+        meta: Dict[str, Any] = {
+            "engine": "hybrid_ddgs_playwright", "query": query, "headless": headless,
+            "search_results": [], "scrape_errors": [], "scraped_urls": [], "search_method": "unknown",
+            "learned_sites": [], "newly_learned": []
+        }
+
+        # compile regex
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
+                                                                         str) and regex_query.strip() else None
+
+        # ---- Helpers ----
+        def _tokenize(t: str) -> List[str]:
+            return re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", (t or "").lower())
+
+        def _split_sents(text: str) -> List[str]:
+            bits = re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip())
+            return [b.strip() for b in bits if b.strip()]
+
+        def _clean_domain(u: str) -> str:
+            try:
+                netloc = urlparse(u).netloc.lower()
+                # Remove 'www.' and other common subdomains
+                parts = netloc.split('.')
+                if len(parts) > 2 and parts[0] in ('www', 'm', 'blog', 'shop'):
+                    return ".".join(parts[1:])
+                return netloc.split(":")[0]
+            except Exception:
+                return ""
+
+        def _hybrid_search(q: str, n: int) -> List[Dict[str, str]]:
+            # 1. Prefer python package
+            try:
+                if verbose: print(f"[PlaywrightBlock] Searching (via DDGS library) for: {q}", file=sys.stderr)
+                with DDGS() as ddgs:
+                    out = []
+                    for r in ddgs.text(q, max_results=n):
+                        url = r.get("href") or r.get("url")
+                        title = r.get("title") or _clean_domain(url)
+                        if url: out.append({"title": title, "url": url})
+                if out:
+                    meta["search_method"] = "ddgs_library"
+                    return out
+            except Exception as e:
+                if verbose: print(f"[PlaywrightBlock] DDGS library failed: {e}", file=sys.stderr)
+                pass  # Fallback
+
+            # 2. HTML-lite fallback
+            if verbose: print(f"[PlaywrightBlock] Searching (via requests fallback) for: {q}", file=sys.stderr)
+            urls = []
+            try:
+                r = requests.get("https://duckduckgo.com/html/",
+                                 params={"q": q},
+                                 headers={"User-Agent": user_agent},
+                                 timeout=(timeout_sec, read_timeout))
+                if r.status_code == 200:
+                    soup = BeautifulSoup(r.text, "html.parser")
+                    for a in soup.select("a.result__a, a.result__url, a.result__a.js-result-title-link"):
+                        href = a.get("href")
+                        title = a.get_text(strip=True) or _clean_domain(href)
+                        if href and href.startswith("http"):
+                            urls.append({"title": title, "url": href})
+                            if len(urls) >= n:
+                                break
+                if urls:
+                    meta["search_method"] = "requests_fallback"
+                    return urls
+            except Exception as e:
+                if verbose: print(f"[PlaywrightBlock] Requests fallback failed: {e}", file=sys.stderr)
+                pass
+
+            meta["search_method"] = "failed"
+            return []
+
+        # ---- Playwright Search + Scrape ----
+        docs_raw: List[Dict[str, str]] = []
+
+        if not query:
+            base = "" if payload is None else str(payload)
+            return base, {"rows": 0, "note": "empty query", "engine": "playwright_hybrid"}
+
+        # --- 1. SEARCH (GENETIC LEARNING) ---
+        search_links = []
+        seen_urls = set()
+
+        # 1a. Build domain lists
+        store = Memory.load()
+
+        # Build master list of "good" sites
+        sites_to_search: Set[str] = set()
+        for s in target_sites.split(","):
+            if s.strip(): sites_to_search.add(s.strip())
+
+        if learn_new_sites:
+            learned_sites = store.get(learned_sites_key, [])
+            if isinstance(learned_sites, list):
+                for s in learned_sites:
+                    sites_to_search.add(str(s))
+        meta["learned_sites"] = list(sites_to_search)
+
+        # Build master list of "bad" sites
+        junk_list: Set[str] = set()
+        for s in junk_domains.split(","):
+            if s.strip(): junk_list.add(s.strip())
+        for s in site_exclude:
+            if s.strip(): junk_list.add(s.strip())
+
+        try:
+            # 1b. Run TARGETED queries on all "good" sites
+            if verbose: print(f"[PlaywrightBlock] Running targeted search on {len(sites_to_search)} known sites...",
+                              file=sys.stderr)
+            for site in sites_to_search:
+                targeted_query = f'{query} site:{site}'
+                links = _hybrid_search(targeted_query, n=num_per_site)
+                for link in links:
+                    url = link["url"]
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        search_links.append(link)
+
+            # 1c. Run GENERAL query for discovery
+            if verbose: print(f"[PlaywrightBlock] Running general search for discovery...", file=sys.stderr)
+            general_links = _hybrid_search(query, n=num_general)
+
+            new_domain_counts: Dict[str, int] = defaultdict(int)
+            discovered_links: List[Dict] = []
+
+            for link in general_links:
+                url = link["url"]
+                if url in seen_urls:
+                    continue
+
+                domain = _clean_domain(url)
+                if not domain:
+                    continue
+
+                # Check if junk or already known
+                if any(domain == s or domain.endswith("." + s) for s in junk_list):
+                    continue
+                if any(domain == s or domain.endswith("." + s) for s in sites_to_search):
+                    continue
+
+                # This is a new, non-junk, non-target domain
+                new_domain_counts[domain] += 1
+                discovered_links.append(link)  # Add it to scrape
+                seen_urls.add(url)
+
+            # 1d. Learn & Evolve
+            newly_learned_sites: List[str] = []
+            if learn_new_sites:
+                for domain, count in new_domain_counts.items():
+                    if count >= learn_min_hits:
+                        newly_learned_sites.append(domain)
+
+                if newly_learned_sites:
+                    if verbose: print(
+                        f"[PlaywrightBlock] Learning {len(newly_learned_sites)} new domains: {newly_learned_sites}",
+                        file=sys.stderr)
+                    # Add to master list and save
+                    current_learned = set(store.get(learned_sites_key, []))
+                    current_learned.update(newly_learned_sites)
+                    store[learned_sites_key] = list(current_learned)
+                    Memory.save(store)
+                    meta["newly_learned"] = newly_learned_sites
+
+            # 1e. Finalize scrape list
+            search_links.extend(discovered_links)
+            search_links = search_links[:num_results]  # Limit *total* scrapes
+
+            if verbose: print(f"[PlaywrightBlock] Total {len(search_links)} links to scrape.", file=sys.stderr)
+            meta["search_results"] = search_links
+            if not search_links:
+                print(f"[PlaywrightBlock] ERROR: No search results found for query: {query}", file=sys.stderr)
+
+        except Exception as e:
+            print(f"[PlaywrightBlock] FATAL ERROR during search step: {e}", file=sys.stderr)
+            return str(payload), {"error": f"Search failed: {e}", **meta}
+
+        # 2. SCRAPE (using Playwright)
+        try:
+            with sync_playwright() as p:
+                if verbose: print(f"[PlaywrightBlock] Launching browser (headless={headless})...", file=sys.stderr)
+                browser = p.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled"])
+                b_context = browser.new_context(user_agent=user_agent, java_script_enabled=True)
+                b_context.set_default_timeout(timeout_ms)
+                page = b_context.new_page()
+
+                for link in search_links:
+                    try:
+                        if verbose: print(f"[PlaywrightBlock] Scraping: {link['url']}", file=sys.stderr)
+                        page.goto(link["url"], timeout=timeout_ms, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)  # Give JS time to render
+                        html = page.content()
+
+                        text = trafilatura.extract(
+                            html,
+                            include_comments=False,
+                            include_tables=False,
+                            deduplicate=True
+                        )
+                        if text and len(text) >= min_doc_chars:
+                            docs_raw.append({"title": link["title"], "text": text, "url": link["url"]})
+                            meta["scraped_urls"].append(link["url"])
+                        elif verbose:
+                            print(f"[PlaywrihtBlock] INFO: Scraped text too short or empty for {link['url']}",
+                                  file=sys.stderr)
+                    except Exception as e:
+                        err_msg = f"{link['url']}: {str(e)[:100]}"
+                        if verbose: print(f"[PlaywrightBlock] SCRAPE_ERROR: {err_msg}", file=sys.stderr)
+                        meta["scrape_errors"].append(err_msg)
+
+                if verbose: print(f"[PlaywrightBlock] Closing browser.", file=sys.stderr)
+                browser.close()
+
+        except Exception as e:
+            print(f"[PlayWwrightBlock] FATAL ERROR during Playwright scrape: {e}", file=sys.stderr)
+            return str(payload), {"error": f"Playwright execution failed: {e}", **meta}
+
+        # ---- 3. Post-Processing ----
+        if verbose: print(f"[PlaywrightBlock] Post-processing {len(docs_raw)} scraped documents...", file=sys.stderr)
+
+        if not docs_raw:
+            base = "" if payload is None else str(payload)
+            print(f"[PlaywrightBlock] ERROR: No pages were successfully scraped.", file=sys.stderr)
+            return base, {
+                "rows": 0, "note": "no pages matched or scraped",
+                "engine": "playwright_hybrid", "query": query, "regex": bool(q_pattern),
+                "neg": neg, "must": must_terms, **meta
+            }
+
+        # ---- ranking BM25-ish (+ regex boost) ----
+        corpus_tokens = [set(_tokenize(d["title"] + " " + d["text"])) for d in docs_raw]
+        N = len(corpus_tokens)
+        q_terms = set(_tokenize(query))
+        df: Dict[str, int] = {}
+        for terms in corpus_tokens:
+            for t in terms:
+                df[t] = df.get(t, 0) + 1
+
+        def _bm25ish_score(doc_text: str, doc_url: str) -> float:
+            words = _tokenize(doc_text);
+            L = len(words) or 1
+            score = 0.0
+            if q_terms:
+                for t in q_terms:
+                    tf = words.count(t)
+                    if tf == 0: continue
+                    idf = log((N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1.0)
+                    k1, b, avgdl = 1.2, 0.75, 2000.0
+                    score += idf * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (L / avgdl))))
+            if q_pattern and q_pattern.search(doc_text):
+                score += 2.0
+
+            # Boost scores for all "good" sites (targeted + learned)
+            doc_domain = _clean_domain(doc_url)
+            if any(doc_domain == s or doc_domain.endswith("." + s) for s in sites_to_search):
+                score += 1.0
+            return score
+
+        ranked = sorted(
+            docs_raw,
+            key=lambda d: _bm25ish_score(d["title"] + " " + d["text"], d["url"]),
+            reverse=True
+        )[:max(1, top_k_docs)]
+
+        # ---- sentence extraction ----
+        hit_sents: List[str] = []
+        per_doc_quota = max(1, top_k_sents // max(1, len(ranked)))
+        for d in ranked:
+            title = (d["title"] or "").strip()
+            sents = _split_sents(d["text"] or "")
+            scored: List[Tuple[float, int, str]] = []
+            for idx, s in enumerate(sents):
+                tok = set(_tokenize(s))
+                overlap = len(tok & q_terms) if q_terms else 0
+                if q_pattern and q_pattern.search(s): overlap += 2
+                if overlap > 0: scored.append((float(overlap), idx, s))
+
+            took = 0
+            for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1]))[:per_doc_quota]:
+                lo = max(0, idx - sent_window);
+                hi = min(len(sents), idx + sent_window + 1)
+                chunk = " ".join(sents[lo:hi]).strip()
+                if chunk and chunk not in hit_sents:
+                    src = f"# {title} — {d.get('url', '')}".strip()
+                    if src not in hit_sents:  # Avoid repeating title
+                        hit_sents.append(src)
+                    hit_sents.append(chunk);
+                    took += 1
+            if took == 0 and sents:
+                chunk = " ".join(sents[: max(1, sent_window + 1)]).strip()
+                if chunk and chunk not in hit_sents:
+                    src = f"# {title} — {d.get('url', '')}".strip()
+                    if src not in hit_sents:
+                        hit_sents.append(src)
+                    hit_sents.append(chunk)
+
+        context = "\n\n".join(hit_sents).strip()
+        if max_chars > 0 and len(context) > max_chars:
+            context = context[:max_chars] + "…"
+
+        # ---- lexicon (from context) ----
+        def _extract_terms_local(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
+            counts: Dict[str, int] = {}
+            for raw in text.split():
+                w = "".join(ch.lower() for ch in raw if ch.isalnum() or ch in "-_")
+                if len(w) < min_len or w in _STOPWORDS: continue
+                counts[w] = counts.get(w, 0) + 1
+            return [t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]]
+
+        lexicon = _extract_terms_local(context, top_k=lexicon_top_k, min_len=lexicon_min_len) if context else []
+        if use_phrases and context:
+            phrases = re.findall(r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b", context)
+            pc: Dict[str, int] = {}
+            for ph in phrases:
+                ph = ph.lower().strip()
+                if any(tok in _STOPWORDS for tok in ph.split()): continue
+                pc[ph] = pc.get(ph, 0) + 1
+            phrase_top = [p for p, _ in sorted(pc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
+            lexicon = list(dict.fromkeys(phrase_top + lexicon))[:lexicon_top_k]
+
+        # ---- store lexicon + context in Memory ----
+        if export_lexicon and lexicon:
+            store = Memory.load()
+            store[lexicon_key] = lexicon
+            Memory.save(store)
+            if verbose: print(f"[PlaywrightBlock] Exported {len(lexicon)} terms to memory[{lexicon_key}]",
+                              file=sys.stderr)
+
+        if export_context and context:
+            store = Memory.load()
+            if append_ctx and isinstance(store.get(context_key), str) and store[context_key]:
+                store[context_key] = store[context_key].rstrip() + "\n\n" + context
+            else:
+                store[context_key] = context
+            Memory.save(store)
+            if verbose: print(f"[PlaywrightBlock] Exported {len(context)} chars to memory[{context_key}]",
+                              file=sys.stderr)
+
+        # ---- compose output ----
+        base = "" if payload is None else str(payload)
+        parts: List[str] = [base] if base else []
+        if inject_lexicon and lexicon:
+            parts.append("[lexicon]\n" + ", ".join(lexicon))
+        if inject_context and context:
+            parts.append("[context]\n" + context)
+        out = "\n\n".join(parts).strip()
+
+        if verbose: print(f"[PlaywrightBlock] Execution complete. Outputting {len(out)} chars.", file=sys.stderr)
+
+        # ---- final metadata ----
+        meta.update({
+            "rows": len(docs_raw),
+            "ranked_docs": len(ranked),
+            "lexicon_key": lexicon_key if (export_lexicon and lexicon) else None,
+            "lexicon_size": len(lexicon),
+            "context_key": context_key if (export_context and context) else None,
+            "context_len": len(context),
+            "top_urls": [d.get("url") for d in ranked],
+            "site_exclude": site_exclude,
+            "junk_domains": list(junk_list),
+        })
+        return out, meta
+
+BLOCKS.register("playwright", PlaywrightBlock)
 @dataclass
 class TensorBlock(BaseBlock):
     """
