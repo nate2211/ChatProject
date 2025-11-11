@@ -72,6 +72,8 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
     Supports auto-selecting device (GPU/CPU).
     """
     try:
+        import os
+        os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
         from transformers import pipeline
         import torch
     except ImportError:
@@ -92,7 +94,8 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
         print(f"[_get_hf_pipeline] Loading pipeline: task={task}, model={model or 'default'}, device={dev_str}... (this may take a moment on first run)")
 
     try:
-        p = pipeline(task=task, model=model, device=resolved_device)
+        from transformers import pipeline
+        p = pipeline(task=task, model=model, device=resolved_device, framework="pt")
         if verbose:
             print(f"[_get_hf_pipeline] Pipeline loaded on device: {p.device}")
         return p
