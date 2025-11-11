@@ -635,17 +635,23 @@ BLOCKS.register("corpus", CorpusBlock)
 @dataclass
 class ChatBlock(BaseBlock):
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        model_name   = str(params.get("model", "toy"))
+        model_name = str(params.get("model", "toy"))
         keep_history = bool(params.get("keep_history", True))
-        lexicon_key  = str(params.get("lexicon_key", "corpus_lexicon"))
-        style        = str(params.get("style", "plain"))  # "plain" | "bullets" | "outline"
+        lexicon_key = str(params.get("lexicon_key", "corpus_lexicon"))
+        style = str(params.get("style", "plain"))  # "plain" | "bullets" | "outline"
+
+        # --- NEW PARAMETERS ---
+        # Read the parameters you are trying to pass
+        include_context = bool(params.get("include_context", True))
+        max_bullets = int(params.get("max_bullets", int(params.get("max_terms", 8))))  # Use max_terms as fallback
+        max_chars = int(params.get("max_chars", 0))  # 0 = unlimited
 
         text = str(payload or "")
 
         # --- [NEW] Robust parser ---
         try:
             # Get the *last* context block
-            inline_ctx = text.rsplit("[context]\n", 1)[1]
+            inline_ctx = text.rsplit("[context]\n", 1)[1] if include_context else ""
         except Exception:
             inline_ctx = ""
 
@@ -676,20 +682,16 @@ class ChatBlock(BaseBlock):
         core = core.strip()
 
         # very small summarizer over the context:
-        def summarize(ctx: str, k: int = 6) -> List[str]:
+        def summarize(ctx: str, k: int = 8) -> List[str]:  # k is max_bullets
             import re
-            # Split by period/newline, but also by the title markers
             sents_raw = re.split(r"(?<=[.!?])\s+|\n+|(?=\s*#\s)", ctx)
-
             good_sents = []
             for s in sents_raw:
                 s = s.strip()
-                if not s:
-                    continue
-                # Filter out junk
+                if not s: continue
                 if s.startswith("# "):  # Skip titles
                     continue
-                if len(s) > 600:  # Skip massive "sentences" (like headers)
+                if len(s) > 600:  # Skip massive "sentences"
                     continue
                 if s.count(' ') < 4:  # Skip things that aren't real sentences
                     continue
@@ -700,38 +702,47 @@ class ChatBlock(BaseBlock):
                 tok = set(s.lower().split())
                 return sum(1 for t in inline_lex if t in tok)
 
-            # Rank the *filtered* sentences
             ranked = sorted(((score(s), idx, s) for idx, s in enumerate(good_sents)), key=lambda x: (-x[0], x[1]))
 
-            # --- [ NEW DE-DUPLICATION LOGIC ] ---
             final_bullets = []
             seen = set()
-            for _, _, s in ranked:  # Iterate through all ranked sentences
+            for _, _, s in ranked:
                 if s not in seen:
                     final_bullets.append(s)
                     seen.add(s)
                     # Stop once we have k unique sentences
-                    if len(final_bullets) >= k:
+                    if len(final_bullets) >= k:  # Use k (max_bullets)
                         break
+            return final_bullets
 
-            return final_bullets  # Return the k unique sentences
+        # --- Use new max_bullets param ---
+        bullets = summarize(inline_ctx, k=max_bullets) if inline_ctx else []
 
-        bullets = summarize(inline_ctx, k=8) if inline_ctx else []
-        model = get_chat_model(model_name)
+        # Get model (and pass max_terms to it)
+        model_kwargs = {}
+        if "max_terms" in params:
+            model_kwargs["max_terms"] = int(params["max_terms"])
+        model = get_chat_model(model_name, **model_kwargs)
 
         if style == "bullets":
             if bullets:
                 body = "- " + "\n- ".join(bullets)
             elif inline_lex:
-                body = "- " + "\n- ".join(inline_lex[:8])
+                body = "- " + "\n- ".join(inline_lex[:max_bullets])
             else:
                 body = core or "No context available."
         elif style == "outline" and bullets:
-            body = "\n".join(f"{i+1}. {s}" for i, s in enumerate(bullets))
+            body = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(bullets))
         else:
+            # Use core text as a fallback if no bullets and no context
             body = " ".join(bullets) if bullets else (inline_ctx or core)
 
-        reply = model.generate(body, lexicon=inline_lex)
+        # --- Pass max_chars to model's generate method ---
+        gen_kwargs = {"lexicon": inline_lex}
+        if max_chars > 0:
+            gen_kwargs["max_chars"] = max_chars
+
+        reply = model.generate(body, **gen_kwargs)
 
         if keep_history:
             HistoryStore.append({"role": "user", "content": text})
@@ -1762,3 +1773,604 @@ class TensorBlock(BaseBlock):
         return out, meta
 
 BLOCKS.register("tensor", TensorBlock)
+
+
+# ---------------- Code Generation (Specialized, no-guides/no-fallbacks) ----------------
+@dataclass
+class CodeBlock(BaseBlock):
+
+    # ---- helpers -------------------------------------------------
+    def _trim_to_tokens(self, pipe, text: str, max_input_tokens: int = 480) -> str:
+        """Trim prompt by tokenizer length (keep task head + tail)."""
+        try:
+            tok = pipe.tokenizer
+            ids = tok.encode(text, add_special_tokens=False)
+            if len(ids) <= max_input_tokens:
+                return text
+            keep_head = min(128, max_input_tokens // 3)
+            keep_tail = max_input_tokens - keep_head
+            head_ids = ids[:keep_head]
+            tail_ids = ids[-keep_tail:]
+            return tok.decode(head_ids, skip_special_tokens=True) + "\n...\n" + tok.decode(tail_ids, skip_special_tokens=True)
+        except Exception:
+            return text[:4000]
+
+    def _extract_code_block(self, s: str, lang: str = "python") -> str:
+        """Extract the largest fenced code block; if none, return raw generation."""
+        s = s.strip()
+        if "```" not in s:
+            return s
+        parts = s.split("```")
+        best = ""
+        for i in range(1, len(parts), 2):
+            block = parts[i]
+            if block.startswith(lang):
+                block = block[len(lang):].lstrip()
+            if len(block) > len(best):
+                best = block
+        return best.strip() or s
+
+    def _strip_banner_comments(self, code: str) -> str:
+        """Remove large banner/license headers if they dominate the top."""
+        lines = code.splitlines()
+        if not lines:
+            return code
+        i = 0
+        banner_lines = 0
+        for ln in lines:
+            t = ln.strip()
+            if t.startswith("#") or t.startswith("//") or t.startswith("/*") or t.startswith("*"):
+                banner_lines += 1
+                i += 1
+                # stop early if banner is obviously long
+                if banner_lines >= 12:
+                    break
+                continue
+            break
+        if banner_lines >= 10:
+            return "\n".join(lines[i:]).lstrip()
+        # Also nuke common license keywords at top few lines
+        head = "\n".join(lines[:10]).lower()
+        if any(k in head for k in ("copyright", "licensed", "apache", "all rights reserved")):
+            return "\n".join(lines[i:]).lstrip()
+        return code
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # Inputs
+        user_prompt = str(params.get("prompt", "")).strip()
+        if not user_prompt:
+            return str(payload), {"error": "CodeBlock requires 'prompt' param (e.g., --extra code.prompt=...)"}
+
+        store = Memory.load()
+        # Context is optional and trimmed hard; no lexicon injection here.
+        ctx_key = str(params.get("context_key", "web_context"))
+        ctx = (store.get(ctx_key, "") or "").strip()
+        context_chars = int(params.get("context_chars", params.get("code.context_chars", 0)))
+        if ctx and context_chars > 0:
+            ctx = ctx[:context_chars]
+
+        # Final prompt: strictly input content, no guides or instructions.
+        # Order: context (if any) then user prompt, separated minimally.
+        if ctx:
+            final_prompt = f"{ctx}\n\n{user_prompt}"
+        else:
+            final_prompt = user_prompt
+
+        model_name = str(params.get("model", "Salesforce/codet5p-220m"))
+        device = params.get("device", "auto")
+
+        # Decoding: deterministic, advanced constraints
+        max_new_tokens = int(params.get("max_new_tokens", 128))
+        min_new_tokens = int(params.get("min_new_tokens", 8))
+        num_beams = int(params.get("num_beams", 4))
+        do_sample = bool(params.get("do_sample", False))
+        temperature = float(params.get("temperature", 0.2))
+        top_k = int(params.get("top_k", 0))         # disabled when 0
+        top_p = float(params.get("top_p", 1.0))     # keep deterministic path
+        repetition_penalty = float(params.get("repetition_penalty", 1.12))
+        no_repeat_ngram_size = int(params.get("no_repeat_ngram_size", 4))
+        early_stopping = bool(params.get("early_stopping", True))
+        max_time_sec = float(params.get("max_time_sec", params.get("code.max_time", 12.0)))
+        max_input_tokens = int(params.get("max_input_tokens", 480))
+
+        inject_tag = str(params.get("inject_tag", "code_solution"))
+        wrap = bool(params.get("wrap", True))
+        lang = str(params.get("lang", "python"))
+
+        pipe = _get_hf_pipeline("text2text-generation", model_name, device=device, verbose=params.get("verbose", False))
+        if pipe is None:
+            return f"{payload}\n\n[{inject_tag}] (Model load failed)", {"error": "pipeline_failed"}
+
+        # Guard against encoder limit
+        final_prompt = self._trim_to_tokens(pipe, final_prompt, max_input_tokens)
+
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            min_new_tokens=min_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            num_beams=num_beams,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            early_stopping=early_stopping,
+            max_time=max_time_sec,
+        )
+
+        try:
+            pred = pipe(final_prompt, **gen_kwargs)
+        except Exception as e:
+            # No fallback content — just surface the error.
+            return f"{payload}\n\n[{inject_tag}] (Error: {e})", {"error": "generation_failed", "exception": str(e)}
+
+        gen_text = ""
+        try:
+            if isinstance(pred, list) and pred:
+                cand = pred[0]
+                gen_text = cand.get("generated_text") or cand.get("summary_text") or ""
+        except Exception:
+            gen_text = ""
+
+        # Post-process ONLY (no fallback synthesis)
+        code_raw = self._extract_code_block(gen_text, lang="python").strip()
+        code_raw = self._strip_banner_comments(code_raw)
+
+        if wrap:
+            code_out = f"```{lang}\n{code_raw}\n```"
+        else:
+            code_out = code_raw
+
+        result = f"{payload}\n\n[{inject_tag}]\n{code_out}"
+        meta = {
+            "model": model_name,
+            "context_chars": len(ctx),
+            "prompt_len": len(final_prompt),
+            "tokens_generated": len(code_raw),
+            "beams": num_beams,
+            "do_sample": do_sample,
+            "temperature": temperature,
+            "no_repeat_ngram_size": no_repeat_ngram_size,
+            "repetition_penalty": repetition_penalty,
+            "max_time_sec": max_time_sec,
+            "max_input_tokens": max_input_tokens,
+        }
+        return result, meta
+
+
+BLOCKS.register("code", CodeBlock)
+
+
+# ---------------- CodeCorpus (code docs & API learner) ----------------
+@dataclass
+class CodeCorpusBlock(BaseBlock):
+    """
+    Code-focused corpus builder (no markdown-it dependency):
+      • Inputs: list of urls, sitemap(s), or (query + site_include) search.
+      • Extracts: headings/paragraphs + fenced code blocks from Markdown/HTML.
+      • Learns: identifiers & API names → exports lexicon (code_lexicon) and context (code_context).
+      • Optional: remembers good domains across runs (learned_code_sites).
+
+    Deps (optional fallbacks included):
+      - requests, beautifulsoup4
+      - trafilatura (preferred HTML text extraction; falls back to bs4)
+      - duckduckgo_search (optional) for discovery
+
+    Example:
+      --extra codecorpus.urls="https://docs.python.org/3/tutorial/index.html,https://pandas.pydata.org/docs/"
+      --extra codecorpus.sitemaps="https://docs.python.org/sitemap.xml"
+      --extra codecorpus.query="list comprehension site:docs.python.org"
+      --extra codecorpus.site_include="docs.python.org,readthedocs.io"
+
+    Exports into Memory by default:
+      - code_lexicon (terms)
+      - code_context (snippets + sentences)
+    """
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        import re, os, json, time, html
+        from typing import List, Dict, Tuple, Set
+        from urllib.parse import urlparse
+        import hashlib
+
+        # ---------- Params ----------
+        query          = str(params.get("query", "")).strip()
+        urls_raw       = str(params.get("urls", "")).strip()
+        sitemaps_raw   = str(params.get("sitemaps", "")).strip()
+        site_include   = [s.strip().lower() for s in str(params.get("site_include", "")).split(",") if s.strip()]
+        site_exclude   = [s.strip().lower() for s in str(params.get("site_exclude", "github.com,stackoverflow.com,reddit.com")).split(",") if s.strip()]
+        max_pages      = int(params.get("max_pages", 12))
+        min_doc_chars  = int(params.get("min_doc_chars", 200))
+        max_chars      = int(params.get("max_chars", 3800))
+        top_k_docs     = int(params.get("top_k_docs", 10))
+        top_k_sents    = int(params.get("top_k_sents", 30))
+        sent_window    = int(params.get("sent_window", 0))
+
+        # Learning
+        learn_new_sites   = bool(params.get("learn_new_sites", True))
+        learned_sites_key = str(params.get("learned_sites_key", "learned_code_sites"))
+        learn_min_hits    = int(params.get("learn_min_hits", 2))
+
+        # Lexicon/context export
+        export_lexicon = bool(params.get("export_lexicon", True))
+        export_context = bool(params.get("export_context", True))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        lexicon_key    = str(params.get("lexicon_key", "code_lexicon"))
+        context_key    = str(params.get("context_key", "code_context"))
+        append_ctx     = bool(params.get("append_context", False))
+        lexicon_top_k  = int(params.get("lexicon_top_k", 60))
+        lexicon_min_len= int(params.get("lexicon_min_len", 3))  # identifiers can be short
+        use_phrases    = bool(params.get("lexicon_phrases", True))
+
+        # Runtime
+        timeout        = float(params.get("timeout", 10.0))
+        read_timeout   = float(params.get("read_timeout", 12.0))
+        user_agent     = str(params.get("user_agent", "promptchat/codecorpus"))
+        verbose        = bool(params.get("verbose", False))
+
+        # ---------- Imports & helpers ----------
+        try:
+            import requests
+        except Exception:
+            return str(payload), {"error": "Install `requests` to use CodeCorpusBlock."}
+
+        try:
+            from bs4 import BeautifulSoup
+        except Exception:
+            return str(payload), {"error": "Install `beautifulsoup4` to use CodeCorpusBlock."}
+
+        try:
+            import trafilatura
+            _has_traf = True
+        except Exception:
+            _has_traf = False
+
+        # Optional discovery
+        try:
+            from ddgs import DDGS  # pip install duckduckgo_search
+            _has_ddgs = True
+        except Exception:
+            _has_ddgs = False
+
+        def _clean_domain(u: str) -> str:
+            try:
+                netloc = urlparse(u).netloc.lower()
+                return netloc.split(":")[0]
+            except Exception:
+                return ""
+
+        def _allowed(url: str) -> bool:
+            d = _clean_domain(url)
+            if site_include and not any(d.endswith(s) for s in site_include):
+                return False
+            if any(d.endswith(s) for s in site_exclude):
+                return False
+            return True
+
+        # --- Identifier & text processing ---
+        _STOP = set([
+            "the","a","an","and","or","if","on","in","to","for","from","of","at","by","with","as","is","are","was",
+            "were","be","been","being","that","this","these","those","it","its","into","about","over","under",
+            "can","should","would","will","may","might","must","do","does","did","done","have","has","had","having",
+            "not","no","yes","you","your","we","our","they","their","there","here","also","such","via","etc","see",
+            "code","example","examples","note","notes","true","false","none","null","class","function","method",
+            "module","package","return","returns","type","types","param","parameter","parameters"
+        ])
+
+        _IDENT_RE = re.compile(
+            r"""
+            (?:
+              [A-Za-z_][A-Za-z0-9_]*           # snake/UPPER/mixed
+              (?:\.[A-Za-z_][A-Za-z0-9_]*)*    # dotted api.name
+            )
+            |
+            (?:
+              [A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]+)+   # camelCase/PascalCase
+            )
+            |
+            (?:
+              [a-z0-9]+(?:-[a-z0-9]+)+               # kebab-case
+            )
+            """,
+            re.VERBOSE
+        )
+
+        def _extract_identifiers(text: str) -> List[str]:
+            ids = _IDENT_RE.findall(text or "")
+            out = []
+            for s in ids:
+                tok = s.strip().strip(".")
+                if len(tok) < lexicon_min_len:
+                    continue
+                low = tok.lower()
+                if low in _STOP:
+                    continue
+                out.append(tok)
+            return out
+
+        def _split_sents(text: str) -> List[str]:
+            bits = re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip())
+            return [b.strip() for b in bits if b.strip()]
+
+        # --- fetch helpers ---
+        def _get(url: str) -> str:
+            try:
+                r = requests.get(url, headers={"User-Agent": user_agent}, timeout=(timeout, read_timeout))
+                if r.status_code == 200:
+                    return r.text
+            except Exception:
+                return ""
+            return ""
+
+        def _extract_text_html(html_text: str) -> Tuple[str, List[str]]:
+            """Return (clean_text, code_blocks) from HTML."""
+            code_blocks: List[str] = []
+            clean_text = ""
+
+            if _has_traf:
+                try:
+                    clean_text = trafilatura.extract(
+                        html_text, include_comments=False, include_tables=False, deduplicate=True
+                    ) or ""
+                except Exception:
+                    clean_text = ""
+
+            if not clean_text:
+                try:
+                    soup = BeautifulSoup(html_text or "", "html.parser")
+                    # collect code fences
+                    for pre in soup.select("pre, code"):
+                        code = pre.get_text("\n", strip=True)
+                        if code and len(code) >= 8:
+                            code_blocks.append(code)
+                    # remove script/style
+                    for t in soup(["script", "style", "noscript"]): t.extract()
+                    clean_text = soup.get_text(" ", strip=True)
+                except Exception:
+                    pass
+
+            return clean_text or "", code_blocks
+
+        # --- Markdown extractor: regex-only (no markdown-it) ---
+        _FENCE_RE = re.compile(
+            r"""
+            ^```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n   # opening fence with optional lang
+            (.*?)                                      # code body (non-greedy)
+            \n```[ \t]*$                               # closing fence
+            """,
+            re.MULTILINE | re.DOTALL | re.VERBOSE
+        )
+
+        def _extract_text_md(md_text: str) -> Tuple[str, List[str]]:
+            """Return (clean_text, code_blocks) from Markdown using regex fences only."""
+            code_blocks: List[str] = []
+            text = md_text or ""
+
+            # collect fenced code
+            for m in _FENCE_RE.finditer(text):
+                code = m.group(2).strip()
+                if len(code) >= 8:
+                    code_blocks.append(code)
+
+            # remove fenced blocks to leave prose
+            text_wo_fences = _FENCE_RE.sub(" ", text)
+
+            # strip inline code ticks (light cleanup)
+            text_wo_inline = re.sub(r"`([^`]+)`", r"\1", text_wo_fences)
+
+            # collapse whitespace
+            clean = re.sub(r"[ \t]+", " ", text_wo_inline)
+            clean = re.sub(r"\n{2,}", "\n", clean).strip()
+
+            return clean, code_blocks
+
+        # --- collect URLs: direct, sitemaps, discovery ---
+        candidates: List[str] = []
+
+        if urls_raw:
+            candidates.extend([u.strip() for u in urls_raw.split(",") if u.strip()])
+
+        if sitemaps_raw:
+            for sm in [s.strip() for s in sitemaps_raw.split(",") if s.strip()]:
+                try:
+                    xml = _get(sm)
+                    if not xml:
+                        continue
+                    locs = re.findall(r"<loc>(.*?)</loc>", xml, re.IGNORECASE | re.DOTALL)
+                    for loc in locs:
+                        u = html.unescape(loc).strip()
+                        if _allowed(u):
+                            candidates.append(u)
+                except Exception:
+                    continue
+
+        if query and not candidates and _has_ddgs:
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_pages * 2):
+                    u = r.get("href") or r.get("url")
+                    if u and _allowed(u):
+                        candidates.append(u)
+
+        # Dedup & cap
+        seen = set()
+        final_urls = []
+        for u in candidates:
+            if u in seen:
+                continue
+            seen.add(u)
+            if _allowed(u):
+                final_urls.append(u)
+            if len(final_urls) >= max_pages:
+                break
+
+        # --- fetch and parse pages ---
+        docs_raw: List[Dict[str, str]] = []
+        domain_hits: Dict[str, int] = {}
+
+        for u in final_urls:
+            html_text = _get(u)
+            if not html_text:
+                continue
+
+            if u.lower().endswith(".md") or "/raw/" in u or "raw.githubusercontent.com" in u:
+                body, code_blocks = _extract_text_md(html_text)
+            else:
+                body, code_blocks = _extract_text_html(html_text)
+
+            code_join = "\n\n".join(code_blocks[:5])
+            full_text = (body.strip() + ("\n\n" + code_join if code_join else "")).strip()
+
+            if len(full_text) < min_doc_chars:
+                continue
+
+            title = _clean_domain(u)
+            try:
+                if "<title" in html_text.lower():
+                    soup = BeautifulSoup(html_text, "html.parser")
+                    if soup.title and soup.title.string:
+                        title = soup.title.string.strip()
+            except Exception:
+                pass
+
+            docs_raw.append({"title": title, "text": full_text, "url": u})
+            d = _clean_domain(u)
+            domain_hits[d] = domain_hits.get(d, 0) + 1
+
+        if not docs_raw:
+            base = "" if payload is None else str(payload)
+            return base, {
+                "rows": 0, "note": "no docs scraped",
+                "query": query, "max_pages": max_pages,
+                "site_include": site_include, "site_exclude": site_exclude
+            }
+
+        # --- rank docs ---
+        def _tokenize(t: str) -> List[str]:
+            return re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-\.]+", (t or "").lower())
+
+        q_terms = set(_tokenize(query)) if query else set()
+
+        def _score(doc: Dict[str, str]) -> float:
+            text = doc["text"]
+            ids = set(i.lower() for i in _extract_identifiers(text))
+            overlap = len(ids & q_terms) if q_terms else len(ids) * 0.1
+            return overlap + min(2.0, len(text) / 4000.0)
+
+        ranked = sorted(docs_raw, key=_score, reverse=True)[:max(1, top_k_docs)]
+
+        # --- sentence extraction (prefer sentences with identifiers) ---
+        hit_sents: List[str] = []
+        per_doc_quota = max(1, top_k_sents // max(1, len(ranked)))
+        for d in ranked:
+            title = (d["title"] or "").strip()
+            sents = _split_sents(d["text"] or "")
+            scored: List[Tuple[float, int, str]] = []
+            for idx, s in enumerate(sents):
+                s_ids = set(_extract_identifiers(s))
+                score = len(s_ids) + (1 if any(t in s.lower() for t in q_terms) else 0)
+                if score > 0:
+                    scored.append((float(score), idx, s))
+            took = 0
+            for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1]))[:per_doc_quota]:
+                lo = max(0, idx - sent_window)
+                hi = min(len(sents), idx + sent_window + 1)
+                chunk = " ".join(sents[lo:hi]).strip()
+                if chunk and chunk not in hit_sents:
+                    src = f"# {title} — {d.get('url','')}".strip()
+                    if not hit_sents or hit_sents[-1] != src:
+                        hit_sents.append(src)
+                    hit_sents.append(chunk)
+                    took += 1
+            if took == 0 and sents:
+                chunk = " ".join(sents[:1]).strip()
+                if chunk:
+                    src = f"# {title} — {d.get('url','')}".strip()
+                    if not hit_sents or hit_sents[-1] != src:
+                        hit_sents.append(src)
+                    hit_sents.append(chunk)
+
+        context = "\n\n".join(hit_sents).strip()
+        if max_chars > 0 and len(context) > max_chars:
+            context = context[:max_chars] + "…"
+
+        # --- lexicon from identifiers + dotted phrases ---
+        def _extract_terms_local(text: str, *, top_k: int, min_len: int) -> List[str]:
+            terms = _extract_identifiers(text)
+            counts: Dict[str, int] = {}
+            for t in terms:
+                counts[t] = counts.get(t, 0) + 1
+            ranked_terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            return [t for t, _ in ranked_terms[:top_k]]
+
+        lexicon = _extract_terms_local(context or "\n".join(d["text"] for d in ranked),
+                                       top_k=lexicon_top_k, min_len=lexicon_min_len)
+
+        if use_phrases and context:
+            phrases = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b", context)
+            pc: Dict[str, int] = {}
+            for ph in phrases:
+                if any(tok.lower() in _STOP for tok in ph.split(".")):
+                    continue
+                pc[ph] = pc.get(ph, 0) + 1
+            phrase_top = [p for p, _ in sorted(pc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
+            seenp = set()
+            merged = []
+            for t in phrase_top + lexicon:
+                if t not in seenp:
+                    merged.append(t); seenp.add(t)
+            lexicon = merged[:lexicon_top_k]
+
+        # --- Learn new domains (optional) ---
+        newly_learned = []
+        if learn_new_sites:
+            store = Memory.load()
+            learned = set(store.get(learned_sites_key, []))
+            for dom, c in domain_hits.items():
+                if c >= learn_min_hits and dom not in learned and _allowed(f"https://{dom}/"):
+                    learned.add(dom)
+                    newly_learned.append(dom)
+            if newly_learned:
+                store[learned_sites_key] = sorted(learned)
+                Memory.save(store)
+
+        # --- Export to Memory ---
+        if export_lexicon and lexicon:
+            store = Memory.load()
+            store[lexicon_key] = lexicon
+            Memory.save(store)
+
+        if export_context and context:
+            store = Memory.load()
+            if append_ctx and isinstance(store.get(context_key), str) and store[context_key]:
+                store[context_key] = store[context_key].rstrip() + "\n\n" + context
+            else:
+                store[context_key] = context
+            Memory.save(store)
+
+        # --- Compose output back into pipeline ---
+        base = "" if payload is None else str(payload)
+        parts: List[str] = [base] if base else []
+        if inject_lexicon and lexicon:
+            parts.append("[lexicon]\n" + ", ".join(lexicon))
+        if inject_context and context:
+            parts.append("[context]\n" + context)
+        out = "\n\n".join(parts).strip()
+
+        meta = {
+            "rows": len(docs_raw),
+            "ranked_docs": len(ranked),
+            "top_urls": [d.get("url") for d in ranked],
+            "lexicon_key": lexicon_key if (export_lexicon and lexicon) else None,
+            "lexicon_size": len(lexicon),
+            "context_key": context_key if (export_context and context) else None,
+            "context_len": len(context),
+            "site_include": site_include,
+            "site_exclude": site_exclude,
+            "learned_sites_key": learned_sites_key if learn_new_sites else None,
+            "newly_learned": newly_learned,
+        }
+        return out, meta
+
+# Register the block
+BLOCKS.register("codecorpus", CodeCorpusBlock)
