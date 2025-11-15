@@ -13,11 +13,12 @@ import json as _json
 import os as _os
 import random
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import feedparser
 import requests
 from datasets import load_dataset
+from playwright.sync_api import sync_playwright, BrowserContext
 
 from registry import BLOCKS
 from models import get_chat_model  # <-- models now live separately
@@ -1180,7 +1181,7 @@ class WebCorpusBlock(BaseBlock):
                 from ddgs import DDGS  # pip install duckduckgo_search
                 with DDGS() as ddgs:
                     out = []
-                    for r in ddgs.text(q, max_results=n):
+                    for r in ddgs.text(q, max_results=n, safesearch='off'):
                         u = r.get("href") or r.get("url")
                         if u:
                             out.append(u)
@@ -1613,7 +1614,7 @@ class PlaywrightBlock(BaseBlock):
                     print(f"[PlaywrightBlock] Searching (via DDGS library) for: {q}", file=sys.stderr)
                 with DDGS() as ddgs:
                     out = []
-                    for r in ddgs.text(q, max_results=n):
+                    for r in ddgs.text(q, max_results=n, safesearch='off'):
                         url = r.get("href") or r.get("url")
                         title = r.get("title") or _clean_domain(url)
                         if url:
@@ -2844,7 +2845,7 @@ class CodeCorpusBlock(BaseBlock):
 
         if query and not candidates and _has_ddgs:
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_pages * 2):
+                for r in ddgs.text(query, max_results=max_pages * 2, safesearch='off'):
                     u = r.get("href") or r.get("url")
                     if u and _allowed(u):
                         candidates.append(u)
@@ -3644,7 +3645,7 @@ class ShoppingBlock(BaseBlock):
                 from ddgs import DDGS
 
                 with DDGS() as ddgs:
-                    for r in ddgs.text(full_query, max_results=limit):
+                    for r in ddgs.text(full_query, max_results=limit, safesearch='off'):
                         results.append(
                             {
                                 "title": r.get("title", ""),
@@ -3889,28 +3890,245 @@ class LinkTrackerBlock(BaseBlock):
     A deep-dive crawler designed to find specific 'hard-to-find' assets.
 
     It searches for a topic, visits the result pages, and scans their HTML
-    for specific file extensions (.pdf, .mp3, .zip) or regex patterns.
+    (and optionally JS-rendered DOM via Playwright) for specific file
+    extensions (.pdf, .mp3, .zip) or regex/keyword patterns.
 
     Modes:
-    - 'media': looks for .mp3, .wav, .flac, .m4a
-    - 'docs': looks for .pdf, .doc, .docx, .txt, .epub
-    - 'archives': looks for .zip, .rar, .7z, .tar
-    - 'custom': uses 'target_extensions' param
+    - 'media': looks for .mp3, .wav, .flac, .m4a, .ogg
+    - 'docs': looks for .pdf, .doc, .docx, .epub, .mobi
+    - 'archives': looks for .zip, .rar, .7z, .tar, .gz
+    - 'custom': uses 'extensions' param
 
     Features:
     - Search engines: duckduckgo (default), google_cse
     - Verify: Can perform a HEAD request to ensure the link is alive (200 OK).
     - Dedupe: Removes duplicate links found across multiple pages.
     - Optional site filter via `site_require` (e.g. archive.org only).
+    - Optional JS rendering via Playwright: linktracker.use_js=true
+    - Optional JS link dump: linktracker.return_all_js_links=true
     """
+
+    # Obvious static / junk-ish filenames we don't want to prioritize
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite",
+        "icon",
+        "favicon",
+        "logo",
+        "tracking",
+        "pixel",
+        "blank",
+        "placeholder",
+    }
+
+    # ------------------------------------------------------------------ #
+    # Search helpers
+    # ------------------------------------------------------------------ #
+
+    def _search_duckduckgo(self, q: str, n: int, ua: str, timeout: float) -> List[str]:
+        """Runs a DuckDuckGo search, returns a list of URLs."""
+        pages: List[str] = []
+
+        # Phase 1: ddgs.text()
+        try:
+            from ddgs import DDGS
+            with DDGS() as ddgs:
+                for r in ddgs.text(q, max_results=n, safesearch="off"):
+                    u = r.get("href") or r.get("url")
+                    if u:
+                        pages.append(u)
+            if pages:
+                return pages
+        except Exception:
+            pass
+
+        # Phase 2: HTML fallback (best effort)
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            from urllib.parse import unquote
+
+            r = requests.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": q},
+                headers={"User-Agent": ua},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select(".result__a"):
+                href = a.get("href")
+                if href and "uddg=" in href:
+                    href = unquote(href.split("uddg=")[1].split("&")[0])
+                    pages.append(href)
+        except Exception:
+            pass
+
+        return pages
+
+    def _search_google_cse(self, q: str, n: int, timeout: float) -> List[str]:
+        """Runs a Google CSE search, returns a list of URLs."""
+        import os
+        import requests
+
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        key = os.environ.get("GOOGLE_API_KEY")
+        if not (cx and key):
+            # No key or CSE ID -> behave like "no results"
+            return []
+
+        out: List[str] = []
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
+                timeout=timeout,
+            )
+            if r.status_code != 200:
+                return []
+            data = r.json()
+            for item in (data.get("items") or []):
+                u = item.get("link")
+                if u:
+                    out.append(u)
+            return out[:n]
+        except Exception:
+            return out[:n]
+
+    # ------------------------------------------------------------------ #
+    # Keyword helpers
+    # ------------------------------------------------------------------ #
+
+    def _extract_keywords_from_query(self, query: str) -> List[str]:
+        """Get significant query tokens, using _STOPWORDS if present."""
+        try:
+            stops = _STOPWORDS
+        except NameError:
+            stops = {"the", "a", "an", "is", "to", "for", "of", "and", "or"}
+
+        tokens = [
+            t
+            for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", query.lower())
+            if t not in stops
+        ]
+        # Deduplicate while keeping order
+        out: List[str] = []
+        for t in tokens:
+            if t not in out:
+                out.append(t)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Fetch helpers
+    # ------------------------------------------------------------------ #
+
+    def _fetch_page_html_plain(self, session, page_url: str, timeout: float) -> str:
+        """Fetch page HTML via requests only."""
+        import requests
+
+        resp = session.get(page_url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+
+    def _fetch_page_with_js(
+        self,
+        page_url: str,
+        timeout: float,
+        ua: str,
+        log: List[str],
+    ) -> Tuple[str, List[Dict[str, str]]]:
+        """
+        Use Playwright to:
+          • Render the page (domcontentloaded, short timeout).
+          • Run JS that collects candidate links:
+                a[href], audio[src], video[src], source[src],
+                iframe[src], embed[src].
+
+        Returns (html, links) where links is a list of {url,text,tag}.
+        """
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception:
+            log.append("Playwright not available, falling back to plain HTML (no JS links).")
+            return "", []
+
+        html = ""
+        links: List[Dict[str, str]] = []
+
+        try:
+            with sync_playwright() as p:
+                browser = p.firefox.launch(headless=True)
+                page = browser.new_page(user_agent=ua)
+                js_timeout_ms = int(min(timeout, 10.0) * 1000)
+                page.goto(page_url, wait_until="domcontentloaded", timeout=js_timeout_ms)
+
+                html = page.content()
+
+                raw_links = page.evaluate(
+                    """
+                    () => {
+                      const out = [];
+                      const seen = new Set();
+
+                      function push(el, url, tag) {
+                        if (!url) return;
+                        if (seen.has(url)) return;
+                        seen.add(url);
+                        const text = (el.innerText || el.textContent || el.title || "").trim();
+                        out.push({ url, text, tag });
+                      }
+
+                      const selectors = [
+                        "a[href]",
+                        "audio[src]",
+                        "video[src]",
+                        "video source[src]",
+                        "source[src]",
+                        "iframe[src]",
+                        "embed[src]"
+                      ];
+
+                      for (const sel of selectors) {
+                        document.querySelectorAll(sel).forEach(el => {
+                          let url = el.href || el.currentSrc || el.src;
+                          if (!url && el.getAttribute) {
+                            url = el.getAttribute("src") || el.getAttribute("href");
+                          }
+                          if (!url) return;
+                          push(el, url, el.tagName.toLowerCase());
+                        });
+                      }
+
+                      return out;
+                    }
+                    """
+                ) or []
+
+                for item in raw_links:
+                    url = item.get("url")
+                    if not url:
+                        continue
+                    links.append({
+                        "url": url,
+                        "text": (item.get("text") or "").strip(),
+                        "tag": item.get("tag") or "a",
+                    })
+
+                browser.close()
+                log.append(f"Rendered JS DOM + gathered {len(links)} JS links for: {page_url}")
+        except Exception as e:
+            log.append(f"Playwright error on {page_url}: {e}")
+
+        return html, links
+
+    # ------------------------------------------------------------------ #
+    # Main execution
+    # ------------------------------------------------------------------ #
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         import os
-        import re
         import requests
         from bs4 import BeautifulSoup
         from urllib.parse import urljoin, urlparse
-        from ddgs import DDGS  # DuckDuckGo Search
 
         # --- Parameters ---
         query = str(params.get("query", "") or str(payload or "")).strip()
@@ -3918,16 +4136,18 @@ class LinkTrackerBlock(BaseBlock):
         num_pages_to_scan = int(params.get("scan_limit", 5))  # How many search results to visit
         timeout = float(params.get("timeout", 5.0))
         verify_links = bool(params.get("verify", True))       # Check if 200 OK
-
-        # NEW: search engine selection
         engine = str(params.get("engine", "duckduckgo")).lower()  # duckduckgo | google_cse
+
+        # NEW: JS & debug options
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))  # soft cap
 
         # Custom filters
         custom_ext = str(params.get("extensions", "")).split(",")
         keywords_in_url = str(params.get("url_keywords", "")).split(",")
 
-        # NEW: required sites (domains/substrings)
-        # Example: "archive.org,ca.archive.org"
+        # Required sites (domains/substrings)
         site_require_raw = str(params.get("site_require", "")).split(",")
         required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
 
@@ -3939,33 +4159,31 @@ class LinkTrackerBlock(BaseBlock):
             targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
         elif mode == "archives":
             targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
+        # "custom" just uses extensions parameter
 
         # Add custom extensions (remove empty strings)
         for e in custom_ext:
-            if e.strip():
-                targets.add(e.strip().lower() if e.startswith(".") else f".{e.strip().lower()}")
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
 
-        # --- [NEW] Smart Keyword Filtering ---
-        # 1. Start with user-provided keywords
-        keywords = [k.strip().lower() for k in keywords_in_url if k.strip()]
-
-        # 2. Automatically add query tokens as required keywords
-        if query:
-            try:
-                query_tokens = [
-                    t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", query.lower())
-                    if t not in _STOPWORDS
-                ]
-            except NameError:
-                query_tokens = [t for t in query.lower().split() if t not in _STOPWORDS]
-
-            for qt in query_tokens:
-                if qt not in keywords:
-                    keywords.append(qt)
-        # --- [END NEW] ---
+        if not targets:
+            # Fallback: if nothing, assume docs
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
 
         if not query:
             return "", {"error": "No query provided for LinkTracker."}
+
+        # --- Keyword filtering: user + query tokens ---
+        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
+        if query:
+            q_tokens = self._extract_keywords_from_query(query)
+            for qt in q_tokens:
+                if qt not in keywords:
+                    keywords.append(qt)
 
         # --- Small helpers ---
         def _clean_domain(u: str) -> str:
@@ -3994,57 +4212,19 @@ class LinkTrackerBlock(BaseBlock):
         elif mode == "docs":
             search_q += " filetype:pdf"
 
-        def _search_duckduckgo(q: str, n: int):
-            pages = []
-            try:
-                with DDGS() as ddgs:
-                    for r in ddgs.text(q, max_results=n):
-                        u = r.get("href") or r.get("url")
-                        if not u:
-                            continue
-                        pages.append(u)
-            except Exception:
-                pass
-            return pages
-
-        def _search_google_cse(q: str, n: int):
-            cx = os.environ.get("GOOGLE_CSE_ID")
-            key = os.environ.get("GOOGLE_API_KEY")
-            if not (cx and key):
-                # No key or CSE ID -> behave like "no results"
-                return []
-            out = []
-            try:
-                # For simplicity, single page of results; n is small anyway for LinkTracker
-                r = requests.get(
-                    "https://www.googleapis.com/customsearch/v1",
-                    params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
-                    timeout=timeout,
-                )
-                if r.status_code != 200:
-                    return []
-                data = r.json()
-                for item in (data.get("items") or []):
-                    u = item.get("link")
-                    if u:
-                        out.append(u)
-                return out[:n]
-            except Exception:
-                return out[:n]
-
         if engine == "google_cse":
-            candidate_pages = _search_google_cse(search_q, num_pages_to_scan * 2)
+            candidate_pages = self._search_google_cse(search_q, num_pages_to_scan * 2, timeout)
         else:
-            candidate_pages = _search_duckduckgo(search_q, num_pages_to_scan * 2)
+            # default duckduckgo
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+            candidate_pages = self._search_duckduckgo(search_q, num_pages_to_scan * 2, ua, timeout)
 
-        # Limit to requested count
-        # AND apply required_sites filter at the hub-page level too
-        filtered_candidates = []
+        # Limit to requested count & apply required_sites at hub-page level
+        filtered_candidates: List[str] = []
         for u in candidate_pages:
             if _allowed_by_required_sites(u):
                 filtered_candidates.append(u)
             elif not required_sites:
-                # If no required_sites, just keep all
                 filtered_candidates.append(u)
             if len(filtered_candidates) >= num_pages_to_scan:
                 break
@@ -4052,27 +4232,62 @@ class LinkTrackerBlock(BaseBlock):
         candidate_pages = filtered_candidates
 
         # --- Step 2: Deep Scan ---
-        found_assets = []
-        seen_urls = set()
+        found_assets: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
 
         session = requests.Session()
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
         })
 
-        log = []
+        log: List[str] = []
+        all_js_links: List[Dict[str, str]] = []  # track js links for debug
 
         for page_url in candidate_pages:
             try:
-                resp = session.get(page_url, timeout=timeout)
-                if resp.status_code != 200:
-                    continue
+                links_on_page: List[Dict[str, str]] = []
 
-                soup = BeautifulSoup(resp.text, "html.parser")
+                if use_js:
+                    html, js_links = self._fetch_page_with_js(page_url, timeout, session.headers["User-Agent"], log)
+                    links_on_page.extend(js_links)
 
-                # Scan every single link on the page
+                    # record JS links
+                    for jl in js_links:
+                        all_js_links.append({
+                            "page": page_url,
+                            "url": jl.get("url", ""),
+                            "text": jl.get("text", ""),
+                            "tag": jl.get("tag", ""),
+                        })
+
+                    if not html:
+                        try:
+                            html = self._fetch_page_html_plain(session, page_url, timeout)
+                        except Exception as e:
+                            log.append(f"Error fetching {page_url} (fallback): {e}")
+                            # if no HTML and no JS links, skip
+                            if not links_on_page:
+                                continue
+                    soup = BeautifulSoup(html, "html.parser")
+                else:
+                    html = self._fetch_page_html_plain(session, page_url, timeout)
+                    soup = BeautifulSoup(html, "html.parser")
+
+                # Add plain HTML <a> links (bounded)
+                link_count = 0
                 for a in soup.find_all("a", href=True):
-                    raw_link = a["href"]
+                    links_on_page.append({
+                        "url": a["href"],
+                        "text": a.get_text(strip=True),
+                        "tag": "a",
+                    })
+                    link_count += 1
+                    if link_count >= max_links_per_page:
+                        break
+
+                # Scan links_on_page for targets
+                for link in links_on_page:
+                    raw_link = link["url"]
                     full_url = urljoin(page_url, raw_link)
                     parsed = urlparse(full_url)
                     path = parsed.path.lower()
@@ -4080,72 +4295,98 @@ class LinkTrackerBlock(BaseBlock):
                     if full_url in seen_urls:
                         continue
 
-                    # 1. Check Extension
+                    # 1. Check extension
                     is_hit = False
                     for ext in targets:
                         if path.endswith(ext):
                             is_hit = True
                             break
 
-                    # --- Keyword filtering ---
-                    if keywords and is_hit:
-                        link_text = (a.get_text(strip=True) or "").lower()
+                    if not is_hit:
+                        continue
+
+                    # 2. Keyword filtering
+                    if keywords:
+                        link_text = (link.get("text") or "").lower()
                         url_text = full_url.lower().replace("%20", " ")
                         haystack = link_text + " " + url_text
                         if not any(k in haystack for k in keywords):
-                            is_hit = False  # Failed keyword check
+                            is_hit = False
 
-                    # --- NEW: required_sites filter at asset level ---
-                    if is_hit and not _allowed_by_required_sites(full_url):
-                        is_hit = False
+                    if not is_hit:
+                        continue
 
-                    if is_hit:
-                        seen_urls.add(full_url)
+                    # 3. Required sites at asset level
+                    if not _allowed_by_required_sites(full_url):
+                        continue
 
-                        # 3. Verification
-                        status = "unverified"
-                        size = "?"
-                        if verify_links:
-                            try:
-                                h = session.head(full_url, allow_redirects=True, timeout=3)
-                                if h.status_code == 200:
-                                    status = "200 OK"
-                                    cl = h.headers.get("Content-Length")
-                                    if cl:
-                                        size = f"{int(cl) // 1024} KB"
-                                else:
-                                    status = f"Dead ({h.status_code})"
-                            except Exception:
-                                status = "Timeout/Error"
+                    # 4. Dedupe
+                    seen_urls.add(full_url)
 
-                        if not verify_links or status == "200 OK":
-                            link_text = (a.get_text(strip=True) or path.split("/")[-1])[:100]
-                            found_assets.append({
-                                "text": link_text,
-                                "url": full_url,
-                                "source": page_url,
-                                "size": size
-                            })
+                    # 5. Verification
+                    status = "unverified"
+                    size = "?"
+                    if verify_links:
+                        try:
+                            h = session.head(full_url, allow_redirects=True, timeout=3)
+                            if h.status_code == 200:
+                                status = "200 OK"
+                                cl = h.headers.get("Content-Length")
+                                if cl:
+                                    size = f"{int(cl) // 1024} KB"
+                            else:
+                                status = f"Dead ({h.status_code})"
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not verify_links or status == "200 OK":
+                        display_text = link.get("text", "") or path.split("/")[-1]
+                        display_text = display_text[:100]
+                        found_assets.append({
+                            "text": display_text,
+                            "url": full_url,
+                            "source": page_url,
+                            "size": size,
+                            "status": status,
+                        })
 
             except Exception as e:
                 log.append(f"Error scanning {page_url}: {e}")
                 continue
 
         # --- Step 3: Format Output ---
+        from urllib.parse import urlparse as _urlparse
+
         if not found_assets:
-            return (
+            base_text = (
                 f"### LinkTracker: No specific assets found.\n"
-                f"Scanned {len(candidate_pages)} pages for extensions: {list(targets)}.\n"
+                f"Scanned {len(candidate_pages)} pages for extensions: {sorted(list(targets))}.\n"
                 f"Required keywords: {keywords}\n"
                 f"Required sites: {required_sites or '[none]'}\n"
-                f"Engine: {engine}"
-            ), {
+                f"Engine: {engine}\n"
+            )
+            lines = [base_text]
+
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                    url = jl["url"]
+                    text = jl["text"] or "(no text)"
+                    tag = jl["tag"] or "a"
+                    lines.append(f"- **[{text}]({url})**")
+                    lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
+
+            return "\n".join(lines), {
                 "count": 0,
                 "keywords_used": keywords,
                 "engine": engine,
                 "required_sites": required_sites,
+                "js_links": all_js_links,
+                "log": log,
             }
 
+        # We have assets
         lines = [f"### LinkTracker Found {len(found_assets)} Assets"]
         lines.append(
             f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
@@ -4153,9 +4394,22 @@ class LinkTrackerBlock(BaseBlock):
         )
         lines.append("")
 
-        for asset in found_assets:  # Show all links
+        for asset in found_assets:
             lines.append(f"- **[{asset['text']}]({asset['url']})**")
-            lines.append(f"  - *Size: {asset['size']} | Source: {urlparse(asset['source']).netloc}*")
+            lines.append(
+                f"  - *Size: {asset['size']} | Status: {asset['status']} | "
+                f"Source: {_urlparse(asset['source']).netloc}*"
+            )
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                url = jl["url"]
+                text = jl["text"] or "(no text)"
+                tag = jl["tag"] or "a"
+                lines.append(f"- **[{text}]({url})**")
+                lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
 
         return "\n".join(lines), {
             "found": len(found_assets),
@@ -4164,18 +4418,23 @@ class LinkTrackerBlock(BaseBlock):
             "keywords_used": keywords,
             "engine": engine,
             "required_sites": required_sites,
+            "js_links": all_js_links,
+            "log": log,
         }
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "rare aphex twin interview",
-            "mode": "docs",           # media, docs, archives, custom
+            "mode": "docs",              # media, docs, archives, custom
             "scan_limit": 5,
             "verify": True,
-            "extensions": ".pdf,.txt",  # optional overrides
+            "extensions": ".pdf,.txt",   # optional overrides
             "url_keywords": "archive,download",  # optional filter
-            "engine": "duckduckgo",   # or: google_cse
-            "site_require": ""        # e.g. 'archive.org,ca.archive.org'
+            "engine": "duckduckgo",      # or: google_cse
+            "site_require": "",          # e.g. 'archive.org,ca.archive.org'
+            "use_js": False,             # Enable Playwright JS rendering
+            "return_all_js_links": False,
+            "max_links_per_page": 500,
         }
 
 
@@ -4435,3 +4694,533 @@ class YouTubeDataBlock(BaseBlock):
 
 
 BLOCKS.register("youtube", YouTubeDataBlock)
+
+
+# ======================= VideoLinkTrackerBlock =============================
+@dataclass
+class VideoLinkTrackerBlock(BaseBlock):
+    """
+    Bounded, smarter video crawler.
+
+    NEW: Can run in two modes via the 'source' param:
+      • source="search" (default): Runs its own web search to find hub pages.
+      • source="payload": Skips search and instead parses the input payload
+                          (e.g., from WebCorpus) for hub page URLs to scan.
+
+    Features:
+      • DuckDuckGo / Google CSE search with optional site: filters.
+      • Optional JS rendering via Playwright (use_js=true).
+      • Ad / tracking filters to skip obvious junk.
+      • Optional shallow second-level crawl (controlled by max_depth).
+      • Stream-aware detection (.mp4, .m3u8, 'videoplayback', etc.)
+      • Optional HEAD-based Content-Type sniffing (smart_sniff).
+      • Hard safety limits (max_pages_total, max_assets).
+    """
+
+    # --- [Constants: VIDEO_EXTENSIONS, VIDEO_PLATFORMS, etc.] ---
+    # (These are unchanged from the file you provided)
+    VIDEO_EXTENSIONS = {
+        ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".m3u8", ".mpd",
+    }
+    VIDEO_PLATFORMS = {
+        "youtube.com/embed/", "youtube-nocookie.com/embed/",
+        "player.vimeo.com/video/", "dailymotion.com/embed/video/",
+        "rumble.com/embed/", "v.redd.it", "/player.html", "/player/",
+    }
+    STREAM_HINT_KEYWORDS = {
+        "videoplayback", "hls", "dash", "manifest", "master.m3u8",
+        "index.m3u8", "playlist.m3u8",
+    }
+    VIDEO_CONTENT_PREFIXES = {"video/"}
+    HLS_CONTENT_TYPES = {"application/x-mpegurl", "application/vnd.apple.mpegurl"}
+    DASH_CONTENT_TYPES = {"application/dash+xml"}
+    AD_HOST_SUBSTRINGS = {
+        "doubleclick", "googlesyndication", "adservice", "adserver",
+        "adsystem", "adnxs", "trk.", "tracking", "analytics",
+        "metrics", "scorecardresearch",
+    }
+    AD_PATH_KEYWORDS = {
+        "/ads/", "/adserver/", "/banner/", "/banners/", "/promo/",
+        "/promotions/", "/tracking/", "/click/", "/impression", "/pixel",
+    }
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite", "icon", "favicon", "logo", "tracking",
+        "pixel", "blank", "placeholder",
+    }
+
+    # --- [End Constants] ---
+
+    # ------------------------------------------------------------------ #
+    # Search helpers
+    # ------------------------------------------------------------------ #
+    def _search_duckduckgo(self, q: str, n: int, ua: str, timeout: float) -> List[str]:
+        pages: List[str] = []
+        try:
+            from ddgs import DDGS
+            with DDGS() as ddgs:
+                for r in ddgs.text(q, max_results=n, safesearch="off"):
+                    u = r.get("href") or r.get("url")
+                    if u: pages.append(u)
+            if pages: return pages
+        except Exception:
+            pass
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            from urllib.parse import unquote
+            r = requests.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": q}, headers={"User-Agent": ua}, timeout=timeout,
+            )
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.select(".result__a"):
+                href = a.get("href")
+                if href and "uddg=" in href:
+                    href = unquote(href.split("uddg=")[1].split("&")[0])
+                    pages.append(href)
+        except Exception:
+            pass
+        return pages
+
+    def _search_google_cse(self, q: str, n: int, timeout: float) -> List[str]:
+        import os, requests
+        cx, key = os.environ.get("GOOGLE_CSE_ID"), os.environ.get("GOOGLE_API_KEY")
+        if not (cx and key): return []
+        out: List[str] = []
+        try:
+            r = requests.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
+                timeout=timeout,
+            )
+            if r.status_code != 200: return []
+            data = r.json()
+            for item in (data.get("items") or []):
+                if u := item.get("link"): out.append(u)
+            return out[:n]
+        except Exception:
+            return out[:n]
+
+    # ------------------------------------------------------------------ #
+    # Keyword / URL heuristics
+    # ------------------------------------------------------------------ #
+    def _get_keywords_from_query(self, query: str) -> List[str]:
+        try:
+            stops = _STOPWORDS
+        except NameError:
+            stops = {"the", "a", "an", "is", "to", "for", "of"}
+        tokens = [
+            t for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", query.lower())
+            if t not in stops and len(t) > 2
+        ]
+        return list(dict.fromkeys(tokens))
+
+    def _clean_domain(self, u: str) -> str:
+        try:
+            netloc = urlparse(u).netloc.lower()
+            return netloc.split(":")[0]
+        except Exception:
+            return ""
+
+    def _looks_like_ad(self, netloc: str, path: str) -> bool:
+        host, p = netloc.lower(), path.lower()
+        if any(sub in host for sub in self.AD_HOST_SUBSTRINGS): return True
+        if any(kw in p for kw in self.AD_PATH_KEYWORDS): return True
+        filename = p.rsplit("/", 1)[-1]
+        if any(junk in filename for junk in self.JUNK_FILENAME_KEYWORDS): return True
+        return False
+
+    def _is_probable_video_url(self, full_url: str, path: str, url_lower: str) -> bool:
+        if any(path.endswith(ext) for ext in self.VIDEO_EXTENSIONS): return True
+        if path.endswith(".m3u8") or path.endswith(".mpd"): return True
+        if any(platform in url_lower for platform in self.VIDEO_PLATFORMS): return True
+        if any(kw in url_lower for kw in self.STREAM_HINT_KEYWORDS): return True
+        return False
+
+    def _is_content_child_candidate(self, full_url: str, netloc: str, path: str) -> bool:
+        p = path.lower()
+        if self._looks_like_ad(netloc, p): return False
+        content_hints = [
+            "/details/", "/video/", "/videos/", "/watch/",
+            "/title/", "/entry/", "/post/",
+        ]
+        if any(h in p for h in content_hints): return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Fetch helpers
+    # ------------------------------------------------------------------ #
+    def _fetch_page_html_plain(self, session, page_url: str, timeout: float) -> str:
+        resp = session.get(page_url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
+
+    # [MODIFIED] Helper now takes an existing context, doesn't start Playwright
+    def _fetch_page_with_js(
+            self,
+            pw_context: BrowserContext,  # <-- Takes context
+            page_url: str,
+            timeout: float,
+            log: List[str],
+    ) -> Tuple[str, List[Dict[str, str]]]:
+
+        html = ""
+        links: List[Dict[str, str]] = []
+        page = None
+        try:
+            page = pw_context.new_page()
+            js_timeout_ms = int(min(timeout, 10.0) * 1000)
+            page.goto(page_url, wait_until="domcontentloaded", timeout=js_timeout_ms)
+            html = page.content()
+            raw_links = page.evaluate(
+                """
+                () => {
+                  const out = []; const seen = new Set();
+                  function push(el, url, tag) {
+                    if (!url || url.startsWith('blob:') || seen.has(url)) return;
+                    seen.add(url);
+                    const text = (el.innerText || el.textContent || el.title || "").trim();
+                    out.push({ url, text, tag });
+                  }
+                  const selectors = [
+                    "video[src]", "video source[src]", "source[src]",
+                    "a[href]", "iframe[src]", "embed[src]"
+                  ];
+                  for (const sel of selectors) {
+                    document.querySelectorAll(sel).forEach(el => {
+                      let url = el.href || el.currentSrc || el.src;
+                      if (!url && el.getAttribute) {
+                        url = el.getAttribute("src") || el.getAttribute("href");
+                      }
+                      push(el, url, el.tagName.toLowerCase());
+                    });
+                  }
+                  return out;
+                }
+                """
+            ) or []
+            for item in raw_links:
+                if url := item.get("url"):
+                    links.append({
+                        "url": url,
+                        "text": (item.get("text") or "").strip(),
+                        "tag": item.get("tag") or "a",
+                    })
+            log.append(f"Rendered JS DOM + gathered {len(links)} JS links for: {page_url}")
+        except Exception as e:
+            log.append(f"Playwright error on {page_url}: {e}")
+        finally:
+            if page and not page.is_closed():
+                page.close()  # Close page, but not context
+        return html, links
+
+    # ------------------------------------------------------------------ #
+    # Main execution
+    # ------------------------------------------------------------------ #
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        import requests
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin, urlparse
+
+        # --- Parameters ---
+        query = str(params.get("query", "") or str(payload or "")).strip()
+        source = str(params.get("source", "search")).lower()
+        sites_raw = str(params.get("sites", "")).split(",")
+        sites = [s.strip().lower() for s in sites_raw if s.strip()]
+        global_mode = not sites
+        if global_mode:
+            sites = ["*"]
+
+        scan_limit = int(params.get("scan_limit", 3))
+        timeout = float(params.get("timeout", 8.0))
+        ua = str(params.get("user_agent", "promptchat/VideoLinkTracker"))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+        verify_links = bool(params.get("verify", False))
+        use_js = bool(params.get("use_js", False))
+        smart_sniff = bool(params.get("smart_sniff", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_depth = int(params.get("max_depth", 0))
+        child_page_limit = int(params.get("child_page_limit", 4))
+        max_pages_total = int(params.get("max_pages_total", 20))
+        max_links_per_page = int(params.get("max_links_per_page", 200))
+        max_assets = int(params.get("max_assets", 100))
+
+        if not query and source == "search":
+            return "", {"error": "VideoLinkTracker: No query provided for 'search' source."}
+
+        keywords = self._get_keywords_from_query(query)
+        log: List[str] = []
+        found_assets: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        visited_pages: set[str] = set()
+        pages_to_crawl_tuples: List[Tuple[str, int]] = []  # (url, depth)
+        pages_processed = 0
+        all_js_links: List[Dict[str, str]] = []
+        session = requests.Session()
+        session.headers.update({"User-Agent": ua})
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if global_mode or not sites or sites == ["*"]:
+                return True
+            d = self._clean_domain(u)
+            return any(req in d for req in sites)
+
+        # --- [MODIFIED] Core crawl function now accepts pw_context ---
+        def crawl_page(
+                page_url: str,
+                depth_left: int,
+                pw_context: Optional[BrowserContext]  # Can be None
+        ) -> List[str]:
+            nonlocal pages_processed
+
+            page_child_candidates: List[str] = []
+            if page_url in visited_pages or depth_left < 0:
+                return page_child_candidates
+            if pages_processed >= max_pages_total or len(found_assets) >= max_assets:
+                return page_child_candidates
+
+            visited_pages.add(page_url)
+            pages_processed += 1
+            links_on_page: List[Dict[str, str]] = []
+
+            try:
+                # Use Playwright if enabled AND context was passed in
+                if use_js and pw_context:
+                    html, js_links = self._fetch_page_with_js(pw_context, page_url, timeout, log)
+                    links_on_page.extend(js_links)
+                    for jl in js_links:
+                        all_js_links.append({**jl, "page": page_url})
+                    if not html:
+                        try:
+                            html = self._fetch_page_html_plain(session, page_url, timeout)
+                        except Exception as e:
+                            log.append(f"Error fetching {page_url} (fallback): {e}")
+                            if not links_on_page: return page_child_candidates
+                    soup = BeautifulSoup(html, "html.parser")
+                else:  # Fallback to plain requests
+                    html = self._fetch_page_html_plain(session, page_url, timeout)
+                    soup = BeautifulSoup(html, "html.parser")
+            except Exception as e:
+                log.append(f"Error fetching/parsing {page_url}: {e}")
+                return page_child_candidates
+
+            # From HTML: add potential links
+            link_count = 0
+            for a in soup.find_all("a", href=True):
+                links_on_page.append({"url": a["href"], "text": a.get_text(strip=True), "tag": "a"})
+                link_count += 1
+                if link_count >= max_links_per_page: break
+            if link_count < max_links_per_page:
+                for v in soup.find_all("video"):
+                    if v.get("src"): links_on_page.append({"url": v["src"], "text": v.get("title", ""), "tag": "video"})
+                    for s in v.find_all("source", src=True): links_on_page.append(
+                        {"url": s["src"], "text": s.get("title", ""), "tag": "source"})
+
+            # --- Filter / classify links ---
+            for link in links_on_page:
+                if len(found_assets) >= max_assets: break
+                try:
+                    full_url = urljoin(page_url, link["url"])
+                    parsed = urlparse(full_url)
+                    netloc, path, url_lower = parsed.netloc, (parsed.path or "/"), full_url.lower()
+
+                    if self._looks_like_ad(netloc, path): continue
+                    head_done, status, content_type = False, "unverified", None
+                    is_video = self._is_probable_video_url(full_url, path.lower(), url_lower)
+
+                    if (not is_video) and depth_left > 0:
+                        if self._is_content_child_candidate(full_url, netloc, path):
+                            if (full_url not in visited_pages and len(page_child_candidates) < child_page_limit):
+                                page_child_candidates.append(full_url)
+
+                    if (not is_video) and smart_sniff:
+                        try:
+                            h = session.head(full_url, allow_redirects=True, timeout=3)
+                            head_done = True
+                            status = f"{h.status_code} OK" if h.status_code == 200 else f"Dead ({h.status_code})"
+                            content_type = (h.headers.get("Content-Type") or "").lower()
+                            if any(content_type.startswith(p) for p in self.VIDEO_CONTENT_PREFIXES): is_video = True
+                            if content_type in self.HLS_CONTENT_TYPES or content_type in self.DASH_CONTENT_TYPES: is_video = True
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not is_video: continue
+                    if full_url in seen_urls: continue
+
+                    haystack = (link.get("text", "") + " " + full_url).lower().replace("%20", " ")
+                    if keywords and not any(k in haystack for k in keywords):
+                        continue  # Not relevant
+
+                    if not _allowed_by_required_sites(full_url): continue
+                    seen_urls.add(full_url)
+
+                    if verify_links and not head_done:
+                        try:
+                            h = session.head(full_url, allow_redirects=True, timeout=3)
+                            status = f"{h.status_code} OK" if h.status_code == 200 else f"Dead ({h.status_code})"
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not verify_links or "OK" in status:
+                        found_assets.append({
+                            "text": (link.get("text", "") or path.split("/")[-1])[:100],
+                            "url": full_url, "source_page": page_url, "tag": link["tag"], "status": status,
+                        })
+                except Exception:
+                    continue
+
+            return page_child_candidates
+
+        # --- MODIFIED Step 1: Discovery (Populate Crawl Queue) ---
+        if source == "payload":
+            log.append("Reading hub pages from payload...")
+            payload_str = str(payload)
+            # Regex to find URLs inside markdown links or # headers
+            urls_from_payload = re.findall(r'#.*?(https?://[^\s<\]]+)', payload_str)
+            urls_from_payload.extend(re.findall(r'\[.*?\]\((https?://[^\s)]+)\)', payload_str))
+            if not urls_from_payload:  # Fallback: find any URL
+                urls_from_payload.extend(re.findall(r'\b(https?://[^\s<\]]+)\b', payload_str))
+
+            seen_payload_urls = set()
+            candidate_pages = []
+            for u in urls_from_payload:
+                u = u.strip().rstrip(')')
+                if u not in seen_payload_urls:
+                    if _allowed_by_required_sites(u):
+                        candidate_pages.append(u)
+                        seen_payload_urls.add(u)
+
+            log.append(f"Found {len(candidate_pages)} unique URLs in payload.")
+            if scan_limit > 0:
+                candidate_pages = candidate_pages[:scan_limit]
+            for url in candidate_pages:
+                pages_to_crawl_tuples.append((url, 0))
+
+        else:  # source == "search"
+            log.append("Finding hub pages via built-in search...")
+            for site_domain in sites:
+                search_q = f"site:{site_domain} {query}" if not global_mode else query
+                log.append(f"Searching {engine} for: {search_q}")
+
+                if engine == "google_cse":
+                    hub_pages = self._search_google_cse(search_q, scan_limit, timeout)
+                else:
+                    hub_pages = self._search_duckduckgo(search_q, scan_limit, ua, timeout)
+
+                if not hub_pages:
+                    log.append(f"No hub pages found for: {search_q}")
+                else:
+                    for page_url in hub_pages[:scan_limit]:
+                        if page_url not in visited_pages:
+                            pages_to_crawl_tuples.append((page_url, 0))
+                if global_mode:  # Global search only runs once
+                    break
+
+                    # --- [MODIFIED] Step 2: Deep Scan (Wrapper) ---
+        # This now wraps the crawl loop with a Playwright instance *if needed*
+
+        try:
+            if use_js:
+                from playwright.sync_api import sync_playwright
+                with sync_playwright() as p:
+                    browser = p.firefox.launch(headless=True)
+                    pw_context: BrowserContext = browser.new_context(user_agent=ua)
+
+                    while pages_to_crawl_tuples and pages_processed < max_pages_total and len(
+                            found_assets) < max_assets:
+                        page_url, depth = pages_to_crawl_tuples.pop(0)  # BFS
+                        if page_url in visited_pages: continue
+
+                        child_candidates = crawl_page(page_url, depth, pw_context)  # Pass context
+
+                        if depth < max_depth:
+                            for child_url in child_candidates:
+                                if child_url not in visited_pages and len(pages_to_crawl_tuples) < (
+                                        max_pages_total - pages_processed):
+                                    pages_to_crawl_tuples.append((child_url, depth + 1))
+                    browser.close()
+            else:
+                # Run without Playwright context
+                while pages_to_crawl_tuples and pages_processed < max_pages_total and len(found_assets) < max_assets:
+                    page_url, depth = pages_to_crawl_tuples.pop(0)
+                    if page_url in visited_pages: continue
+
+                    child_candidates = crawl_page(page_url, depth, None)  # Pass None
+
+                    if depth < max_depth:
+                        for child_url in child_candidates:
+                            if child_url not in visited_pages and len(pages_to_crawl_tuples) < (
+                                    max_pages_total - pages_processed):
+                                pages_to_crawl_tuples.append((child_url, depth + 1))
+        except Exception as e:
+            log.append(f"FATAL CRAWL ERROR: {e}")
+            if "browser" in locals() and locals()["browser"].is_connected():
+                locals()["browser"].close()
+
+        # --- Step 3: Format Output ---
+        from urllib.parse import urlparse as _urlparse
+        display_sites = "[payload]" if source == "payload" else ("[all]" if global_mode else ", ".join(sites))
+
+        if not found_assets:
+            base_text = (
+                f"### VideoTracker: No video assets found.\n"
+                f"Source: {source} | Scanned {display_sites} for query: {query}\n"
+                f"Required keywords: {keywords}\n"
+                f"Log: {log}\n"
+            )
+            lines = [base_text]
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                    lines.append(f"- <{jl.get('tag')}> [{jl.get('text')}]({jl.get('url')}) @ {host}")
+            return "\n".join(lines), {
+                "count": 0, "keywords_used": keywords, "sites": [] if global_mode else sites,
+                "global_mode": global_mode, "log": log, "js_links": all_js_links, "source": source,
+            }
+
+        found_assets.sort(key=lambda a: len(a["url"]))
+        lines = [f"### VideoTracker Found {len(found_assets)} Assets"]
+        lines.append(
+            f"_Source: {source} | Query: {query} | Sites: {display_sites} | Keywords: {keywords} | Pages: {pages_processed}_")
+        lines.append("")
+
+        for asset in found_assets:
+            lines.append(f"- **[{asset['text']}]({asset['url']})**")
+            lines.append(
+                f"  - *Tag: <{asset['tag']}> | Source: {_urlparse(asset['source_page']).netloc} | Status: {asset['status']}*")
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                lines.append(f"- <{jl.get('tag')}> [{jl.get('text')}]({jl.get('url')}) @ {host}")
+
+        return "\n".join(lines), {
+            "found": len(found_assets), "scanned_sites": [] if global_mode else sites, "global_mode": global_mode,
+            "assets": found_assets, "keywords_used": keywords, "pages_processed": pages_processed,
+            "log": log, "js_links": all_js_links, "source": source,
+        }
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "rare aphex twin interview",
+            "source": "search",  # NEW: 'search' or 'payload'
+            "sites": "",  # empty = global search
+            "scan_limit": 3,
+            "verify": False,
+            "engine": "duckduckgo",
+            "use_js": True,  # Defaulting to True for better video finding
+            "smart_sniff": False,
+            "max_depth": 0,
+            "child_page_limit": 4,
+            "max_pages_total": 20,
+            "max_links_per_page": 200,
+            "max_assets": 100,
+            "return_all_js_links": False,
+        }
+
+
+# Register the block
+BLOCKS.register("videotracker", VideoLinkTrackerBlock)
