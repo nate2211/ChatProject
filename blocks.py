@@ -10,25 +10,23 @@ import json
 import os
 import re
 import sqlite3
+import sys
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional, Set
 import json as _json
 import os as _os
-import random
 import time
 from urllib.parse import urlencode, urlparse
-
 import feedparser
 import requests
-from datasets import load_dataset
-from playwright.sync_api import sync_playwright, BrowserContext
-
+from playwright.sync_api import BrowserContext
 from registry import BLOCKS
 from models import get_chat_model  # <-- models now live separately
 import xml.etree.ElementTree as ET
 import re as _re
 from dotenv import load_dotenv
+
 load_dotenv()
 # ---------------- Paths & helpers ----------------
 APP_DIR = _os.path.join(_os.path.expanduser("~"), ".promptchat")
@@ -296,6 +294,67 @@ class BaseBlock:
         """Returns a dictionary of default parameters for the GUI."""
         return {}
 
+    # [NEW] Generic helper to run a sub-block pipeline on a value
+    def run_sub_pipeline(
+            self,
+            initial_value: Any,
+            pipeline_param_name: str,
+            parent_params: Dict[str, Any]
+    ) -> Any:
+        """
+        Runs a mini-pipeline of sub-blocks on a value.
+
+        Args:
+            initial_value: The starting value (e.g., a query string).
+            pipeline_param_name: The key in 'parent_params' that holds the list/string of
+                                 sub-blocks (e.g., "subpipeline").
+            parent_params: The main block's 'params' dict.
+
+        Returns:
+            The final, processed value from the last sub-block.
+        """
+        from registry import SUB_BLOCKS
+        import subblocks
+        # 1) Read the pipeline definition from params, e.g.:
+        #    subpipeline = "prompt_query,another_sub"
+        pipeline_def = parent_params.get(pipeline_param_name, None)
+
+        if pipeline_def is None:
+            # No pipeline defined – just return original value
+            return initial_value
+
+        # 2) Normalize to a list of sub-block names
+        if isinstance(pipeline_def, str):
+            sub_block_names = [s.strip() for s in pipeline_def.split(",") if s.strip()]
+        elif isinstance(pipeline_def, list):
+            sub_block_names = [str(s) for s in pipeline_def]
+        else:
+            sub_block_names = []
+
+        if not sub_block_names:
+            return initial_value
+
+        current_value = initial_value
+
+        for sub_block_name in sub_block_names:
+            try:
+                # Collect sub-params: e.g., "prompt_query.op" -> {"op": ...}
+                sub_params = {}
+                prefix = f"{sub_block_name}."
+                for k, v in parent_params.items():
+                    if k.startswith(prefix):
+                        sub_params[k[len(prefix):]] = v
+
+                sub_block_inst = SUB_BLOCKS.create(sub_block_name)
+                current_value = sub_block_inst.execute(current_value, params=sub_params)
+
+            except Exception as e:
+                print(f"[BaseBlock] Sub-pipeline failed at '{sub_block_name}': {e}", file=sys.stderr)
+                # Stop the sub-pipeline, but keep the last good value
+                return current_value
+
+        return current_value
+
 
 # ---------------- Memory & History stores ----------------
 class Memory:
@@ -482,7 +541,10 @@ class SelfCheckBlock(BaseBlock):
         return {
             "info": "No parameters."
         }
+
 BLOCKS.register("self_check", SelfCheckBlock)
+
+
 
 
 # --- term extraction for lexicon ---
@@ -504,7 +566,283 @@ def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]
     terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [t for t, _ in terms[:top_k]]
 
+# ---------------- Prompt Builder (Smart & Dissecting) ----------------
+@dataclass
+class PromptBlock(BaseBlock):
+    """
+    Assembles a final prompt from a template and context/lexicon from Memory.
 
+    Features
+    --------
+    • SMART: Auto-detects context/lexicon keys from Memory based on
+      priority lists, with manual override.
+    • DISSECTING: Optionally dissects the payload (prompt) into:
+        {task}   – what the model should do (summarize, explain, compare…)
+        {topics} – condensed topic terms extracted from the prompt
+    """
+
+    # --- Auto-detection config ---
+    PREFERRED_CONTEXT_KEYS = ["web_context", "corpus_docs"]
+    PREFERRED_LEXICON_KEYS = ["web_lexicon", "corpus_lexicon", "intel_prose"]
+
+
+    # Canonical task verbs
+    _TASK_WORDS = {
+        "summarize", "explain", "compare", "contrast", "define", "describe",
+        "analyze", "evaluate", "argue", "answer", "list", "provide",
+        "generate", "create", "write", "detail", "outline", "discuss",
+        "rewrite", "translate", "debug", "fix"
+    }
+
+    # Question words that imply "answer/explain"
+    _QUESTION_LEADS = {"what", "why", "how", "when", "where", "which", "who"}
+
+    # --- Helper Methods ---
+
+    def _format_value(self, value: Any, fallback: str) -> str:
+        """Helper to format memory values for injection."""
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            return value if value.strip() else fallback
+        if isinstance(value, list):
+            terms = [str(v) for v in value if str(v).strip()]
+            return ", ".join(terms) if terms else fallback
+        if isinstance(value, dict):
+            try:
+                return _json.dumps(value, indent=2)
+            except Exception:
+                return str(value)
+        return str(value)
+
+    def _find_key_in_store(self, store: Dict[str, Any], keys: List[str]) -> Optional[str]:
+        """Find the first key in the list that exists and has content in the store."""
+        for key in keys:
+            if store.get(key):
+                return key
+        return None
+
+    # --- Prompt Dissection ---
+
+    def _tokenize_prompt(self, text: str) -> List[str]:
+        """
+        Light tokenization: lowercased, alnum + internal -/' preserved.
+        """
+        tokens: List[str] = []
+        for raw in (text or "").split():
+            w = "".join(ch.lower() for ch in raw if ch.isalnum() or ch in "'-")
+            w = w.strip("'-")
+            if w:
+                tokens.append(w)
+        return tokens
+
+    def _dedupe_preserve_order(self, items: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for x in items:
+            if x not in seen:
+                seen.add(x)
+                out.append(x)
+        return out
+
+    def _infer_task_from_tokens(self, tokens: List[str]) -> str:
+        """
+        Infer a task phrase from tokens.
+        Priority:
+          1) Explicit task word in prompt (summarize, explain, rewrite, …)
+          2) Question-style prompt → 'answer' / 'explain'
+          3) Fallback: 'address'
+        """
+        # 1) Direct task word
+        for t in tokens:
+            if t in self._TASK_WORDS:
+                return t
+
+        # 2) If prompt starts with a question lead, treat as "answer/explain"
+        if tokens:
+            first = tokens[0]
+            if first in self._QUESTION_LEADS or first.endswith("?"):
+                return "answer"
+
+        # 3) Otherwise, default neutral task
+        return "address"
+
+    def _dissect_prompt(self, payload_str: str, max_topics: int = 16) -> Dict[str, Any]:
+        """
+        Dissects a prompt into 'task' and 'topics'.
+        Also returns the raw topic token list for metadata.
+        """
+        tokens = self._tokenize_prompt(payload_str)
+
+        if not tokens:
+            return {"task": "address", "topics_str": "the following", "topics_list": []}
+
+        task = self._infer_task_from_tokens(tokens)
+
+        # Remove task tokens & stopwords to get topics
+        topic_candidates = [
+            t for t in tokens
+            if t not in self._TASK_WORDS and t not in _STOPWORDS
+        ]
+
+        topics_list = self._dedupe_preserve_order(topic_candidates)[:max_topics]
+        topics_str = " ".join(topics_list) if topics_list else "the following"
+
+        return {
+            "task": task,
+            "topics_str": topics_str,
+            "topics_list": topics_list,
+        }
+
+    # --- Main Execution ---
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        """
+        Build the final prompt using:
+          • {context} – from Memory (auto or explicit key)
+          • {lexicon} – from Memory (auto or explicit key)
+          • {payload} – original user request
+          • {task}    – inferred/explicit task from the prompt
+          • {topics}  – condensed topic summary from the prompt
+        """
+        # Default template uses dissected keys but is backward-compatible via format_map
+        template = str(params.get(
+            "template",
+            "### Context\n{context}\n\n"
+            "### Key Terms\n{lexicon}\n\n"
+            "### Task\n"
+            "Using the context and key terms provided, your goal is to **{task}** "
+            "the following topics: **{topics}**.\n\n"
+            "(Original Request: {payload})"
+        ))
+
+        fallback_text = str(params.get("fallback_text", "(none)"))
+        # Allow per-run toggle of dissection
+        dissect_enabled = bool(params.get("dissect", True))
+        max_topics = int(params.get("max_topics", 16))
+
+        store = Memory.load()
+        payload_str = str(payload).strip()
+
+        meta: Dict[str, Any] = {
+            "template_keys_provided": ["payload", "context", "lexicon", "task", "topics"],
+            "context_key_used": None,
+            "lexicon_key_used": None,
+            "context_chars": 0,
+            "lexicon_terms": 0,
+            "dissected_task": None,
+            "dissected_topics": None,
+            "dissected_topics_list": None,
+            "error": None,
+        }
+
+        # --- Dissect payload -> task/topics (optional) ---
+        if dissect_enabled:
+            dissected = self._dissect_prompt(payload_str, max_topics=max_topics)
+            task_str = dissected["task"]
+            topics_str = dissected["topics_str"]
+            meta["dissected_task"] = task_str
+            meta["dissected_topics"] = topics_str
+            meta["dissected_topics_list"] = dissected["topics_list"]
+        else:
+            task_str = "address"
+            topics_str = "the following"
+            meta["dissected_task"] = task_str
+            meta["dissected_topics"] = topics_str
+            meta["dissected_topics_list"] = []
+
+        # --- Smart Context-Key-Finding ---
+        context_str = fallback_text
+        explicit_context_key = params.get("context_key")
+
+        if explicit_context_key and explicit_context_key not in (
+                "(Optional: auto-detected if blank)", "", None
+        ):
+            # If explicit key exists but is empty, fall back to auto
+            if store.get(explicit_context_key):
+                meta["context_key_used"] = explicit_context_key
+            else:
+                meta["context_key_used"] = self._find_key_in_store(
+                    store, self.PREFERRED_CONTEXT_KEYS
+                )
+        else:
+            meta["context_key_used"] = self._find_key_in_store(
+                store, self.PREFERRED_CONTEXT_KEYS
+            )
+
+        if meta["context_key_used"]:
+            context_str = self._format_value(store.get(meta["context_key_used"]), fallback_text)
+
+        # --- Smart Lexicon-Key-Finding ---
+        lexicon_str = fallback_text
+        explicit_lexicon_key = params.get("lexicon_key")
+
+        if explicit_lexicon_key and explicit_lexicon_key not in (
+                "(Optional: auto-detected if blank)", "", None
+        ):
+            if store.get(explicit_lexicon_key):
+                meta["lexicon_key_used"] = explicit_lexicon_key
+            else:
+                meta["lexicon_key_used"] = self._find_key_in_store(
+                    store, self.PREFERRED_LEXICON_KEYS
+                )
+        else:
+            meta["lexicon_key_used"] = self._find_key_in_store(
+                store, self.PREFERRED_LEXICON_KEYS
+            )
+
+        if meta["lexicon_key_used"]:
+            lexicon_str = self._format_value(store.get(meta["lexicon_key_used"]), fallback_text)
+
+        # --- Final Prompt Assembly ---
+        try:
+            format_map = defaultdict(
+                lambda: "",
+                {
+                    "payload": payload_str,
+                    "context": context_str,
+                    "lexicon": lexicon_str,
+                    "task": task_str,
+                    "topics": topics_str,
+                },
+            )
+
+            final_prompt = template.format_map(format_map)
+
+            meta["context_chars"] = len(context_str) if context_str != fallback_text else 0
+            meta["lexicon_terms"] = (
+                len([t for t in lexicon_str.split(",") if t.strip()])
+                if lexicon_str != fallback_text
+                else 0
+            )
+
+        except Exception as e:
+            final_prompt = f"[TEMPLATE ERROR: {e}]\n\n{payload_str}"
+            meta["error"] = str(e)
+
+        return final_prompt, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        """Returns default parameters for the GUI / CLI help."""
+        return {
+            "template": (
+                "### Context\n{context}\n\n"
+                "### Key Terms\n{lexicon}\n\n"
+                "### Task\n"
+                "Using the context, your goal is to **{task}** the following "
+                "topics: **{topics}**.\n"
+                "(Original Request: {payload})"
+            ),
+            "context_key": "(Optional: auto-detected if blank)",
+            "lexicon_key": "(Optional: auto-detected if blank)",
+            "fallback_text": "(none)",
+            "dissect": True,  # Toggle smart prompt dissection on/off
+            "max_topics": 16,  # Max topic terms extracted from the prompt
+        }
+
+
+# Register the new block
+BLOCKS.register("prompt", PromptBlock)
 # ---------------- Corpus (HF with timeout + wiki_api fallback) ----------------
 @dataclass
 class CorpusBlock(BaseBlock):
@@ -1005,7 +1343,9 @@ class ChatBlock(BaseBlock):
             "max_terms": 8,
             "max_chars": 0
         }
+
 BLOCKS.register("chat", ChatBlock)
+
 
 # ---------------- WebCorpus (web search + fetch + summarize) ----------------
 @dataclass
@@ -1017,10 +1357,7 @@ class WebCorpusBlock(BaseBlock):
       • Regex / must / negative filtering
       • BM25-ish re-ranking + sentence extraction
       • Exports lexicon into Memory and injects [lexicon]/[context] into pipeline
-
-    New:
-      • min_term_overlap: require at least N query tokens to appear in doc text.
-        This helps avoid collisions like "RAF" (air force) when query is "Raf Simons".
+      • Pluggable query processing via `subpipeline` param.
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -1030,43 +1367,77 @@ class WebCorpusBlock(BaseBlock):
         from urllib.parse import urlparse
 
         # ---- Params ----
-        query        = str(params.get("query", "") or str(payload or "")).strip()
-        engine       = str(params.get("engine", "duckduckgo")).lower()  # duckduckgo | serpapi | google_cse
-        num_results  = int(params.get("num_results", 10))
-        max_fetch    = int(params.get("max_fetch", 8))                  # how many pages to actually fetch
-        timeout_sec  = float(params.get("timeout", 8.0))
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        engine = str(params.get("engine", "duckduckgo")).lower()  # duckduckgo | serpapi | google_cse
+        num_results = int(params.get("num_results", 10))
+        max_fetch = int(params.get("max_fetch", 8))  # how many pages to actually fetch
+        timeout_sec = float(params.get("timeout", 8.0))
         read_timeout = float(params.get("read_timeout", 12.0))
-        user_agent   = str(params.get("user_agent", "promptchat/webcorpus"))
-        pause        = float(params.get("pause", 0.7))                  # polite delay between fetches
-        cache_dir    = str(params.get("cache_dir", os.path.join(APP_DIR, "webcache")))
+        user_agent = str(params.get("user_agent", "promptchat/webcorpus"))
+        pause = float(params.get("pause", 0.7))  # polite delay between fetches
+        cache_dir = str(params.get("cache_dir", os.path.join(APP_DIR, "webcache")))
         os.makedirs(cache_dir, exist_ok=True)
 
         # text handling
-        regex_query   = params.get("regex")
-        neg           = [s.strip() for s in str(params.get("neg", "")).split(",") if s.strip()]
-        must_terms    = [s.strip().lower() for s in str(params.get("must_terms", "")).split(",") if s.strip()]
-        top_k_docs    = int(params.get("top_k_docs", 6))
-        top_k_sents   = int(params.get("top_k_sents", 18))
-        sent_window   = int(params.get("sent_window", 1))
-        max_chars     = int(params.get("max_chars", 2800))
+        regex_query = params.get("regex")
+        neg = [s.strip() for s in str(params.get("neg", "")).split(",") if s.strip()]
+        must_terms = [s.strip().lower() for s in str(params.get("must_terms", "")).split(",") if s.strip()]
+        top_k_docs = int(params.get("top_k_docs", 6))
+        top_k_sents = int(params.get("top_k_sents", 18))
+        sent_window = int(params.get("sent_window", 1))
+        max_chars = int(params.get("max_chars", 2800))
         min_doc_chars = int(params.get("min_doc_chars", 400))
-        site_include  = [s.strip().lower() for s in str(params.get("site_include", "")).split(",") if s.strip()]
-        site_exclude  = [s.strip().lower() for s in str(params.get("site_exclude", "")).split(",") if s.strip()]
+        site_include = [s.strip().lower() for s in str(params.get("site_include", "")).split(",") if s.strip()]
+        site_exclude = [s.strip().lower() for s in str(params.get("site_exclude", "")).split(",") if s.strip()]
 
-        # NEW: minimum number of query tokens that must appear in the doc
         min_term_overlap = int(params.get("min_term_overlap", 1))
 
         # lexicon export
-        export_lexicon  = bool(params.get("export_lexicon", True))
-        lexicon_key     = str(params.get("lexicon_key", "web_lexicon"))
-        inject_lexicon  = bool(params.get("inject_lexicon", True))
-        inject_context  = bool(params.get("inject_context", True))
-        lexicon_top_k   = int(params.get("lexicon_top_k", 40))
+        export_lexicon = bool(params.get("export_lexicon", True))
+        lexicon_key = str(params.get("lexicon_key", "web_lexicon"))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        lexicon_top_k = int(params.get("lexicon_top_k", 40))
         lexicon_min_len = int(params.get("lexicon_min_len", 4))
-        use_phrases     = bool(params.get("lexicon_phrases", True))
+        use_phrases = bool(params.get("lexicon_phrases", True))
 
         # compile regex
         q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
+
+        # ---- Build list of queries to run (subpipeline OR raw) ----
+        queries_to_run: Any
+
+        if "subpipeline" in params and str(params["subpipeline"]).strip():
+            # Use the configured subpipeline
+            queries_to_run = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+            )
+        else:
+            # No subpipeline configured: just use the raw query.
+            queries_to_run = [query_raw] if query_raw else []
+
+        # Normalize result from subpipeline
+        if isinstance(queries_to_run, str):
+            queries_to_run = [queries_to_run]
+        elif not isinstance(queries_to_run, list):
+            queries_to_run = [query_raw] if query_raw else []
+
+        # Strip empties
+        queries_to_run = [q.strip() for q in queries_to_run if isinstance(q, str) and q.strip()]
+
+        if not queries_to_run:
+            base = "" if payload is None else str(payload)
+            return base, {
+                "rows": 0,
+                "note": "empty query",
+                "engine": engine,
+                "query": query_raw,
+                "queries_run": [],
+            }
+
+        meta: Dict[str, Any] = {"queries_run": queries_to_run}
 
         # ---- Helpers ----
         def _tokenize(t: str) -> List[str]:
@@ -1125,7 +1496,6 @@ class WebCorpusBlock(BaseBlock):
             return ""
 
         def _extract_text(html: str, url: str) -> str:
-            # Use trafilatura for much cleaner text extraction
             try:
                 import trafilatura
                 clean_text = trafilatura.extract(
@@ -1140,7 +1510,6 @@ class WebCorpusBlock(BaseBlock):
             except Exception:
                 pass
 
-            # Fallback: raw BeautifulSoup
             try:
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(html or "", "html.parser")
@@ -1150,7 +1519,7 @@ class WebCorpusBlock(BaseBlock):
             except Exception:
                 return ""
 
-        def _matches(text: str) -> bool:
+        def _matches(text: str, query: str) -> bool:
             if not text or len(text) < min_doc_chars:
                 return False
             low = text.lower()
@@ -1169,15 +1538,28 @@ class WebCorpusBlock(BaseBlock):
             if q_pattern and not q_pattern.search(text):
                 return False
 
-            # token overlap
+            # token overlap (uses the passed-in query)
             if query and not q_pattern:
                 qt = [t for t in _tokenize(query) if t not in _STOPWORDS]
                 if qt:
-                    overlap = sum(1 for t in qt if t in low)
+                    overlap = sum(1 for t in qt if t in low) # This counts *unique* terms found
                     if overlap < min_term_overlap:
                         return False
 
             return True
+
+        # [NEW] This helper function is required for the fix
+        def _matches_any(text: str) -> bool:
+            """
+            Accept a document if it matches the original query OR any
+            of the sub-queries produced by the subpipeline.
+            """
+            if not queries_to_run:
+                return _matches(text, query_raw)
+            for q in queries_to_run:
+                if q and _matches(text, q):
+                    return True
+            return False
 
         # ---- Search backends ----
         def search_duckduckgo(q: str, n: int) -> List[str]:
@@ -1196,10 +1578,12 @@ class WebCorpusBlock(BaseBlock):
             import requests
             urls = []
             try:
-                r = requests.get("https://duckduckgo.com/html/",
-                                 params={"q": q},
-                                 headers={"User-Agent": user_agent},
-                                 timeout=(timeout_sec, read_timeout))
+                r = requests.get(
+                    "https://duckduckgo.com/html/",
+                    params={"q": q},
+                    headers={"User-Agent": user_agent},
+                    timeout=(timeout_sec, read_timeout)
+                )
                 if r.status_code == 200:
                     from bs4 import BeautifulSoup
                     soup = BeautifulSoup(r.text, "html.parser")
@@ -1219,9 +1603,11 @@ class WebCorpusBlock(BaseBlock):
                 return []
             import requests
             try:
-                r = requests.get("https://serpapi.com/search",
-                                 params={"engine": "google", "q": q, "num": n, "api_key": key},
-                                 timeout=(timeout_sec, read_timeout))
+                r = requests.get(
+                    "https://serpapi.com/search",
+                    params={"engine": "google", "q": q, "num": n, "api_key": key},
+                    timeout=(timeout_sec, read_timeout)
+                )
                 r.raise_for_status()
                 data = r.json()
                 out = []
@@ -1234,7 +1620,7 @@ class WebCorpusBlock(BaseBlock):
                 return []
 
         def search_google_cse(q: str, n: int) -> List[str]:
-            cx  = os.environ.get("GOOGLE_CSE_ID")
+            cx = os.environ.get("GOOGLE_CSE_ID")
             key = os.environ.get("GOOGLE_API_KEY")
             if not (cx and key):
                 return []
@@ -1242,9 +1628,11 @@ class WebCorpusBlock(BaseBlock):
             out = []
             try:
                 for start in range(1, min(n, 10) + 1, 10):
-                    r = requests.get("https://www.googleapis.com/customsearch/v1",
-                                     params={"q": q, "cx": cx, "key": key, "num": min(10, n), "start": start},
-                                     timeout=(timeout_sec, read_timeout))
+                    r = requests.get(
+                        "https://www.googleapis.com/customsearch/v1",
+                        params={"q": q, "cx": cx, "key": key, "num": min(10, n), "start": start},
+                        timeout=(timeout_sec, read_timeout)
+                    )
 
                     r.raise_for_status()
                     data = r.json()
@@ -1258,21 +1646,23 @@ class WebCorpusBlock(BaseBlock):
                 return out[:n]
             return out[:n]
 
-        if not query:
-            base = "" if payload is None else str(payload)
-            return base, {"rows": 0, "note": "empty query", "engine": engine}
-
-        if engine == "serpapi":
-            urls = search_serpapi(query, num_results)
-        elif engine == "google_cse":
-            urls = search_google_cse(query, num_results)
-        else:
-            urls = search_duckduckgo(query, num_results)
+        # ---- Run searches for each query ----
+        all_urls: List[str] = []
+        for q in queries_to_run:
+            if not q:
+                continue
+            if engine == "serpapi":
+                urls = search_serpapi(q, num_results)
+            elif engine == "google_cse":
+                urls = search_google_cse(q, num_results)
+            else:
+                urls = search_duckduckgo(q, num_results)
+            all_urls.extend(urls)
 
         # Filter by site allow/deny, dedupe domains
         seen = set()
         filtered = []
-        for u in urls:
+        for u in all_urls:
             if not _allow_site(u):
                 continue
             d = _clean_domain(u)
@@ -1282,15 +1672,18 @@ class WebCorpusBlock(BaseBlock):
             filtered.append(u)
         urls = filtered[:max_fetch] if max_fetch > 0 else filtered
 
-        # Fetch pages
+        # ---- Fetch pages ----
         docs_raw: List[Dict[str, str]] = []
         for u in urls:
             html = _fetch_html(u)
             if not html:
                 continue
             text = _extract_text(html, u)
-            if not _matches(text):
+
+            # [FIXED] Check relevance against ANY of the sub-queries
+            if not _matches_any(text):
                 continue
+
             title_guess = _clean_domain(u)
             try:
                 from bs4 import BeautifulSoup
@@ -1300,26 +1693,30 @@ class WebCorpusBlock(BaseBlock):
                     title_guess = t
             except Exception:
                 pass
+
             docs_raw.append({"title": title_guess, "text": text, "url": u})
             time.sleep(pause)
 
         if not docs_raw:
             base = "" if payload is None else str(payload)
-            return base, {
+            meta.update({
                 "rows": 0,
                 "note": "no pages matched",
                 "engine": engine,
-                "query": query,
+                "query": query_raw,
                 "regex": bool(q_pattern),
                 "neg": neg,
                 "must_terms": must_terms,
                 "sites": {"include": site_include, "exclude": site_exclude},
-            }
+            })
+            return base, meta
 
         # ---- ranking BM25-ish (+ regex boost) ----
         corpus_tokens = [set(_tokenize(d["title"] + " " + d["text"])) for d in docs_raw]
         N = len(corpus_tokens)
-        q_terms = set(_tokenize(query))
+
+        # Rank relevance based on *original* query
+        q_terms = set(_tokenize(query_raw)) if query_raw else set()
         df: Dict[str, int] = {}
         for terms in corpus_tokens:
             for t in terms:
@@ -1356,6 +1753,7 @@ class WebCorpusBlock(BaseBlock):
             scored: List[Tuple[float, int, str]] = []
             for idx, s in enumerate(sents):
                 tok = set(_tokenize(s))
+                # Use original query terms for overlap
                 overlap = len(tok & q_terms) if q_terms else 0
                 if q_pattern and q_pattern.search(s):
                     overlap += 2
@@ -1369,7 +1767,7 @@ class WebCorpusBlock(BaseBlock):
                 chunk = " ".join(sents[lo:hi]).strip()
                 if chunk and chunk not in hit_sents:
                     if title and (not hit_sents or not hit_sents[-1].startswith("# ")):
-                        src = f"# {title} — {d.get('url','')}".strip()
+                        src = f"# {title} — {d.get('url', '')}".strip()
                         hit_sents.append(src)
                     hit_sents.append(chunk)
                     took += 1
@@ -1378,7 +1776,7 @@ class WebCorpusBlock(BaseBlock):
                 chunk = " ".join(sents[: max(1, sent_window + 1)]).strip()
                 if chunk and chunk not in hit_sents:
                     if title and (not hit_sents or not hit_sents[-1].startswith("# ")):
-                        src = f"# {title} — {d.get('url','')}".strip()
+                        src = f"# {title} — {d.get('url', '')}".strip()
                         hit_sents.append(src)
                     hit_sents.append(chunk)
 
@@ -1398,7 +1796,10 @@ class WebCorpusBlock(BaseBlock):
 
         lexicon = _extract_terms_local(context, top_k=lexicon_top_k, min_len=lexicon_min_len) if context else []
         if use_phrases and context:
-            phrases = re.findall(r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b", context)
+            phrases = re.findall(
+                r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b",
+                context
+            )
             pc: Dict[str, int] = {}
             for ph in phrases:
                 ph = ph.lower().strip()
@@ -1410,8 +1811,8 @@ class WebCorpusBlock(BaseBlock):
 
         # ---- store lexicon + context in Memory ----
         export_context = bool(params.get("export_context", True))
-        context_key    = str(params.get("context_key", "web_context"))
-        append_ctx     = bool(params.get("append_context", False))
+        context_key = str(params.get("context_key", "web_context"))
+        append_ctx = bool(params.get("append_context", False))
 
         if export_lexicon and lexicon:
             store = Memory.load()
@@ -1435,9 +1836,9 @@ class WebCorpusBlock(BaseBlock):
             parts.append("[context]\n" + context)
         out = "\n\n".join(parts).strip()
 
-        meta = {
+        meta.update({
             "engine": engine,
-            "query": query,
+            "query": query_raw,
             "regex": bool(q_pattern),
             "neg": neg,
             "must_terms": must_terms,
@@ -1451,12 +1852,14 @@ class WebCorpusBlock(BaseBlock):
             "site_include": site_include,
             "site_exclude": site_exclude,
             "min_term_overlap": min_term_overlap,
-        }
+        })
         return out, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "",
+            "subpipeline": "", # Default: no subpipeline
+            "prompt_query.op": "clean_permutate", # Config for sub-block
             "engine": "duckduckgo, google_cse",
             "num_results": 10,
             "max_fetch": 8,
@@ -1478,6 +1881,7 @@ class WebCorpusBlock(BaseBlock):
             "min_term_overlap": 1,
         }
 
+
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
 
@@ -1485,17 +1889,11 @@ BLOCKS.register("webcorpus", WebCorpusBlock)
 @dataclass
 class PlaywrightBlock(BaseBlock):
     """
-    Playwright-powered corpus builder (Hybrid v7.2):
-      • Performs targeted searches on a hardcoded list AND a "learned" list from memory.
-      • Runs a general search to "discover" new high-quality domains.
-      • Filters out junk domains (pinterest, ebay, etc.).
-      • "Learns" new, good domains by saving them to memory.json for future runs.
-      • Feeds all high-quality URLs (targeted, learned, discovered) into Playwright.
-      • Uses 'trafilatura', BM25 ranking, and sentence extraction as before.
-
-    New:
-      • min_term_overlap: require at least N query tokens to appear in text
-        (used for learning + keeping scraped docs).
+    Playwright-powered corpus builder (Hybrid v7.2) with optional subpipeline:
+      • If `subpipeline` is provided, expand the raw query into multiple
+        natural queries (e.g. via PromptQuerySubBlock) and search each.
+      • If `subpipeline` is NOT provided, behave like before and use the
+        raw query as-is.
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -1517,8 +1915,48 @@ class PlaywrightBlock(BaseBlock):
             print("python -m playwright install --with-deps chromium", file=sys.stderr)
             return str(payload), {"error": "Missing dependencies. See console."}
 
+        # ---- Base raw query ----
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+
+        # ---- Optional subpipeline expansion ----
+        # Only run subpipeline if the caller explicitly passed a non-empty one.
+        subpipe_name = str(params.get("subpipeline", "")).strip()
+
+        if subpipe_name:
+            # Use the subpipeline to produce multiple natural queries
+            queries_to_run: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+            )
+
+            # Normalize to list[str]
+            if isinstance(queries_to_run, str):
+                queries_to_run = [queries_to_run]
+            elif not isinstance(queries_to_run, list):
+                queries_to_run = [query_raw] if query_raw else []
+        else:
+            # No subpipeline => behave like old behavior: single query
+            queries_to_run = [query_raw] if query_raw else []
+
+        # Filter out empties
+        queries_to_run = [q.strip() for q in queries_to_run if str(q).strip()]
+
+        # If we have nothing meaningful, bail early
+        if not queries_to_run:
+            base = "" if payload is None else str(payload)
+            return base, {
+                "rows": 0,
+                "note": "empty query",
+                "engine": "hybrid_ddgs_playwright",
+                "query": query_raw,
+                "queries_run": [],
+            }
+
+        # Keep original semantics: 'query' is used for overlap/ranking.
+        query = query_raw
+
         # ---- Params ----
-        query        = str(params.get("query", "") or str(payload or "")).strip()
         num_results  = int(params.get("num_results", 15))  # Max *total* links to scrape
         headless     = bool(params.get("headless", True))
         timeout_sec  = float(params.get("timeout", 15.0))
@@ -1570,7 +2008,8 @@ class PlaywrightBlock(BaseBlock):
         timeout_ms = int(timeout_sec * 1000)
         meta: Dict[str, Any] = {
             "engine": "hybrid_ddgs_playwright",
-            "query": query,
+            "query": query_raw,
+            "queries_run": queries_to_run,
             "headless": headless,
             "search_results": [],
             "scrape_errors": [],
@@ -3597,8 +4036,6 @@ class CodeSearchBlock(BaseBlock):
 
 BLOCKS.register("codesearch", CodeSearchBlock)
 
-
-
 # ---------------- LocalCodeCorpus (scans local files) ----------------
 @dataclass
 class LocalCodeCorpusBlock(BaseBlock):
@@ -3944,6 +4381,7 @@ class LocalCodeCorpusBlock(BaseBlock):
 
 
 BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
+
 # ======================= NewsBlock =========================================
 @dataclass
 class NewsBlock(BaseBlock):
@@ -5069,8 +5507,19 @@ class LinkTrackerBlock(BaseBlock):
             return "", {"error": "No query provided for LinkTracker."}
 
         # --- Keyword filtering: user + query tokens ---
-        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
-        if query:
+        strict_keywords = bool(params.get("strict_keywords", False))
+
+        keywords: List[str] = [
+            k.strip().lower() for k in keywords_in_url if k.strip()
+        ]
+
+        if strict_keywords:
+            # Do NOT split the query into tokens — treat whole query as one keyword
+            whole = query.lower().strip()
+            if whole and whole not in keywords:
+                keywords.append(whole)
+        else:
+            # Default (existing behavior): split query into tokens
             q_tokens = self._extract_keywords_from_query(query)
             for qt in q_tokens:
                 if qt not in keywords:
@@ -5326,6 +5775,7 @@ class LinkTrackerBlock(BaseBlock):
             "use_js": False,             # Enable Playwright JS rendering
             "return_all_js_links": False,
             "max_links_per_page": 500,
+            "strict_keywords": False,
         }
 
 
@@ -6115,3 +6565,211 @@ class VideoLinkTrackerBlock(BaseBlock):
 
 # Register the block
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
+
+@dataclass
+class TorOnionBlock(BaseBlock):
+    """
+    Onion discovery using ONLY:
+      - DuckDuckGo (onion mirror) via Tor
+      - Crawling DDG result pages and extracting .onion links
+    """
+
+    # Official DuckDuckGo .onion HTML endpoint
+    DDG_ONION = (
+        "https://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/html/"
+    )
+
+    # ---------------- Tor Session ----------------
+
+    def _make_tor_session(self, tor_host="127.0.0.1", tor_port=9050,
+                          timeout=10.0, user_agent=None):
+        import requests
+        session = requests.Session()
+        proxy = f"socks5h://{tor_host}:{tor_port}"
+        session.proxies = {"http": proxy, "https": proxy}
+        if user_agent:
+            session.headers.update({"User-Agent": user_agent})
+        session._tor_timeout = timeout
+        return session
+
+    def _is_onion_url(self, url: str) -> bool:
+        from urllib.parse import urlparse
+        try:
+            host = urlparse(url).netloc.lower()
+            return ".onion" in host
+        except:
+            return False
+
+    # ---------------- DuckDuckGo HTML Search ----------------
+
+    def _search_ddg(self, session, query, max_results, timeout, log):
+        import requests
+        from bs4 import BeautifulSoup
+        from urllib.parse import unquote
+
+        urls = []
+        try:
+            resp = session.get(self.DDG_ONION, params={"q": query}, timeout=timeout)
+            resp.raise_for_status()
+        except Exception as e:
+            log.append(f"[TorOnion] DuckDuckGo search failed: {e}")
+            return urls
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for a in soup.select(".result__a"):
+            href = a.get("href")
+            if not href:
+                continue
+
+            # decode DDG redirect-style URLs
+            if "uddg=" in href:
+                try:
+                    href = unquote(href.split("uddg=")[1].split("&")[0])
+                except Exception:
+                    pass
+
+            urls.append(href)
+            if len(urls) >= max_results:
+                break
+
+        log.append(f"[TorOnion] DuckDuckGo returned {len(urls)} result URLs.")
+        return urls
+
+    # ---------------- HTML Fetch ----------------
+
+    def _fetch_html(self, session, url, timeout, sleep_between, log):
+        import time, requests
+        try:
+            if sleep_between > 0:
+                time.sleep(sleep_between)
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            log.append(f"[TorOnion] Error fetching {url}: {e}")
+            return None
+
+    # ---------------- Onion Extraction ----------------
+
+    def _extract_onions(self, html, base_url):
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+        import re
+
+        soup = BeautifulSoup(html, "html.parser")
+        out = set()
+
+        # 1. Normal <a href> scanning
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if ".onion" in href:
+                full = urljoin(base_url, href)
+                if ".onion" in full:
+                    out.add(full)
+
+        # 2. Regex scanning
+        pattern = re.compile(
+            r"(https?://)?([a-z2-7]{16,56}\.onion)([^\s'\"<>]*)",
+            re.IGNORECASE
+        )
+        for m in pattern.finditer(html):
+            scheme, host, tail = m.groups()
+            scheme = scheme or "http://"
+            url = (scheme + host + tail).rstrip(").,;\"'")
+            out.add(url)
+
+        return out
+
+    # ---------------- Execute ----------------
+
+    def execute(self, payload, *, params):
+        query = params.get("query") or payload
+        query = str(query).strip()
+        mode = (params.get("mode") or "list").lower()
+
+        tor_host = params.get("tor_host", "127.0.0.1")
+        tor_port = int(params.get("tor_port", 9050))
+        timeout = float(params.get("timeout", 10.0))
+        user_agent = params.get("user_agent", "Mozilla/5.0 TorOnionBlock/1.0")
+
+        scan_limit = int(params.get("scan_limit", 10))
+        max_onions = int(params.get("max_onions", 50))
+        sleep_between = float(params.get("sleep_between", 0.0))
+
+        log = []
+
+        # Step 1: Create Tor session
+        session = self._make_tor_session(tor_host, tor_port, timeout, user_agent)
+
+        # Step 2: Search DuckDuckGo
+        result_urls = self._search_ddg(session, query, scan_limit, timeout, log)
+
+        onions = set()
+
+        # Step 3: Crawl DDG result pages
+        for url in result_urls:
+            if self._is_onion_url(url):
+                onions.add(url)
+
+            html = self._fetch_html(session, url, timeout, sleep_between, log)
+            if html:
+                onions |= self._extract_onions(html, url)
+
+        onions = sorted(onions)[:max_onions]
+
+        if not onions:
+            return (
+                f"### TorOnionBlock: No .onion addresses found\n- Query: `{query}`",
+                {"query": query, "onions": [], "log": log},
+            )
+
+        # Output: list mode
+        if mode == "list":
+            out = f"### TorOnionBlock: Found {len(onions)} .onion addresses\n"
+            out += f"_Query: `{query}`_\n\n"
+            out += "\n".join(f"- `{o}`" for o in onions)
+            return out, {"query": query, "onions": onions, "log": log}
+
+        # Output: preview mode
+        previews = []
+        for o in onions:
+            previews.append(self._preview(session, o, timeout, sleep_between, log))
+
+        return previews, {
+            "query": query,
+            "onions": onions,
+            "previews": previews,
+            "log": log,
+        }
+
+    # ---------------- Preview Helper ----------------
+
+    def _preview(self, session, url, timeout, sleep_between, log):
+        html = self._fetch_html(session, url, timeout, sleep_between, log)
+        if not html:
+            return {"url": url, "title": "(unreachable)", "snippet": ""}
+
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
+        title = soup.title.string.strip() if soup.title else "(no title)"
+        text = soup.get_text(" ", strip=True)[:600]
+        return {"url": url, "title": title, "snippet": text}
+
+    # ---------------- Parameter Info ----------------
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "privacy email",
+            "mode": "list",                 # list | preview
+            "scan_limit": 10,               # number of DDG result URLs to crawl
+            "max_onions": 50,               # maximum onion URLs to return
+            "tor_host": "127.0.0.1",        # Tor SOCKS proxy host
+            "tor_port": 9050,               # Tor SOCKS proxy port (9150 for Tor Browser)
+            "timeout": 10.0,                # per-request timeout
+            "sleep_between": 0.0,           # delay between fetches
+            "user_agent": "Mozilla/5.0 TorOnionBlock/1.0",
+        }
+
+
+BLOCKS.register("toronion", TorOnionBlock)

@@ -44,7 +44,7 @@ DARK_STYLESHEET = """
         color: #dcdcdc;
     }
     QTabWidget::pane {
-        border-top: 2px solid #4f4f4f;
+        border-top: 2px solid #4f4f4f;4
     }
     QTabBar::tab {
         background: #4a4a4a;

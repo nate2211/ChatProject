@@ -32,3 +32,4 @@ class Registry:
 
 
 BLOCKS = Registry()
+SUB_BLOCKS = Registry()
