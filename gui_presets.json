@@ -15,9 +15,9 @@
     "extras": "# Scrapes the web, analyzes the text, then chats.\nwebcorpus.query={payload}\nwebcorpus.lexicon_key=web_lexicon\nwebcorpus.context_key=web_context\nwebcorpus.min_term_overlap={payload.length}\n\nintelligence.code_concepts_key=intel_code\nintelligence.prose_concepts_key=intel_prose\n\nchat.lexicon_key=intel_prose\nchat.style=bullets\nchat.max_bullets=8"
   },
   {
-    "name": "Generate Code (Quick)",
-    "blocks": ["codecorpus", "code", "self_check"],
-    "extras": "# This preset scrapes code sites, then uses the 'code'\n# block to generate an answer.\ncodecorpus.query={payload}\ncodecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\ncodecorpus.max_pages=5\ncodecorpus.lexicon_key=code_lexicon\ncodecorpus.context_key=code_context\n\ncode.prompt={payload}\ncode.model=Salesforce/codet5p-220m-py\ncode.context_key=code_context\ncode.context_chars=1500\ncode.lexicon_key=code_lexicon\ncode.max_new_tokens=256\ncode.num_beams=4\ncode.max_time_sec=180.0"
+    "name": "Generate Code (Fresh Scrape)",
+    "blocks": ["codecorpus", "codesearch", "code", "self_check"],
+    "extras": "# 1. Scrape web, 2. Search DB, 3. Generate Code\n# This is a full, slow RAG pipeline.\n\n# 1. Scrape web and save to 'code_corpus.db'\ncodecorpus.query={payload}\ncodecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\ncodecorpus.max_pages=5\ncodecorpus.db_path=code_corpus.db\n\n# 2. Search 'code_corpus.db' for the same query\ncodesearch.query={payload}\ncodesearch.db_path=code_corpus.db\ncodesearch.export_key=code_context\ncodesearch.top_k=5\n\n# 3. Generate code using the search results\ncode.prompt={payload}\ncode.model=Salesforce/codet5p-220m-py\ncode.context_key=code_context\ncode.context_chars=1500\ncode.max_new_tokens=256\ncode.num_beams=4\ncode.max_time_sec=180.0"
   },
   {
     "name": "Research Topic (Deep Dive)",
@@ -90,9 +90,9 @@
     "extras": "# Scrapes the web, analyzes, then chats.\npipeline.stages=webcorpus|intelligence|chat\n\npipeline.webcorpus.query={payload}\npipeline.webcorpus.lexicon_key=web_lexicon\npipeline.webcorpus.context_key=web_context\npipeline.webcorpus.min_term_overlap={payload.length}\n\npipeline.intelligence.prose_concepts_key=intel_prose\n\npipeline.chat.lexicon_key=intel_prose\npipeline.chat.style=bullets\npipeline.chat.max_bullets=8"
   },
   {
-    "name": "Generate Code (Quick) (Pipeline)",
+    "name": "Generate Code (Fresh Scrape) (Pipeline)",
     "blocks": ["pipeline"],
-    "extras": "# Scrapes code sites, then generates code.\npipeline.stages=codecorpus|code|self_check\n\npipeline.codecorpus.query={payload}\npipeline.codecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\npipeline.codecorpus.max_pages=5\npipeline.codecorpus.context_key=code_context\n\npipeline.code.prompt={payload}\npipeline.code.model=Salesforce/codet5p-220m-py\npipeline.code.context_key=code_context\npipeline.code.context_chars=1500\npipeline.code.max_new_tokens=256\npipeline.code.num_beams=4\npipeline.code.max_time_sec=180.0"
+    "extras": "# 1. Scrape web, 2. Search DB, 3. Generate Code\npipeline.stages=codecorpus|codesearch|code|self_check\n\n# 1. Scrape web and save to 'code_corpus.db'\npipeline.codecorpus.query={payload}\npipeline.codecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\npipeline.codecorpus.max_pages=5\npipeline.codecorpus.db_path=code_corpus.db\n\n# 2. Search 'code_corpus.db' for the same query\npipeline.codesearch.query={payload}\npipeline.codesearch.db_path=code_corpus.db\npipeline.codesearch.export_key=code_context\npipeline.codesearch.top_k=5\n\n# 3. Generate code using the search results\npipeline.code.prompt={payload}\npipeline.code.model=Salesforce/codet5p-220m-py\npipeline.code.context_key=code_context\npipeline.code.context_chars=1500\npipeline.code.max_new_tokens=256\npipeline.code.num_beams=4\npipeline.code.max_time_sec=180.0"
   },
   {
     "name": "Research (Deep Dive) (Pipeline)",
@@ -130,8 +130,8 @@
     "extras": "# 1. Search Web -> 2. Write Report -> 3. Append Context\npipeline.stages=webcorpus|chat|concat\n\n# Search\npipeline.webcorpus.query={payload}\npipeline.webcorpus.context_key=web_context\npipeline.webcorpus.export_context=true\npipeline.webcorpus.min_term_overlap={payload.length}\n\n# Chat\npipeline.chat.include_context=true\npipeline.chat.style=plain\n\n# Concat\npipeline.concat.parts=payload, text:___, text:### 📑 References & Context, memory:web_context\npipeline.concat.sep=\\n\\n"
   },
   {
-    "name": "Code Solutions + Docs (Concat Pipeline)",
+    "name": "Code Solutions + Docs (Fresh Scrape) (Concat Pipeline)",
     "blocks": ["pipeline"],
-    "extras": "# 1. Scrape Docs -> 2. Write Code -> 3. Append Doc Snippets\npipeline.stages=codecorpus|code|concat\n\n# Scrape\npipeline.codecorpus.query={payload}\npipeline.codecorpus.context_key=code_context\npipeline.codecorpus.max_pages=3\n\n# Generate\npipeline.code.prompt={payload}\npipeline.code.context_key=code_context\npipeline.code.context_chars=2000\n\n# Concat\npipeline.concat.parts=payload, text:___, text:### 📚 Documentation Used, memory:code_context\npipeline.concat.sep=\\n\\n"
+    "extras": "# 1. Scrape Docs -> 2. Search Docs -> 3. Write Code -> 4. Append Doc Snippets\npipeline.stages=codecorpus|codesearch|code|concat\n\n# 1. Scrape\npipeline.codecorpus.query={payload}\npipeline.codecorpus.db_path=code_corpus.db\npipeline.codecorpus.max_pages=3\n\n# 2. Search\npipeline.codesearch.query={payload}\npipeline.codesearch.db_path=code_corpus.db\npipeline.codesearch.export_key=code_context\npipeline.codesearch.top_k=3\n\n# 3. Generate\npipeline.code.prompt={payload}\npipeline.code.context_key=code_context\npipeline.code.context_chars=2000\n\n# 4. Concat\npipeline.concat.parts=payload, text:___, text:### 📚 Documentation Used, memory:code_context\npipeline.concat.sep=\\n\\n"
   }
 ]

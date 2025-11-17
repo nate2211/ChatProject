@@ -3,10 +3,14 @@
 # ========================================================
 from __future__ import annotations
 
+import ast
 import functools
 import html
 import json
+import os
 import re
+import sqlite3
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, List, Optional
 import json as _json
@@ -2036,9 +2040,17 @@ class TensorBlock(BaseBlock):
             return "", {"error": "TensorBlock received empty payload."}
 
         # --- Core params ---
-        task = str(params.get("task", "zero-shot-classification"))
+        raw_task = str(params.get("task", "zero-shot-classification"))
+        task = raw_task
+        hf_task = raw_task  # what we actually pass to _get_hf_pipeline
+
+        # Alias code-generation -> text2text-generation HF pipeline
+        if raw_task == "code-generation":
+            hf_task = "text2text-generation"
+            task = "code-generation"
+
         model = params.get("model")  # None lets HF pipeline pick default
-        model_name = str(model) if model else f"default_for_{task}"
+        model_name = str(model) if model else f"default_for_{hf_task}"
         device = params.get("device", "auto")
         verbose = bool(params.get("verbose", False))
         auto_keywords_key = params.get("auto_keywords_key")
@@ -2057,11 +2069,16 @@ class TensorBlock(BaseBlock):
 
         meta: Dict[str, Any] = {
             "task": task,
+            "hf_task": hf_task,
             "model": model_name,
         }
 
-        pipe = _get_hf_pipeline(task, model_name if model else None,
-                                device=device, verbose=verbose)
+        pipe = _get_hf_pipeline(
+            hf_task,                      # <--- use hf_task here
+            model_name if model else None,
+            device=device,
+            verbose=verbose,
+        )
         if pipe is None:
             return text, {"error": "Failed to load HF pipeline. See console logs.", "meta": meta}
         meta["device"] = str(pipe.device)
@@ -2081,7 +2098,7 @@ class TensorBlock(BaseBlock):
         elif task == "ner":
             kwargs["grouped_entities"] = bool(params.get("grouped_entities", True))
 
-        elif task == "text2text-generation":
+        elif task in ("text2text-generation", "code-generation"):
             # Use the payload inside a template, e.g. "Rewrite this: {payload}"
             run_text = generation_prompt.format(payload=text)
             kwargs["max_new_tokens"] = int(params.get("max_new_tokens", 50))
@@ -2242,19 +2259,25 @@ BLOCKS.register("tensor", TensorBlock)
 
 
 # ---------------- Code Generation (Specialized, no-guides/no-fallbacks) ----------------
+
 @dataclass
 class CodeBlock(BaseBlock):
 
     # ---- helpers -------------------------------------------------
     def _trim_to_tokens(self, pipe, text: str, max_input_tokens: int = 480) -> str:
-        """Trim prompt by tokenizer length (keep task head + tail)."""
+        """
+        Trim prompt by tokenizer length (keep task head + tail).
+
+        - Respects model_max_length if available.
+        - Never sends more than the smaller of (max_input_tokens, model_max_length - safety).
+        """
         try:
             tok = pipe.tokenizer
 
-            # Respect model's own maximum if available
             model_max = getattr(tok, "model_max_length", None)
-            if isinstance(model_max, int) and model_max > 0:
-                limit = min(max_input_tokens, model_max)
+            # Some tokenizers use huge sentinels like 1000000000000000019884624838656 – clamp aggressively
+            if isinstance(model_max, int) and 0 < model_max < 100000:
+                limit = min(max_input_tokens, model_max - 8)
             else:
                 limit = max_input_tokens
 
@@ -2262,20 +2285,17 @@ class CodeBlock(BaseBlock):
             if len(ids) <= limit:
                 return text
 
-            # Keep head + tail, biasing towards keeping more tail (typically user prompt)
+            # Keep head + tail, bias towards user prompt (tail)
             keep_head = min(128, limit // 3)
             keep_tail = max(limit - keep_head, 0)
 
             head_ids = ids[:keep_head]
             tail_ids = ids[-keep_tail:] if keep_tail > 0 else []
 
-            return (
-                tok.decode(head_ids, skip_special_tokens=True)
-                + "\n...\n"
-                + tok.decode(tail_ids, skip_special_tokens=True)
-            )
+            trimmed_ids = head_ids + tail_ids
+            return tok.decode(trimmed_ids, skip_special_tokens=True)
         except Exception:
-            # Last-resort hard cut
+            # Last-resort hard cut by characters (defensive)
             return text[:4000]
 
     def _guess_lang_from_prompt(self, prompt: str, explicit_lang: str) -> str:
@@ -2283,12 +2303,12 @@ class CodeBlock(BaseBlock):
         lang = (explicit_lang or "").strip().lower() or "python"
         p = prompt.lower()
 
-        # Very light-weight guessing — only a few common langs
-        if "javascript" in p or " typescript" in p or " ts " in p:
+        # Read explicit hints in natural language
+        if "javascript" in p and "typescript" not in p:
             return "javascript"
-        if "typescript" in p:
+        if " typescript" in p or " ts " in p or " ts\n" in p:
             return "typescript"
-        if "c++" in p or "cpp" in p:
+        if "c++" in p or " cpp" in p:
             return "cpp"
         if "c#" in p or "csharp" in p:
             return "csharp"
@@ -2296,17 +2316,42 @@ class CodeBlock(BaseBlock):
             return "rust"
         if "java" in p and "javascript" not in p:
             return "java"
+        if "go code" in p or "golang" in p:
+            return "go"
 
         # If user already uses a fenced code block hint like ```python
-        for marker in ("```python", "```js", "```ts", "```cpp", "```csharp", "```rust", "```java"):
-            if marker in p:
-                # Extract lang from marker
-                return marker.strip("`").split()[-1]
+        fence_lang_re = re.compile(r"```(\w+)")
+        m = fence_lang_re.search(p)
+        if m:
+            return m.group(1).lower()
+
+        # Handle file extension hints
+        ext_map = {
+            ".py": "python",
+            ".js": "javascript",
+            ".ts": "typescript",
+            ".rs": "rust",
+            ".cs": "csharp",
+            ".cpp": "cpp",
+            ".cc": "cpp",
+            ".java": "java",
+            ".go": "go",
+        }
+        for ext, l in ext_map.items():
+            if ext in p:
+                return l
 
         return lang or "python"
 
     def _extract_code_block(self, s: str, lang: str = "python") -> str:
-        """Extract the best fenced code block; if none, return raw generation."""
+        """
+        Extract the best fenced code block; if none, return raw generation.
+
+        Handles:
+        - ```lang ... ```
+        - multiple blocks (picks most code-like)
+        - strips language tags on first line
+        """
         s = s.strip()
         if "```" not in s:
             return s
@@ -2314,7 +2359,6 @@ class CodeBlock(BaseBlock):
         parts = s.split("```")
         candidates = []
 
-        # Simple set of known language tags to strip from the first line
         LANG_TAGS = {
             "python", "py",
             "javascript", "js",
@@ -2329,7 +2373,6 @@ class CodeBlock(BaseBlock):
         for i in range(1, len(parts), 2):
             block = parts[i]
 
-            # Separate first line (possibly language) from body
             lines = block.splitlines()
             if not lines:
                 continue
@@ -2337,69 +2380,109 @@ class CodeBlock(BaseBlock):
             first = lines[0].strip().lower()
             stripped = False
 
-            # If first token is a language tag, drop it
+            # Drop language tag line (```python, ```js, etc.)
             if first in LANG_TAGS:
                 lines = lines[1:]
                 stripped = True
-            elif first.startswith(lang):  # e.g., "python3"
+            elif first.startswith(lang):  # e.g., "python3", "javascript:"
                 lines = lines[1:]
                 stripped = True
 
             body = "\n".join(lines).strip()
-
             if not body:
                 continue
 
-            # Score block for "code-likeness"
             score = self._score_code_like(body, lang=lang, lang_stripped=stripped)
             candidates.append((score, body))
 
         if not candidates:
             return s
 
-        # Pick highest scoring block
         candidates.sort(key=lambda x: x[0], reverse=True)
         best = candidates[0][1].strip()
         return best or s
 
     def _score_code_like(self, block: str, lang: str, lang_stripped: bool) -> float:
         """
-        Heuristic score: more punctuation + keywords + indentation → more code-like.
+        Heuristic "code-likeness" score.
+
+        - rewards punctuation, digits, indent, keywords
+        - penalizes tracebacks / generic error logs
+        - discourages long prose-like paragraphs
         """
         lines = block.splitlines()
         if not lines:
             return 0.0
 
         text = block
-        punct = sum(c in "{}[]();:.,+-=*/<>|&^%" for c in text)
+        punct = sum(c in "{}[]();:.,+-=*/<>|&^%#" for c in text)
         letters = sum(c.isalpha() for c in text)
         digits = sum(c.isdigit() for c in text)
         indented = sum(1 for ln in lines if ln.startswith((" ", "\t")))
+
         keywords = 0
+        lang = lang or "python"
 
         if lang == "python":
-            PY_KW = ("def ", "class ", "import ", "from ", "async ", "await ", "return ", "with ", "for ", "while ", "if ", "elif ", "else:")
-            keywords = sum(1 for ln in lines for kw in PY_KW if kw in ln)
+            KW = (
+                "def ", "class ", "import ", "from ",
+                "async ", "await ", "return ",
+                "with ", "for ", "while ", "if ",
+                "elif ", "else:", "try:", "except", "finally:",
+            )
         elif lang in ("javascript", "typescript", "js", "ts"):
-            JS_KW = ("function ", "=>", "const ", "let ", "var ", "return ", "if (", "for (", "while (", "class ")
-            keywords = sum(1 for ln in lines for kw in JS_KW if kw in ln)
+            KW = (
+                "function ", "=>", "const ", "let ", "var ",
+                "return ", "if (", "for (", "while (", "class ",
+                "async ", "await ",
+            )
+        elif lang in ("cpp", "c++"):
+            KW = ("#include", "std::", "int main", "template<", "namespace ", "class ")
+        elif lang in ("csharp", "c#"):
+            KW = ("using System", "namespace ", "class ", "public ", "static void Main")
+        elif lang == "rust":
+            KW = ("fn ", "let ", "mut ", "pub ", "impl ", "use ")
+        elif lang == "java":
+            KW = ("class ", "public static void main", "import ", "package ")
+        elif lang == "go":
+            KW = ("package ", "func main", "import ", "go func")
+        else:
+            # fallback generic
+            KW = ("class ", "def ", "function ", "return ")
 
-        # Base score from punctuation and structure
+        for ln in lines:
+            for kw in KW:
+                if kw in ln:
+                    keywords += 1
+
         score = (
-            punct * 1.0
-            + digits * 0.3
-            + keywords * 6.0
-            + indented * 0.5
+            punct * 1.0 +
+            digits * 0.3 +
+            keywords * 6.0 +
+            indented * 0.5
         )
 
-        # Slight boost if a language tag was stripped
         if lang_stripped:
             score *= 1.2
 
-        # Prevent extremely long pure-text blocks from dominating
+        lower = text.lower()
+        if "traceback (most recent call last)" in lower:
+            score -= 40.0
+        if "error:" in lower or "exception:" in lower:
+            score -= 15.0
+        if "warning:" in lower:
+            score -= 5.0
+
+        # Penalize obviously prose-y blocks: lots of letters, hardly any punctuation
         if letters > 0:
             ratio = punct / max(letters, 1)
             score *= (1.0 + ratio)
+
+        # Prefer moderately sized blocks
+        if len(lines) < 3:
+            score *= 0.7
+        elif len(lines) > 200:
+            score *= 0.8
 
         return score
 
@@ -2408,6 +2491,7 @@ class CodeBlock(BaseBlock):
         lines = code.splitlines()
         if not lines:
             return code
+
         i = 0
         banner_lines = 0
         for ln in lines:
@@ -2415,21 +2499,63 @@ class CodeBlock(BaseBlock):
             if t.startswith("#") or t.startswith("//") or t.startswith("/*") or t.startswith("*"):
                 banner_lines += 1
                 i += 1
-                # stop early if banner is obviously long
                 if banner_lines >= 12:
                     break
                 continue
             break
+
         if banner_lines >= 10:
             return "\n".join(lines[i:]).lstrip()
-        # Also nuke common license keywords at top few lines
+
         head = "\n".join(lines[:10]).lower()
         if any(k in head for k in ("copyright", "licensed", "apache", "all rights reserved")):
             return "\n".join(lines[i:]).lstrip()
+
         return code
 
+    def _strip_explanatory_lines(self, code: str) -> str:
+        """
+        Remove leading explanatory fluff like:
+          - "Here is the Python code:"
+          - "You can use the following function:"
+        while keeping the actual code intact.
+        """
+        lines = code.splitlines()
+        out: List[str] = []
+        skipping = True
+
+        EXPL_PATTERNS = (
+            "here is the", "here's the", "here is an example",
+            "you can use the following", "the following code",
+            "sample code", "for example:",
+        )
+
+        for ln in lines:
+            ln_stripped = ln.strip().lower()
+
+            if skipping:
+                if not ln.strip():
+                    # still in leading blank space
+                    continue
+                # If the line looks like explanation and not code, skip it
+                if any(p in ln_stripped for p in EXPL_PATTERNS):
+                    continue
+                # if the line is clearly code, stop skipping
+                if any(sym in ln for sym in ("def ", "class ", "function ", "=>", "{", "}", "(", ")", "=")):
+                    skipping = False
+                    out.append(ln)
+                else:
+                    # treat as possible explanation and skip
+                    continue
+            else:
+                out.append(ln)
+
+        if not out:
+            return code
+        return "\n".join(out)
+
     def _post_sanitize_code(self, code: str) -> str:
-        """Final cleanup: trim stray fences, ensure sane trailing newline."""
+        """Final cleanup: trim stray fences, remove fluff, ensure sane trailing newline."""
         c = code.strip()
 
         # Strip surrounding fences if somehow still present
@@ -2439,6 +2565,13 @@ class CodeBlock(BaseBlock):
         # Avoid runaway trailing snippets after '```'
         if "```" in c:
             c = c.split("```", 1)[0].rstrip()
+
+        c = self._strip_explanatory_lines(c)
+
+        # Normalize line endings and ensure trailing newline
+        c = c.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+        if not c.endswith("\n"):
+            c += "\n"
 
         return c
 
@@ -2452,15 +2585,13 @@ class CodeBlock(BaseBlock):
             }
 
         store = Memory.load()
-        # Context is optional and trimmed hard; no lexicon injection here.
         ctx_key = str(params.get("context_key", "web_context"))
         ctx = (store.get(ctx_key, "") or "").strip()
         context_chars = int(params.get("context_chars", params.get("code.context_chars", 0)))
         if ctx and context_chars > 0:
             ctx = ctx[:context_chars]
 
-        # Final prompt: strictly input content, no guides or instructions.
-        # Order: context (if any) then user prompt, separated minimally.
+        # Final prompt: strictly input content, no high-level guides or instructions.
         if ctx:
             final_prompt = f"{ctx}\n\n{user_prompt}"
         else:
@@ -2472,19 +2603,31 @@ class CodeBlock(BaseBlock):
         model_name = str(params.get("model", "Salesforce/codet5p-220m"))
         device = params.get("device", "auto")
 
-        # Decoding: deterministic, advanced constraints
-        max_new_tokens = int(params.get("max_new_tokens", 128))
-        min_new_tokens = int(params.get("min_new_tokens", 8))
-        num_beams = int(params.get("num_beams", 4))
+        # Decoding / generation params
+        def _as_int(d: Dict[str, Any], key: str, default: int) -> int:
+            try:
+                return int(d.get(key, default))
+            except Exception:
+                return default
+
+        def _as_float(d: Dict[str, Any], key: str, default: float) -> float:
+            try:
+                return float(d.get(key, default))
+            except Exception:
+                return default
+
+        max_new_tokens = _as_int(params, "max_new_tokens", 128)
+        min_new_tokens = _as_int(params, "min_new_tokens", 8)
+        num_beams = _as_int(params, "num_beams", 4)
+        top_k = _as_int(params, "top_k", 0)
+        no_repeat_ngram_size = _as_int(params, "no_repeat_ngram_size", 4)
+
         do_sample = bool(params.get("do_sample", False))
-        temperature = float(params.get("temperature", 0.2))
-        top_k = int(params.get("top_k", 0))         # disabled when 0
-        top_p = float(params.get("top_p", 1.0))     # keep deterministic path
-        repetition_penalty = float(params.get("repetition_penalty", 1.12))
-        no_repeat_ngram_size = int(params.get("no_repeat_ngram_size", 4))
-        early_stopping = bool(params.get("early_stopping", True))
-        max_time_sec = float(params.get("max_time_sec", params.get("code.max_time", 12.0)))
-        max_input_tokens = int(params.get("max_input_tokens", 480))
+        temperature = _as_float(params, "temperature", 0.2)
+        top_p = _as_float(params, "top_p", 1.0)
+        repetition_penalty = _as_float(params, "repetition_penalty", 1.12)
+        max_time_sec = _as_float(params, "max_time_sec", params.get("code.max_time", 12.0))
+        max_input_tokens = _as_int(params, "max_input_tokens", 480)
 
         inject_tag = str(params.get("inject_tag", "code_solution"))
         wrap = bool(params.get("wrap", True))
@@ -2513,7 +2656,7 @@ class CodeBlock(BaseBlock):
             num_beams=num_beams,
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
-            early_stopping=early_stopping,
+            early_stopping=bool(params.get("early_stopping", True)),
             max_time=max_time_sec,
         )
 
@@ -2541,8 +2684,7 @@ class CodeBlock(BaseBlock):
         code_raw = self._strip_banner_comments(code_raw)
         code_raw = self._post_sanitize_code(code_raw)
 
-        # Safety: if we somehow got completely empty, keep the raw gen
-        if not code_raw:
+        if not code_raw.strip():
             code_raw = gen_text
 
         if wrap:
@@ -2551,6 +2693,7 @@ class CodeBlock(BaseBlock):
             code_out = code_raw
 
         result = f"{payload}\n\n[{inject_tag}]\n{code_out}"
+
         meta = {
             "model": model_name,
             "lang": lang,
@@ -2598,76 +2741,300 @@ class CodeBlock(BaseBlock):
 
 BLOCKS.register("code", CodeBlock)
 
-
 # ---------------- CodeCorpus (code docs & API learner) ----------------
 @dataclass
 class CodeCorpusBlock(BaseBlock):
     """
-    Code-focused corpus builder (no markdown-it dependency):
+    Code-focused corpus builder.
       • Inputs: list of urls, sitemap(s), or (query + site_include) search.
-      • Extracts: headings/paragraphs + fenced code blocks from Markdown/HTML.
-      • Learns: identifiers & API names → exports lexicon (code_lexicon) and context (code_context).
-      • Optional: remembers good domains across runs (learned_code_sites).
+      • Extracts: fenced / <pre>/<code> blocks from Markdown/HTML.
+      • Saves ONLY code snippets to a local SQLite FTS5 database (kind='code').
+      • NEW: Can use Playwright to fall back for JS-heavy sites.
+      • NEW: Remembers scraped URLs and skips them unless force_refresh=true.
 
-    Deps (optional fallbacks included):
+    Deps:
       - requests, beautifulsoup4
-      - trafilatura (preferred HTML text extraction; falls back to bs4)
-      - duckduckgo_search (optional) for discovery
+      - trafilatura (optional, preferred for HTML)
+      - duckduckgo_search (optional, for query)
+      - playwright (optional, for use_playwright_fallback=true)
 
     Example:
-      --extra codecorpus.urls="https://docs.python.org/3/tutorial/index.html,https://pandas.pydata.org/docs/"
-      --extra codecorpus.sitemaps="https://docs.python.org/sitemap.xml"
-      --extra codecorpus.query="list comprehension site:docs.python.org"
-      --extra codecorpus.site_include="docs.python.org,readthedocs.io"
-
-    Exports into Memory by default:
-      - code_lexicon (terms)
-      - code_context (snippets + sentences)
+      --block codecorpus --extra codecorpus.urls="https://react.dev/learn"
+      --extra codecorpus.use_playwright_fallback=true
     """
 
+    # --- DB Helpers ---
+
+    def _init_db(self, db_path: str):
+        """Initialize the FTS5 virtual table."""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
+                url UNINDEXED,    -- Don't index the URL itself
+                title,            -- Index the title
+                content,          -- Index the main content
+                kind,             -- 'prose' or 'code'
+                tokenize = 'porter unicode61'
+            );
+            """)
+
+    # --- NEW: URL Tracking DB ---
+    def _init_url_tracking_db(self, db_path: str):
+        """
+        Initializes a separate table to track scraped URLs and times.
+        """
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_urls (
+                url TEXT PRIMARY KEY,
+                last_scraped_time REAL NOT NULL
+            );
+            """)
+
+    def _get_last_scraped_time(self, conn: sqlite3.Connection, url: str) -> float:
+        """Check the DB for the last scraped time of a URL."""
+        try:
+            cur = conn.execute(
+                "SELECT last_scraped_time FROM indexed_urls WHERE url = ?", (url,)
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row else 0.0
+        except sqlite3.Error as e:
+            print(f"Error checking scrape time for {url}: {e}")
+            return 0.0
+
+    # --- END NEW ---
+
+    def _clean_domain(self, u: str) -> str:
+        """Utility to get the bare domain from a URL."""
+        try:
+            netloc = urlparse(u).netloc.lower()
+            return netloc.split(":")[0]
+        except Exception:
+            return ""
+
+    def _clear_db_for_urls(self, conn: sqlite3.Connection, urls: List[str]):
+        """Clear old entries for domains we are about to re-scrape."""
+        domains = set(self._clean_domain(u) for u in urls)
+        domains.discard("")
+        if not domains:
+            return
+
+        patterns = [f"https://{d}%" for d in domains] + [f"http://{d}%" for d in domains]
+        placeholders = " OR ".join(["url LIKE ?"] * len(patterns))
+
+        try:
+            # Clear from FTS table
+            cur = conn.execute(f"DELETE FROM docs WHERE {placeholders};", patterns)
+            print(f"Cleared {cur.rowcount} old FTS entries for domains: {', '.join(domains)}")
+
+            # --- NEW: Clear from tracking table ---
+            cur_track = conn.execute(f"DELETE FROM indexed_urls WHERE {placeholders};", patterns)
+            print(f"Cleared {cur_track.rowcount} old tracking entries.")
+
+        except sqlite3.Error as e:
+            print(f"Error clearing old entries: {e}")
+
+    def _looks_like_traceback(self, code: str) -> bool:
+        c = code.lower()
+        if "traceback (most recent call last)" in c:
+            return True
+        if "error:" in c or "exception" in c:
+            # Very simple heuristic: mostly "File ..." lines, no 'def'/'class'
+            lines = [ln.strip() for ln in code.splitlines() if ln.strip()]
+            file_like = sum(ln.startswith("file \"") or ln.startswith("file \"") for ln in lines)
+            has_def = any("def " in ln or "class " in ln for ln in lines)
+            if file_like >= 2 and not has_def:
+                return True
+        return False
+
+    # --- Identifier & text processing ---
+    _STOP = set([
+        "the", "a", "an", "and", "or", "if", "on", "in", "to", "for", "from", "of", "at", "by", "with", "as", "is",
+        "are", "was", "were", "be", "been", "being", "that", "this", "these", "those", "it", "its", "into", "about",
+        "over", "under", "can", "should", "would", "will", "may", "might", "must", "do", "does", "did", "done", "have",
+        "has", "had", "having", "not", "no", "yes", "you", "your", "we", "our", "they", "their", "there", "here",
+        "also", "such", "via", "etc", "see",
+        "code", "example", "examples", "note", "notes", "true", "false", "none", "null", "class", "function", "method",
+        "module", "package", "return", "returns", "type", "types", "param", "parameter", "parameters"
+    ])
+
+    _IDENT_RE = re.compile(
+        r"""
+        (?:
+          [A-Za-z_][A-Za-z0-9_]* # snake/UPPER/mixed
+          (?:\.[A-Za-z_][A-Za-z0-9_]*)* # dotted api.name
+        )
+        |
+        (?:
+          [A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]+)+  # camelCase/PascalCase
+        )
+        |
+        (?:
+          [a-z0-9]+(?:-[a-z0-9]+)+              # kebab-case
+        )
+        """,
+        re.VERBOSE
+    )
+
+    _FENCE_RE = re.compile(
+        r"""
+        ^```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n   # opening fence with optional lang
+        (.*?)                                     # code body (non-greedy)
+        \n```[ \t]*$                              # closing fence
+        """,
+        re.MULTILINE | re.DOTALL | re.VERBOSE
+    )
+
+    def _extract_identifiers(self, text: str, min_len: int) -> List[str]:
+        ids = self._IDENT_RE.findall(text or "")
+        out = []
+        for s in ids:
+            tok = s.strip().strip(".")
+            if len(tok) < min_len:
+                continue
+            low = tok.lower()
+            if low in self._STOP:
+                continue
+            out.append(tok)
+        return out
+
+    # --- fetch helpers ---
+
+    def _get_page_static(self, url: str) -> str:
+        """Fast static HTML fetch using requests."""
+        try:
+            import requests
+            r = requests.get(
+                url,
+                headers={"User-Agent": self.user_agent},
+                timeout=(self.timeout, self.read_timeout)
+            )
+            if r.status_code == 200:
+                return r.text
+        except Exception as e:
+            print(f"Static fetch failed for {url}: {e}")
+            return ""
+        return ""
+
+    def _get_page_dynamic(self, browser: "Browser", url: str) -> str:
+        """Rendered HTML fetch using an existing Playwright browser instance."""
+        page = None
+        try:
+            page = browser.new_page(
+                user_agent=self.user_agent,
+                java_script_enabled=True
+            )
+            page.goto(url, timeout=int(self.timeout * 1000), wait_until="domcontentloaded")
+            page.wait_for_timeout(500)
+            return page.content()
+        except Exception as e:
+            print(f"Playwright fetch error for {url}: {e}")
+            return ""
+        finally:
+            if page:
+                page.close()
+
+    def _extract_text_html(self, html_text: str, has_trafilatura: bool) -> Tuple[str, List[str]]:
+        """
+        Return (clean_text, code_blocks) from HTML.
+        """
+        from bs4 import BeautifulSoup
+
+        code_blocks: List[str] = []
+        clean_text = ""
+
+        if has_trafilatura:
+            try:
+                import trafilatura
+                clean_text = trafilatura.extract(
+                    html_text, include_comments=False, include_tables=False, deduplicate=True
+                ) or ""
+            except Exception:
+                clean_text = ""
+
+        try:
+            soup = BeautifulSoup(html_text or "", "html.parser")
+            # collect <pre>/<code> blocks as code
+            for pre in soup.select("pre, code"):
+                try:
+                    code = pre.get_text("\n", strip=True)
+                except Exception:
+                    code = ""
+                if code and len(code) >= 8:
+                    code_blocks.append(code)
+
+            if not clean_text:
+                for t in soup(["script", "style", "noscript", "pre", "code"]):
+                    t.extract()
+                clean_text = soup.get_text(" ", strip=True)
+        except Exception:
+            pass
+
+        return clean_text or "", code_blocks
+
+    def _extract_text_md(self, md_text: str) -> Tuple[str, List[str]]:
+        """Return (clean_text, code_blocks) from Markdown using regex fences only."""
+        code_blocks: List[str] = []
+        text = md_text or ""
+        for m in self._FENCE_RE.finditer(text):
+            code = m.group(2).strip()
+            if len(code) >= 8:
+                code_blocks.append(code)
+        text_wo_fences = self._FENCE_RE.sub(" ", text)
+        text_wo_inline = re.sub(r"`([^`]+)`", r"\1", text_wo_fences)
+        clean = re.sub(r"[ \t]+", " ", text_wo_inline)
+        clean = re.sub(r"\n{2,}", "\n", clean).strip()
+        return clean, code_blocks
+
+    # --- main execution ---
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        import re, os, json, time, html
-        from typing import List, Dict, Tuple, Set
-        from urllib.parse import urlparse
-        import hashlib
-
         # ---------- Params ----------
-        query          = str(params.get("query", "")).strip()
-        urls_raw       = str(params.get("urls", "")).strip()
-        sitemaps_raw   = str(params.get("sitemaps", "")).strip()
-        site_include   = [s.strip().lower() for s in str(params.get("site_include", "")).split(",") if s.strip()]
-        site_exclude   = [s.strip().lower() for s in str(params.get("site_exclude", "github.com,stackoverflow.com,reddit.com")).split(",") if s.strip()]
-        max_pages      = int(params.get("max_pages", 12))
-        min_doc_chars  = int(params.get("min_doc_chars", 200))
-        max_chars      = int(params.get("max_chars", 3800))
-        top_k_docs     = int(params.get("top_k_docs", 10))
-        top_k_sents    = int(params.get("top_k_sents", 30))
-        sent_window    = int(params.get("sent_window", 0))
+        query = str(params.get("query", "")).strip()
+        urls_raw = str(params.get("urls", "")).strip()
+        sitemaps_raw = str(params.get("sitemaps", "")).strip()
 
-        # Learning
-        learn_new_sites   = bool(params.get("learn_new_sites", True))
+        site_include_raw = str(params.get("site_include", "")).strip()
+        if not site_include_raw or site_include_raw.lower() in {"none", "any", "*"}:
+            site_include: List[str] = []
+        else:
+            site_include = [
+                s.strip().lower()
+                for s in site_include_raw.split(",")
+                if s.strip() and s.strip().lower() not in {"none", "any", "*"}
+            ]
+
+        site_exclude_raw = str(params.get("site_exclude", "")).strip()
+        if not site_exclude_raw or site_exclude_raw.lower() in {"none", "any"}:
+            site_exclude: List[str] = []
+        else:
+            site_exclude = [
+                s.strip().lower()
+                for s in site_exclude_raw.split(",")
+                if s.strip() and s.strip().lower() not in {"none", "any"}
+            ]
+
+        max_pages = int(params.get("max_pages", 12))
+        min_doc_chars = int(params.get("min_doc_chars", 200))
+
+        learn_new_sites = bool(params.get("learn_new_sites", True))
         learned_sites_key = str(params.get("learned_sites_key", "learned_code_sites"))
-        learn_min_hits    = int(params.get("learn_min_hits", 2))
+        learn_min_hits = int(params.get("learn_min_hits", 2))
 
-        # Lexicon/context export
-        export_lexicon = bool(params.get("export_lexicon", True))
-        export_context = bool(params.get("export_context", True))
-        inject_lexicon = bool(params.get("inject_lexicon", True))
-        inject_context = bool(params.get("inject_context", True))
-        lexicon_key    = str(params.get("lexicon_key", "code_lexicon"))
-        context_key    = str(params.get("context_key", "code_context"))
-        append_ctx     = bool(params.get("append_context", False))
-        lexicon_top_k  = int(params.get("lexicon_top_k", 60))
-        lexicon_min_len= int(params.get("lexicon_min_len", 3))  # identifiers can be short
-        use_phrases    = bool(params.get("lexicon_phrases", True))
+        db_path = str(params.get("db_path", "code_corpus.db"))
 
-        # Runtime
-        timeout        = float(params.get("timeout", 10.0))
-        read_timeout   = float(params.get("read_timeout", 12.0))
-        user_agent     = str(params.get("user_agent", "promptchat/codecorpus"))
-        verbose        = bool(params.get("verbose", False))
+        self.timeout = float(params.get("timeout", 10.0))
+        self.read_timeout = float(params.get("read_timeout", 12.0))
+        self.user_agent = str(params.get("user_agent", "promptchat/codecorpus"))
+        verbose = bool(params.get("verbose", False))
 
-        # ---------- Imports & helpers ----------
+        use_playwright_fallback = bool(params.get("use_playwright_fallback", True))
+
+        # --- NEW: Refresh Param ---
+        force_refresh = bool(params.get("force_refresh", False))
+
+        # --- Check dependencies ---
         try:
             import requests
         except Exception:
@@ -2684,155 +3051,48 @@ class CodeCorpusBlock(BaseBlock):
         except Exception:
             _has_traf = False
 
-        # Optional discovery
         try:
-            from ddgs import DDGS  # pip install duckduckgo_search
+            from ddgs import DDGS
             _has_ddgs = True
         except Exception:
             _has_ddgs = False
 
-        def _clean_domain(u: str) -> str:
-            try:
-                netloc = urlparse(u).netloc.lower()
-                return netloc.split(":")[0]
-            except Exception:
-                return ""
+        try:
+            from playwright.sync_api import sync_playwright, Page, Browser
+            _has_playwright = True
+        except Exception:
+            _has_playwright = False
+            if use_playwright_fallback:
+                print(
+                    "Warning: use_playwright_fallback=true, but 'playwright' is not installed. Skipping JS rendering.")
+                use_playwright_fallback = False
 
         def _allowed(url: str) -> bool:
-            d = _clean_domain(url)
+            d = self._clean_domain(url)
+            if not d:
+                return False
             if site_include and not any(d.endswith(s) for s in site_include):
                 return False
             if any(d.endswith(s) for s in site_exclude):
                 return False
             return True
 
-        # --- Identifier & text processing ---
-        _STOP = set([
-            "the","a","an","and","or","if","on","in","to","for","from","of","at","by","with","as","is","are","was",
-            "were","be","been","being","that","this","these","those","it","its","into","about","over","under",
-            "can","should","would","will","may","might","must","do","does","did","done","have","has","had","having",
-            "not","no","yes","you","your","we","our","they","their","there","here","also","such","via","etc","see",
-            "code","example","examples","note","notes","true","false","none","null","class","function","method",
-            "module","package","return","returns","type","types","param","parameter","parameters"
-        ])
+        # --- Initialize DB ---
+        try:
+            self._init_db(db_path)
+            self._init_url_tracking_db(db_path)  # --- NEW ---
+        except Exception as e:
+            return str(payload), {"error": f"Failed to initialize database at {db_path}: {e}"}
 
-        _IDENT_RE = re.compile(
-            r"""
-            (?:
-              [A-Za-z_][A-Za-z0-9_]*           # snake/UPPER/mixed
-              (?:\.[A-Za-z_][A-Za-z0-9_]*)*    # dotted api.name
-            )
-            |
-            (?:
-              [A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]+)+   # camelCase/PascalCase
-            )
-            |
-            (?:
-              [a-z0-9]+(?:-[a-z0-9]+)+               # kebab-case
-            )
-            """,
-            re.VERBOSE
-        )
-
-        def _extract_identifiers(text: str) -> List[str]:
-            ids = _IDENT_RE.findall(text or "")
-            out = []
-            for s in ids:
-                tok = s.strip().strip(".")
-                if len(tok) < lexicon_min_len:
-                    continue
-                low = tok.lower()
-                if low in _STOP:
-                    continue
-                out.append(tok)
-            return out
-
-        def _split_sents(text: str) -> List[str]:
-            bits = re.split(r"(?<=[.!?])\s+|\n+", (text or "").strip())
-            return [b.strip() for b in bits if b.strip()]
-
-        # --- fetch helpers ---
-        def _get(url: str) -> str:
-            try:
-                r = requests.get(url, headers={"User-Agent": user_agent}, timeout=(timeout, read_timeout))
-                if r.status_code == 200:
-                    return r.text
-            except Exception:
-                return ""
-            return ""
-
-        def _extract_text_html(html_text: str) -> Tuple[str, List[str]]:
-            """Return (clean_text, code_blocks) from HTML."""
-            code_blocks: List[str] = []
-            clean_text = ""
-
-            if _has_traf:
-                try:
-                    clean_text = trafilatura.extract(
-                        html_text, include_comments=False, include_tables=False, deduplicate=True
-                    ) or ""
-                except Exception:
-                    clean_text = ""
-
-            if not clean_text:
-                try:
-                    soup = BeautifulSoup(html_text or "", "html.parser")
-                    # collect code fences
-                    for pre in soup.select("pre, code"):
-                        code = pre.get_text("\n", strip=True)
-                        if code and len(code) >= 8:
-                            code_blocks.append(code)
-                    # remove script/style
-                    for t in soup(["script", "style", "noscript"]): t.extract()
-                    clean_text = soup.get_text(" ", strip=True)
-                except Exception:
-                    pass
-
-            return clean_text or "", code_blocks
-
-        # --- Markdown extractor: regex-only (no markdown-it) ---
-        _FENCE_RE = re.compile(
-            r"""
-            ^```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n   # opening fence with optional lang
-            (.*?)                                      # code body (non-greedy)
-            \n```[ \t]*$                               # closing fence
-            """,
-            re.MULTILINE | re.DOTALL | re.VERBOSE
-        )
-
-        def _extract_text_md(md_text: str) -> Tuple[str, List[str]]:
-            """Return (clean_text, code_blocks) from Markdown using regex fences only."""
-            code_blocks: List[str] = []
-            text = md_text or ""
-
-            # collect fenced code
-            for m in _FENCE_RE.finditer(text):
-                code = m.group(2).strip()
-                if len(code) >= 8:
-                    code_blocks.append(code)
-
-            # remove fenced blocks to leave prose
-            text_wo_fences = _FENCE_RE.sub(" ", text)
-
-            # strip inline code ticks (light cleanup)
-            text_wo_inline = re.sub(r"`([^`]+)`", r"\1", text_wo_fences)
-
-            # collapse whitespace
-            clean = re.sub(r"[ \t]+", " ", text_wo_inline)
-            clean = re.sub(r"\n{2,}", "\n", clean).strip()
-
-            return clean, code_blocks
-
-        # --- collect URLs: direct, sitemaps, discovery ---
+        # --- collect URLs ---
         candidates: List[str] = []
-
         if urls_raw:
             candidates.extend([u.strip() for u in urls_raw.split(",") if u.strip()])
 
         if sitemaps_raw:
             for sm in [s.strip() for s in sitemaps_raw.split(",") if s.strip()]:
                 try:
-                    xml = _get(sm)
+                    xml = self._get_page_static(sm)
                     if not xml:
                         continue
                     locs = re.findall(r"<loc>(.*?)</loc>", xml, re.IGNORECASE | re.DOTALL)
@@ -2843,16 +3103,19 @@ class CodeCorpusBlock(BaseBlock):
                 except Exception:
                     continue
 
-        if query and not candidates and _has_ddgs:
+        if query and not (urls_raw or sitemaps_raw) and _has_ddgs:
+            from ddgs import DDGS
             with DDGS() as ddgs:
-                for r in ddgs.text(query, max_results=max_pages * 2, safesearch='off'):
-                    u = r.get("href") or r.get("url")
-                    if u and _allowed(u):
-                        candidates.append(u)
+                try:
+                    for r in ddgs.text(query, max_results=max_pages * 2, safesearch='off'):
+                        u = r.get("href") or r.get("url")
+                        if u and _allowed(u):
+                            candidates.append(u)
+                except Exception as e:
+                    print(f"DDGS search failed: {e}")
 
-        # Dedup & cap
         seen = set()
-        final_urls = []
+        final_urls: List[str] = []
         for u in candidates:
             if u in seen:
                 continue
@@ -2862,173 +3125,185 @@ class CodeCorpusBlock(BaseBlock):
             if len(final_urls) >= max_pages:
                 break
 
+        if not final_urls:
+            return str(payload), {"rows": 0, "note": "no matching URLs found to scrape"}
+
+        # --- NEW: Playwright Lifecycle Management ---
+        playwright_context = None
+        browser = None
+        if use_playwright_fallback and _has_playwright:
+            try:
+                from playwright.sync_api import sync_playwright
+                playwright_context = sync_playwright().start()
+                browser = playwright_context.chromium.launch(headless=True)
+            except Exception as e:
+                print(f"Failed to launch Playwright, disabling fallback: {e}")
+                use_playwright_fallback = False
+                if playwright_context:
+                    playwright_context.stop()
+                playwright_context = None
+
+        # --- Connect to DB and clear old entries ---
+        try:
+            conn = sqlite3.connect(db_path)
+            # --- NEW: Only clear if refreshing ---
+            if force_refresh:
+                self._clear_db_for_urls(conn, final_urls)
+            # --- END NEW ---
+        except Exception as e:
+            if browser:
+                browser.close()
+            if playwright_context:
+                playwright_context.stop()
+            return str(payload), {"error": f"DB connect/clear failed: {e}"}
+
         # --- fetch and parse pages ---
-        docs_raw: List[Dict[str, str]] = []
-        domain_hits: Dict[str, int] = {}
+        domain_hits: Dict[str, int] = defaultdict(int)
+        total_prose = 0
+        total_code = 0
+        # --- NEW: Counters ---
+        total_indexed = 0
+        total_updated = 0
+        total_skipped = 0
+        total_errors = 0
+        # --- END NEW ---
 
         for u in final_urls:
-            html_text = _get(u)
-            if not html_text:
-                continue
-
-            if u.lower().endswith(".md") or "/raw/" in u or "raw.githubusercontent.com" in u:
-                body, code_blocks = _extract_text_md(html_text)
-            else:
-                body, code_blocks = _extract_text_html(html_text)
-
-            code_join = "\n\n".join(code_blocks[:5])
-            full_text = (body.strip() + ("\n\n" + code_join if code_join else "")).strip()
-
-            if len(full_text) < min_doc_chars:
-                continue
-
-            title = _clean_domain(u)
             try:
-                if "<title" in html_text.lower():
-                    soup = BeautifulSoup(html_text, "html.parser")
-                    if soup.title and soup.title.string:
-                        title = soup.title.string.strip()
-            except Exception:
-                pass
+                # --- NEW: Check if URL should be skipped ---
+                current_time = time.time()
+                last_scraped_time = self._get_last_scraped_time(conn, u)
 
-            docs_raw.append({"title": title, "text": full_text, "url": u})
-            d = _clean_domain(u)
-            domain_hits[d] = domain_hits.get(d, 0) + 1
-
-        if not docs_raw:
-            base = "" if payload is None else str(payload)
-            return base, {
-                "rows": 0, "note": "no docs scraped",
-                "query": query, "max_pages": max_pages,
-                "site_include": site_include, "site_exclude": site_exclude
-            }
-
-        # --- rank docs ---
-        def _tokenize(t: str) -> List[str]:
-            return re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-\.]+", (t or "").lower())
-
-        q_terms = set(_tokenize(query)) if query else set()
-
-        def _score(doc: Dict[str, str]) -> float:
-            text = doc["text"]
-            ids = set(i.lower() for i in _extract_identifiers(text))
-            overlap = len(ids & q_terms) if q_terms else len(ids) * 0.1
-            return overlap + min(2.0, len(text) / 4000.0)
-
-        ranked = sorted(docs_raw, key=_score, reverse=True)[:max(1, top_k_docs)]
-
-        # --- sentence extraction (prefer sentences with identifiers) ---
-        hit_sents: List[str] = []
-        per_doc_quota = max(1, top_k_sents // max(1, len(ranked)))
-        for d in ranked:
-            title = (d["title"] or "").strip()
-            sents = _split_sents(d["text"] or "")
-            scored: List[Tuple[float, int, str]] = []
-            for idx, s in enumerate(sents):
-                s_ids = set(_extract_identifiers(s))
-                score = len(s_ids) + (1 if any(t in s.lower() for t in q_terms) else 0)
-                if score > 0:
-                    scored.append((float(score), idx, s))
-            took = 0
-            for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1]))[:per_doc_quota]:
-                lo = max(0, idx - sent_window)
-                hi = min(len(sents), idx + sent_window + 1)
-                chunk = " ".join(sents[lo:hi]).strip()
-                if chunk and chunk not in hit_sents:
-                    src = f"# {title} — {d.get('url','')}".strip()
-                    if not hit_sents or hit_sents[-1] != src:
-                        hit_sents.append(src)
-                    hit_sents.append(chunk)
-                    took += 1
-            if took == 0 and sents:
-                chunk = " ".join(sents[:1]).strip()
-                if chunk:
-                    src = f"# {title} — {d.get('url','')}".strip()
-                    if not hit_sents or hit_sents[-1] != src:
-                        hit_sents.append(src)
-                    hit_sents.append(chunk)
-
-        context = "\n\n".join(hit_sents).strip()
-        if max_chars > 0 and len(context) > max_chars:
-            context = context[:max_chars] + "…"
-
-        # --- lexicon from identifiers + dotted phrases ---
-        def _extract_terms_local(text: str, *, top_k: int, min_len: int) -> List[str]:
-            terms = _extract_identifiers(text)
-            counts: Dict[str, int] = {}
-            for t in terms:
-                counts[t] = counts.get(t, 0) + 1
-            ranked_terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-            return [t for t, _ in ranked_terms[:top_k]]
-
-        lexicon = _extract_terms_local(context or "\n".join(d["text"] for d in ranked),
-                                       top_k=lexicon_top_k, min_len=lexicon_min_len)
-
-        if use_phrases and context:
-            phrases = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\b", context)
-            pc: Dict[str, int] = {}
-            for ph in phrases:
-                if any(tok.lower() in _STOP for tok in ph.split(".")):
+                if last_scraped_time > 0.0 and not force_refresh:
+                    if verbose:
+                        print(f"Skipping (already indexed): {u}")
+                    total_skipped += 1
                     continue
-                pc[ph] = pc.get(ph, 0) + 1
-            phrase_top = [p for p, _ in sorted(pc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
-            seenp = set()
-            merged = []
-            for t in phrase_top + lexicon:
-                if t not in seenp:
-                    merged.append(t); seenp.add(t)
-            lexicon = merged[:lexicon_top_k]
+                # --- END NEW ---
 
-        # --- Learn new domains (optional) ---
-        newly_learned = []
+                html_text = self._get_page_static(u)
+                if not html_text:
+                    total_errors += 1
+                    continue
+
+                if u.lower().endswith(".md") or "/raw/" in u or "raw.githubusercontent.com" in u:
+                    prose_body, code_blocks = self._extract_text_md(html_text)
+                else:
+                    prose_body, code_blocks = self._extract_text_html(html_text, _has_traf)
+
+                code_text = "\n\n".join(code_blocks).strip()
+
+                if len(code_text) < min_doc_chars and use_playwright_fallback and browser and not u.lower().endswith(
+                        ".md"):
+                    if verbose:
+                        print(f"Static scrape for {u} got {len(code_text)} code chars, retrying with Playwright...")
+                    html_text_js = self._get_page_dynamic(browser, u)
+                    if html_text_js:
+                        html_text = html_text_js  # Use JS html for title
+                        prose_body, code_blocks = self._extract_text_html(html_text, _has_traf)
+                        code_text = "\n\n".join(code_blocks).strip()
+
+                if len(code_text) < min_doc_chars:
+                    total_skipped += 1  # Skip if still not enough content
+                    continue
+
+                title = self._clean_domain(u)
+                try:
+                    if "<title" in html_text.lower():
+                        from bs4 import BeautifulSoup
+                        soup = BeautifulSoup(html_text, "html.parser")
+                        if soup.title and soup.title.string:
+                            title = " ".join(soup.title.string.strip().split())
+                except Exception:
+                    pass
+
+                # --- Insert ONLY code snippets into DB ---
+                url_had_code = False
+                for code in code_blocks:
+                    code = (code or "").strip()
+                    if len(code) < 20:
+                        continue
+                    if self._looks_like_traceback(code):
+                        continue
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+                        (u, title, code, "code")
+                    )
+                    total_code += 1
+                    url_had_code = True
+
+                # --- NEW: Update tracking DB only if we found content ---
+                if url_had_code:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_urls (url, last_scraped_time) VALUES (?, ?)",
+                        (u, current_time)
+                    )
+                    if last_scraped_time == 0.0:
+                        total_indexed += 1
+                    else:
+                        total_updated += 1
+                # --- END NEW ---
+
+                domain_hits[self._clean_domain(u)] += 1
+
+            except Exception as e:
+                total_errors += 1
+                if verbose:
+                    print(f"Error processing {u}: {e}")
+
+        # --- Close Playwright ---
+        if browser: browser.close()
+        if playwright_context: playwright_context.stop()
+
+        # --- Commit DB ---
+        try:
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+        # --- Learn new domains ---
+        newly_learned: List[str] = []
         if learn_new_sites:
             store = Memory.load()
             learned = set(store.get(learned_sites_key, []))
             for dom, c in domain_hits.items():
+                if not dom: continue
                 if c >= learn_min_hits and dom not in learned and _allowed(f"https://{dom}/"):
                     learned.add(dom)
                     newly_learned.append(dom)
             if newly_learned:
-                store[learned_sites_key] = sorted(learned)
+                store[learned_sites_key] = sorted(list(learned))
                 Memory.save(store)
 
-        # --- Export to Memory ---
-        if export_lexicon and lexicon:
-            store = Memory.load()
-            store[lexicon_key] = lexicon
-            Memory.save(store)
-
-        if export_context and context:
-            store = Memory.load()
-            if append_ctx and isinstance(store.get(context_key), str) and store[context_key]:
-                store[context_key] = store[context_key].rstrip() + "\n\n" + context
-            else:
-                store[context_key] = context
-            Memory.save(store)
-
-        # --- Compose output back into pipeline ---
+        # --- Compose output ---
         base = "" if payload is None else str(payload)
-        parts: List[str] = [base] if base else []
-        if inject_lexicon and lexicon:
-            parts.append("[lexicon]\n" + ", ".join(lexicon))
-        if inject_context and context:
-            parts.append("[context]\n" + context)
-        out = "\n\n".join(parts).strip()
+        # --- NEW: Updated report ---
+        out_msg = (
+            f"Web corpus scan complete. Processed {len(final_urls)} URLs.\n"
+            f"  - New Snippets Indexed: {total_indexed}\n"
+            f"  - Snippets Updated:     {total_updated}\n"
+            f"  - URLs Skipped:         {total_skipped}\n"
+            f"  - Total Snippets Added: {total_code}\n"
+            f"  - Errors:               {total_errors}"
+        )
 
         meta = {
-            "rows": len(docs_raw),
-            "ranked_docs": len(ranked),
-            "top_urls": [d.get("url") for d in ranked],
-            "lexicon_key": lexicon_key if (export_lexicon and lexicon) else None,
-            "lexicon_size": len(lexicon),
-            "context_key": context_key if (export_context and context) else None,
-            "context_len": len(context),
+            "db_path": db_path,
+            "urls_scraped": len(final_urls),
+            "total_prose_snippets": 0,  # This block only indexes code
+            "total_code_snippets": total_code,
+            "files_indexed": total_indexed,
+            "files_updated": total_updated,
+            "files_skipped": total_skipped,
+            "errors": total_errors,
             "site_include": site_include,
             "site_exclude": site_exclude,
             "learned_sites_key": learned_sites_key if learn_new_sites else None,
             "newly_learned": newly_learned,
         }
-        return out, meta
+        return f"{base}\n\n[corpus_update]\n{out_msg}", meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -3039,20 +3314,636 @@ class CodeCorpusBlock(BaseBlock):
             "site_exclude": "github.com,stackoverflow.com",
             "max_pages": 12,
             "min_doc_chars": 200,
-            "max_chars": 3800,
-            "top_k_docs": 10,
-            "top_k_sents": 30,
             "learn_new_sites": True,
-            "lexicon_key": "code_lexicon",
-            "context_key": "code_context",
-            "append_ctx": False,
-            "lexicon_top_k": 60,
-            "lexicon_min_len": 3
+            "learned_sites_key": "learned_code_sites",
+            "db_path": "code_corpus.db",
+            "timeout": 10.0,
+            "read_timeout": 12.0,
+            "use_playwright_fallback": True,
+            "force_refresh": False  # <-- NEW PARAM
         }
+
+
 # Register the block
 BLOCKS.register("codecorpus", CodeCorpusBlock)
 
+# ---------------- CodeSearch (prioritize code kind) ----------------
+@dataclass
+class CodeSearchBlock(BaseBlock):
+    """
+    Searches a pre-built CodeCorpus SQLite FTS5 database for relevant snippets.
+    This is the "Retrieval" part of a RAG pipeline for CodeBlock.
 
+    This improved version features a more robust, content-aware language
+    detection for syntax highlighting and a slightly refined query parser.
+
+    Inputs:
+      --extra codesearch.query="how to plot with pandas"
+
+    Params:
+      db_path: Path to the SQLite DB (default: code_corpus.db)
+      top_k: Number of snippets to retrieve (default: 5)
+      kind: 'all', 'code', 'prose' (default: 'all')
+      export_key: Memory key to save context to (default: code_search_context)
+      inject: Inject the results into the payload (default: True)
+      max_chars: Truncate the total context (default: 4000)
+      use_bm25: Try to use bm25(docs) for ranking (default: True, with safe fallback)
+      prefix_match: Add '*' to terms for prefix-match (default: True)
+    """
+
+    # Minimal stop-word list for queries
+    _SEARCH_STOP_WORDS = set([
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
+        "how", "in", "is", "it", "of", "on", "or", "show", "tell", "that",
+        "the", "this", "to", "what", "when", "where", "which", "with",
+        "me", "give", "using", "write", "a", "basic", "script", "to"
+    ])
+
+    def _format_query(self, query: str, *, prefix_match: bool = True) -> str:
+        """
+        Format a user query for FTS5 'MATCH'.
+
+        - Strips punctuation that tends to break FTS syntax.
+        - Drops stop words.
+        - AND-joins remaining terms for relevance.
+        - Optionally turns each term into a prefix search: foo -> "foo*"
+        """
+        # Keep word chars, whitespace, dashes, dots, and symbols common in code.
+        cleaned_query = re.sub(r"[^\w\s\-.+#]", " ", query or "")
+
+        terms = []
+        raw_terms = []
+        for t in cleaned_query.split():
+            raw = t.strip()
+            if not raw:
+                continue
+            raw_terms.append(raw)
+
+            term = raw.lower()
+            if term in self._SEARCH_STOP_WORDS or len(term) <= 1:
+                continue
+
+            # Add prefix wildcard for better matching, but not on very short terms.
+            if prefix_match and len(term) > 2:
+                term = term + "*"
+
+            terms.append(f'"{term}"')
+
+        if not terms:
+            # Fallback: if everything was filtered, just OR the raw tokens
+            return " OR ".join(f'"{t.lower()}"' for t in raw_terms if t.strip())
+
+        # Use AND for more relevant hits
+        return " AND ".join(terms)
+
+    def _guess_code_lang(self, code_snippet: str) -> str:
+        """
+        Heuristically guess the programming language of a code snippet
+        based on common keywords and syntax.
+        """
+        # Use a copy for manipulation
+        code = code_snippet.strip()
+        lower_code = code.lower()
+
+        # High-confidence signals first
+        if "import React" in code or "useState" in code or ".jsx" in lower_code:
+            return "jsx"
+        if "function(" in lower_code or "=>" in code or "const " in lower_code:
+            if "interface " in lower_code or ": string" in code or " type " in lower_code:
+                return "typescript"
+            return "javascript"
+        if "import " in lower_code and "def " in lower_code:
+            return "python"
+        if "#include" in lower_code and "std::" in lower_code:
+            return "cpp"
+        if "public static void main" in lower_code or "System.out.println" in lower_code:
+            return "java"
+        if "using System;" in lower_code or "namespace " in lower_code:
+            return "csharp"
+        if "fn main" in lower_code and ("let mut" in lower_code or "&str" in lower_code):
+            return "rust"
+        if "package main" in lower_code and "func main" in lower_code:
+            return "go"
+
+        # Fallback to empty for the ``` fence
+        return ""
+
+    def _run_query(
+            self,
+            conn: sqlite3.Connection,
+            fts_query: str,
+            kind: str,
+            top_k: int,
+            use_bm25: bool,
+    ) -> Tuple[List[sqlite3.Row], bool]:
+        """
+        Run a single FTS search for a given kind ('code' or 'prose').
+
+        Returns (rows, used_bm25_for_this_query).
+        """
+        rows: List[sqlite3.Row] = []
+        used_bm25_here = False
+
+        # Prefer bm25(docs) ordering if available, as it provides better relevance.
+        if use_bm25:
+            sql = (
+                "SELECT url, title, content, kind, bm25(docs) AS score "
+                "FROM docs "
+                "WHERE docs MATCH ? AND kind = ? "
+                "ORDER BY score "  # Lower (more negative) bm25 score is better
+                "LIMIT ?;"
+            )
+            try:
+                rows = conn.execute(sql, (fts_query, kind, int(top_k))).fetchall()
+                used_bm25_here = True
+                return rows, used_bm25_here
+            except sqlite3.Error as e:
+                # If bm25 isn't available, fall through to simple MATCH fallback
+                if "no such function: bm25" not in str(e).lower():
+                    raise  # A real error occurred
+
+        # Fallback: rely on FTS5 default ranking
+        sql = (
+            "SELECT url, title, content, kind "
+            "FROM docs "
+            "WHERE docs MATCH ? AND kind = ? "
+            "LIMIT ?;"
+        )
+        rows = conn.execute(sql, (fts_query, kind, int(top_k))).fetchall()
+        return rows, used_bm25_here
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        query = str(params.get("query", "")).strip()
+        if not query:
+            return str(payload), {"error": "CodeSearchBlock requires 'query' param."}
+
+        db_path = str(params.get("db_path", "code_corpus.db"))
+        top_k = int(params.get("top_k", 5))
+        kind = str(params.get("kind", "all")).lower()
+        export_key = str(params.get("export_key", "code_search_context"))
+        inject = bool(params.get("inject", True))
+        max_chars = int(params.get("max_chars", 4000))
+        use_bm25 = bool(params.get("use_bm25", True))
+        prefix_match = bool(params.get("prefix_match", True))
+
+        fts_query = self._format_query(query, prefix_match=prefix_match)
+        if not fts_query:
+            return (
+                str(payload),
+                {"error": "Query was empty after filtering stop words.", "query": query},
+            )
+
+        rows: List[sqlite3.Row] = []
+        used_bm25_any = False
+
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.row_factory = sqlite3.Row
+
+                # 1. Prioritize code hits, as they are generally more valuable.
+                if kind != "prose":
+                    code_rows, used_bm25_code = self._run_query(
+                        conn, fts_query, "code", top_k, use_bm25
+                    )
+                    rows.extend(code_rows)
+                    used_bm25_any = used_bm25_any or used_bm25_code
+
+                # 2. If we still need more results, fetch prose hits.
+                if kind != "code" and len(rows) < top_k:
+                    remaining = max(top_k - len(rows), 1)
+                    prose_rows, used_bm25_prose = self._run_query(
+                        conn, fts_query, "prose", remaining, use_bm25
+                    )
+                    rows.extend(prose_rows)
+                    used_bm25_any = used_bm25_any or used_bm25_prose
+
+        except sqlite3.Error as e:
+            err_msg = f"DB search failed (is {db_path} built?): {e}"
+            return str(payload), {"error": err_msg, "query": fts_query}
+
+        if not rows:
+            context = f"# No code snippets found for query: {query}"
+        else:
+            context_parts: List[str] = []
+            total_chars = 0
+            code_hits = 0
+            prose_hits = 0
+
+            for r in rows[:top_k]:
+                content = (r["content"] or "").strip()
+                if not content:
+                    continue
+
+                knd = r["kind"] or "prose"
+                header = f"### {knd.upper()} from {r['title'] or r['url']}\n"
+
+                if knd == "code":
+                    # Use the improved content-aware language guesser.
+                    lang = self._guess_code_lang(content)
+                    body = f"```{lang}\n{content}\n```\n"
+                    code_hits += 1
+                else:
+                    body = content + "\n"
+                    prose_hits += 1
+
+                piece = header + body
+                if total_chars > 0 and (total_chars + len(piece) > max_chars):
+                    # Stop if we'd exceed the budget
+                    break
+
+                context_parts.append(piece)
+                total_chars += len(piece)
+
+            if not context_parts:
+                context = f"# No valid snippets found for query: {query}"
+            else:
+                context = "\n---\n".join(context_parts)
+                if len(context) > max_chars:
+                    context = context[:max_chars] + "\n... (truncated)"
+
+        # Save to memory for other blocks and optionally inject into payload
+        store = Memory.load()
+        store[export_key] = context
+        Memory.save(store)
+
+        out_payload = f"{payload}\n\n[code_search_context]\n{context}" if inject else str(payload)
+
+        meta = {
+            "query": query,
+            "fts_query": fts_query,
+            "db_path": db_path,
+            "hits": len(rows),
+            "code_hits": code_hits,
+            "prose_hits": prose_hits,
+            "export_key": export_key,
+            "context_len": len(context),
+            "used_bm25": used_bm25_any,
+        }
+        return out_payload.strip(), meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "REQUIRED: search query",
+            "db_path": "code_corpus.db",
+            "top_k": 5,
+            "kind": "all",
+            "export_key": "code_search_context",
+            "inject": True,
+            "max_chars": 4000,
+            "use_bm25": True,
+            "prefix_match": True,
+        }
+
+
+BLOCKS.register("codesearch", CodeSearchBlock)
+
+
+
+# ---------------- LocalCodeCorpus (scans local files) ----------------
+@dataclass
+class LocalCodeCorpusBlock(BaseBlock):
+    """
+    Scans a local directory for code files (.py, .js, etc.) and adds them
+    to the same SQLite FTS5 database used by CodeCorpusBlock and CodeSearchBlock.
+
+    This allows your RAG pipeline to have context on your local projects.
+    It tracks modification times and only updates new or changed files.
+
+    NEW: For .py files, it uses AST to index functions and classes individually
+    for much more accurate search results.
+    """
+
+    def _init_fts_db(self, db_path: str):
+        """
+        Initializes the FTS5 table (same as CodeCorpusBlock).
+        """
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
+                url UNINDEXED,    -- File path or file_path::chunk_name
+                title,            -- File name or file :: chunk
+                content,          -- File content or chunk content
+                kind,             -- 'code' or 'prose'
+                tokenize = 'porter unicode61'
+            );
+            """)
+
+    def _init_tracking_db(self, db_path: str):
+        """
+        Initializes a separate table to track file modification times.
+        """
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_files (
+                path TEXT PRIMARY KEY,
+                last_indexed_mtime REAL NOT NULL
+            );
+            """)
+
+    def _get_last_mtime(self, conn: sqlite3.Connection, file_path: str) -> float:
+        """Check the DB for the last indexed modification time of a file."""
+        try:
+            cur = conn.execute(
+                "SELECT last_indexed_mtime FROM indexed_files WHERE path = ?", (file_path,)
+            )
+            row = cur.fetchone()
+            return float(row[0]) if row else 0.0
+        except sqlite3.Error as e:
+            print(f"Error checking mtime for {file_path}: {e}")
+            return 0.0
+
+    # --- NEW: AST-based Python file processor ---
+    def _process_python_file(
+            self,
+            conn: sqlite3.Connection,
+            file_path: str,
+            file_name: str,
+            current_mtime: float,
+            min_chars: int
+    ) -> Tuple[int, int]:
+        """
+        Parse a .py file into functions/classes using AST and index them individually.
+        Returns (new_chunks_indexed, chunks_updated).
+        """
+        indexed = 0
+        updated = 0
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            if len(content) < min_chars:
+                return 0, 0  # Skip small files
+
+            tree = ast.parse(content, filename=file_path)
+
+            # 1. Index the top-level file docstring as "prose"
+            file_docstring = ast.get_docstring(tree) or ""
+            if file_docstring and len(file_docstring) > min_chars:
+                last_mtime = self._get_last_mtime(conn, file_path)  # Use file_path as URL
+                if current_mtime > last_mtime:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+                        (file_path, file_name, file_docstring, "prose")  # Store docstring as prose
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                        (file_path, current_mtime)
+                    )
+                    if last_mtime == 0.0:
+                        indexed += 1
+                    else:
+                        updated += 1
+
+            # 2. Index functions and classes as "code"
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    chunk_name = node.name
+                    try:
+                        # ast.get_source_segment gets the full source, including decorators
+                        chunk_content = ast.get_source_segment(content, node)
+                        if not chunk_content or len(chunk_content) < min_chars:
+                            continue
+                    except Exception:
+                        continue  # Skip nodes we can't get source for
+
+                    # Use a unique URL/path for this chunk
+                    chunk_url = f"{file_path}::{chunk_name}"
+                    chunk_title = f"{file_name} :: {chunk_name}"
+
+                    # Check mtime for this *chunk*
+                    last_mtime = self._get_last_mtime(conn, chunk_url)
+
+                    if current_mtime > last_mtime:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+                            (chunk_url, chunk_title, chunk_content, "code")
+                        )
+                        conn.execute(
+                            "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                            (chunk_url, current_mtime)
+                        )
+                        if last_mtime == 0.0:
+                            indexed += 1
+                        else:
+                            updated += 1
+
+            # If we didn't index any chunks, at least update the main file's mtime
+            # to prevent re-parsing it every time if it hasn't changed.
+            if indexed == 0 and updated == 0:
+                last_mtime = self._get_last_mtime(conn, file_path)
+                if current_mtime > last_mtime:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                        (file_path, current_mtime)
+                    )
+
+            return indexed, updated
+
+        except (SyntaxError, ValueError) as e:
+            print(f"Skipping {file_path} (AST parsing failed): {e}")
+            return 0, 0
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            return 0, 0
+
+    # --- NEW: Generic file processor ---
+    def _process_generic_file(
+            self,
+            conn: sqlite3.Connection,
+            file_path: str,
+            file_name: str,
+            current_mtime: float,
+            last_mtime: float,
+            min_chars: int
+    ) -> Tuple[int, int]:
+        """Indexes a non-Python file (e.g., .md, .txt) as a single document."""
+        indexed, updated = 0, 0
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+
+            if len(content) < min_chars:
+                return 0, 0
+
+            # Determine kind. Use "prose" for text/md, "code" for others
+            kind = "prose" if file_name.endswith(('.md', '.txt')) else "code"
+
+            # Add to FTS database
+            conn.execute(
+                "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+                (file_path, file_name, content, kind)
+            )
+
+            # Update tracking database
+            conn.execute(
+                "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                (file_path, current_mtime)
+            )
+
+            if last_mtime == 0.0:
+                indexed = 1
+            else:
+                updated = 1
+        except Exception as e:
+            print(f"Error processing generic file {file_path}: {e}")
+
+        return indexed, updated
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # ---------- Params ----------
+        db_path = str(params.get("db_path", "code_corpus.db"))
+
+        scan_path_raw = str(params.get("scan_path", "")).strip()
+        if not scan_path_raw:
+            return str(payload), {"error": "LocalCodeCorpusBlock requires 'scan_path' param."}
+
+        scan_path = os.path.abspath(os.path.expanduser(scan_path_raw))
+
+        extensions_raw = str(params.get("extensions", ".py,.js,.ts,.md,.txt,.java,.cpp,.c,.h,.rs,.go"))
+        extensions = tuple([e.strip() for e in extensions_raw.split(',') if e.strip()])
+        py_extensions = tuple([e for e in extensions if e == '.py'])  # Separate .py
+        other_extensions = tuple([e for e in extensions if e != '.py'])  # All others
+
+        min_chars = int(params.get("min_chars", 50))
+        verbose = bool(params.get("verbose", False))
+
+        check_for_updates = bool(params.get("check_for_updates", False))
+
+        skip_default_dirs = bool(params.get("skip_default_dirs", True))
+        skip_venv_dirs = bool(params.get("skip_venv_dirs", True))
+        extra_skip_dirs_raw = str(params.get("extra_skip_dirs", ""))
+
+        skip_set = set()
+        if skip_default_dirs:
+            skip_set.update(('.git', 'node_modules', '__pycache__'))
+        if skip_venv_dirs:
+            skip_set.update(('venv', '.venv'))
+        if extra_skip_dirs_raw:
+            skip_set.update([d.strip() for d in extra_skip_dirs_raw.split(',') if d.strip()])
+
+        if not os.path.isdir(scan_path):
+            return str(payload), {"error": f"Path not found or is not a directory: {scan_path}"}
+
+        # --- Initialize DBs ---
+        try:
+            self._init_fts_db(db_path)
+            self._init_tracking_db(db_path)
+        except Exception as e:
+            return str(payload), {"error": f"Failed to initialize database: {e}"}
+
+        # --- Scan Files ---
+        total_indexed = 0
+        total_updated = 0
+        total_skipped = 0
+        total_errors = 0
+
+        try:
+            conn = sqlite3.connect(db_path)
+        except Exception as e:
+            return str(payload), {"error": f"Failed to open DB {db_path}: {e}"}
+
+        try:
+            for root, dirs, files in os.walk(scan_path, topdown=True):
+                if skip_set:
+                    dirs[:] = [d for d in dirs if d not in skip_set]
+
+                for file in files:
+                    # Decide which extensions list to check
+                    is_py = file.endswith(py_extensions)
+                    is_other = file.endswith(other_extensions)
+
+                    if not (is_py or is_other):
+                        continue
+
+                    file_path = os.path.join(root, file)
+
+                    try:
+                        current_mtime = os.path.getmtime(file_path)
+                        # --- MODIFIED: Use file_path for mtime check ---
+                        # For AST-parsed files, we check mtime *per chunk* inside _process_python_file
+                        # For generic files, we check here.
+                        last_mtime = self._get_last_mtime(conn, file_path)
+
+                        if not check_for_updates and last_mtime > 0.0 and not is_py:
+                            if verbose: print(f"Skipping (already indexed): {file_path}")
+                            total_skipped += 1
+                            continue
+
+                        if check_for_updates and current_mtime <= last_mtime and not is_py:
+                            if verbose: print(f"Skipping (up-to-date): {file_path}")
+                            total_skipped += 1
+                            continue
+
+                        # --- MODIFIED: Route to specific processor ---
+                        indexed, updated = 0, 0
+                        if is_py:
+                            # Use AST parser for Python files
+                            # This block now handles its own mtime checks per chunk
+                            indexed, updated = self._process_python_file(
+                                conn, file_path, file, current_mtime, min_chars
+                            )
+                        else:
+                            # Use generic whole-file parser for others
+                            indexed, updated = self._process_generic_file(
+                                conn, file_path, file, current_mtime, last_mtime, min_chars
+                            )
+
+                        total_indexed += indexed
+                        total_updated += updated
+                        if indexed == 0 and updated == 0:
+                            total_skipped += 1  # Skipped due to min_chars or other
+                        # --- END MODIFIED ---
+
+                    except (IOError, OSError) as e:
+                        if verbose: print(f"Error reading {file_path}: {e}")
+                        total_errors += 1
+                    except Exception as e:
+                        if verbose: print(f"Error processing {file_path}: {e}")
+                        total_errors += 1
+
+            conn.commit()
+
+        except Exception as e:
+            total_errors += 1
+            print(f"A critical error occurred: {e}")
+        finally:
+            conn.close()
+
+        # --- Compose output ---
+        base = "" if payload is None else str(payload)
+        out_msg = (
+            f"Local code scan complete for: {scan_path}\n"
+            f"  - New Chunks Indexed: {total_indexed}\n"
+            f"  - Chunks Updated:     {total_updated}\n"
+            f"  - Files/Chunks Skipped: {total_skipped}\n"
+            f"  - Errors:            {total_errors}"
+        )
+
+        meta = {
+            "db_path": db_path,
+            "scan_path": scan_path,
+            "files_indexed": total_indexed,  # Renamed to reflect chunks
+            "files_updated": total_updated,  # Renamed to reflect chunks
+            "files_skipped": total_skipped,
+            "errors": total_errors,
+        }
+        return f"{base}\n\n[local_corpus_update]\n{out_msg}", meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "scan_path": "REQUIRED: The local directory to scan (e.g., ~/PycharmProjects)",
+            "db_path": "code_corpus.db",
+            "extensions": ".py,.js,.ts,.md,.txt,.java,.cpp,.c,.h,.rs,.go",
+            "min_chars": 50,
+            "verbose": False,
+            "check_for_updates": False,
+            "skip_default_dirs": True,
+            "skip_venv_dirs": True,
+            "extra_skip_dirs": "",
+        }
+
+
+BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
 # ======================= NewsBlock =========================================
 @dataclass
 class NewsBlock(BaseBlock):
