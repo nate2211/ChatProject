@@ -4067,7 +4067,6 @@ class CodeSearchBlock(BaseBlock):
         # Initialize counters *before* the if/else block
         code_hits = 0
         prose_hits = 0
-        context = ""
         # --- [END FIX] ---
         if not rows:
             context = f"# No code snippets found for query: {query}"
