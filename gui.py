@@ -12,30 +12,35 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import threading
+
 # Import ALL blocks eagerly in the main thread.
 import blocks
 import pipeline  # Ensure pipeline is also registered
 from registry import BLOCKS
 
-# [MODIFIED] Import models and _MODELS directly
+# [MODIFIED] Import models, _MODELS, and get_chat_model
 import models
+
 try:
-    # This is what you requested: import the dictionary directly
-    from models import _MODELS
+    from models import _MODELS, get_chat_model
 except ImportError:
     print("WARNING: Could not import _MODELS from models.py. Using fallback.", file=sys.stderr)
-    _MODELS = {"lexicon": None, "lexicon-adv": None} # Fallback
+    _MODELS = {"lexicon": None, "lexicon-adv": None}  # Fallback
+
+    def get_chat_model(name, **kwargs):
+        raise ImportError("Could not load get_chat_model")
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QCheckBox, QPlainTextEdit, QTabWidget,
     QStatusBar, QAction, QFileDialog, QListWidgetItem, QAbstractItemView,
-    QGroupBox, QSplitter, QLabel, QMessageBox, QComboBox
+    QGroupBox, QSplitter, QLabel, QMessageBox, QComboBox, QInputDialog  # <-- QInputDialog added
 )
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, Qt
 
 APP_TITLE = "PromptChat GUI"
 STATE_FILE = Path(".promptchat_gui_state.json")
+PRESET_FILE = Path(__file__).parent / "gui_presets.json"
 
 # DARK_STYLESHEET (omitted for brevity)
 DARK_STYLESHEET = """
@@ -122,36 +127,82 @@ DARK_STYLESHEET = """
     }
 """
 
+
 # ======================= PRESETS =========================================
-# These are global presets that set the pipeline AND extras.
-# ======================= PRESETS =========================================
+
 def load_presets() -> List[Dict[str, Any]]:
     """
-    Loads presets from 'presets.json' in the same directory.
-    Returns a default empty preset if the file is missing or invalid.
+    Loads presets from 'gui_presets.json'.
+
+    In-memory structure always has a placeholder as index 0:
+        {
+          "name": "--- Select a Preset ---",
+          "blocks": [],
+          "extras": "",
+          "model": "lexicon"
+        }
+
+    The disk file stores ONLY user presets (index >= 1).
     """
-    default_preset = [{"name": "--- Select a Preset ---", "blocks": [], "extras": ""}]
+    placeholder = {
+        "name": "--- Select a Preset ---",
+        "blocks": [],
+        "extras": "",
+        "model": "lexicon",
+    }
 
-    # Locate the JSON file relative to this script
-    preset_path = Path(__file__).parent / "gui_presets.json"
-
-    if preset_path.exists():
+    if PRESET_FILE.exists():
         try:
-            with open(preset_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, list):
-                    return data
-                else:
-                    print("Warning: presets.json must contain a list.")
+            with open(PRESET_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if not isinstance(raw, list):
+                return [placeholder]
+
+            cleaned: List[Dict[str, Any]] = []
+            for entry in raw:
+                if not isinstance(entry, Dict):
+                    continue
+                name = str(entry.get("name", "")).strip()
+                if not name:
+                    continue
+                blocks = entry.get("blocks", [])
+                if not isinstance(blocks, list):
+                    blocks = []
+                extras = str(entry.get("extras", "") or "")
+                model = str(entry.get("model", "lexicon") or "lexicon")
+                cleaned.append(
+                    {
+                        "name": name,
+                        "blocks": blocks,
+                        "extras": extras,
+                        "model": model,
+                    }
+                )
+            if cleaned:
+                return [placeholder] + cleaned
         except Exception as e:
-            print(f"Error loading presets.json: {e}")
-    else:
-        print(f"Notice: presets.json not found at {preset_path}. Using default.")
+            print(f"Error loading gui_presets.json: {e}", file=sys.stderr)
 
-    return default_preset
+    # Fallback: just the placeholder
+    return [placeholder]
 
 
-GUI_PRESETS = load_presets()
+GUI_PRESETS: List[Dict[str, Any]] = load_presets()
+
+
+def save_presets_to_disk() -> None:
+    """
+    Writes GUI_PRESETS[1:] (user presets) to 'gui_presets.json'.
+    We never store the placeholder on disk.
+    """
+    try:
+        data_to_save = GUI_PRESETS[1:]  # skip placeholder
+        PRESET_FILE.write_text(
+            json.dumps(data_to_save, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print(f"Error saving gui_presets.json: {e}", file=sys.stderr)
 
 
 # ======================= WORKER THREAD ===================================
@@ -160,50 +211,78 @@ class Worker(QObject):
     finished = pyqtSignal(bool, str, dict)
     status_update = pyqtSignal(str)
 
-    def __init__(self, blocks_sel: List[str], prompt: str, extras_raw: str, print_json: bool,
-                 stop_event: threading.Event, model_name: str):
+    def __init__(
+        self,
+        blocks_sel: List[str],
+        prompt: str,
+        extras_raw: str,
+        print_json: bool,
+        stop_event: threading.Event,
+        model_name: str,
+    ):
         super().__init__()
         self.blocks_sel = blocks_sel
         self.prompt = prompt
         self.extras_raw = extras_raw
         self.print_json = print_json
         self.stop_event = stop_event
-        self.model_name = model_name  # Store the model name
+        self.model_name = model_name
 
     @pyqtSlot()
     def run(self):
         try:
-            import blocks  # safe here too
+            import blocks
             blocks.ensure_app_dirs()
-            # --- New: payload-derived variables for presets ---
             prompt_str = self.prompt or ""
-            # word-based length (for min_term_overlap, etc.)
             payload_word_len = len(prompt_str.split()) if prompt_str.strip() else 0
-            # raw character length if you ever want it
             payload_char_len = len(prompt_str)
 
             extras_raw_substituted = (
                 self.extras_raw
-                # original behaviour
                 .replace("{payload}", prompt_str)
-                # NEW: word-count length (for min_term_overlap)
                 .replace("{payload.length}", str(payload_word_len))
-                .replace("{payload_len}", str(payload_word_len))  # alias, optional
-                # Optional: expose char length too if you want later
                 .replace("{payload.char_length}", str(payload_char_len))
             )
             extras_list = [ln.strip() for ln in extras_raw_substituted.splitlines() if ln.strip()]
             extras = blocks.parse_extras(extras_list)
 
+            # Inject selected model into chat/code + pipeline.chat/pipeline.code
             if self.model_name:
                 extras.setdefault("chat", {})["model"] = self.model_name
-                extras.setdefault("pipeline", {})["chat.model"] = self.model_name
+                extras.setdefault("code", {})["model"] = self.model_name
+
+                pipe_extras = extras.setdefault("pipeline", {})
+                pipe_extras.setdefault("chat.model", self.model_name)
+                pipe_extras.setdefault("code.model", self.model_name)
+
+            # NEW: model-specific params via "modelname.param" extras section
+            # Example:
+            #   hf-llm.max_new_tokens=512
+            #   hf-llm.temperature=0.4
+            model_key = (self.model_name or "").strip().lower()
+            model_params: Dict[str, Any] = {}
+
+            if model_key:
+                for section_name, section_dict in extras.items():
+                    if section_name.lower() == model_key and isinstance(section_dict, dict):
+                        model_params = section_dict
+                        break
+
+            if model_params:
+                chat_ex = extras.setdefault("chat", {})
+                code_ex = extras.setdefault("code", {})
+                pipe_ex = extras.setdefault("pipeline", {})
+
+                for k, v in model_params.items():
+                    chat_ex.setdefault(k, v)
+                    code_ex.setdefault(k, v)
+                    pipe_ex.setdefault(f"chat.{k}", v)
+                    pipe_ex.setdefault(f"code.{k}", v)
 
             results_md: List[str] = []
             results_json: List[Dict[str, Any]] = []
             combined_meta: Dict[str, Any] = {"runs": []}
 
-            # [NEW] We now track both the root and the chained payload
             root_payload = self.prompt
             current_payload = self.prompt
 
@@ -214,7 +293,6 @@ class Worker(QObject):
 
                 self.status_update.emit(f"Running {idx}/{len(self.blocks_sel)}: {block_name}")
 
-                # --- [NEW] Smart Parameter and Payload Logic ---
                 block_key = block_name.lower()
                 params: Dict[str, Any] = {}
                 params.update(extras.get(block_key, {}))
@@ -223,67 +301,56 @@ class Worker(QObject):
                 if block_name == "pipeline":
                     params["_gui_extras_passthrough"] = extras
 
-                # Check for our new 'magic' parameter
-                # Default behavior is 'chain'
                 payload_source = params.pop("_payload_source", "chain")
-
                 payload_to_use = root_payload if payload_source == "root" else current_payload
-                # --- [END NEW] ---
 
                 blk = BLOCKS.create(block_name)
                 try:
-                    # Use the payload we selected (root or chain)
                     result, meta = blk.execute(payload_to_use, params=params)
 
-                    # --- [NEW] Smart Chaining Logic ---
                     if payload_source == "root":
-                        # This block ran on the root payload.
-                        # We assume its result is *additive* and should be appended.
-                        # We must strip the root payload from its result to avoid duplication.
                         if result.startswith(root_payload):
                             additive_result = result[len(root_payload):].strip()
                             if additive_result:
                                 current_payload = current_payload + "\n\n" + additive_result
                         else:
-                            # Fallback: just append the whole thing if it didn't include the payload
-                            # This happens if the block has inject_context=false
                             current_payload = current_payload + "\n\n" + result
                     else:
-                        # This is the original behavior: replace the payload
                         current_payload = result
-                    # --- [END NEW] ---
 
-                    # The rest of the logging is the same, but we log the 'result'
-                    # which may be different from the 'current_payload'
-                    results_md.append(f"\n\n# ── {block_name} ─────────────────────────────────────\n{result}")
-                    results_json.append({"block": block_name, "metadata": meta, "result": result})
+                    results_md.append(
+                        f"\n\n# ── {block_name} ─────────────────────────────────────\n{result}"
+                    )
+                    results_json.append(
+                        {"block": block_name, "metadata": meta, "result": result}
+                    )
                     combined_meta["runs"].append({"block": block_name, "metadata": meta})
 
                 except Exception as e:
                     import traceback
                     tb = traceback.format_exc()
                     err_blob = f"[{block_name}] ERROR: {e}\n{tb}"
-                    results_md.append(f"\n\n# ── {block_name} (ERROR) ───────────────────────────\n{err_blob}")
-                    results_json.append({"block": block_name, "error": str(e), "traceback": tb})
+                    results_md.append(
+                        f"\n\n# ── {block_name} (ERROR) ───────────────────────────\n{err_blob}"
+                    )
+                    results_json.append(
+                        {"block": block_name, "error": str(e), "traceback": tb}
+                    )
                     combined_meta["runs"].append({"block": block_name, "error": str(e)})
                     self.status_update.emit(f"Failed on block '{block_name}'. Stopping pipeline.")
                     break
 
-            # --- [NEW] FINAL OUTPUT FORMATTING LOGIC ---
-
-            # Check for the new magic flag in the "all" section of extras
             final_output_only = extras.get("all", {}).get("final_output_only", False)
 
             if self.print_json:
                 out = json.dumps(results_json, indent=2, ensure_ascii=False)
             elif final_output_only:
-                # User *only* wants the final, clean payload
                 out = current_payload
             else:
-                # This is the original behavior (full log)
-                out = f"--- FINAL OUTPUT ---\n{current_payload}\n\n--- RUN LOG ---\n" + "".join(
-                    results_md).lstrip()
-            # --- [END NEW] ---
+                out = (
+                    f"--- FINAL OUTPUT ---\n{current_payload}\n\n"
+                    "--- RUN LOG ---\n" + "".join(results_md).lstrip()
+                )
             self.finished.emit(True, out, combined_meta)
         except Exception as e:
             import traceback
@@ -313,6 +380,7 @@ class PromptChatGUI(QMainWindow):
     # ---------------- UI building ----------------
     def _build_menu(self) -> None:
         menu = self.menuBar()
+
         file_menu = menu.addMenu("File")
         save_action = QAction("Save Result As…", self)
         save_action.triggered.connect(self._save_result_as)
@@ -327,7 +395,6 @@ class PromptChatGUI(QMainWindow):
         run_action.setShortcut("Ctrl+Return")
         run_action.triggered.connect(self._on_run_clicked)
         run_menu.addAction(run_action)
-
         cancel_action = QAction("Cancel Run", self)
         cancel_action.triggered.connect(self._cancel_run)
         run_menu.addAction(cancel_action)
@@ -342,16 +409,15 @@ class PromptChatGUI(QMainWindow):
         self.setCentralWidget(main_widget)
         root_layout = QVBoxLayout(main_widget)
 
-        # --- Top-level Vertical Splitter ---
         top_level_splitter = QSplitter(Qt.Vertical)
         root_layout.addWidget(top_level_splitter, 1)
 
-        # --- Top Section: Block Selection ---
+        # ---- Top: block list / pipeline / presets / model ----
         top = QGroupBox("Build Pipeline")
         top_layout = QHBoxLayout(top)
         top_level_splitter.addWidget(top)
 
-        # Left: Available Blocks
+        # Left: Available blocks
         available_layout = QVBoxLayout()
         available_layout.addWidget(QLabel("Available Blocks"))
         self.blocks_list = QListWidget()
@@ -361,7 +427,7 @@ class PromptChatGUI(QMainWindow):
         available_layout.addWidget(self.blocks_list)
         top_layout.addLayout(available_layout, 1)
 
-        # Middle: Add/Remove Buttons
+        # Middle: pipeline + up/down
         mid_buttons_layout = QVBoxLayout()
         mid_buttons_layout.addStretch(1)
         btn_add = QPushButton("Add ->")
@@ -373,7 +439,6 @@ class PromptChatGUI(QMainWindow):
         mid_buttons_layout.addStretch(1)
         top_layout.addLayout(mid_buttons_layout)
 
-        # Right: Pipeline Stages
         pipeline_layout = QVBoxLayout()
         pipeline_layout.addWidget(QLabel("Pipeline Stages (Run in Order)"))
         self.pipeline_list = QListWidget()
@@ -394,27 +459,42 @@ class PromptChatGUI(QMainWindow):
 
         top_layout.addLayout(pipeline_layout, 1)
 
-        # Right-most: Parameter Info Box & Run Controls
+        # Right: presets + model + params + run controls
         right_controls_layout = QVBoxLayout()
 
+        # Presets
         right_controls_layout.addWidget(QLabel("Presets"))
         self.preset_combo = QComboBox()
-        for preset in GUI_PRESETS:
-            self.preset_combo.addItem(preset["name"])
+        self._populate_presets_combo()
         self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
         right_controls_layout.addWidget(self.preset_combo)
 
-        # Chat Model Selector
-        right_controls_layout.addWidget(QLabel("Chat Model (for 'chat' block)"))
+        # Preset buttons
+        preset_btns = QWidget()
+        preset_btns_layout = QHBoxLayout(preset_btns)
+        preset_btns_layout.setContentsMargins(0, 0, 0, 0)
+        self.save_preset_btn = QPushButton("Save Preset…")
+        self.save_preset_btn.clicked.connect(self._save_preset)
+        self.delete_preset_btn = QPushButton("Delete Preset")
+        self.delete_preset_btn.clicked.connect(self._delete_preset)
+        preset_btns_layout.addWidget(self.save_preset_btn)
+        preset_btns_layout.addWidget(self.delete_preset_btn)
+        right_controls_layout.addWidget(preset_btns)
+
+        # Model picker
+        right_controls_layout.addWidget(QLabel("Chat Model (Select to see params)"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(sorted(_MODELS.keys()))
+        self.model_combo.currentTextChanged.connect(self._on_model_selected)
         right_controls_layout.addWidget(self.model_combo)
 
-        right_controls_layout.addWidget(QLabel("Block Parameters (Double-click to add)"))
+        # Block/Model params list
+        right_controls_layout.addWidget(QLabel("Block/Model Parameters (Double-click to add)"))
         self.block_params_list = QListWidget()
         self.block_params_list.itemDoubleClicked.connect(self._add_param_to_extras)
         right_controls_layout.addWidget(self.block_params_list, 1)
 
+        # Run controls
         run_controls_widget = QWidget()
         run_controls_hbox = QHBoxLayout(run_controls_widget)
         run_controls_hbox.setContentsMargins(0, 0, 0, 0)
@@ -428,13 +508,12 @@ class PromptChatGUI(QMainWindow):
 
         top_layout.addLayout(right_controls_layout, 1)
 
-        # --- Bottom Widget (to hold the other splitters) ---
+        # ---- Bottom: prompt / extras / result tabs ----
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         top_level_splitter.addWidget(bottom_widget)
 
-        # --- Middle Section: Prompt + Extras ---
         prompt_output_splitter = QSplitter(Qt.Vertical)
         bottom_layout.addWidget(prompt_output_splitter, 1)
 
@@ -455,7 +534,6 @@ class PromptChatGUI(QMainWindow):
 
         mid.setSizes([700, 300])
 
-        # --- Bottom Section: Output Tabs ---
         tabs = QTabWidget()
         prompt_output_splitter.addWidget(tabs)
 
@@ -472,9 +550,21 @@ class PromptChatGUI(QMainWindow):
 
         top_level_splitter.setSizes([250, 550])
 
-        # --- Status Bar ---
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage("Ready")
+
+    def _populate_presets_combo(self, select_index: Optional[int] = None) -> None:
+        """Refresh the presets combo from GUI_PRESETS."""
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        for preset in GUI_PRESETS:
+            self.preset_combo.addItem(preset.get("name", ""))
+        # Default selection
+        if select_index is not None and 0 <= select_index < self.preset_combo.count():
+            self.preset_combo.setCurrentIndex(select_index)
+        else:
+            self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
 
     def _refresh_block_list(self) -> None:
         names = BLOCKS.names()
@@ -508,11 +598,11 @@ class PromptChatGUI(QMainWindow):
         selected_rows = sorted([self.pipeline_list.row(item) for item in self.pipeline_list.selectedItems()])
         if not selected_rows:
             row = self.pipeline_list.count() - 1
-            if row <= 0: return
+            if row <= 0:
+                return
             selected_rows = [row]
-
-        if selected_rows[0] == 0: return
-
+        if selected_rows[0] == 0:
+            return
         for row in selected_rows:
             item = self.pipeline_list.takeItem(row)
             self.pipeline_list.insertItem(row - 1, item)
@@ -521,15 +611,17 @@ class PromptChatGUI(QMainWindow):
             self.pipeline_list.scrollToItem(self.pipeline_list.selectedItems()[0])
 
     def _move_down(self) -> None:
-        selected_rows = sorted([self.pipeline_list.row(item) for item in self.pipeline_list.selectedItems()],
-                               reverse=True)
+        selected_rows = sorted(
+            [self.pipeline_list.row(item) for item in self.pipeline_list.selectedItems()],
+            reverse=True,
+        )
         if not selected_rows:
             row = self.pipeline_list.count() - 1
-            if row < 0 or row == self.pipeline_list.count() - 1: return
+            if row < 0 or row == self.pipeline_list.count() - 1:
+                return
             selected_rows = [row]
-
-        if selected_rows[0] == self.pipeline_list.count() - 1: return
-
+        if selected_rows[0] == self.pipeline_list.count() - 1:
+            return
         for row in selected_rows:
             item = self.pipeline_list.takeItem(row)
             self.pipeline_list.insertItem(row + 1, item)
@@ -537,16 +629,18 @@ class PromptChatGUI(QMainWindow):
         if self.pipeline_list.selectedItems():
             self.pipeline_list.scrollToItem(self.pipeline_list.selectedItems()[-1])
 
+    # ---------------- Block / Model params ----------------
     @pyqtSlot(QListWidgetItem, QListWidgetItem)
     def _on_block_selected(self, current_item: QListWidgetItem, previous_item: QListWidgetItem):
         """Called when the user clicks a block in the 'Available Blocks' list."""
         self.block_params_list.clear()
 
         if not current_item:
-            self.block_params_list.addItem("Select a block to see params.")
+            self.block_params_list.addItem("Select a block or model to see params.")
             return
 
         block_name = current_item.text()
+
         try:
             block_instance = BLOCKS.create(block_name)
             params_info = block_instance.get_params_info()
@@ -555,7 +649,7 @@ class PromptChatGUI(QMainWindow):
                 self.block_params_list.addItem(f"No parameters for {block_name}")
                 return
 
-            # [MODIFIED] Add hint for pipeline delegation
+            self.block_params_list.addItem(f"--- ({block_name} Block Parameters) ---")
             if block_name == "pipeline":
                 self.block_params_list.addItem("--- (Use 'pipeline.block.param=val') ---")
 
@@ -563,33 +657,89 @@ class PromptChatGUI(QMainWindow):
                 item_str = f"{key}={json.dumps(value)}"
                 self.block_params_list.addItem(item_str)
 
+            if block_name.lower() == "chat":
+                self.block_params_list.addItem("")  # spacer
+                self._load_model_params(self.model_combo.currentText())
+
         except Exception as e:
-            self.block_params_list.addItem(f"Error loading params:\n{e}")
+            self.block_params_list.addItem(f"Error loading block params:\n{e}")
+
+    @pyqtSlot(str)
+    def _on_model_selected(self, model_name: str):
+        """Called when the model_combo changes."""
+        current_block_item = self.blocks_list.currentItem()
+        if current_block_item and current_block_item.text().lower() == "chat":
+            self._on_block_selected(current_block_item, None)
+        else:
+            # Show model params even if chat block isn't selected
+            self.block_params_list.clear()
+            self._load_model_params(model_name)
+
+    def _load_model_params(self, model_name: str):
+        """Helper to load a model's params into the list widget."""
+        if not model_name:
+            return
+
+        try:
+            model_instance = get_chat_model(model_name)
+            params_info = model_instance.get_params_info()
+
+            if not params_info:
+                self.block_params_list.addItem(f"No parameters for model {model_name}")
+                return
+
+            self.block_params_list.addItem(f"--- ({model_name} Model Parameters) ---")
+
+            for key, value in params_info.items():
+                if key == "model_name":
+                    continue
+                item_str = f"{key}={json.dumps(value)}"
+                self.block_params_list.addItem(item_str)
+
+        except Exception as e:
+            self.block_params_list.addItem(f"Error loading model params:\n{e}")
 
     @pyqtSlot()
     def _add_param_to_extras(self):
         """Adds the selected param to the --extra text box."""
-        block_name = ""
-        current_block_item = self.blocks_list.currentItem()
-        if current_block_item:
-            block_name = current_block_item.text().lower()
-
         selected_item = self.block_params_list.currentItem()
         if not selected_item:
             return
 
         item_str = selected_item.text()
-        text_to_add = ""
+        if "---" in item_str or "=" not in item_str:
+            return
 
-        if "=" in item_str and " " not in item_str:
-            # [MODIFIED] Check if we are adding a param for a block *inside* a pipeline
-            current_pipeline = self._get_pipeline_blocks()
-            if len(current_pipeline) == 1 and current_pipeline[0] == "pipeline":
-                # We are in pipeline mode, so prefix the param
+        block_name = ""
+        current_block_item = self.blocks_list.currentItem()
+        if current_block_item:
+            block_name = current_block_item.text().lower()
+
+        text_to_add = ""
+        is_pipeline_mode = "pipeline" in self._get_pipeline_blocks()
+
+        # Check if the selected param is a model param
+        is_model_param = False
+        try:
+            key, val = item_str.split("=", 1)
+            model_instance = get_chat_model(self.model_combo.currentText())
+            if key in model_instance.get_params_info():
+                is_model_param = True
+        except Exception:
+            pass  # Not a model param
+
+        if block_name == "chat" or is_model_param:
+            if is_pipeline_mode:
+                text_to_add = f"pipeline.chat.{item_str}"
+            else:
+                text_to_add = f"chat.{item_str}"
+        elif block_name:
+            if is_pipeline_mode:
                 text_to_add = f"pipeline.{block_name}.{item_str}"
             else:
-                # We are in manual block mode
                 text_to_add = f"{block_name}.{item_str}"
+        else:
+            text_to_add = item_str
 
         if text_to_add:
             current_extras = self.extras_text.toPlainText()
@@ -598,12 +748,19 @@ class PromptChatGUI(QMainWindow):
             self.extras_text.appendPlainText(text_to_add)
             self.extras_text.centerCursor()
 
+    # ---------------- Presets: load / save / delete ----------------
     @pyqtSlot(int)
     def _on_preset_selected(self, index: int):
-        """Called when the user selects a preset from the main dropdown."""
-        # [FIX] Clear the form if user selects index 0
+        """
+        When user selects a preset:
+          - index 0 → clear pipeline + extras (placeholder)
+          - index > 0 → load preset blocks, extras, model
+        """
+        if index < 0 or index >= len(GUI_PRESETS):
+            return
+
         if index == 0:
-            # Check if the list is already clear to prevent needless signals
+            # Placeholder: clear current config
             if self.pipeline_list.count() > 0 or self.extras_text.toPlainText():
                 self.pipeline_list.clear()
                 self.extras_text.clear()
@@ -611,37 +768,131 @@ class PromptChatGUI(QMainWindow):
             return
 
         preset = GUI_PRESETS[index]
+        blocks = preset.get("blocks", [])
+        extras_text = preset.get("extras", "") or ""
+        model_name = preset.get("model", "")
 
         self.pipeline_list.clear()
-        self.pipeline_list.addItems(preset["blocks"])
+        if isinstance(blocks, list):
+            self.pipeline_list.addItems(blocks)
 
-        extras_text = (preset["extras"] or "").strip()
         self.extras_text.setPlainText(extras_text)
 
-        # [FIX] Block signals while resetting the index to prevent re-triggering
+        if model_name and self.model_combo.findText(model_name) != -1:
+            self.model_combo.setCurrentText(model_name)
+
+        # Return combo to placeholder (optional UX choice)
         self.preset_combo.blockSignals(True)
         self.preset_combo.setCurrentIndex(0)
         self.preset_combo.blockSignals(False)
+        self.statusBar().showMessage(f"Loaded preset: {preset.get('name', '')}")
+
+    def _save_preset(self) -> None:
+        """
+        Save the current pipeline, extras, and model as a named preset.
+
+        - Prompts for name.
+        - If a preset with that name exists (index > 0), ask to overwrite.
+        - Writes GUI_PRESETS[1:] to gui_presets.json.
+        """
+        name, ok = QInputDialog.getText(
+            self,
+            "Save Preset",
+            "Preset name:",
+        )
+        if not ok:
+            return
+
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, APP_TITLE, "Preset name cannot be empty.")
+            return
+
+        if name == GUI_PRESETS[0]["name"]:
+            QMessageBox.warning(self, APP_TITLE, "This name is reserved. Choose another.")
+            return
+
+        # Determine if we're overwriting an existing preset
+        existing_index = -1
+        for idx in range(1, len(GUI_PRESETS)):
+            if GUI_PRESETS[idx].get("name") == name:
+                existing_index = idx
+                break
+
+        if existing_index != -1:
+            reply = QMessageBox.question(
+                self,
+                APP_TITLE,
+                f"A preset named '{name}' already exists.\nOverwrite it?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+            target_index = existing_index
+        else:
+            target_index = len(GUI_PRESETS)
+            GUI_PRESETS.append({})
+
+        # Build preset from current GUI state
+        preset = {
+            "name": name,
+            "blocks": self._get_pipeline_blocks(),
+            "extras": self.extras_text.toPlainText(),
+            "model": self.model_combo.currentText() or "lexicon",
+        }
+        GUI_PRESETS[target_index] = preset
+
+        save_presets_to_disk()
+        self._populate_presets_combo(select_index=0)
+        self.statusBar().showMessage(f"Preset saved: {name}")
+
+    def _delete_preset(self) -> None:
+        """
+        Delete the currently selected preset (index > 0).
+        """
+        index = self.preset_combo.currentIndex()
+        if index <= 0:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "Select a user preset (not the placeholder) to delete.",
+            )
+            return
+
+        if index >= len(GUI_PRESETS):
+            return
+
+        name = GUI_PRESETS[index].get("name", "")
+        reply = QMessageBox.question(
+            self,
+            APP_TITLE,
+            f"Delete preset '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        GUI_PRESETS.pop(index)
+        save_presets_to_disk()
+        self._populate_presets_combo(select_index=0)
+        self.statusBar().showMessage(f"Preset deleted: {name}")
 
     # ---------------- persistence ----------------
     def _load_state(self) -> None:
         try:
             if STATE_FILE.exists():
                 data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-
                 pipeline_blocks = data.get("pipeline_blocks", [])
                 if isinstance(pipeline_blocks, list):
                     self.pipeline_list.addItems(pipeline_blocks)
-
                 self.prompt_text.setPlainText(data.get("prompt", ""))
                 self.extras_text.setPlainText(data.get("extras", ""))
                 self.json_var.setChecked(bool(data.get("print_json", False)))
-
-                # Load model selection
                 model_name = data.get("model_name", "lexicon")
                 if self.model_combo.findText(model_name) != -1:
                     self.model_combo.setCurrentText(model_name)
-
         except Exception:
             pass
 
@@ -652,7 +903,7 @@ class PromptChatGUI(QMainWindow):
                 "prompt": self.prompt_text.toPlainText(),
                 "extras": self.extras_text.toPlainText(),
                 "print_json": self.json_var.isChecked(),
-                "model_name": self.model_combo.currentText(),  # Save model
+                "model_name": self.model_combo.currentText(),
             }
             STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception:
@@ -660,7 +911,6 @@ class PromptChatGUI(QMainWindow):
 
     # ---------------- run/cancel ----------------
     def _on_run_clicked(self) -> None:
-        # If a previous run is still alive, don’t start a new one
         if self.run_thread and self.run_thread.isRunning():
             QMessageBox.information(self, APP_TITLE, "A run is already in progress.")
             return
@@ -669,35 +919,42 @@ class PromptChatGUI(QMainWindow):
         prompt = self.prompt_text.toPlainText()
         extras_raw = self.extras_text.toPlainText()
         print_json = self.json_var.isChecked()
-        model_name = self.model_combo.currentText()  # Get model
+        model_name = self.model_combo.currentText()
 
         if not blocks_sel:
             QMessageBox.critical(self, APP_TITLE, "Pipeline is empty. Add blocks to run.")
             return
         if not prompt.strip():
-            reply = QMessageBox.question(self, APP_TITLE, "Prompt is empty. Continue?",
-                                         QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            reply = QMessageBox.question(
+                self,
+                APP_TITLE,
+                "Prompt is empty. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
             if reply == QMessageBox.No:
                 return
 
-        # Reset stop flag and UI
         self._stop_event.clear()
         self._set_running(True)
         self._clear_outputs()
         self.statusBar().showMessage(f"Running {len(blocks_sel)} block(s)…")
 
-        # Create thread WITH PARENT so Qt manages lifetime safely
         self.run_thread = QThread(self)
-        self.worker = Worker(blocks_sel, prompt, extras_raw, print_json, self._stop_event, model_name)  # Pass model
+        self.worker = Worker(
+            blocks_sel,
+            prompt,
+            extras_raw,
+            print_json,
+            self._stop_event,
+            model_name,
+        )
         self.worker.moveToThread(self.run_thread)
 
-        # Wire signals
         self.run_thread.started.connect(self.worker.run)
         self.worker.status_update.connect(self.statusBar().showMessage)
         self.worker.finished.connect(self._display_run, Qt.QueuedConnection)
 
-        # Proper shutdown: when worker is done, stop the thread event loop,
-        # delete worker, THEN when the thread actually finishes, clean references
         self.worker.finished.connect(self.run_thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.run_thread.finished.connect(self._on_thread_finished)
@@ -707,11 +964,9 @@ class PromptChatGUI(QMainWindow):
 
     def _cancel_run(self) -> None:
         if self.run_thread and self.run_thread.isRunning():
-            self._stop_event.set()  # ask worker to stop between blocks
+            self._stop_event.set()
             self.statusBar().showMessage("Cancel requested…")
-            # Also ask the thread event loop to quit once the current slot returns
             self.run_thread.requestInterruption()
-            # We DO NOT quit() here; worker.finished will quit() after run() returns
         else:
             self.statusBar().showMessage("Nothing to cancel.")
 
@@ -720,11 +975,13 @@ class PromptChatGUI(QMainWindow):
         self.blocks_list.setEnabled(not running)
         self.pipeline_list.setEnabled(not running)
         self.preset_combo.setEnabled(not running)
-        self.model_combo.setEnabled(not running)  # Disable model combo
+        self.model_combo.setEnabled(not running)
         self.block_params_list.setEnabled(not running)
         self.prompt_text.setReadOnly(running)
         self.extras_text.setReadOnly(running)
         self.json_var.setEnabled(not running)
+        self.save_preset_btn.setEnabled(not running)
+        self.delete_preset_btn.setEnabled(not running)
 
     def _clear_outputs(self) -> None:
         self.result_text.clear()
@@ -732,7 +989,6 @@ class PromptChatGUI(QMainWindow):
 
     @pyqtSlot()
     def _on_thread_finished(self):
-        # Now the thread has fully stopped; safe to clear references
         self.run_thread = None
         self.worker = None
 
@@ -742,13 +998,11 @@ class PromptChatGUI(QMainWindow):
         self._save_state()
         self.statusBar().showMessage("Done" if ok else "Failed")
         self.result_text.setPlainText(result or "")
-
         try:
             meta_str = json.dumps(meta, indent=2, ensure_ascii=False)
             self.meta_text.setPlainText(meta_str)
         except Exception:
             self.meta_text.setPlainText("(no metadata)")
-
         if not ok:
             QMessageBox.critical(self, APP_TITLE, "Run failed — see Result tab for details.")
 
@@ -758,10 +1012,11 @@ class PromptChatGUI(QMainWindow):
         if not content.strip():
             QMessageBox.information(self, APP_TITLE, "Nothing to save.")
             return
-
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Result As…", "",
-            "Text (*.txt);;Markdown (*.md);;JSON (*.json);;All files (*.*)"
+            self,
+            "Save Result As…",
+            "",
+            "Text (*.txt);;Markdown (*.md);;JSON (*.json);;All files (*.*)",
         )
         if not path:
             return
@@ -779,8 +1034,11 @@ class PromptChatGUI(QMainWindow):
             "- Use Presets dropdown for quickstarts.\n"
             "- Add blocks from 'Available' to 'Pipeline Stages'.\n"
             "- Reorder the pipeline with Up/Down.\n"
-            "- Click a block to see params; double-click to add.\n"
-            "- Output of one block is the input for the next."
+            "- Click a block to see its params.\n"
+            "- Select a model in the dropdown to see its params.\n"
+            "- Double-click a param to add it to the --extra box.\n"
+            "- Use 'Save Preset…' to store your current pipeline/model/extras.\n"
+            "- Use 'Delete Preset' to remove a saved preset.",
         )
 
     def closeEvent(self, event):
@@ -788,9 +1046,7 @@ class PromptChatGUI(QMainWindow):
             self._stop_event.set()
             self.run_thread.requestInterruption()
             self.run_thread.quit()
-            # Wait a bit longer to avoid the fatal
             if not self.run_thread.wait(5000):
-                # Last resort (not ideal, but prevents fatal on exit)
                 self.run_thread.terminate()
                 self.run_thread.wait(1000)
         event.accept()
@@ -815,8 +1071,8 @@ if __name__ == "__main__":
         import blocks
         import pipeline
         from registry import BLOCKS
-        import models  # Import models
-        from models import _MODELS  # [MODIFIED] Import _MODELS directly
+        import models
+        from models import _MODELS, get_chat_model
     except ImportError as e:
         print(f"CRITICAL ERROR: Could not import project files: {e}", file=sys.stderr)
         print("Please ensure gui.py is in the same directory as blocks.py and registry.py.", file=sys.stderr)

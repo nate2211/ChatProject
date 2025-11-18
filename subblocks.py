@@ -156,6 +156,75 @@ class PromptQuerySubBlock(BaseSubBlock):
 
         return out
 
+    def _hf_rewrite_queries(self, queries: List[str], params: Dict[str, Any]) -> List[str]:
+        """
+        HF pass that takes already-processed queries and lets
+        a small model polish them into nicer web search queries.
+
+        This does NOT change the earlier segmentation logic; it's a
+        final, best-effort rewrite layer.
+        """
+        if not queries:
+            return queries
+
+        try:
+            from blocks import _get_hf_pipeline
+        except ImportError:
+            print("[PromptQuerySubBlock] Could not import _get_hf_pipeline; skipping HF rewrite.")
+            return queries
+
+        model_name = str(params.get("hf_model", "google/flan-t5-small"))
+        pipe = _get_hf_pipeline(
+            "text2text-generation",
+            model_name,
+            device=params.get("hf_device", "auto"),
+            verbose=params.get("hf_verbose", False),
+        )
+        if pipe is None:
+            print(f"[PromptQuerySubBlock] Failed to load HF model '{model_name}', skipping HF rewrite.")
+            return queries
+
+        max_new_tokens = int(params.get("hf_max_new_tokens", 32))
+        temperature = float(params.get("hf_temperature", 0.3))
+        top_p = float(params.get("hf_top_p", 0.9))
+
+        rewritten: List[str] = []
+
+        for q in queries:
+            prompt = (
+                "Rewrite this into a concise, high-quality web search query. "
+                "Preserve all important names, brands, and years. "
+                "Prefer noun phrases over full questions. "
+                "Keep it under 10 words and avoid quotes or extra punctuation.\n"
+                f"Query: {q}"
+            )
+            try:
+                pred = pipe(
+                    prompt,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    do_sample=True,
+                )
+                text = (pred[0].get("generated_text") or "").strip()
+                if text:
+                    rewritten.append(text)
+                else:
+                    rewritten.append(q)
+            except Exception as e:
+                print(f"[PromptQuerySubBlock] HF rewrite error on '{q}': {e}")
+                rewritten.append(q)
+
+        # light dedupe after rewrite
+        out: List[str] = []
+        seen = set()
+        for r in rewritten:
+            r = r.strip()
+            if r and r not in seen:
+                seen.add(r)
+                out.append(r)
+        return out
+
     def execute(self, value: Any, *, params: Dict[str, Any]) -> List[str]:
         query = str(value or "")
         if not query:
@@ -193,7 +262,12 @@ class PromptQuerySubBlock(BaseSubBlock):
             queries.extend(segments)
 
             # 3. Dedup + natural-language filter + "no-whole-prompt" filter
-            return self._post_filter_queries(queries, clean_tokens)
+            final = self._post_filter_queries(queries, clean_tokens)
+
+            # 4. HF rewrite to polish final queries for web search (always on if model available)
+            final = self._hf_rewrite_queries(final, params)
+
+            return final
 
         # Default/passthrough
         q = query.strip()
@@ -201,9 +275,375 @@ class PromptQuerySubBlock(BaseSubBlock):
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "op": "clean_permutate"
+            "op": "clean_permutate",
+            # HF rewrite options (always used when possible)
+            "hf_model": "google/flan-t5-small",
+            "hf_max_new_tokens": 32,
+            "hf_temperature": 0.3,
+            "hf_top_p": 0.9,
+            "hf_device": "auto",
+            "hf_verbose": False,
         }
+
 
 
 # Register in the SUB_BLOCKS registry
 SUB_BLOCKS.register("prompt_query", PromptQuerySubBlock)
+
+# ======================= NEW ENGLISH SUB-BLOCK ==========================
+@dataclass
+class EnglishChatSubBlock(BaseSubBlock):
+    """
+    A sub-block that uses an HF model to rewrite text.
+    Designed to be called via `run_sub_pipeline` from a parent block.
+
+    Operations (op=):
+    - "fix_grammar": Corrects spelling and grammar.
+    - "simplify": Rewrites text to be simple and easy to understand.
+    - "professional": Rewrites text in a more formal, professional tone.
+    - "casual": Rewrites text in a casual, friendly tone.
+    - "passthrough": Returns the text unchanged (default).
+
+    Extra handling for marketplace-style ads / listings:
+    - ad_mode = "skip"    → detect listing-like blobs and return as-is (no HF).
+    - ad_mode = "shorten" → detect listing-like blobs and return a short title only.
+    - ad_mode = "rewrite" → detect listing-like blobs, shorten them, then send
+                             that cleaned string through the HF model.
+    """
+
+    # --------- Heuristics to detect listing / ad blobs ---------
+    @staticmethod
+    def _is_listing_snippet(text: str) -> bool:
+        """
+        Very lightweight check to see if this looks like a resale / marketplace
+        listing blob, e.g. Depop / Grailed / eBay style text or generic
+        catalog/filter UI like "Sort By: - Size: Various".
+
+        Heuristics:
+          - Contains known marketplace keywords (depop, grailed, ebay, poshmark, etc.).
+          - Contains "other shirts you may like" / "you may also like".
+          - Contains multiple prices or explicit currency with symbols.
+          - Lots of hyphen / ' - - ' style separators.
+          - Filter UI phrases like "Sort By:" + "Size:".
+        """
+        import re
+
+        t = (text or "").lower()
+        if not t:
+            return False
+
+        # --- 1) Marketplace / shop / catalog phrases ---
+        marketplace_keywords = [
+            "depop", "grailed", "poshmark", "ebay", "vinted",
+            "etsy", "stockx", "farfetch", "ssense",
+            "add to bundle", "add to cart", "add to bag",
+            "other shirts you may like",
+            "you may also like",
+            "shop now",
+            "view all",
+        ]
+        if any(k in t for k in marketplace_keywords):
+            return True
+
+        # Filter / catalog UI patterns like your example:
+        # "Raf Simons Women Sort By: - Size: Various Raf Simons $479 ..."
+        if "sort by" in t and "size" in t:
+            return True
+
+        # Generic "Size: S M L" pattern (size filter)
+        if "size:" in t or "sizes:" in t:
+            # If we see size plus at least one price, it's almost certainly a listing
+            if "$" in t or "£" in t or "€" in t:
+                return True
+
+        # --- 2) Currency + multiple prices ---
+        if "$" in t or "£" in t or "€" in t:
+            price_hits = re.findall(r"[$£€]\s?\d+", t)
+            if len(price_hits) >= 2:
+                return True
+
+        # --- 3) Hyphen-heavy, scraped layout ---
+        if t.count(" - ") >= 3 or " - - " in t:
+            return True
+
+        # --- 4) Extreme repetition (same tokens over and over) ---
+        tokens = [tok for tok in re.split(r"\s+", t) if tok]
+        if len(tokens) > 30:
+            uniq = set(tokens)
+            if len(uniq) < len(tokens) * 0.5:  # >50% repetition
+                return True
+
+        return False
+
+    @staticmethod
+    def _shorten_listing(text: str) -> str:
+        """
+        Try to compress a messy listing blob down to a concise product title.
+
+        Strategy:
+          - Take the first line or chunk before obvious site markers (e.g. ' - Depop').
+          - Remove trailing site names / boilerplate fragments.
+          - Collapse repeated whitespace and hyphens.
+        """
+        import re
+
+        if not text:
+            return ""
+
+        # First, break on newlines to get the first non-empty line.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            text = lines[0]
+
+        # Then, cut off at obvious site markers.
+        cut_markers = [" - depop", " | depop", "| grailed", "- grailed", "| ebay", " - ebay"]
+        lower = text.lower()
+        cut_idx = None
+        for m in cut_markers:
+            idx = lower.find(m)
+            if idx != -1:
+                cut_idx = idx
+                break
+        if cut_idx is not None:
+            text = text[:cut_idx]
+
+        # Remove repeated marketplace boilerplate phrases that survive
+        boilerplate_patterns = [
+            r"other shirts you may like.*",
+            r"you may also like.*",
+            r"add to bundle.*",
+        ]
+        for pat in boilerplate_patterns:
+            text = re.sub(pat, "", text, flags=re.IGNORECASE)
+
+        # Collapse repeated spaces and hyphens
+        text = re.sub(r"\s*-\s*", " - ", text)
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    def execute(self, value: Any, *, params: Dict[str, Any]) -> Any:
+        # --- Local import to avoid circular dependency ---
+        try:
+            # This import happens at runtime, not module load time
+            from blocks import _get_hf_pipeline
+        except ImportError:
+            print("[EnglishChatSubBlock] CRITICAL: Failed to import _get_hf_pipeline.")
+            return value
+        # --- End local import ---
+
+        text = str(value or "")
+        op = str(params.get("op", "passthrough")).lower()
+
+        # If no operation, just pass the value through
+        if op == "passthrough" or not text:
+            return text
+
+        # --------- NEW: pre-process listing-like blobs ---------
+        ad_mode = str(params.get("ad_mode", "skip")).lower()  # skip | shorten | rewrite
+
+        is_listing = self._is_listing_snippet(text)
+        if is_listing:
+            if ad_mode == "skip":
+                # Detected as a marketplace ad; do not send to HF at all.
+                # Caller can decide to ignore these upstream.
+                return text
+
+            cleaned = self._shorten_listing(text)
+
+            if ad_mode == "shorten":
+                # Return the cleaned product title only, no HF.
+                return cleaned or text
+
+            if ad_mode == "rewrite":
+                # Use cleaned title (if any) as the basis for the HF rewrite
+                if cleaned:
+                    text = cleaned
+
+        # --------- Normal HF rewrite path ---------
+        model = str(params.get("model", "google/flan-t5-small"))
+
+        pipe = _get_hf_pipeline(
+            "text2text-generation",
+            model,
+            device=params.get("device", "auto"),
+            verbose=params.get("verbose", False)
+        )
+        if pipe is None:
+            print(f"[EnglishChatSubBlock] Failed to load model '{model}', returning original text.")
+            return text  # Failed to load, return original
+
+        # Define the instruction-prompt for the model
+        templates = {
+            "fix_grammar": f"Correct the spelling and grammar of the following text: {text}",
+            "simplify": f"Rewrite the following text to be simple and easy to understand: {text}",
+            "professional": f"Rewrite the following text in a formal, professional business tone: {text}",
+            "casual": f"Rewrite the following text in a casual, friendly, and informal tone: {text}"
+        }
+
+        prompt = templates.get(op)
+        if not prompt:
+            print(f"[EnglishChatSubBlock] Unknown op '{op}', returning original text.")
+            return text  # Unknown op
+
+        try:
+            # Set reasonable generation parameters
+            gen_kwargs = {
+                "max_new_tokens": int(params.get("max_new_tokens", len(text.split()) + 50)),
+                "min_length": int(params.get("min_length", 5)),
+                "temperature": float(params.get("temperature", 0.7)),
+                "top_p": float(params.get("top_p", 0.95)),
+                "do_sample": True
+            }
+
+            pred = pipe(prompt, **gen_kwargs)
+            generated_text = pred[0]["generated_text"].strip()
+
+            return generated_text if generated_text else text
+
+        except Exception as e:
+            print(f"[EnglishChatSubBlock] Error during generation: {e}")
+            return text  # Return original on failure
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "op": "passthrough",          # fix_grammar | simplify | professional | casual
+            "model": "google/flan-t5-small",
+            "max_new_tokens": 128,
+            "temperature": 0.7,
+            "top_p": 0.95,
+            # New ad-handling knob
+            "ad_mode": "skip",           # skip | shorten | rewrite
+        }
+
+# Register the new sub-block
+SUB_BLOCKS.register("english_chat", EnglishChatSubBlock)
+
+# ======================= NEW CODE SUB-BLOCK ==========================
+@dataclass
+class CodeChatSubBlock(BaseSubBlock):
+    """
+    A sub-block that uses an HF model to rewrite or explain code.
+    Designed to be called via `run_sub_pipeline` from a parent block.
+
+    Operations (op=):
+      - "refactor"     : Refactor code for clarity & maintainability.
+      - "add_comments" : Add concise, helpful comments without changing logic.
+      - "docstring"    : Add or improve docstrings for functions/classes.
+      - "fix"          : Fix syntax/logic errors and return valid code.
+      - "explain"      : Explain what the code does in natural language.
+      - "passthrough"  : Return the code unchanged (default).
+    """
+
+    def execute(self, value: Any, *, params: Dict[str, Any]) -> Any:
+        # --- Local import to avoid circular dependency ---
+        try:
+            from blocks import _get_hf_pipeline
+        except ImportError:
+            print("[CodeChatSubBlock] CRITICAL: Failed to import _get_hf_pipeline.")
+            return value
+        # --- End local import ---
+
+        code = str(value or "")
+        if not code.strip():
+            return code
+
+        op = str(params.get("op", "passthrough")).lower()
+        if op == "passthrough":
+            return code
+
+        model = str(params.get("model", "google/flan-t5-small"))
+        lang = str(params.get("lang", "python")).strip().lower() or "python"
+
+        pipe = _get_hf_pipeline(
+            "text2text-generation",
+            model,
+            device=params.get("device", "auto"),
+            verbose=params.get("verbose", False),
+        )
+        if pipe is None:
+            print(f"[CodeChatSubBlock] Failed to load model '{model}', returning original code.")
+            return code
+
+        # Instruction-style prompts for different operations
+        base_intro = f"The following is {lang} code.\n\n"
+        templates = {
+            "refactor": (
+                base_intro
+                + "Refactor this code to improve readability and maintainability, "
+                  "while preserving its behavior. Return only the refactored code.\n\n"
+                  "Code:\n"
+                + code
+            ),
+            "add_comments": (
+                base_intro
+                + "Add concise, helpful comments to this code without changing its behavior. "
+                  "Return only the commented code.\n\n"
+                  "Code:\n"
+                + code
+            ),
+            "docstring": (
+                base_intro
+                + "Add or improve docstrings for all public functions, methods, and classes. "
+                  "Return only the updated code with docstrings.\n\n"
+                  "Code:\n"
+                + code
+            ),
+            "fix": (
+                base_intro
+                + "Fix any syntax or obvious logic errors in this code and return valid, "
+                  "runnable code. Preserve the original intent as much as possible.\n\n"
+                  "Code:\n"
+                + code
+            ),
+            "explain": (
+                base_intro
+                + "Explain clearly and concisely what this code does, step by step. "
+                  "Return only the explanation in English.\n\n"
+                  "Code:\n"
+                + code
+            ),
+        }
+
+        prompt = templates.get(op)
+        if not prompt:
+            print(f"[CodeChatSubBlock] Unknown op '{op}', returning original code.")
+            return code
+
+        try:
+            gen_kwargs = {
+                "max_new_tokens": int(params.get("max_new_tokens", max(64, len(code.split()) + 50))),
+                "min_length": int(params.get("min_length", 5)),
+                "temperature": float(params.get("temperature", 0.3 if op != "explain" else 0.7)),
+                "top_p": float(params.get("top_p", 0.95)),
+                "do_sample": bool(params.get("do_sample", op == "explain")),
+            }
+
+            pred = pipe(prompt, **gen_kwargs)
+            generated_text = (pred[0].get("generated_text") or "").strip()
+
+            # If the op returns code, fall back to the original on empty
+            if not generated_text:
+                return code
+
+            return generated_text
+
+        except Exception as e:
+            print(f"[CodeChatSubBlock] Error during generation: {e}")
+            return code  # Return original on failure
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "op": "passthrough",        # refactor | add_comments | docstring | fix | explain | passthrough
+            "model": "google/flan-t5-small",
+            "lang": "python",
+            "max_new_tokens": 256,
+            "min_length": 5,
+            "temperature": 0.3,
+            "top_p": 0.95,
+            "do_sample": False,
+        }
+
+
+# Register the new sub-block
+SUB_BLOCKS.register("code_chat", CodeChatSubBlock)

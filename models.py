@@ -2,7 +2,7 @@
 # ================  models.py  ===========================
 # ========================================================
 from __future__ import annotations
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 import re
 
 
@@ -11,6 +11,10 @@ class BaseChatModel:
     def generate(self, user_text: str, *, lexicon: List[str] | None = None, **kwargs) -> str:
         raise NotImplementedError
 
+    def get_params_info(self) -> Dict[str, Any]:
+        """Returns a dictionary of default parameters for the GUI."""
+        return {}
+
 
 class LexiconFirstToyModel(BaseChatModel):
     """
@@ -18,7 +22,8 @@ class LexiconFirstToyModel(BaseChatModel):
     - Selects up to N lexicon terms and weaves them into a concise paragraph.
     - No personas, no guidelines, no system prompts.
     """
-    def __init__(self, max_terms: int = 10) -> None:
+    # [MODIFIED] Added **_: object to ignore extra kwargs like 'max_new_tokens'
+    def __init__(self, max_terms: int = 10, **_: object) -> None:
         self.max_terms = int(max_terms)
 
     def generate(self, user_text: str, *, lexicon: List[str] | None = None, **kwargs) -> str:
@@ -30,6 +35,11 @@ class LexiconFirstToyModel(BaseChatModel):
         if terms:
             return f"Answer (lexicon-informed):\n\n{body}\n\n[using terms] {', '.join(terms)}"
         return f"Answer (lexicon-informed):\n\n{body}"
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "max_terms": 10
+        }
 
 
 # ===================== NEW ADVANCED MODEL =====================
@@ -53,7 +63,8 @@ class LexiconAdvanceModel(BaseChatModel):
       - max_sent_len: int  → drop overly long sentences (default 260)
     """
 
-    def __init__(self, max_terms: int = 12) -> None:
+    # [MODIFIED] Added **_: object to ignore extra kwargs
+    def __init__(self, max_terms: int = 12, **_: object) -> None:
         self.max_terms = int(max_terms)
 
     # ---------- helpers ----------
@@ -173,27 +184,41 @@ class LexiconAdvanceModel(BaseChatModel):
             return text[:max_chars].rstrip() + "…"
         return text
 
+    def get_params_info(self) -> Dict[str, Any]:
+        # These are all the **kwargs
+        return {
+            "max_terms": 12,
+            "style": "plain",
+            "max_bullets": 8,
+            "highlight": True,
+            "min_sent_len": 24,
+            "max_sent_len": 260
+        }
+
+
 class HFLocalLLMModel(BaseChatModel):
     """
     Local LLM wrapper using Hugging Face + transformers + torch.
-    No API key, uses public models (downloaded once, then cached).
 
-    Defaults:
-      • mode="seq2seq" with google/flan-t5-small  (good for summarization / Q&A)
-      • Or mode="causal" with gpt2-like models for free-form generation.
+    This is a generic wrapper that can be used as:
 
-    __init__ kwargs (all optional):
-      - model_name: str         → HF model id (default: "google/flan-t5-small")
-      - mode: "seq2seq"|"causal"→ controls pipeline/task
-      - max_new_tokens: int     → max tokens to generate (default: 256)
-      - temperature: float      → sampling temperature (default: 0.7)
-      - top_p: float            → nucleus sampling (default: 0.9)
-      - top_k: int              → top-k sampling (default: 50)
-      - device: int|str|None    → 0 for CUDA, -1 for CPU, None = auto
+      model = HFLocalLLMModel(
+          model_name="google/flan-t5-small",
+          mode="seq2seq",
+          max_new_tokens=256,
+          temperature=0.7,
+          top_p=0.9,
+          top_k=50,
+          device=None,
+          max_chars=0,
+      )
 
-    generate(...) respects:
-      - max_chars: int          → clamp final text by characters (0 = unlimited)
-      - style: "plain"|"bullets"|"outline" (hint only; it affects prompt wording)
+    generate(user_text, lexicon=None, style="plain", max_chars=..., max_new_tokens=..., ...)
+
+    Notes:
+      • Constructor arguments set *defaults*.
+      • Per-call kwargs override those defaults.
+      • Unknown kwargs are ignored.
     """
 
     def __init__(
@@ -205,14 +230,13 @@ class HFLocalLLMModel(BaseChatModel):
         top_p: float = 0.9,
         top_k: int = 50,
         device: int | str | None = None,
+        max_chars: int = 0,
         **_: object,  # swallow extra kwargs like max_terms, etc.
     ) -> None:
         from transformers import pipeline
         import torch
 
-        # Choose sensible defaults:
-        #   - seq2seq: flan-t5-small is instruction-ish and light
-        #   - causal: gpt2 is tiny and widely available
+        # Mode selection: seq2seq vs causal
         self.mode = (mode or "seq2seq").lower()
         if self.mode not in {"seq2seq", "causal"}:
             self.mode = "seq2seq"
@@ -224,12 +248,15 @@ class HFLocalLLMModel(BaseChatModel):
                 model_name = "gpt2"
 
         self.model_name = model_name
-        self.max_new_tokens = int(max_new_tokens)
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.top_k = int(top_k)
 
-        # Device: auto-detect if not provided
+        # Store defaults (used when call doesn't override)
+        self.default_max_new_tokens = int(max_new_tokens)
+        self.default_temperature = float(temperature)
+        self.default_top_p = float(top_p)
+        self.default_top_k = int(top_k)
+        self.default_max_chars = int(max_chars)
+
+        # Device selection
         if device is None:
             if torch.cuda.is_available():
                 device = 0
@@ -237,13 +264,8 @@ class HFLocalLLMModel(BaseChatModel):
                 device = -1
         self.device = device
 
-        # Pick task based on mode
-        if self.mode == "seq2seq":
-            task = "text2text-generation"
-        else:
-            task = "text-generation"
+        task = "text2text-generation" if self.mode == "seq2seq" else "text-generation"
 
-        # Build pipeline once
         self._pipe = pipeline(
             task=task,
             model=self.model_name,
@@ -251,13 +273,17 @@ class HFLocalLLMModel(BaseChatModel):
             device=self.device,
         )
 
+    # ---------- helpers ----------
+
     def _build_prompt(
         self,
         user_text: str,
         lexicon: List[str] | None,
         style: str = "plain",
     ) -> str:
-        """Turn user_text + lexicon + style into a single prompt string."""
+        """
+        Build a simple instruction-style prompt, with optional style and lexicon hints.
+        """
         user_text = (user_text or "").strip()
         lexicon = lexicon or []
         style = (style or "plain").strip().lower()
@@ -270,19 +296,16 @@ class HFLocalLLMModel(BaseChatModel):
 
         lex_hint = ""
         if lexicon:
-            # keep order, dedupe
             uniq = list(dict.fromkeys(lexicon))
             lex_hint = " When relevant, include or address these terms: " + ", ".join(uniq) + "."
 
         if self.mode == "seq2seq":
-            # seq2seq (e.g., flan-t5) usually expects instructions
             prompt = (
                 "You are a concise assistant. Read the following text and respond helpfully."
                 f"{style_hint}{lex_hint}\n\n"
                 f"Text:\n{user_text}\n\nAnswer:"
             )
         else:
-            # causal LM (gpt2-style) prompt
             prompt = (
                 "User:\n"
                 f"{user_text}\n\n"
@@ -291,43 +314,68 @@ class HFLocalLLMModel(BaseChatModel):
             )
         return prompt.strip()
 
-    def generate(self, user_text: str, *, lexicon: List[str] | None = None, **kwargs) -> str:
-        # Extract extra controls
-        max_chars = int(kwargs.get("max_chars", 0))
+    # ---------- main ----------
+
+    def generate(
+        self,
+        user_text: str,
+        *,
+        lexicon: List[str] | None = None,
+        **kwargs: Any,
+    ) -> str:
+        # Per-call char clamp; default from constructor
+        max_chars = int(kwargs.get("max_chars", self.default_max_chars))
         style = (kwargs.get("style") or "plain").strip().lower()
 
         prompt = self._build_prompt(user_text, lexicon, style=style)
 
-        # Basic length guard to avoid insane inputs
+        # Hard safety guard on prompt length
         if len(prompt) > 8000:
             prompt = prompt[-8000:]
 
-        # Run the pipeline
+        # Read generation parameters (per-call override > defaults)
+        gen_max_new_tokens = int(kwargs.get("max_new_tokens", self.default_max_new_tokens))
+        gen_temperature = float(kwargs.get("temperature", self.default_temperature))
+        gen_top_p = float(kwargs.get("top_p", self.default_top_p))
+        gen_top_k = int(kwargs.get("top_k", self.default_top_k))
+
         outputs = self._pipe(
             prompt,
-            max_new_tokens=self.max_new_tokens,
+            max_new_tokens=gen_max_new_tokens,
             do_sample=True,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
+            temperature=gen_temperature,
+            top_p=gen_top_p,
+            top_k=gen_top_k,
         )
 
-        # Hugging Face pipeline always returns a list[dict]
         if not outputs:
             return ""
 
         generated = outputs[0].get("generated_text", "") or ""
 
-        # For causal LMs, strip the prompt back off
         if self.mode == "causal" and generated.startswith(prompt):
             text = generated[len(prompt):].strip()
         else:
-            # seq2seq models usually just output the answer
             text = generated.strip()
 
         if max_chars > 0 and len(text) > max_chars:
             text = text[:max_chars].rstrip() + "…"
+
         return text
+
+    def get_params_info(self) -> Dict[str, Any]:
+        # Report constructor defaults so GUI can surface them
+        return {
+            "model_name": self.model_name,
+            "mode": self.mode,
+            "max_new_tokens": self.default_max_new_tokens,
+            "temperature": self.default_temperature,
+            "top_p": self.default_top_p,
+            "top_k": self.default_top_k,
+            "device": self.device,
+            "max_chars": self.default_max_chars,
+        }
+
 
 
 class LexiconFinalizeModel(BaseChatModel):
@@ -361,6 +409,12 @@ class LexiconFinalizeModel(BaseChatModel):
 
         # Fallback: No tags found, just return the text as-is
         return text
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "info": "This model finalizes output. It has no parameters."
+        }
+
 
 # --- simple factory ---
 _MODELS: Dict[str, type[BaseChatModel]] = {
