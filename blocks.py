@@ -5366,26 +5366,15 @@ class LinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
 
     def _fetch_page_with_network_sniff(
-        self,
-        page_url: str,
-        timeout: float,
-        ua: str,
-        log: List[str],
-        extensions: set,
+            self,
+            page_url: str,
+            timeout: float,
+            ua: str,
+            log: List[str],
+            extensions: set,
     ) -> Tuple[str, List[Dict[str, str]]]:
-        """
-        Loads page in Playwright and captures:
-        1. DOM snapshot (html = page.content())
-        2. Network Responses (actual files transferring over the wire)
-
-        Returns:
-            html: str        (may be "")
-            found_items: [{ url, text, tag, size }]
-                tag  = "network_sniff"
-                size = content-length header or "?"
-        """
         try:
-            from playwright.sync_api import sync_playwright
+            from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
         except ImportError:
             log.append("Playwright not installed (network sniff unavailable).")
             return "", []
@@ -5404,7 +5393,7 @@ class LinkTrackerBlock(BaseBlock):
                     try:
                         url = response.url
 
-                        # 1) Filter by extension first (fast path)
+                        # 1) Extension-based fast path
                         if any(url.lower().endswith(ext) for ext in extensions):
                             if url not in seen_network:
                                 seen_network.add(url)
@@ -5413,50 +5402,55 @@ class LinkTrackerBlock(BaseBlock):
                                         "url": url,
                                         "text": "[Network File]",
                                         "tag": "network_sniff",
-                                        "size": response.headers.get(
-                                            "content-length", "?"
-                                        ),
+                                        "size": response.headers.get("content-length", "?"),
                                     }
                                 )
                                 return
 
-                        # 2) Fallback to Content-Type (audio/video/streams)
+                        # 2) Content-Type sniff (streams)
                         ctype = response.headers.get("content-type", "").lower()
-                        if (
-                            "audio" in ctype
-                            or "video" in ctype
-                            or "application/octet-stream" in ctype
-                        ):
+                        if "audio" in ctype or "video" in ctype or "application/octet-stream" in ctype:
                             cl_raw = response.headers.get("content-length", "0")
                             try:
                                 cl = int(cl_raw)
                             except Exception:
                                 cl = 0
 
-                            # Skip tiny stuff (icons/tracking pixels)
-                            if cl > 50000:
-                                if url not in seen_network:
-                                    seen_network.add(url)
-                                    found_items.append(
-                                        {
-                                            "url": url,
-                                            "text": f"[Network Stream] ({ctype})",
-                                            "tag": "network_sniff",
-                                            "size": str(cl),
-                                        }
-                                    )
+                            # Skip tiny assets (icons / pixels)
+                            if cl > 50000 and url not in seen_network:
+                                seen_network.add(url)
+                                found_items.append(
+                                    {
+                                        "url": url,
+                                        "text": f"[Network Stream] ({ctype})",
+                                        "tag": "network_sniff",
+                                        "size": str(cl),
+                                    }
+                                )
                     except Exception:
-                        # Best-effort — no hard failures here
-                        return
+                        return  # best-effort
 
                 page.on("response", handle_response)
 
-                page.goto(
-                    page_url,
-                    wait_until="networkidle",
-                    timeout=int(timeout * 1000),
-                )
-                page.wait_for_timeout(2000)  # give autoplay/scripts some extra time
+                # Use a looser wait condition and a longer timeout just for sniffing
+                sniff_goto_timeout = max(15000, int(timeout * 1000))  # e.g. 15s minimum
+
+                try:
+                    page.goto(
+                        page_url,
+                        wait_until="domcontentloaded",  # <-- key change
+                        timeout=sniff_goto_timeout,
+                    )
+                except PlaywrightTimeoutError as e:
+                    # Even if DOM timeout fires, we may still have sniffed some traffic
+                    log.append(
+                        f"Network sniff: goto timeout on {page_url} ({e}). "
+                        f"Proceeding with whatever responses we captured."
+                    )
+
+                # Let the page run for a sniff window
+                sniff_window_ms = int(timeout * 1000)  # can be separate param if you want
+                page.wait_for_timeout(sniff_window_ms)
 
                 html = page.content()
                 browser.close()
@@ -5686,8 +5680,37 @@ class LinkTrackerBlock(BaseBlock):
         from bs4 import BeautifulSoup
         from urllib.parse import urljoin, urlparse
 
+        # --- Base raw query & optional subpipeline expansion ---
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        subpipe_name = str(params.get("subpipeline", "")).strip()
+
+        if subpipe_name:
+            # Use the same helper as PlaywrightBlock: expand raw prompt into queries
+            queries_to_run: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+            )
+            if isinstance(queries_to_run, str):
+                queries_to_run = [queries_to_run]
+            elif not isinstance(queries_to_run, list):
+                queries_to_run = [query_raw] if query_raw else []
+        else:
+            queries_to_run = [query_raw] if query_raw else []
+
+        # Normalize & filter empties
+        queries_to_run = [str(q).strip() for q in queries_to_run if str(q).strip()]
+
+        if not queries_to_run:
+            return "", {
+                "error": "No query provided for LinkTracker (empty after subpipeline).",
+                "queries_run": [],
+            }
+
+        # Canonical query: first expanded query (used for keyword extraction etc.)
+        query = queries_to_run[0]
+
         # --- Parameters ---
-        query = str(params.get("query", "") or str(payload or "")).strip()
         mode = str(params.get("mode", "docs")).lower()
         num_pages_to_scan = int(
             params.get("scan_limit", 5)
@@ -5719,6 +5742,11 @@ class LinkTrackerBlock(BaseBlock):
         # Required sites (domains/substrings)
         site_require_raw = str(params.get("site_require", "")).split(",")
         required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        max_depth = int(params.get("max_depth", 0))
+        max_depth = max(0, max_depth)
+
+        max_pages_total = int(params.get("max_pages_total", params.get("scan_limit", 5)))
+        max_pages_total = max(1, max_pages_total)
 
         # Setup target extensions based on mode
         targets = set()
@@ -5796,72 +5824,137 @@ class LinkTrackerBlock(BaseBlock):
 
         # --- Step 1: Discovery (Find Hub Pages) ---
 
-        # Slightly tuned search query per mode (optional)
-        search_q = query
-        if mode == "media":
-            search_q += " index of mp3"
-        elif mode == "docs":
-            search_q += " filetype:pdf"
+        def _augment_search_query(q: str, mode: str, required_sites: list[str]) -> str:
+            """
+            Augment the raw query with:
+              • site: filters for all required_sites (if any)
+              • mode-specific hints (media/docs)
+            """
+            sq = q.strip()
 
-        # 1) Run search ONCE with a fixed cap, independent of scan_limit
-        if engine == "google_cse":
-            raw_pages = self._search_google_cse(
-                search_q, search_results_cap, timeout
-            )
-        else:
-            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-            raw_pages = self._search_duckduckgo(
-                search_q, search_results_cap, ua, timeout
-            )
+            # --- Build site: clause from required_sites -------------------------
+            site_clauses: list[str] = []
+            for raw in required_sites or []:
+                s = (raw or "").strip().lower()
+                if not s:
+                    continue
 
-        # 2) Apply required_sites + truncate to num_pages_to_scan
-        filtered_candidates: List[str] = []
-        for u in raw_pages:
-            if _allowed_by_required_sites(u):
-                filtered_candidates.append(u)
-            elif not required_sites:
-                filtered_candidates.append(u)
+                # Strip protocol and path, keep just host-ish part
+                # e.g. "https://sub.example.com/foo" -> "sub.example.com"
+                if "://" in s:
+                    s = s.split("://", 1)[1]
+                s = s.split("/", 1)[0].lstrip(".")
 
-            if len(filtered_candidates) >= num_pages_to_scan:
+                if not s:
+                    continue
+
+                site_clauses.append(f"site:{s}")
+
+            if site_clauses:
+                # (site:a OR site:b OR site:c) <query>
+                sites_expr = " OR ".join(site_clauses)
+                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+            # --- Mode-specific bias --------------------------------------------
+            # Only add these if they’re not already present to avoid duplication.
+            q_lower = sq.lower()
+            if mode == "media":
+                media_hint = "(mp3 OR flac OR m4a OR ogg)"
+                if "mp3" not in q_lower and "flac" not in q_lower and "m4a" not in q_lower and "ogg" not in q_lower:
+                    sq = f"{sq} {media_hint}".strip()
+            elif mode == "docs":
+                if "filetype:pdf" not in q_lower:
+                    sq = f"{sq} filetype:pdf".strip()
+
+            return sq
+
+        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+
+        seen_search_urls: set[str] = set()
+        candidate_pages: List[str] = []
+
+        for q in queries_to_run:
+            search_q = _augment_search_query(q, mode, required_sites)
+
+            if engine == "google_cse":
+                raw_pages = self._search_google_cse(
+                    search_q, search_results_cap, timeout
+                )
+            else:
+                raw_pages = self._search_duckduckgo(
+                    search_q, search_results_cap, ua, timeout
+                )
+
+            # Apply required_sites + truncate to overall caps
+            for u in raw_pages:
+                if u in seen_search_urls:
+                    continue
+                if _allowed_by_required_sites(u) or not required_sites:
+                    candidate_pages.append(u)
+                    seen_search_urls.add(u)
+
+                # Respect both scan_limit (per block call) and max_pages_total (global safety)
+                if len(candidate_pages) >= num_pages_to_scan or len(candidate_pages) >= max_pages_total:
+                    break
+
+            if len(candidate_pages) >= num_pages_to_scan or len(candidate_pages) >= max_pages_total:
                 break
 
-        candidate_pages = filtered_candidates
+        # --- Step 2: Depth-based parallel scan ---
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # --- Step 2: Deep Scan ---
         found_assets: List[Dict[str, Any]] = []
-        seen_urls: set[str] = set()
-
-        session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "PromptChat/LinkTracker"
-            }
-        )
+        seen_asset_urls: set[str] = set()  # dedupe assets
+        visited_pages: set[str] = set()  # dedupe pages
 
         log: List[str] = []
-        all_js_links: List[Dict[str, str]] = []       # JS DOM links (debug)
+        all_js_links: List[Dict[str, str]] = []  # JS DOM links (debug)
         all_network_links: List[Dict[str, str]] = []  # network-sniff hits (debug)
 
-        for page_url in candidate_pages:
+        # --- Local helpers for this crawl ---
+
+        def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
+            """
+            Worker: fetch + parse a single page, return assets and next pages.
+            Each worker uses its own requests.Session and Playwright instance.
+            """
+            import requests
+            from bs4 import BeautifulSoup
+
+            local_log: List[str] = []
+            local_js_links: List[Dict[str, str]] = []
+            local_network_links: List[Dict[str, str]] = []
+            local_assets: List[Dict[str, Any]] = []
+            next_pages: List[str] = []
+
+            # Per-thread session
+            session = requests.Session()
+            session.headers.update(
+                {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "PromptChat/LinkTracker"
+                }
+            )
+
             try:
                 links_on_page: List[Dict[str, str]] = []
                 html = ""
 
-                # Optional: network-sniff first (captures real media/file transfers)
+                # Optional: network sniff first
                 sniff_items: List[Dict[str, str]] = []
                 if use_network_sniff:
                     sniff_html, sniff_items = self._fetch_page_with_network_sniff(
                         page_url,
                         timeout,
                         session.headers["User-Agent"],
-                        log,
+                        local_log,
                         targets,
                     )
                     html = sniff_html or html
 
                     for si in sniff_items:
-                        all_network_links.append(
+                        local_network_links.append(
                             {
                                 "page": page_url,
                                 "url": si.get("url", ""),
@@ -5877,15 +5970,14 @@ class LinkTrackerBlock(BaseBlock):
                         page_url,
                         timeout,
                         session.headers["User-Agent"],
-                        log,
+                        local_log,
                     )
                     if js_html:
                         html = js_html
                     links_on_page.extend(js_links)
 
-                    # record JS links
                     for jl in js_links:
-                        all_js_links.append(
+                        local_js_links.append(
                             {
                                 "page": page_url,
                                 "url": jl.get("url", ""),
@@ -5900,16 +5992,38 @@ class LinkTrackerBlock(BaseBlock):
                                 session, page_url, timeout
                             )
                         except Exception as e:
-                            log.append(f"Error fetching {page_url} (fallback): {e}")
+                            local_log.append(
+                                f"Error fetching {page_url} (fallback): {e}"
+                            )
                             if not links_on_page and not sniff_items:
-                                continue
+                                return {
+                                    "page": page_url,
+                                    "assets": local_assets,
+                                    "next_pages": next_pages,
+                                    "js_links": local_js_links,
+                                    "network_links": local_network_links,
+                                    "log": local_log,
+                                }
                     soup = BeautifulSoup(html or "", "html.parser")
                 else:
                     if not html:
-                        html = self._fetch_page_html_plain(session, page_url, timeout)
+                        try:
+                            html = self._fetch_page_html_plain(
+                                session, page_url, timeout
+                            )
+                        except Exception as e:
+                            local_log.append(f"Error fetching {page_url}: {e}")
+                            return {
+                                "page": page_url,
+                                "assets": local_assets,
+                                "next_pages": next_pages,
+                                "js_links": local_js_links,
+                                "network_links": local_network_links,
+                                "log": local_log,
+                            }
                     soup = BeautifulSoup(html or "", "html.parser")
 
-                # Add plain HTML <a> links (bounded)
+                # Plain HTML <a> links (bounded)
                 link_count = 0
                 for a in soup.find_all("a", href=True):
                     links_on_page.append(
@@ -5923,22 +6037,18 @@ class LinkTrackerBlock(BaseBlock):
                     if link_count >= max_links_per_page:
                         break
 
-                # Scan DOM links_on_page for targets
+                # ---- Scan DOM links for assets ----
                 for link in links_on_page:
                     raw_link = link["url"]
                     full_url = urljoin(page_url, raw_link)
                     parsed = urlparse(full_url)
                     path = parsed.path.lower()
 
-                    if full_url in seen_urls:
+                    # Check extension
+                    if not any(path.endswith(ext) for ext in targets):
                         continue
 
-                    # 1. Check extension
-                    is_hit = any(path.endswith(ext) for ext in targets)
-                    if not is_hit:
-                        continue
-
-                    # 2. Keyword filtering with min_term_overlap
+                    # Keyword filtering with min_term_overlap
                     if keywords:
                         link_text = (link.get("text") or "").lower()
                         url_text = full_url.lower().replace("%20", " ")
@@ -5946,14 +6056,11 @@ class LinkTrackerBlock(BaseBlock):
                         if not _term_overlap_ok(haystack):
                             continue
 
-                    # 3. Required sites at asset level
+                    # Required sites at asset level
                     if not _allowed_by_required_sites(full_url):
                         continue
 
-                    # 4. Dedupe
-                    seen_urls.add(full_url)
-
-                    # 5. Verification
+                    # Verify (HEAD)
                     status = "unverified"
                     size = "?"
                     if verify_links:
@@ -5974,7 +6081,7 @@ class LinkTrackerBlock(BaseBlock):
                     if not verify_links or status == "200 OK":
                         display_text = link.get("text", "") or path.split("/")[-1]
                         display_text = display_text[:100]
-                        found_assets.append(
+                        local_assets.append(
                             {
                                 "text": display_text,
                                 "url": full_url,
@@ -5984,26 +6091,21 @@ class LinkTrackerBlock(BaseBlock):
                             }
                         )
 
-                # Additionally, incorporate network-sniffed assets (already ext-filtered)
+                # ---- Network-sniffed assets ----
                 if sniff_items:
                     for item in sniff_items:
                         full_url = item.get("url")
                         if not full_url:
                             continue
-                        if full_url in seen_urls:
-                            continue
                         if not _allowed_by_required_sites(full_url):
                             continue
 
-                        # Keyword filter for sniff hits with min_term_overlap
                         if keywords:
                             link_text = (item.get("text") or "").lower()
                             url_text = full_url.lower().replace("%20", " ")
                             haystack = link_text + " " + url_text
                             if not _term_overlap_ok(haystack):
                                 continue
-
-                        seen_urls.add(full_url)
 
                         status = "sniffed"
                         size = item.get("size") or "?"
@@ -6024,12 +6126,12 @@ class LinkTrackerBlock(BaseBlock):
 
                         if not verify_links or status == "200 OK":
                             display_text = (
-                                item.get("text")
-                                or full_url.rsplit("/", 1)[-1]
-                                or "[network asset]"
+                                    item.get("text")
+                                    or full_url.rsplit("/", 1)[-1]
+                                    or "[network asset]"
                             )
                             display_text = display_text[:100]
-                            found_assets.append(
+                            local_assets.append(
                                 {
                                     "text": display_text,
                                     "url": full_url,
@@ -6039,10 +6141,94 @@ class LinkTrackerBlock(BaseBlock):
                                 }
                             )
 
-            except Exception as e:
-                log.append(f"Error scanning {page_url}: {e}")
-                continue
+                # ---- Enqueue next-level pages (HTML-like, not assets) ----
+                if depth < max_depth:
+                    for link in links_on_page:
+                        raw_link = link.get("url") or ""
+                        if not raw_link:
+                            continue
+                        full_url = urljoin(page_url, raw_link)
+                        if not _allowed_by_required_sites(full_url):
+                            continue
 
+                        lpath = urlparse(full_url).path.lower()
+                        # Skip direct asset URLs (we only want hubs)
+                        if any(lpath.endswith(ext) for ext in targets):
+                            continue
+
+                        if keywords:
+                            haystack = (link.get("text") or "") + " " + full_url
+                            if not _term_overlap_ok(haystack):
+                                continue
+
+                        next_pages.append(full_url)
+
+            except Exception as e:
+                local_log.append(f"Error scanning {page_url}: {e}")
+
+            return {
+                "page": page_url,
+                "assets": local_assets,
+                "next_pages": next_pages,
+                "js_links": local_js_links,
+                "network_links": local_network_links,
+                "log": local_log,
+            }
+
+        # BFS frontier: start from candidate pages at depth 0
+        frontier: List[str] = []
+        for u in candidate_pages:
+            if _allowed_by_required_sites(u):
+                frontier.append(u)
+            elif not required_sites:
+                frontier.append(u)
+
+        # Ensure we don't exceed total page cap at depth 0
+        frontier = frontier[:max_pages_total]
+
+        current_depth = 0
+        while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
+            # Filter out already-visited URLs & enforce cap
+            remaining_slots = max_pages_total - len(visited_pages)
+            batch = [u for u in frontier if u not in visited_pages][:remaining_slots]
+            if not batch:
+                break
+
+            next_frontier: List[str] = []
+            max_workers = min(8, len(batch))  # tune if you want
+
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                future_map = {
+                    ex.submit(_process_page, url, current_depth): url
+                    for url in batch
+                }
+
+                for fut in as_completed(future_map):
+                    res = fut.result()
+                    page_url = res["page"]
+                    visited_pages.add(page_url)
+
+                    # Merge logs / debug links
+                    log.extend(res["log"])
+                    all_js_links.extend(res["js_links"])
+                    all_network_links.extend(res["network_links"])
+
+                    # Merge assets (dedupe by URL)
+                    for asset in res["assets"]:
+                        a_url = asset["url"]
+                        if not a_url or a_url in seen_asset_urls:
+                            continue
+                        seen_asset_urls.add(a_url)
+                        found_assets.append(asset)
+
+                    # Build next frontier (dedupe at this level)
+                    for nxt in res["next_pages"]:
+                        if nxt not in visited_pages:
+                            next_frontier.append(nxt)
+
+            # Prepare for next depth
+            current_depth += 1
+            frontier = list(dict.fromkeys(next_frontier))  # preserve order & dedupe
         # --- Step 3: Format Output ---
         from urllib.parse import urlparse as _urlparse
 
@@ -6093,6 +6279,7 @@ class LinkTrackerBlock(BaseBlock):
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "log": log,
+                "queries_run": queries_to_run,
             }
 
         # We have assets
@@ -6138,7 +6325,7 @@ class LinkTrackerBlock(BaseBlock):
 
         return "\n".join(lines), {
             "found": len(found_assets),
-            "scanned_pages": len(candidate_pages),
+            "scanned_pages": len(visited_pages),
             "assets": found_assets,
             "keywords_used": keywords,
             "min_term_overlap": min_term_overlap,
@@ -6147,6 +6334,7 @@ class LinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "log": log,
+            "queries_run": queries_to_run,
         }
 
     def get_params_info(self) -> Dict[str, Any]:
@@ -6168,6 +6356,9 @@ class LinkTrackerBlock(BaseBlock):
             "return_network_sniff_links": False,
             # NEW:
             "min_term_overlap": 1,       # require at least N keyword hits in URL/text
+            "max_depth": 0,              # 0 = search pages only, 1 = follow their links, etc.
+            "max_pages_total": 32,       # global safety cap on pages crawled
+            "subpipeline": "",
         }
 
 
@@ -7285,28 +7476,30 @@ class VideoLinkTrackerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "rare aphex twin interview",
-            "source": "search",  # 'search' or 'payload'
-            "sites": "",         # empty = global search
-            "scan_limit": 3,
-            "verify": False,
-            "engine": "duckduckgo",
-            "use_js": True,
-            "smart_sniff": False,
-            "max_depth": 0,
-            "child_page_limit": 4,
-            "max_pages_total": 20,
-            "max_links_per_page": 200,
-            "max_assets": 100,
+            "mode": "docs",  # media, docs, archives, custom
+            "scan_limit": 5,
+            "search_results_cap": 256,
+            "verify": True,
+            "extensions": ".pdf,.txt",  # optional overrides
+            "url_keywords": "archive,download",  # optional filter
+            "engine": "duckduckgo",  # or: google_cse
+            "site_require": "",  # e.g. 'archive.org,ca.archive.org'
+            "use_js": False,  # Enable Playwright JS rendering
             "return_all_js_links": False,
+            "max_links_per_page": 500,
+            "strict_keywords": False,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
+            "min_term_overlap": 1,  # require at least N keyword hits in URL/text
             # NEW:
-            "min_term_overlap": 1,   # require at least N keyword hits in URL/text
+            "max_depth": 0,  # 0 = search pages only, 1 = follow their links, etc.
+            "max_pages_total": 32,  # global safety cap on pages crawled
         }
 
 
 # Register the block
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
+
 # ======================= TorOnionBlock =============================
 @dataclass
 class TorOnionBlock(BaseBlock):
