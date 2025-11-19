@@ -1,5 +1,11 @@
+import requests
+import html
+import re
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+from urllib.parse import urljoin, urlparse
+import xml.etree.ElementTree as ET
+from transformers.generation.continuous_batching import requests
 
 from registry import SUB_BLOCKS
 from blocks import _STOPWORDS
@@ -550,3 +556,294 @@ class CodeChatSubBlock(BaseSubBlock):
 
 # Register the new sub-block
 SUB_BLOCKS.register("code_chat", CodeChatSubBlock)
+
+# ======================= NEW SITEMAP SUB-BLOCK ==========================
+@dataclass
+class SitemapSubBlock(BaseSubBlock):
+    """
+    A sub-block that finds, downloads, and parses sitemaps.
+    Can use explicitly provided sitemaps, OR discover them from
+    a provided input URL/Domain, OR from 'site_require' parameters.
+    """
+
+    DEFAULT_SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml"]
+
+    def _get_sitemap_urls(self, session: "requests.Session", url: str, timeout: float) -> List[str]:
+        import requests
+        urls: List[str] = []
+        try:
+            if url.count("/sitemap") > 5: return []
+            if not url.startswith("http"): return []  # Sanity check
+
+            r = session.get(url, timeout=timeout)
+            r.raise_for_status()
+            content = r.text
+        except Exception:
+            return []
+
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError:
+            locs = re.findall(r"(https?://[^\s<>]+)", content)
+            return [loc.strip() for loc in locs if len(loc.strip()) > 10]
+        except Exception:
+            return []
+
+        if root.tag.endswith('sitemapindex'):
+            for sitemap_tag in root.findall('.//{*}sitemap'):
+                loc_tag = sitemap_tag.find('{*}loc')
+                if loc_tag is not None:
+                    s = html.unescape(loc_tag.text).strip()
+                    urls.extend(self._get_sitemap_urls(session, s, timeout))
+        elif root.tag.endswith('urlset'):
+            for url_tag in root.findall('.//{*}url'):
+                loc_tag = url_tag.find('{*}loc')
+                if loc_tag is not None:
+                    u = html.unescape(loc_tag.text).strip()
+                    if u: urls.append(u)
+        return urls
+
+    def _find_sitemap_index(self, session: "requests.Session", base_url: str, timeout: float) -> Tuple[str, List[str]]:
+        parsed = urlparse(base_url)
+        domain = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+        sitemap_urls: List[str] = []
+
+        # 1. Robots.txt
+        try:
+            robots_url = urljoin(domain, '/robots.txt')
+            r = session.get(robots_url, timeout=timeout)
+            if r.status_code == 200:
+                for line in r.text.splitlines():
+                    if line.lower().startswith('sitemap:'):
+                        s = line.split(':', 1)[1].strip()
+                        if s: sitemap_urls.append(s)
+                if sitemap_urls: return domain, sitemap_urls
+        except Exception:
+            pass
+
+        # 2. Defaults
+        for path in self.DEFAULT_SITEMAP_PATHS:
+            full = urljoin(domain, path)
+            try:
+                r = session.head(full, timeout=timeout)
+                if 200 <= r.status_code < 400:
+                    sitemap_urls.append(full)
+                    return domain, sitemap_urls
+            except Exception:
+                continue
+
+        return domain, sitemap_urls
+
+    def execute(self, value: Any, *, params: Dict[str, Any]) -> List[str]:
+        import requests
+
+        # 1. Sanitization
+        query_or_domain = str(value or "").strip().strip("'").strip('"')
+
+        op = str(params.get("op", "get_urls")).lower()
+        timeout = float(params.get("timeout", 10.0))
+
+        # explicit sitemaps
+        explicit_sitemaps_raw = params.get("sitemaps", [])
+        if isinstance(explicit_sitemaps_raw, str):
+            explicit_sitemaps = [s.strip() for s in explicit_sitemaps_raw.split(',') if s.strip()]
+        else:
+            explicit_sitemaps = [str(s).strip() for s in explicit_sitemaps_raw if str(s).strip()]
+
+        # [NEW] site_require (passed from LinkTracker)
+        site_require_raw = params.get("site_require", [])
+        if isinstance(site_require_raw, str):
+            site_require_list = [s.strip() for s in site_require_raw.split(',') if s.strip()]
+        else:
+            site_require_list = []
+        # Early exit: If nothing provided to work with, and input is just a keyword
+        if not explicit_sitemaps and not site_require_list:
+            if not query_or_domain or "." not in query_or_domain:
+                return []
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": "PromptChat/SitemapSubBlock"})
+
+        final_sitemap_index_urls: List[str] = []
+
+        # A. explicit sitemaps
+        final_sitemap_index_urls.extend([s for s in explicit_sitemaps if s.startswith('http')])
+
+        # B. site_require domains (Auto-discovery)
+        for d in site_require_list:
+            if not d: continue
+            target = d if d.startswith("http") else f"https://{d}"
+            try:
+                _, found = self._find_sitemap_index(session, target, timeout)
+                final_sitemap_index_urls.extend(found)
+            except:
+                pass
+
+        # C. input domain (Auto-discovery)
+        if query_or_domain and "." in query_or_domain:
+            target = query_or_domain if query_or_domain.startswith("http") else f"https://{query_or_domain}"
+            try:
+                _, found = self._find_sitemap_index(session, target, timeout)
+                final_sitemap_index_urls.extend(found)
+            except:
+                pass
+
+        # Dedupe indices
+        final_sitemap_index_urls = list(set(final_sitemap_index_urls))
+
+        if op == "get_index":
+            return final_sitemap_index_urls
+
+        # Recursive Fetch
+        all_content_urls: List[str] = []
+        for sitemap_url in final_sitemap_index_urls:
+            try:
+                all_content_urls.extend(self._get_sitemap_urls(session, sitemap_url, timeout))
+            except:
+                continue
+
+        return list(set(all_content_urls))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "op": "get_urls",
+            "sitemaps": "",
+            "site_require": "",  # Implicitly used, but good to document
+            "timeout": 10.0,
+        }
+
+# Register the new sub-block
+SUB_BLOCKS.register("sitemap", SitemapSubBlock)
+
+
+# ======================= NEW XML SUB-BLOCK ==========================
+@dataclass
+class XmlSubBlock(BaseSubBlock):
+    """
+    A sub-block that fetches and parses XML (RSS, Atom, or generic).
+    Extracts links or specific attribute values to be used as crawl targets.
+
+    Params:
+    - op: "extract_links" (default) | "xpath"
+    - xpath: (Optional) Custom path to find elements, e.g., ".//enclosure"
+    - attr: (Optional) Attribute to extract from found elements.
+            If empty, extracts element text.
+    """
+
+    def _strip_namespaces(self, el: ET.Element) -> ET.Element:
+        """
+        Recursively removes {http://...} namespaces from tags to make
+        parsing RSS/Atom feeds much easier without strict schema definitions.
+        """
+        if el.tag.startswith("{"):
+            el.tag = el.tag.split("}", 1)[1]
+        for child in el:
+            self._strip_namespaces(child)
+        return el
+
+    def execute(self, value: Any, *, params: Dict[str, Any]) -> List[str]:
+        # Local import to avoid collisions
+        import requests
+
+        url_or_xml = str(value or "").strip()
+        if not url_or_xml:
+            return []
+
+        op = str(params.get("op", "extract_links")).lower()
+        custom_xpath = str(params.get("xpath", "")).strip()
+        target_attr = str(params.get("attr", "")).strip()
+        timeout = float(params.get("timeout", 10.0))
+
+        content = ""
+
+        # 1. Fetch if it's a URL
+        if url_or_xml.startswith("http://") or url_or_xml.startswith("https://"):
+            try:
+                with requests.Session() as session:
+                    session.headers.update({"User-Agent": "PromptChat/XmlSubBlock"})
+                    r = session.get(url_or_xml, timeout=timeout)
+                    r.raise_for_status()
+                    content = r.text
+            except Exception as e:
+                print(f"[XmlSubBlock] Fetch error: {e}")
+                return []
+        else:
+            # Assume it's raw XML string
+            content = url_or_xml
+
+        if not content:
+            return []
+
+        # 2. Parse XML
+        extracted_values: List[str] = []
+        try:
+            # Basic string cleanup to avoid encoding issues
+            content = content.strip()
+            root = ET.fromstring(content)
+
+            # Strip namespaces to standardize RSS vs Atom parsing
+            root = self._strip_namespaces(root)
+        except ET.ParseError as e:
+            print(f"[XmlSubBlock] Parse error: {e}")
+            return []
+        except Exception:
+            return []
+
+        # 3. Extraction Logic
+
+        # MODE A: Custom XPath
+        if op == "xpath" and custom_xpath:
+            try:
+                elements = root.findall(custom_xpath)
+                for el in elements:
+                    if target_attr:
+                        val = el.get(target_attr)
+                    else:
+                        val = el.text
+
+                    if val:
+                        extracted_values.append(val.strip())
+            except Exception as e:
+                print(f"[XmlSubBlock] XPath error: {e}")
+
+        # MODE B: Smart Link Extraction (RSS/Atom/Media default)
+        else:
+            # 1. Standard RSS <link> (text content)
+            for link in root.findall(".//link"):
+                # Atom uses href attribute, RSS uses text
+                if link.text and "http" in link.text:
+                    extracted_values.append(link.text.strip())
+                elif link.get("href"):
+                    extracted_values.append(link.get("href").strip())
+
+            # 2. Enclosures (Podcasts/Media)
+            for enc in root.findall(".//enclosure"):
+                u = enc.get("url")
+                if u: extracted_values.append(u.strip())
+
+            # 3. Media Content (Yahoo Media namespace style)
+            for media in root.findall(".//content"):
+                u = media.get("url")
+                if u: extracted_values.append(u.strip())
+
+        # Dedupe and basic validation
+        valid_urls = []
+        seen = set()
+        for v in extracted_values:
+            if v and v not in seen and v.startswith("http"):
+                seen.add(v)
+                valid_urls.append(v)
+
+        return valid_urls
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "op": "extract_links",  # extract_links | xpath
+            "xpath": "",  # e.g. ".//enclosure"
+            "attr": "",  # e.g. "url"
+            "timeout": 10.0
+        }
+
+
+# Register the new sub-block
+SUB_BLOCKS.register("xml", XmlSubBlock)

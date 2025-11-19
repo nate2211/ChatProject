@@ -33,6 +33,7 @@ APP_DIR = _os.path.join(_os.path.expanduser("~"), ".promptchat")
 MEMORY_PATH = _os.path.join(APP_DIR, "memory.json")
 HISTORY_PATH = _os.path.join(APP_DIR, "history.json")
 
+
 def ensure_app_dirs() -> None:
     _os.makedirs(APP_DIR, exist_ok=True)
     for p in (MEMORY_PATH, HISTORY_PATH):
@@ -75,12 +76,15 @@ def parse_extras(items: List[str]) -> Dict[str, Dict[str, Any]]:
         key = key.strip()
         out.setdefault(group, {})[key] = _coerce(v)
     return out
+
+
 # ======================= Utilities =========================================
 _UA = (
     "Mozilla/5.0 (X11; Linux x86_64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0 Safari/537.36"
 )
+
 
 def _http_get(url: str, *, timeout: float = 12.0, headers: Optional[Dict[str, str]] = None) -> requests.Response:
     h = {"User-Agent": _UA, "Accept": "*/*"}
@@ -90,9 +94,11 @@ def _http_get(url: str, *, timeout: float = 12.0, headers: Optional[Dict[str, st
     resp.raise_for_status()
     return resp
 
+
 def _is_json_content(resp: requests.Response) -> bool:
     ctype = (resp.headers.get("Content-Type") or "").lower()
     return "application/json" in ctype or resp.text.strip().startswith("{") or resp.text.strip().startswith("[")
+
 
 def _safe_json(resp: requests.Response) -> Any:
     try:
@@ -100,18 +106,21 @@ def _safe_json(resp: requests.Response) -> Any:
     except Exception:
         return json.loads(resp.text)
 
-def _markdown_list(items: List[Dict[str, Any]], title_key="title", url_key="link", extra_keys: Optional[List[str]] = None, limit: int = 10) -> str:
+
+def _markdown_list(items: List[Dict[str, Any]], title_key="title", url_key="link",
+                   extra_keys: Optional[List[str]] = None, limit: int = 10) -> str:
     out = []
     for row in items[:limit]:
         title = row.get(title_key) or row.get("name") or row.get("headline") or "(no title)"
-        link  = row.get(url_key) or row.get("url") or row.get("href") or ""
+        link = row.get(url_key) or row.get("url") or row.get("href") or ""
         extra = []
         if extra_keys:
             for k in extra_keys:
                 v = row.get(k)
                 if v:
                     if isinstance(v, (dict, list)):
-                        v = json.dumps(v, ensure_ascii=False)[:240] + "…" if len(json.dumps(v)) > 240 else json.dumps(v, ensure_ascii=False)
+                        v = json.dumps(v, ensure_ascii=False)[:240] + "…" if len(json.dumps(v)) > 240 else json.dumps(v,
+                                                                                                                      ensure_ascii=False)
                     extra.append(f"_{k}:_ {v}")
         title = html.escape(str(title))
         if link:
@@ -119,6 +128,7 @@ def _markdown_list(items: List[Dict[str, Any]], title_key="title", url_key="link
         else:
             out.append(f"- {title}" + (f" — {' • '.join(extra)}" if extra else ""))
     return "\n".join(out) if out else "_(no items)_"
+
 
 def _fallback_parse_rss(xml_text: str, *, limit: int = 10) -> List[Dict[str, Any]]:
     # Very small RSS/Atom fallback (title + link + published)
@@ -133,17 +143,18 @@ def _fallback_parse_rss(xml_text: str, *, limit: int = 10) -> List[Dict[str, Any
         title = (e.findtext("atom:title", default="", namespaces=ns) or "").strip()
         link_el = e.find("atom:link", ns)
         href = link_el.get("href") if link_el is not None else ""
-        pub  = (e.findtext("atom:updated", default="", namespaces=ns) or "").strip()
+        pub = (e.findtext("atom:updated", default="", namespaces=ns) or "").strip()
         if title or href:
             items.append({"title": title, "link": href, "published": pub})
     # RSS items
     for i in root.findall(".//item"):
         title = (i.findtext("title") or "").strip()
-        link  = (i.findtext("link") or "").strip()
-        pub   = (i.findtext("pubDate") or "").strip()
+        link = (i.findtext("link") or "").strip()
+        pub = (i.findtext("pubDate") or "").strip()
         if title or link:
             items.append({"title": title, "link": link, "published": pub})
     return items[:limit]
+
 
 def _parse_feed(url: str, *, limit: int = 10) -> List[Dict[str, Any]]:
     """Parse RSS/Atom using feedparser if available, else tiny fallback."""
@@ -161,6 +172,7 @@ def _parse_feed(url: str, *, limit: int = 10) -> List[Dict[str, Any]]:
     # Fallback: fetch and parse minimal
     resp = _http_get(url)
     return _fallback_parse_rss(resp.text, limit=limit)
+
 
 def _extract_first_img_src(html_text: str) -> Optional[str]:
     # very light heuristic for <img src="..."> (used for APOD page)
@@ -218,6 +230,7 @@ _IDENT_RE = _re.compile(
     _re.VERBOSE
 )
 
+
 def _extract_prose_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
     """Extracts common terms from prose, ignoring stopwords."""
     counts: Dict[str, int] = {}
@@ -228,6 +241,7 @@ def _extract_prose_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> Lis
         counts[w] = counts.get(w, 0) + 1
     terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [t for t, _ in terms[:top_k]]
+
 
 def _extract_code_identifiers(text: str, *, top_k: int = 100, min_len: int = 3) -> List[str]:
     """Extracts API names, function names, and identifiers from code."""
@@ -244,6 +258,8 @@ def _extract_code_identifiers(text: str, *, top_k: int = 100, min_len: int = 3) 
     # Rank by frequency
     ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [t for t, _ in ranked[:top_k]]
+
+
 # ---------------- Caching for local ML models ----------------
 @functools.lru_cache(maxsize=4)
 def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int = "auto", verbose: bool = False):
@@ -258,7 +274,8 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
         from transformers import pipeline
         import torch
     except ImportError:
-        print("[_get_hf_pipeline] ERROR: `transformers` or `torch` not installed. Please `pip install transformers torch`")
+        print(
+            "[_get_hf_pipeline] ERROR: `transformers` or `torch` not installed. Please `pip install transformers torch`")
         return None
 
     resolved_device: int = -1  # Default to CPU
@@ -272,7 +289,8 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
 
     if verbose:
         dev_str = f"cuda:{resolved_device}" if resolved_device >= 0 else "cpu"
-        print(f"[_get_hf_pipeline] Loading pipeline: task={task}, model={model or 'default'}, device={dev_str}... (this may take a moment on first run)")
+        print(
+            f"[_get_hf_pipeline] Loading pipeline: task={task}, model={model or 'default'}, device={dev_str}... (this may take a moment on first run)")
 
     try:
         from transformers import pipeline
@@ -283,6 +301,7 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
     except Exception as e:
         print(f"[_get_hf_pipeline] ERROR: Failed to load pipeline (task={task}, model={model}): {e}")
         return None
+
 
 # ---------------- Base class ----------------
 @dataclass
@@ -322,7 +341,7 @@ class BaseBlock:
             return initial_value
 
         if isinstance(pipeline_def, str):
-            sub_block_names = [s.strip() for s in pipeline_def.split(",") if s.strip()]
+            sub_block_names = [s.strip() for s in pipeline_def.split("|") if s.strip()]
         elif isinstance(pipeline_def, list):
             sub_block_names = [str(s) for s in pipeline_def]
         else:
@@ -409,8 +428,9 @@ class GuardBlock(BaseBlock):
             "blocked": "word1,word2",
             "replacement": "[redacted]"
         }
-BLOCKS.register("guard", GuardBlock)
 
+
+BLOCKS.register("guard", GuardBlock)
 
 
 # ---------------- Tools (calc/time) ----------------
@@ -462,6 +482,8 @@ class ToolRouterBlock(BaseBlock):
         return {
             "info": "Payload-driven. No parameters."
         }
+
+
 BLOCKS.register("tools", ToolRouterBlock)
 
 
@@ -489,6 +511,8 @@ class HistoryBlock(BaseBlock):
             "op": "show",
             "n": 10
         }
+
+
 BLOCKS.register("history", HistoryBlock)
 
 
@@ -519,6 +543,8 @@ class MemoryBlock(BaseBlock):
             "key": "default",
             "value": None
         }
+
+
 BLOCKS.register("memory", MemoryBlock)
 
 
@@ -538,20 +564,25 @@ class SelfCheckBlock(BaseBlock):
             "info": "No parameters."
         }
 
+
 BLOCKS.register("self_check", SelfCheckBlock)
-
-
-
 
 # --- term extraction for lexicon ---
 _STOPWORDS = {
-    "the","a","an","and","or","but","if","on","in","to","for","from","of","at","by","with","as","is","are",
-    "was","were","be","been","being","that","this","these","those","it","its","into","about","over","under",
-    "up","down","out","so","than","then","too","very","can","cannot","could","should","would","will","may",
-    "might","must","do","does","did","done","doing","have","has","had","having","not","no","yes","you","your",
-    "yours","we","our","ours","they","their","theirs","i","me","my","mine","he","she","him","her","his","hers",
-    "them","there","here","also","such","via"
+    "the", "a", "an", "and", "or", "but", "if", "on", "in", "to", "for", "from", "of", "at", "by", "with", "as", "is",
+    "are",
+    "was", "were", "be", "been", "being", "that", "this", "these", "those", "it", "its", "into", "about", "over",
+    "under",
+    "up", "down", "out", "so", "than", "then", "too", "very", "can", "cannot", "could", "should", "would", "will",
+    "may",
+    "might", "must", "do", "does", "did", "done", "doing", "have", "has", "had", "having", "not", "no", "yes", "you",
+    "your",
+    "yours", "we", "our", "ours", "they", "their", "theirs", "i", "me", "my", "mine", "he", "she", "him", "her", "his",
+    "hers",
+    "them", "there", "here", "also", "such", "via"
 }
+
+
 def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
     counts: Dict[str, int] = {}
     for raw in text.split():
@@ -561,6 +592,7 @@ def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]
         counts[w] = counts.get(w, 0) + 1
     terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
     return [t for t, _ in terms[:top_k]]
+
 
 # ---------------- Prompt Builder (Smart & Dissecting) ----------------
 @dataclass
@@ -580,7 +612,6 @@ class PromptBlock(BaseBlock):
     # --- Auto-detection config ---
     PREFERRED_CONTEXT_KEYS = ["web_context", "corpus_docs"]
     PREFERRED_LEXICON_KEYS = ["web_lexicon", "corpus_lexicon", "intel_prose"]
-
 
     # Canonical task verbs
     _TASK_WORDS = {
@@ -1333,6 +1364,8 @@ class CorpusBlock(BaseBlock):
 
 # keep registration
 BLOCKS.register("corpus", CorpusBlock)
+
+
 # ---------------- Chat (no personas/prompts; uses lexicon only) ----------------
 @dataclass
 class ChatBlock(BaseBlock):
@@ -2092,6 +2125,7 @@ class WebCorpusBlock(BaseBlock):
 
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
+
 # ---------------- WebCorpus (Playwright Hybrid) ----------------
 @dataclass
 class PlaywrightBlock(BaseBlock):
@@ -2693,6 +2727,7 @@ class PlaywrightBlock(BaseBlock):
 
 BLOCKS.register("playwright", PlaywrightBlock)
 
+
 @dataclass
 class TensorBlock(BaseBlock):
     """
@@ -2753,7 +2788,7 @@ class TensorBlock(BaseBlock):
         }
 
         pipe = _get_hf_pipeline(
-            hf_task,                      # <--- use hf_task here
+            hf_task,  # <--- use hf_task here
             model_name if model else None,
             device=device,
             verbose=verbose,
@@ -2933,6 +2968,7 @@ class TensorBlock(BaseBlock):
             "min_length": 10,
             "max_length": 100
         }
+
 
 BLOCKS.register("tensor", TensorBlock)
 
@@ -3280,6 +3316,8 @@ class CodeBlock(BaseBlock):
 
 
 BLOCKS.register("code", CodeBlock)
+
+
 # ---------------- CodeCorpus (code docs & API learner) ----------------
 @dataclass
 class CodeCorpusBlock(BaseBlock):
@@ -3866,6 +3904,7 @@ class CodeCorpusBlock(BaseBlock):
 # Register the block
 BLOCKS.register("codecorpus", CodeCorpusBlock)
 
+
 # ---------------- CodeSearch (prioritize code kind) ----------------
 @dataclass
 class CodeSearchBlock(BaseBlock):
@@ -4139,6 +4178,7 @@ class CodeSearchBlock(BaseBlock):
 
 
 BLOCKS.register("codesearch", CodeSearchBlock)
+
 
 # ---------------- LocalCodeCorpus (scans local files) ----------------
 @dataclass
@@ -4486,6 +4526,7 @@ class LocalCodeCorpusBlock(BaseBlock):
 
 BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
 
+
 # ======================= NewsBlock =========================================
 @dataclass
 class NewsBlock(BaseBlock):
@@ -4540,7 +4581,7 @@ class NewsBlock(BaseBlock):
             elif isinstance(data, dict):
                 # Wikipedia summary example
                 title = data.get("title") or data.get("displaytitle") or "(no title)"
-                link  = data.get("content_urls", {}).get("desktop", {}).get("page") or data.get("extract_url") or ""
+                link = data.get("content_urls", {}).get("desktop", {}).get("page") or data.get("extract_url") or ""
                 items.append({
                     "title": title,
                     "link": link,
@@ -4761,6 +4802,7 @@ class NasaBlock(BaseBlock):
             "q": "e.g., earth, jupiter aurora"
         }
 
+
 BLOCKS.register("nasa", NasaBlock)
 
 
@@ -4913,9 +4955,9 @@ class ShoppingBlock(BaseBlock):
         "depop": "depop.com",
         "poshmark": "poshmark.com",
         "ebay": "ebay.com",
-        "mercari": "mercari.com",          # US/Global Mercari
-        "mercari_jp": "jp.mercari.com",    # Japanese Mercari
-        "rakuma": "fril.jp",               # Rakuma uses fril.jp domain
+        "mercari": "mercari.com",  # US/Global Mercari
+        "mercari_jp": "jp.mercari.com",  # Japanese Mercari
+        "rakuma": "fril.jp",  # Rakuma uses fril.jp domain
         "rakuten": "rakuten.co.jp",
         "yahoo_jp": "page.auctions.yahoo.co.jp",
         "therealreal": "therealreal.com",
@@ -4968,7 +5010,7 @@ class ShoppingBlock(BaseBlock):
         num_per_site = int(params.get("num_per_site", 6))
         timeout = float(params.get("timeout", 10.0))
         currency_filter = str(params.get("currency", "")).upper()  # e.g. USD, JPY
-        backend = str(params.get("backend", "ddg")).lower()        # "ddg" or "playwright"
+        backend = str(params.get("backend", "ddg")).lower()  # "ddg" or "playwright"
 
         # Memory export
         export_key = str(params.get("export_key", "shopping_results"))
@@ -5316,7 +5358,9 @@ class ShoppingBlock(BaseBlock):
 
 BLOCKS.register("shopping", ShoppingBlock)
 
+
 # ======================= LinkTrackerBlock ==================================
+
 @dataclass
 class LinkTrackerBlock(BaseBlock):
     """
@@ -5342,11 +5386,19 @@ class LinkTrackerBlock(BaseBlock):
     - Optional Playwright network sniff:
         • linktracker.use_network_sniff=true
         • linktracker.return_network_sniff_links=true
-    - NEW: min_term_overlap:
+    - min_term_overlap:
         • linktracker.min_term_overlap=N
         Require at least N distinct keyword tokens (from query + url_keywords)
         to appear in the URL/text haystack. For "lil uzi vert", setting
         min_term_overlap=2 or 3 will bias to links that really mention the artist.
+
+    Advanced:
+    - subpipeline:
+        • Can be a chain like "prompt_query|sitemap" or "prompt_query|xml".
+        • If the final sub-block returns a list of URLs (e.g. from sitemap/xml),
+          LinkTracker will:
+              1) Harvest direct assets from that list (.mp3, .flac, .pdf, etc.)
+              2) Use the remaining URLs as candidate HTML pages for BFS crawling.
     """
 
     # Obvious static / junk-ish filenames we don't want to prioritize
@@ -5359,6 +5411,11 @@ class LinkTrackerBlock(BaseBlock):
         "pixel",
         "blank",
         "placeholder",
+    }
+
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
     }
 
     # ------------------------------------------------------------------ #
@@ -5409,7 +5466,11 @@ class LinkTrackerBlock(BaseBlock):
 
                         # 2) Content-Type sniff (streams)
                         ctype = response.headers.get("content-type", "").lower()
-                        if "audio" in ctype or "video" in ctype or "application/octet-stream" in ctype:
+                        if (
+                                "audio" in ctype
+                                or "video" in ctype
+                                or "application/octet-stream" in ctype
+                        ):
                             cl_raw = response.headers.get("content-length", "0")
                             try:
                                 cl = int(cl_raw)
@@ -5432,24 +5493,21 @@ class LinkTrackerBlock(BaseBlock):
 
                 page.on("response", handle_response)
 
-                # Use a looser wait condition and a longer timeout just for sniffing
-                sniff_goto_timeout = max(15000, int(timeout * 1000))  # e.g. 15s minimum
+                sniff_goto_timeout = max(15000, int(timeout * 1000))  # >= 15s
 
                 try:
                     page.goto(
                         page_url,
-                        wait_until="domcontentloaded",  # <-- key change
+                        wait_until="domcontentloaded",
                         timeout=sniff_goto_timeout,
                     )
                 except PlaywrightTimeoutError as e:
-                    # Even if DOM timeout fires, we may still have sniffed some traffic
                     log.append(
                         f"Network sniff: goto timeout on {page_url} ({e}). "
-                        f"Proceeding with whatever responses we captured."
+                        "Proceeding with whatever responses we captured."
                     )
 
-                # Let the page run for a sniff window
-                sniff_window_ms = int(timeout * 1000)  # can be separate param if you want
+                sniff_window_ms = int(timeout * 1000)
                 page.wait_for_timeout(sniff_window_ms)
 
                 html = page.content()
@@ -5551,7 +5609,6 @@ class LinkTrackerBlock(BaseBlock):
             for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", query.lower())
             if t not in stops
         ]
-        # Deduplicate while keeping order
         out: List[str] = []
         for t in tokens:
             if t not in out:
@@ -5571,11 +5628,11 @@ class LinkTrackerBlock(BaseBlock):
         return resp.text
 
     def _fetch_page_with_js(
-        self,
-        page_url: str,
-        timeout: float,
-        ua: str,
-        log: List[str],
+            self,
+            page_url: str,
+            timeout: float,
+            ua: str,
+            log: List[str],
     ) -> Tuple[str, List[Dict[str, str]]]:
         """
         Use Playwright to:
@@ -5601,7 +5658,7 @@ class LinkTrackerBlock(BaseBlock):
             with sync_playwright() as p:
                 browser = p.firefox.launch(headless=True)
                 page = browser.new_page(user_agent=ua)
-                js_timeout_ms = int(min(timeout, 10.0) * 1000)
+                js_timeout_ms = int(max(timeout, 10.0) * 1000)
                 page.goto(
                     page_url,
                     wait_until="domcontentloaded",
@@ -5680,75 +5737,47 @@ class LinkTrackerBlock(BaseBlock):
         from bs4 import BeautifulSoup
         from urllib.parse import urljoin, urlparse
 
-        # --- Base raw query & optional subpipeline expansion ---
+        # --- 1. Input & optional sub-pipeline (sitemap/xml/etc.) ---
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
-        subpipe_name = str(params.get("subpipeline", "")).strip()
+        subpipe_name = str(params.get("subpipeline", "") or "").strip()
 
         if subpipe_name:
-            # Use the same helper as PlaywrightBlock: expand raw prompt into queries
-            queries_to_run: Any = self.run_sub_pipeline(
+            pipeline_result: Any = self.run_sub_pipeline(
                 initial_value=query_raw,
                 pipeline_param_name="subpipeline",
                 parent_params=params,
             )
-            if isinstance(queries_to_run, str):
-                queries_to_run = [queries_to_run]
-            elif not isinstance(queries_to_run, list):
-                queries_to_run = [query_raw] if query_raw else []
         else:
-            queries_to_run = [query_raw] if query_raw else []
+            pipeline_result = query_raw
 
-        # Normalize & filter empties
-        queries_to_run = [str(q).strip() for q in queries_to_run if str(q).strip()]
-
-        if not queries_to_run:
-            return "", {
-                "error": "No query provided for LinkTracker (empty after subpipeline).",
-                "queries_run": [],
-            }
-
-        # Canonical query: first expanded query (used for keyword extraction etc.)
-        query = queries_to_run[0]
-
-        # --- Parameters ---
+        # --- 2. Configuration Parameters ---
         mode = str(params.get("mode", "docs")).lower()
-        num_pages_to_scan = int(
-            params.get("scan_limit", 5)
-        )  # How many search results to visit
-        timeout = float(params.get("timeout", 5.0))
-        verify_links = bool(
-            params.get("verify", True)
-        )  # Check if 200 OK
-        engine = str(params.get("engine", "duckduckgo")).lower()  # duckduckgo | google_cse
+        scan_limit = int(params.get("scan_limit", 5))
+        max_pages_total = int(params.get("max_pages_total", scan_limit))
+        max_pages_total = max(1, max_pages_total)
 
-        # NEW: JS & network-sniff options
+        timeout = float(params.get("timeout", 5.0))
+        verify_links = bool(params.get("verify", True))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
         use_js = bool(params.get("use_js", False))
         return_all_js_links = bool(params.get("return_all_js_links", False))
-        max_links_per_page = int(params.get("max_links_per_page", 500))  # soft cap
+        max_links_per_page = int(params.get("max_links_per_page", 500))
         search_results_cap = int(params.get("search_results_cap", 256))
         use_network_sniff = bool(params.get("use_network_sniff", False))
-        return_network_sniff_links = bool(
-            params.get("return_network_sniff_links", False)
-        )
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
 
-        # NEW: min_term_overlap
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
 
-        # Custom filters
         custom_ext = str(params.get("extensions", "")).split(",")
         keywords_in_url = str(params.get("url_keywords", "")).split(",")
-
-        # Required sites (domains/substrings)
         site_require_raw = str(params.get("site_require", "")).split(",")
         required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
         max_depth = int(params.get("max_depth", 0))
         max_depth = max(0, max_depth)
 
-        max_pages_total = int(params.get("max_pages_total", params.get("scan_limit", 5)))
-        max_pages_total = max(1, max_pages_total)
-
-        # Setup target extensions based on mode
+        # --- 3. Target Extensions ---
         targets = set()
         if mode == "media":
             targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
@@ -5756,9 +5785,7 @@ class LinkTrackerBlock(BaseBlock):
             targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
         elif mode == "archives":
             targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
-        # "custom" just uses extensions parameter
 
-        # Add custom extensions (remove empty strings)
         for e in custom_ext:
             e = e.strip()
             if not e:
@@ -5768,49 +5795,37 @@ class LinkTrackerBlock(BaseBlock):
             targets.add(e.lower())
 
         if not targets:
-            # Fallback: if nothing, assume docs
             targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
 
-        if not query:
-            return "", {"error": "No query provided for LinkTracker."}
-
-        # --- Keyword filtering: user + query tokens ---
+        # --- 4. Keyword Extraction (from the *raw* user query) ---
+        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
         strict_keywords = bool(params.get("strict_keywords", False))
 
-        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
+        if query_raw:
+            if strict_keywords:
+                whole = query_raw.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                q_tokens = self._extract_keywords_from_query(query_raw)
+                for qt in q_tokens:
+                    if qt not in keywords:
+                        keywords.append(qt)
 
-        if strict_keywords:
-            # Do NOT split the query into tokens — treat whole query as one keyword
-            whole = query.lower().strip()
-            if whole and whole not in keywords:
-                keywords.append(whole)
-        else:
-            # Default (existing behavior): split query into tokens
-            q_tokens = self._extract_keywords_from_query(query)
-            for qt in q_tokens:
-                if qt not in keywords:
-                    keywords.append(qt)
-
-        # --- Small helpers ---
+        # --- 5. Helper Functions ---
         def _clean_domain(u: str) -> str:
             try:
-                netloc = urlparse(u).netloc.lower()
-                return netloc.split(":")[0]
+                return urlparse(u).netloc.lower().split(":")[0]
             except Exception:
                 return ""
 
         def _allowed_by_required_sites(u: str) -> bool:
-            """
-            If required_sites is empty -> always True.
-            Otherwise, URL's domain must contain at least one of required_sites entries.
-            """
             if not required_sites:
                 return True
             d = _clean_domain(u)
             return any(req in d for req in required_sites)
 
         def _term_overlap_ok(haystack: str) -> bool:
-            """Require at least min_term_overlap distinct keyword hits in haystack."""
             if not keywords:
                 return True
             h = haystack.lower()
@@ -5822,86 +5837,125 @@ class LinkTrackerBlock(BaseBlock):
                     return True
             return False
 
-        # --- Step 1: Discovery (Find Hub Pages) ---
+        def _clean_path(u: str) -> str:
+            try:
+                return urlparse(u).path.lower()
+            except Exception:
+                return ""
 
         def _augment_search_query(q: str, mode: str, required_sites: list[str]) -> str:
-            """
-            Augment the raw query with:
-              • site: filters for all required_sites (if any)
-              • mode-specific hints (media/docs)
-            """
             sq = q.strip()
-
-            # --- Build site: clause from required_sites -------------------------
-            site_clauses: list[str] = []
+            site_clauses = []
             for raw in required_sites or []:
                 s = (raw or "").strip().lower()
                 if not s:
                     continue
-
-                # Strip protocol and path, keep just host-ish part
-                # e.g. "https://sub.example.com/foo" -> "sub.example.com"
                 if "://" in s:
                     s = s.split("://", 1)[1]
                 s = s.split("/", 1)[0].lstrip(".")
-
                 if not s:
                     continue
-
                 site_clauses.append(f"site:{s}")
 
             if site_clauses:
-                # (site:a OR site:b OR site:c) <query>
                 sites_expr = " OR ".join(site_clauses)
                 sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
 
-            # --- Mode-specific bias --------------------------------------------
-            # Only add these if they’re not already present to avoid duplication.
             q_lower = sq.lower()
             if mode == "media":
                 media_hint = "(mp3 OR flac OR m4a OR ogg)"
-                if "mp3" not in q_lower and "flac" not in q_lower and "m4a" not in q_lower and "ogg" not in q_lower:
+                if not any(x in q_lower for x in ["mp3", "flac", "m4a", "ogg"]):
                     sq = f"{sq} {media_hint}".strip()
             elif mode == "docs":
                 if "filetype:pdf" not in q_lower:
                     sq = f"{sq} filetype:pdf".strip()
-
             return sq
 
-        ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-
-        seen_search_urls: set[str] = set()
+        # --- 6. Search vs URL-list triage (sitemap/xml/etc.) ---
         candidate_pages: List[str] = []
+        direct_asset_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine = False
 
-        for q in queries_to_run:
-            search_q = _augment_search_query(q, mode, required_sites)
+        # If subpipeline (e.g., sitemap/xml) returned a URL list:
+        if isinstance(pipeline_result, list) and pipeline_result:
+            first_item = str(pipeline_result[0]).strip()
+            if first_item.startswith("http://") or first_item.startswith("https://"):
+                skip_search_engine = True
+                queries_to_run = ["<URL list>"]
 
-            if engine == "google_cse":
-                raw_pages = self._search_google_cse(
-                    search_q, search_results_cap, timeout
-                )
+                unique_urls = [
+                    str(u).strip() for u in pipeline_result if str(u).strip()
+                ]
+                unique_urls = list(dict.fromkeys(unique_urls))  # preserve order
+
+                for u in unique_urls:
+                    if not _allowed_by_required_sites(u):
+                        continue
+
+                    path = _clean_path(u)
+
+                    # 1) Direct asset match (e.g., .mp3/.flac/.pdf/etc.)
+                    if any(path.endswith(ext) for ext in targets):
+                        if _term_overlap_ok(u):
+                            direct_asset_urls.append(u)
+                        continue
+
+                    # 2) Junk static assets we never want to crawl
+                    if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        continue
+
+                    # 3) HTML-like pages worth scanning
+                    if not keywords or _term_overlap_ok(u):
+                        candidate_pages.append(u)
+
+                candidate_pages = candidate_pages[:max_pages_total]
+
+        # If we're *not* using a URL-list, fallback to search-engine queries
+        if not skip_search_engine:
+            if isinstance(pipeline_result, str) and pipeline_result.strip():
+                queries_to_run = [pipeline_result.strip()]
+            elif isinstance(pipeline_result, list):
+                # List of non-URL strings (e.g. from a prompt_query sub-block)
+                for qv in pipeline_result:
+                    qv_s = str(qv).strip()
+                    if qv_s:
+                        queries_to_run.append(qv_s)
             else:
-                raw_pages = self._search_duckduckgo(
-                    search_q, search_results_cap, ua, timeout
-                )
+                if query_raw:
+                    queries_to_run = [query_raw]
 
-            # Apply required_sites + truncate to overall caps
-            for u in raw_pages:
-                if u in seen_search_urls:
-                    continue
-                if _allowed_by_required_sites(u) or not required_sites:
-                    candidate_pages.append(u)
-                    seen_search_urls.add(u)
+            if not queries_to_run and query_raw:
+                queries_to_run = [query_raw]
 
-                # Respect both scan_limit (per block call) and max_pages_total (global safety)
-                if len(candidate_pages) >= num_pages_to_scan or len(candidate_pages) >= max_pages_total:
+        # Canonical query string (for display only)
+        query = queries_to_run[0] if queries_to_run else query_raw
+
+        # --- 7. Search-based discovery (if not URL-list mode) ---
+        if not skip_search_engine and queries_to_run:
+            ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+            seen_search_urls: set[str] = set()
+
+            for q in queries_to_run:
+                search_q = _augment_search_query(q, mode, required_sites)
+
+                if engine == "google_cse":
+                    raw_pages = self._search_google_cse(search_q, search_results_cap, timeout)
+                else:
+                    raw_pages = self._search_duckduckgo(search_q, search_results_cap, ua, timeout)
+
+                for u in raw_pages:
+                    if u in seen_search_urls:
+                        continue
+                    if _allowed_by_required_sites(u) or not required_sites:
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+                    if len(candidate_pages) >= max_pages_total:
+                        break
+                if len(candidate_pages) >= max_pages_total:
                     break
 
-            if len(candidate_pages) >= num_pages_to_scan or len(candidate_pages) >= max_pages_total:
-                break
-
-        # --- Step 2: Depth-based parallel scan ---
-        from collections import deque
+        # --- 8. Crawl / Page Scan ---
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         found_assets: List[Dict[str, Any]] = []
@@ -5909,16 +5963,54 @@ class LinkTrackerBlock(BaseBlock):
         visited_pages: set[str] = set()  # dedupe pages
 
         log: List[str] = []
-        all_js_links: List[Dict[str, str]] = []  # JS DOM links (debug)
-        all_network_links: List[Dict[str, str]] = []  # network-sniff hits (debug)
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
 
-        # --- Local helpers for this crawl ---
+        # 8a. First, harvest direct assets from URL list (sitemap/xml/etc.)
+        if direct_asset_urls:
+            session_direct = requests.Session()
+            session_direct.headers.update(
+                {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                  "PromptChat/LinkTracker"
+                }
+            )
 
+            for u in direct_asset_urls:
+                if u in seen_asset_urls:
+                    continue
+                seen_asset_urls.add(u)
+
+                status = "unverified"
+                size = "?"
+                if verify_links:
+                    try:
+                        h = session_direct.head(u, allow_redirects=True, timeout=3)
+                        if h.status_code == 200:
+                            status = "200 OK"
+                            cl = h.headers.get("Content-Length")
+                            if cl:
+                                size = f"{int(cl) // 1024} KB"
+                        else:
+                            status = f"Dead ({h.status_code})"
+                    except Exception:
+                        status = "Timeout/Error"
+
+                if not verify_links or status == "200 OK":
+                    filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
+                    filename = filename[:100]
+                    found_assets.append(
+                        {
+                            "text": filename,
+                            "url": u,
+                            "source": "<urls>",
+                            "size": size,
+                            "status": status,
+                        }
+                    )
+
+        # 8b. Page-worker for BFS
         def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
-            """
-            Worker: fetch + parse a single page, return assets and next pages.
-            Each worker uses its own requests.Session and Playwright instance.
-            """
             import requests
             from bs4 import BeautifulSoup
 
@@ -5928,7 +6020,6 @@ class LinkTrackerBlock(BaseBlock):
             local_assets: List[Dict[str, Any]] = []
             next_pages: List[str] = []
 
-            # Per-thread session
             session = requests.Session()
             session.headers.update(
                 {
@@ -5941,7 +6032,6 @@ class LinkTrackerBlock(BaseBlock):
                 links_on_page: List[Dict[str, str]] = []
                 html = ""
 
-                # Optional: network sniff first
                 sniff_items: List[Dict[str, str]] = []
                 if use_network_sniff:
                     sniff_html, sniff_items = self._fetch_page_with_network_sniff(
@@ -5964,7 +6054,6 @@ class LinkTrackerBlock(BaseBlock):
                             }
                         )
 
-                # Optional JS rendering for DOM links
                 if use_js:
                     js_html, js_links = self._fetch_page_with_js(
                         page_url,
@@ -6044,11 +6133,9 @@ class LinkTrackerBlock(BaseBlock):
                     parsed = urlparse(full_url)
                     path = parsed.path.lower()
 
-                    # Check extension
                     if not any(path.endswith(ext) for ext in targets):
                         continue
 
-                    # Keyword filtering with min_term_overlap
                     if keywords:
                         link_text = (link.get("text") or "").lower()
                         url_text = full_url.lower().replace("%20", " ")
@@ -6056,11 +6143,9 @@ class LinkTrackerBlock(BaseBlock):
                         if not _term_overlap_ok(haystack):
                             continue
 
-                    # Required sites at asset level
                     if not _allowed_by_required_sites(full_url):
                         continue
 
-                    # Verify (HEAD)
                     status = "unverified"
                     size = "?"
                     if verify_links:
@@ -6152,7 +6237,6 @@ class LinkTrackerBlock(BaseBlock):
                             continue
 
                         lpath = urlparse(full_url).path.lower()
-                        # Skip direct asset URLs (we only want hubs)
                         if any(lpath.endswith(ext) for ext in targets):
                             continue
 
@@ -6183,19 +6267,17 @@ class LinkTrackerBlock(BaseBlock):
             elif not required_sites:
                 frontier.append(u)
 
-        # Ensure we don't exceed total page cap at depth 0
         frontier = frontier[:max_pages_total]
 
         current_depth = 0
         while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
-            # Filter out already-visited URLs & enforce cap
             remaining_slots = max_pages_total - len(visited_pages)
             batch = [u for u in frontier if u not in visited_pages][:remaining_slots]
             if not batch:
                 break
 
             next_frontier: List[str] = []
-            max_workers = min(8, len(batch))  # tune if you want
+            max_workers = min(8, len(batch))
 
             with ThreadPoolExecutor(max_workers=max_workers) as ex:
                 future_map = {
@@ -6208,12 +6290,10 @@ class LinkTrackerBlock(BaseBlock):
                     page_url = res["page"]
                     visited_pages.add(page_url)
 
-                    # Merge logs / debug links
                     log.extend(res["log"])
                     all_js_links.extend(res["js_links"])
                     all_network_links.extend(res["network_links"])
 
-                    # Merge assets (dedupe by URL)
                     for asset in res["assets"]:
                         a_url = asset["url"]
                         if not a_url or a_url in seen_asset_urls:
@@ -6221,15 +6301,14 @@ class LinkTrackerBlock(BaseBlock):
                         seen_asset_urls.add(a_url)
                         found_assets.append(asset)
 
-                    # Build next frontier (dedupe at this level)
                     for nxt in res["next_pages"]:
                         if nxt not in visited_pages:
                             next_frontier.append(nxt)
 
-            # Prepare for next depth
             current_depth += 1
-            frontier = list(dict.fromkeys(next_frontier))  # preserve order & dedupe
-        # --- Step 3: Format Output ---
+            frontier = list(dict.fromkeys(next_frontier))
+
+        # --- 9. Format Output ---
         from urllib.parse import urlparse as _urlparse
 
         if not found_assets:
@@ -6282,7 +6361,6 @@ class LinkTrackerBlock(BaseBlock):
                 "queries_run": queries_to_run,
             }
 
-        # We have assets
         lines = [f"### LinkTracker Found {len(found_assets)} Assets"]
         lines.append(
             f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
@@ -6340,29 +6418,30 @@ class LinkTrackerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "rare aphex twin interview",
-            "mode": "docs",              # media, docs, archives, custom
+            "timeout": 5,
+            "mode": "docs",  # media, docs, archives, custom
             "scan_limit": 5,
             "search_results_cap": 256,
             "verify": True,
-            "extensions": ".pdf,.txt",   # optional overrides
+            "extensions": ".pdf,.txt",  # optional overrides
             "url_keywords": "archive,download",  # optional filter
-            "engine": "duckduckgo",      # or: google_cse
-            "site_require": "",          # e.g. 'archive.org,ca.archive.org'
-            "use_js": False,             # Enable Playwright JS rendering
+            "engine": "duckduckgo",  # or: google_cse
+            "site_require": "",  # e.g. 'archive.org,ca.archive.org'
+            "use_js": False,  # Enable Playwright JS rendering
             "return_all_js_links": False,
             "max_links_per_page": 500,
             "strict_keywords": False,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
-            # NEW:
-            "min_term_overlap": 1,       # require at least N keyword hits in URL/text
-            "max_depth": 0,              # 0 = search pages only, 1 = follow their links, etc.
-            "max_pages_total": 32,       # global safety cap on pages crawled
-            "subpipeline": "",
+            "min_term_overlap": 1,  # require at least N keyword hits in URL/text
+            "max_depth": 0,  # 0 = search pages only, 1 = follow their links, etc.
+            "max_pages_total": 32,  # global safety cap on pages crawled
+            "subpipeline": "",  # e.g. 'prompt_query|sitemap' or 'prompt_query|xml'
         }
 
 
 BLOCKS.register("linktracker", LinkTrackerBlock)
+
 
 # ======================= YouTubeDataBlock ==================================
 @dataclass
@@ -6556,7 +6635,8 @@ class YouTubeDataBlock(BaseBlock):
                     "duration_display": _fmt_duration(dur_sec),
                     "view_count": int(stats.get("viewCount", 0)) if stats.get("viewCount") is not None else None,
                     "like_count": int(stats.get("likeCount", 0)) if stats.get("likeCount") is not None else None,
-                    "comment_count": int(stats.get("commentCount", 0)) if stats.get("commentCount") is not None else None,
+                    "comment_count": int(stats.get("commentCount", 0)) if stats.get(
+                        "commentCount") is not None else None,
                 }
             )
 
@@ -6606,11 +6686,11 @@ class YouTubeDataBlock(BaseBlock):
         return {
             "query": "Playboi Carti unreleased",
             "max_results": 5,
-            "order": "relevance",        # date | rating | relevance | title | viewCount
-            "safe_search": "moderate",   # none | moderate | strict
+            "order": "relevance",  # date | rating | relevance | title | viewCount
+            "safe_search": "moderate",  # none | moderate | strict
             "channel_id": "",
-            "video_duration": "any",     # any | short | medium | long
-            "published_after": "",       # RFC3339, e.g. 2023-01-01T00:00:00Z
+            "video_duration": "any",  # any | short | medium | long
+            "published_after": "",  # RFC3339, e.g. 2023-01-01T00:00:00Z
             "export_key": "youtube_results",
             "export_to_memory": True,
             "engine_note": "Uses GOOGLE_API_KEY env var (YouTube Data API v3)",
@@ -6621,6 +6701,9 @@ BLOCKS.register("youtube", YouTubeDataBlock)
 
 
 # ======================= VideoLinkTrackerBlock =============================
+
+# ======================= VideoLinkTrackerBlock =============================
+
 @dataclass
 class VideoLinkTrackerBlock(BaseBlock):
     """
@@ -6645,6 +6728,13 @@ class VideoLinkTrackerBlock(BaseBlock):
           Require at least N distinct keyword tokens (from the query) to appear
           in the URL/text haystack. For "lil uzi vert", setting
           min_term_overlap=2 or 3 biases strongly to pages *about* Lil Uzi Vert.
+      • NEW: subpipeline (optional):
+          - videotracker.subpipeline="prompt_query"
+          - videotracker.subpipeline="prompt_query|sitemap"
+          - videotracker.subpipeline="prompt_query|xml"
+        If the final sub-block returns:
+          • List[str] of URLs → treat as hub pages to crawl (sitemap/xml).
+          • List[str] of queries → run search for each (prompt_query).
     """
 
     # --- Constants --------------------------------------------------------
@@ -6964,9 +7054,37 @@ class VideoLinkTrackerBlock(BaseBlock):
         from bs4 import BeautifulSoup
         from urllib.parse import urlparse as _urlparse
 
-        # --- Parameters ---
-        query = str(params.get("query", "") or str(payload or "")).strip()
+        # --- Parameters & OPTIONAL subpipeline -----------------------------
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
         source = str(params.get("source", "search")).lower()
+
+        # NEW: optional subpipeline (prompt_query, sitemap, xml, etc.)
+        subpipe_name = str(params.get("subpipeline", "") or "").strip()
+        pipeline_urls: List[str] = []
+        pipeline_queries: List[str] = []
+
+        if subpipe_name:
+            # Only run subpipeline if the parameter exists & is non-empty
+            pr = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+            )
+
+            if isinstance(pr, list):
+                for item in pr:
+                    s = str(item or "").strip()
+                    if not s:
+                        continue
+                    if s.startswith("http://") or s.startswith("https://"):
+                        pipeline_urls.append(s)
+                    else:
+                        pipeline_queries.append(s)
+            elif isinstance(pr, str):
+                # Allow subpipeline to rewrite the query string if it wants
+                s = pr.strip()
+                if s:
+                    query_raw = s
 
         sites_raw = str(params.get("sites", "")).split(",")
         sites = [s.strip().lower() for s in sites_raw if s.strip()]
@@ -6998,12 +7116,14 @@ class VideoLinkTrackerBlock(BaseBlock):
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
 
-        if not query and source == "search":
+        # Old behavior: only error if no query AND no subpipeline
+        if not query_raw and source == "search" and not subpipe_name:
             return "", {
                 "error": "VideoLinkTracker: No query provided for 'search' source."
             }
 
-        keywords = self._get_keywords_from_query(query)
+        # Keywords are always extracted from the *original* query text
+        keywords = self._get_keywords_from_query(query_raw)
         log: List[str] = []
         found_assets: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
@@ -7227,6 +7347,14 @@ class VideoLinkTrackerBlock(BaseBlock):
         # ------------------------------------------------------------------
         # Step 1: Discovery (Populate Crawl Queue)
         # ------------------------------------------------------------------
+
+        # NEW: if sitemap/xml subpipeline returned URLs, treat them as hub pages
+        if pipeline_urls:
+            limited = pipeline_urls[:scan_limit] if scan_limit > 0 else pipeline_urls
+            for u in limited:
+                if _allowed_by_required_sites(u):
+                    pages_to_crawl_tuples.append((u, 0))
+
         if source == "payload":
             log.append("Reading hub pages from payload...")
 
@@ -7262,32 +7390,46 @@ class VideoLinkTrackerBlock(BaseBlock):
         else:  # source == "search"
             log.append("Finding hub pages via built-in search...")
 
-            for site_domain in sites:
-                search_q = (
-                    f"site:{site_domain} {query}"
-                    if not global_mode
-                    else query
-                )
-                log.append(f"Searching {engine} for: {search_q}")
+            # Queries from prompt_query subpipeline OR fallback to raw query
+            search_queries: List[str] = []
+            if pipeline_queries:
+                search_queries = pipeline_queries
+            elif query_raw:
+                search_queries = [query_raw]
 
-                if engine == "google_cse":
-                    hub_pages = self._search_google_cse(
-                        search_q, scan_limit, timeout
-                    )
-                else:
-                    hub_pages = self._search_duckduckgo(
-                        search_q, scan_limit, ua, timeout
-                    )
+            if not search_queries and not pipeline_urls:
+                log.append("No query or subpipeline-derived search queries; skipping search.")
+            else:
+                for site_domain in sites:
+                    for q in search_queries:
+                        if not q:
+                            continue
+                        search_q = (
+                            f"site:{site_domain} {q}"
+                            if not global_mode
+                            else q
+                        )
+                        log.append(f"Searching {engine} for: {search_q}")
 
-                if not hub_pages:
-                    log.append(f"No hub pages found for: {search_q}")
-                else:
-                    for page_url in hub_pages[:scan_limit]:
-                        if page_url not in visited_pages:
-                            pages_to_crawl_tuples.append((page_url, 0))
+                        if engine == "google_cse":
+                            hub_pages = self._search_google_cse(
+                                search_q, scan_limit, timeout
+                            )
+                        else:
+                            hub_pages = self._search_duckduckgo(
+                                search_q, scan_limit, ua, timeout
+                            )
 
-                if global_mode:
-                    break
+                        if not hub_pages:
+                            log.append(f"No hub pages found for: {search_q}")
+                        else:
+                            for page_url in hub_pages[:scan_limit]:
+                                if page_url not in visited_pages:
+                                    pages_to_crawl_tuples.append((page_url, 0))
+
+                        if global_mode:
+                            # For global mode, we only need to run once per query
+                            break
 
         # ------------------------------------------------------------------
         # Step 2: Deep Scan (Wrapper around crawl_page)
@@ -7364,10 +7506,15 @@ class VideoLinkTrackerBlock(BaseBlock):
             else ("[all]" if global_mode else ", ".join(sites))
         )
 
+        # Display query: prefer raw, otherwise first prompt_query variant
+        display_query = query_raw
+        if not display_query and pipeline_queries:
+            display_query = pipeline_queries[0]
+
         if not found_assets:
             base_text = (
                 f"### VideoTracker: No video assets found.\n"
-                f"Source: {source} | Scanned {display_sites} for query: {query}\n"
+                f"Source: {source} | Scanned {display_sites} for query: {display_query}\n"
                 f"Required keywords: {keywords}\n"
                 f"min_term_overlap: {min_term_overlap}\n"
                 f"Log: {log}\n"
@@ -7411,6 +7558,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "source": source,
+                "subpipeline": subpipe_name,
             }
 
         # Sort assets for nicer display (shorter URLs first)
@@ -7418,7 +7566,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
         lines = [f"### VideoTracker Found {len(found_assets)} Assets"]
         lines.append(
-            f"_Source: {source} | Query: {query} | Sites: {display_sites} | "
+            f"_Source: {source} | Query: {display_query} | Sites: {display_sites} | "
             f"Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
             f"Pages: {pages_processed}_"
         )
@@ -7471,6 +7619,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "source": source,
+            "subpipeline": subpipe_name,
         }
 
     def get_params_info(self) -> Dict[str, Any]:
@@ -7494,11 +7643,14 @@ class VideoLinkTrackerBlock(BaseBlock):
             # NEW:
             "max_depth": 0,  # 0 = search pages only, 1 = follow their links, etc.
             "max_pages_total": 32,  # global safety cap on pages crawled
+            "subpipeline": "",  # e.g. "prompt_query|sitemap" or "prompt_query|xml"
         }
 
 
 # Register the block
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
+
+
 
 # ======================= TorOnionBlock =============================
 @dataclass
@@ -7696,13 +7848,13 @@ class TorOnionBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "privacy email",
-            "mode": "list",                 # list | preview
-            "scan_limit": 10,               # number of DDG result URLs to crawl
-            "max_onions": 50,               # maximum onion URLs to return
-            "tor_host": "127.0.0.1",        # Tor SOCKS proxy host
-            "tor_port": 9050,               # Tor SOCKS proxy port (9150 for Tor Browser)
-            "timeout": 10.0,                # per-request timeout
-            "sleep_between": 0.0,           # delay between fetches
+            "mode": "list",  # list | preview
+            "scan_limit": 10,  # number of DDG result URLs to crawl
+            "max_onions": 50,  # maximum onion URLs to return
+            "tor_host": "127.0.0.1",  # Tor SOCKS proxy host
+            "tor_port": 9050,  # Tor SOCKS proxy port (9150 for Tor Browser)
+            "timeout": 10.0,  # per-request timeout
+            "sleep_between": 0.0,  # delay between fetches
             "user_agent": "Mozilla/5.0 TorOnionBlock/1.0",
         }
 
