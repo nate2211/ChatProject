@@ -7,6 +7,7 @@ import ast
 import functools
 import html
 import json
+import math
 import os
 import re
 import sqlite3
@@ -19,6 +20,7 @@ import os as _os
 import time
 from urllib.parse import urlencode, urlparse, urljoin
 import feedparser
+import numpy as np
 import requests
 from playwright.sync_api import BrowserContext
 from registry import BLOCKS
@@ -3201,11 +3203,19 @@ class CodeBlock(BaseBlock):
         # --- [FIXED] Only pass known/safe params to model constructor ---
         # This prevents the `prompt=` kwarg from crashing the model's __init__
         init_kwargs: Dict[str, Any] = {}
-        model_init_keys = ["max_terms", "max_new_tokens", "temperature", "top_p", "top_k", "device", "mode"]
+        model_init_keys = [
+            "model_name",        # <-- ADD THIS LINE
+            "max_terms",
+            "max_new_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "device",
+            "mode",
+        ]
         for key in model_init_keys:
             if key in params:
                 init_kwargs[key] = params[key]
-
         try:
             model = get_chat_model(model_name, **init_kwargs)
         except Exception as e:
@@ -3905,275 +3915,295 @@ class CodeCorpusBlock(BaseBlock):
 BLOCKS.register("codecorpus", CodeCorpusBlock)
 
 
-# ---------------- CodeSearch (prioritize code kind) ----------------
+
 @dataclass
 class CodeSearchBlock(BaseBlock):
     """
-    Searches a pre-built CodeCorpus SQLite FTS5 database for relevant snippets.
-    This is the "Retrieval" part of a RAG pipeline for CodeBlock.
+    "Smarter" Code Retrieval using SQLite FTS + Numpy Vector Reranking.
 
-    This improved version features a more robust, content-aware language
-    detection for syntax highlighting and a slightly refined query parser.
+    Features:
+      • Retrieval: Fetches a large pool of candidates (top_k * 5) using SQLite FTS5.
+      • Vectorization: Uses Numpy to build a Term-Document Matrix based on query terms.
+      • Scoring: Computes Cosine Similarity (Query vs. Candidates).
+      • Heuristics: Boosts scores for 'code' vs 'prose', and penalizes 'spaghetti' code.
+      • Diversity: Penalizes multiple chunks from the same file to ensure broad context.
 
     Inputs:
-      --extra codesearch.query="how to plot with pandas"
+      --extra codesearch.query="how to implement a router in python"
 
-    Params:
-      db_path: Path to the SQLite DB (default: code_corpus.db)
-      top_k: Number of snippets to retrieve (default: 5)
-      kind: 'all', 'code', 'prose' (default: 'all')
-      export_key: Memory key to save context to (default: code_search_context)
-      inject: Inject the results into the payload (default: True)
-      max_chars: Truncate the total context (default: 4000)
-      use_bm25: Try to use bm25(docs) for ranking (default: True, with safe fallback)
-      prefix_match: Add '*' to terms for prefix-match (default: True)
+    Requires:
+      `pip install numpy` (Falls back to standard python scoring if missing).
     """
 
-    # Minimal stop-word list for queries
-    _SEARCH_STOP_WORDS = set([
+    _SEARCH_STOP_WORDS = {
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
         "how", "in", "is", "it", "of", "on", "or", "show", "tell", "that",
         "the", "this", "to", "what", "when", "where", "which", "with",
-        "me", "give", "using", "write", "a", "basic", "script", "to"
-    ])
+        "me", "give", "using", "write", "basic", "script", "code", "function"
+    }
 
-    def _format_query(self, query: str, *, prefix_match: bool = True) -> str:
-        """
-        Format a user query for FTS5 'MATCH'.
+    # --- 1. Text Processing & Helpers ---
 
-        - Strips punctuation that tends to break FTS syntax.
-        - Drops stop words.
-        - AND-joins remaining terms for relevance.
-        - Optionally turns each term into a prefix search: foo -> "foo*"
-        """
-        # Keep word chars, whitespace, dashes, dots, and symbols common in code.
-        cleaned_query = re.sub(r"[^\w\s\-.+#]", " ", query or "")
+    def _tokenize(self, text: str) -> List[str]:
+        """Splits text into lowercase alphanumeric tokens."""
+        return re.findall(r"\w+", (text or "").lower())
 
-        terms = []
-        raw_terms = []
-        for t in cleaned_query.split():
-            raw = t.strip()
-            if not raw:
-                continue
-            raw_terms.append(raw)
-
-            term = raw.lower()
-            if term in self._SEARCH_STOP_WORDS or len(term) <= 1:
-                continue
-
-            # Add prefix wildcard for better matching, but not on very short terms.
-            if prefix_match and len(term) > 2:
-                term = term + "*"
-
-            terms.append(f'"{term}"')
-
-        if not terms:
-            # Fallback: if everything was filtered, just OR the raw tokens
-            return " OR ".join(f'"{t.lower()}"' for t in raw_terms if t.strip())
-
-        # Use AND for more relevant hits
-        return " AND ".join(terms)
+    def _extract_identifiers(self, text: str) -> Set[str]:
+        """Extracts likely variable/function names (snake_case, camelCase)."""
+        # (Simplified regex for speed)
+        return set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text))
 
     def _guess_code_lang(self, code_snippet: str) -> str:
-        """
-        Heuristically guess the programming language of a code snippet
-        based on common keywords and syntax.
-        """
-        # Use a copy for manipulation
-        code = code_snippet.strip()
-        lower_code = code.lower()
-
-        # High-confidence signals first
-        if "import React" in code or "useState" in code or ".jsx" in lower_code:
-            return "jsx"
-        if "function(" in lower_code or "=>" in code or "const " in lower_code:
-            if "interface " in lower_code or ": string" in code or " type " in lower_code:
-                return "typescript"
-            return "javascript"
-        if "import " in lower_code and "def " in lower_code:
-            return "python"
-        if "#include" in lower_code and "std::" in lower_code:
-            return "cpp"
-        if "public static void main" in lower_code or "System.out.println" in lower_code:
-            return "java"
-        if "using System;" in lower_code or "namespace " in lower_code:
-            return "csharp"
-        if "fn main" in lower_code and ("let mut" in lower_code or "&str" in lower_code):
-            return "rust"
-        if "package main" in lower_code and "func main" in lower_code:
-            return "go"
-
-        # Fallback to empty for the ``` fence
+        """Heuristic language detection for code blocks."""
+        s = code_snippet.lower()
+        if "def " in s and "import " in s: return "python"
+        if "function" in s and "{" in s: return "javascript"
+        if "public class" in s or "system.out" in s: return "java"
+        if "#include" in s and "std::" in s: return "cpp"
+        if "using system" in s or "namespace" in s: return "csharp"
         return ""
 
-    def _run_query(
+    def _format_fts_query(self, query: str) -> str:
+        """Formats a raw string into a valid SQLite FTS5 query string."""
+        tokens = [t for t in self._tokenize(query) if t not in self._SEARCH_STOP_WORDS]
+        if not tokens:
+            return query.replace('"', '""')  # Fallback
+
+        # Strategy: (term1* AND term2*) OR (term1* OR term2*)
+        and_part = " AND ".join(f'"{t}"*' for t in tokens)
+        or_part = " OR ".join(f'"{t}"*' for t in tokens)
+        return f"({and_part}) OR ({or_part})"
+
+    # --- 2. Numpy Scoring Engine ---
+
+    def _rank_with_numpy(
             self,
-            conn: sqlite3.Connection,
-            fts_query: str,
-            kind: str,
-            top_k: int,
-            use_bm25: bool,
-    ) -> Tuple[List[sqlite3.Row], bool]:
+            query: str,
+            candidates: List[Dict[str, Any]]
+    ) -> List[Tuple[float, Dict[str, Any]]]:
         """
-        Run a single FTS search for a given kind ('code' or 'prose').
-
-        Returns (rows, used_bm25_for_this_query).
+        Uses Numpy to perform Cosine Similarity + Heuristic weighting.
         """
-        rows: List[sqlite3.Row] = []
-        used_bm25_here = False
+        if not candidates:
+            return []
 
-        # Prefer bm25(docs) ordering if available, as it provides better relevance.
-        if use_bm25:
-            sql = (
-                "SELECT url, title, content, kind, bm25(docs) AS score "
-                "FROM docs "
-                "WHERE docs MATCH ? AND kind = ? "
-                "ORDER BY score "  # Lower (more negative) bm25 score is better
-                "LIMIT ?;"
-            )
-            try:
-                rows = conn.execute(sql, (fts_query, kind, int(top_k))).fetchall()
-                used_bm25_here = True
-                return rows, used_bm25_here
-            except sqlite3.Error as e:
-                # If bm25 isn't available, fall through to simple MATCH fallback
-                if "no such function: bm25" not in str(e).lower():
-                    raise  # A real error occurred
+        # --- A. Prepare Vocabulary (Query-Centric) ---
+        # We only care about dimensions (words) that exist in the query.
+        q_tokens = [t for t in self._tokenize(query) if t not in self._SEARCH_STOP_WORDS]
+        vocab = sorted(list(set(q_tokens)))
 
-        # Fallback: rely on FTS5 default ranking
-        sql = (
-            "SELECT url, title, content, kind "
-            "FROM docs "
-            "WHERE docs MATCH ? AND kind = ? "
-            "LIMIT ?;"
-        )
-        rows = conn.execute(sql, (fts_query, kind, int(top_k))).fetchall()
-        return rows, used_bm25_here
+        if not vocab:
+            # If query was only stopwords, return SQLite order
+            return [(1.0, c) for c in candidates]
+
+        n_docs = len(candidates)
+        n_terms = len(vocab)
+
+        # --- B. Build Matrices ---
+        # Query Vector (1 x V)
+        # Doc Matrix   (N x V)
+
+        # 1. Query Vector (Binary: 1 if term exists)
+        Q = np.ones(n_terms, dtype=np.float32)
+
+        # 2. Document Matrix (Term Counts)
+        D = np.zeros((n_docs, n_terms), dtype=np.float32)
+
+        # 3. Feature Arrays for Heuristics
+        kinds_score = np.zeros(n_docs, dtype=np.float32)
+        lengths_score = np.zeros(n_docs, dtype=np.float32)
+
+        vocab_map = {term: i for i, term in enumerate(vocab)}
+
+        for i, doc in enumerate(candidates):
+            content = (doc.get("content") or "").lower()
+            title = (doc.get("title") or "").lower()
+            kind = (doc.get("kind") or "prose").lower()
+
+            # Fill Document Matrix
+            # We give 2x weight to matches in the Title
+            doc_tokens = self._tokenize(content) + (self._tokenize(title) * 2)
+
+            for t in doc_tokens:
+                if t in vocab_map:
+                    D[i, vocab_map[t]] += 1.0
+
+            # Fill Heuristic Arrays
+            # 1. Kind Boost: Code > Prose
+            if "code" in kind:
+                kinds_score[i] = 1.2
+            else:
+                kinds_score[i] = 0.9
+
+            # 2. Length Heuristic (Bell curve preference for medium chunks)
+            # Small (<100 chars) = bad. Huge (>3000 chars) = bad.
+            ln = len(content)
+            if ln < 100:
+                lengths_score[i] = 0.5
+            elif ln > 3000:
+                lengths_score[i] = 0.7
+            else:
+                lengths_score[i] = 1.0
+
+        # --- C. TF-IDF Weighing (Simplified) ---
+        # Calculate Document Frequency (how many docs contain term t)
+        df = np.sum(D > 0, axis=0)
+        # Avoid divide by zero
+        idf = np.log((n_docs + 1) / (df + 1)) + 1
+
+        # Apply IDF to Document Matrix
+        D_tfidf = D * idf
+
+        # --- D. Cosine Similarity ---
+        # Dot product of Query and Docs
+        # Q is all 1s (scaled by IDF effectively in dot product if we weighed Q,
+        # but here we map Q against D_tfidf directly)
+
+        # Dot product: sum of weights for matched terms
+        dot_products = np.dot(D_tfidf, Q)
+
+        # Norms (magnitude of vectors)
+        doc_norms = np.linalg.norm(D_tfidf, axis=1)
+        q_norm = np.linalg.norm(Q)
+
+        # Avoid zero division
+        doc_norms[doc_norms == 0] = 1.0
+
+        cosine_sim = dot_products / (doc_norms * q_norm)
+
+        # --- E. Final Weighted Score ---
+        # Score = CosineSim * KindBoost * LengthBoost
+        final_scores = cosine_sim * kinds_score * lengths_score
+
+        # Zip and Sort
+        results = []
+        for i in range(n_docs):
+            results.append((float(final_scores[i]), candidates[i]))
+
+        # Sort Descending
+        results.sort(key=lambda x: x[0], reverse=True)
+        return results
+
+
+    # --- 3. Main Execution ---
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         query = str(params.get("query", "")).strip()
         if not query:
-            return str(payload), {"error": "CodeSearchBlock requires 'query' param."}
+            return str(payload), {"error": "CodeSearchBlock: 'query' parameter is required."}
 
         db_path = str(params.get("db_path", "code_corpus.db"))
         top_k = int(params.get("top_k", 5))
-        kind = str(params.get("kind", "all")).lower()
         export_key = str(params.get("export_key", "code_search_context"))
+        max_chars = int(params.get("max_chars", 6000))
         inject = bool(params.get("inject", True))
-        max_chars = int(params.get("max_chars", 4000))
-        use_bm25 = bool(params.get("use_bm25", True))
-        prefix_match = bool(params.get("prefix_match", True))
 
-        fts_query = self._format_query(query, prefix_match=prefix_match)
-        if not fts_query:
-            return (
-                str(payload),
-                {"error": "Query was empty after filtering stop words.", "query": query},
-            )
+        # 1. Fetch Candidates from SQLite
+        # We fetch 4x top_k to give the Numpy reranker a good pool to filter from.
+        fetch_limit = top_k * 4
+        fts_query = self._format_fts_query(query)
 
-        rows: List[sqlite3.Row] = []
-        used_bm25_any = False
-
+        rows = []
         try:
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
-
-                # 1. Prioritize code hits, as they are generally more valuable.
-                if kind != "prose":
-                    code_rows, used_bm25_code = self._run_query(
-                        conn, fts_query, "code", top_k, use_bm25
-                    )
-                    rows.extend(code_rows)
-                    used_bm25_any = used_bm25_any or used_bm25_code
-
-                # 2. If we still need more results, fetch prose hits.
-                if kind != "code" and len(rows) < top_k:
-                    remaining = max(top_k - len(rows), 1)
-                    prose_rows, used_bm25_prose = self._run_query(
-                        conn, fts_query, "prose", remaining, use_bm25
-                    )
-                    rows.extend(prose_rows)
-                    used_bm25_any = used_bm25_any or used_bm25_prose
-
+                # Fetch basic matches
+                sql = f"""
+                    SELECT url, title, content, kind 
+                    FROM docs 
+                    WHERE docs MATCH ? 
+                    LIMIT ?
+                """
+                cursor = conn.execute(sql, (fts_query, fetch_limit))
+                # Convert to list of dicts so we can mutate/score easily
+                rows = [dict(row) for row in cursor.fetchall()]
         except sqlite3.Error as e:
-            err_msg = f"DB search failed (is {db_path} built?): {e}"
-            return str(payload), {"error": err_msg, "query": fts_query}
-        # --- [FIX] ---
-        # Initialize counters *before* the if/else block
-        code_hits = 0
-        prose_hits = 0
-        # --- [END FIX] ---
+            return str(payload), {"error": f"DB Error: {e}", "query": query}
+
         if not rows:
-            context = f"# No code snippets found for query: {query}"
-        else:
-            context_parts: List[str] = []
-            total_chars = 0
-            code_hits = 0
-            prose_hits = 0
+            return str(payload), {"note": "No results found in SQLite.", "hits": 0}
 
-            for r in rows[:top_k]:
-                content = (r["content"] or "").strip()
-                if not content:
-                    continue
+        # 2. Re-rank (Vector vs Fallback)
+        scored_candidates = self._rank_with_numpy(query, rows)
+        ranker_used = "numpy_cosine"
 
-                knd = r["kind"] or "prose"
-                header = f"### {knd.upper()} from {r['title'] or r['url']}\n"
+        # 3. Apply Diversity Filter & Final Selection
+        # We want to avoid filling the context with 5 chunks from the exact same file.
+        final_selection = []
+        seen_files = {}  # filename -> count
 
-                if knd == "code":
-                    # Use the improved content-aware language guesser.
-                    lang = self._guess_code_lang(content)
-                    body = f"```{lang}\n{content}\n```\n"
-                    code_hits += 1
-                else:
-                    body = content + "\n"
-                    prose_hits += 1
+        total_chars = 0
 
-                piece = header + body
-                if total_chars > 0 and (total_chars + len(piece) > max_chars):
-                    # Stop if we'd exceed the budget
-                    break
+        for score, doc in scored_candidates:
+            if len(final_selection) >= top_k:
+                break
 
-                context_parts.append(piece)
-                total_chars += len(piece)
+            # Extract file path/name from URL or Title for grouping
+            # Usually URL is "path/to/file::chunk_name"
+            origin = doc['url'].split("::")[0]
 
-            if not context_parts:
-                context = f"# No valid snippets found for query: {query}"
+            # Diversity Penalty: Skip if we already have 2 chunks from this file
+            if seen_files.get(origin, 0) >= 2:
+                continue
+
+            # Length cap check
+            content = doc['content']
+            if total_chars + len(content) > max_chars:
+                continue
+
+            final_selection.append(doc)
+            seen_files[origin] = seen_files.get(origin, 0) + 1
+            total_chars += len(content)
+
+        # 4. Format Output
+        context_blocks = []
+        for doc in final_selection:
+            title = doc['title']
+            kind = doc['kind']
+            content = doc['content']
+
+            # Add nice markdown fencing
+            lang = ""
+            if "code" in kind:
+                lang = kind.split(":")[-1] if ":" in kind else self._guess_code_lang(content)
+
+            header = f"### {kind.upper()} | {title}"
+            if lang and "code" in kind:
+                block = f"{header}\n```{lang}\n{content}\n```"
             else:
-                context = "\n---\n".join(context_parts)
-                if len(context) > max_chars:
-                    context = context[:max_chars] + "\n... (truncated)"
+                block = f"{header}\n{content}"
 
-        # Save to memory for other blocks and optionally inject into payload
+            context_blocks.append(block)
+
+        full_context = "\n\n".join(context_blocks)
+
+        # 5. Save & Return
         store = Memory.load()
-        store[export_key] = context
+        store[export_key] = full_context
         Memory.save(store)
-
-        out_payload = f"{payload}\n\n[code_search_context]\n{context}" if inject else str(payload)
 
         meta = {
             "query": query,
-            "fts_query": fts_query,
-            "db_path": db_path,
-            "hits": len(rows),
-            "code_hits": code_hits,
-            "prose_hits": prose_hits,
-            "export_key": export_key,
-            "context_len": len(context),
-            "used_bm25": used_bm25_any,
+            "hits_found": len(rows),
+            "hits_returned": len(final_selection),
+            "ranker": ranker_used,
+            "diversity_groups": len(seen_files)
         }
-        return out_payload.strip(), meta
+
+        out_text = str(payload)
+        if inject and full_context:
+            out_text += f"\n\n[{export_key}]\n{full_context}"
+
+        return out_text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "query": "REQUIRED: search query",
+            "query": "REQUIRED. The search string.",
             "db_path": "code_corpus.db",
             "top_k": 5,
-            "kind": "all",
-            "export_key": "code_search_context",
             "inject": True,
-            "max_chars": 4000,
-            "use_bm25": True,
-            "prefix_match": True,
+            "export_key": "code_search_context",
+            "max_chars": 6000
         }
 
 
@@ -4190,9 +4220,72 @@ class LocalCodeCorpusBlock(BaseBlock):
     This allows your RAG pipeline to have context on your local projects.
     It tracks modification times and only updates new or changed files.
 
-    NEW: For .py files, it uses AST to index functions and classes individually
+    For .py files, it uses AST to index functions and classes individually
     for much more accurate search results.
+
+    Enhanced:
+      • Language-aware 'kind' field (code:py, code:js, prose:md, ...)
+      • Markdown fences keep their language (```python vs ```js)
+      • Python chunks get more descriptive titles and lightweight headers
+      • max_class_lines param to avoid indexing giant classes as single blobs
     """
+
+    # Map extensions to languages (for kind tagging)
+    LANG_BY_EXT = {
+        ".py": "python",
+        ".js": "javascript",
+        ".ts": "typescript",
+        ".md": "markdown",
+        ".txt": "text",
+        ".java": "java",
+        ".cpp": "cpp",
+        ".c": "c",
+        ".h": "c-header",
+        ".rs": "rust",
+        ".go": "go",
+    }
+
+    # Default maximum number of lines for a class before it's considered
+    # "too big" to index as a single chunk. Overridable via param.
+    MAX_CLASS_LINES = 140
+
+    _MD_FENCE_RE = re.compile(
+        r"""
+        ```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n   # opening fence + optional lang
+        (.*?)                                    # body
+        \n```                                    # closing fence
+        """,
+        re.MULTILINE | re.DOTALL | re.VERBOSE
+    )
+
+    def _extract_md_fences(self, text: str) -> Tuple[str, List[Tuple[str, str]]]:
+        """
+        Extract fenced code blocks from Markdown text.
+
+        Returns:
+          (prose_without_fences,
+           [(lang, code_block_1), (lang, code_block_2), ...])
+
+        'lang' is the raw fence language (e.g. 'python', 'js', 'sh').
+        """
+        if not text:
+            return "", []
+
+        code_blocks: List[Tuple[str, str]] = []
+
+        def _repl(match: re.Match) -> str:
+            lang = (match.group(1) or "").strip().lower()
+            body = (match.group(2) or "").strip()
+            if len(body) >= 8:
+                code_blocks.append((lang, body))
+            # Replace with a single blank line to keep some structure
+            return "\n"
+
+        without_fences = self._MD_FENCE_RE.sub(_repl, text)
+        # Normalize whitespace a bit
+        without_fences = re.sub(r"[ \t]+", " ", without_fences)
+        without_fences = re.sub(r"\n{3,}", "\n\n", without_fences)
+        return without_fences.strip(), code_blocks
 
     def _init_fts_db(self, db_path: str):
         """
@@ -4204,7 +4297,7 @@ class LocalCodeCorpusBlock(BaseBlock):
                 url UNINDEXED,    -- File path or file_path::chunk_name
                 title,            -- File name or file :: chunk
                 content,          -- File content or chunk content
-                kind,             -- 'code' or 'prose'
+                kind,             -- 'code', 'prose', or language-tagged variants
                 tokenize = 'porter unicode61'
             );
             """)
@@ -4222,7 +4315,7 @@ class LocalCodeCorpusBlock(BaseBlock):
             """)
 
     def _get_last_mtime(self, conn: sqlite3.Connection, file_path: str) -> float:
-        """Check the DB for the last indexed modification time of a file."""
+        """Check the DB for the last indexed modification time of a file or chunk."""
         try:
             cur = conn.execute(
                 "SELECT last_indexed_mtime FROM indexed_files WHERE path = ?", (file_path,)
@@ -4233,18 +4326,44 @@ class LocalCodeCorpusBlock(BaseBlock):
             print(f"Error checking mtime for {file_path}: {e}")
             return 0.0
 
-    # --- NEW: AST-based Python file processor ---
+    # ---- helpers -------------------------------------------------
+    def _kind_for_file(self, file_name: str, is_prose: bool) -> str:
+        """
+        Build a language-aware kind string like 'code:py' or 'prose:md'.
+        """
+        ext = os.path.splitext(file_name)[1].lower()
+        lang = self.LANG_BY_EXT.get(ext, "")
+        base = "prose" if is_prose else "code"
+        if lang:
+            return f"{base}:{lang}"
+        return base
+
+    def _kind_for_lang(self, lang: str, base: str = "code") -> str:
+        """
+        Build a kind from an explicit language (e.g. from Markdown fences).
+        """
+        lang = (lang or "").strip().lower()
+        if not lang:
+            return base
+        return f"{base}:{lang}"
+
+    # --- AST-based Python file processor ---
     def _process_python_file(
             self,
             conn: sqlite3.Connection,
             file_path: str,
             file_name: str,
             current_mtime: float,
-            min_chars: int
+            min_chars: int,
+            max_class_lines: int,
     ) -> Tuple[int, int]:
         """
         Parse a .py file into functions/classes using AST and index them individually.
         Returns (new_chunks_indexed, chunks_updated).
+
+        max_class_lines controls when we skip indexing a class as a single giant
+        chunk and instead rely on its methods (FunctionDef/AsyncFunctionDef) as
+        the primary units.
         """
         indexed = 0
         updated = 0
@@ -4257,17 +4376,19 @@ class LocalCodeCorpusBlock(BaseBlock):
 
             tree = ast.parse(content, filename=file_path)
 
-            # 1. Index the top-level file docstring as "prose"
+            # 1. Index the top-level file docstring as "prose:py" (narrative context)
             file_docstring = ast.get_docstring(tree) or ""
             if file_docstring and len(file_docstring) > min_chars:
                 last_mtime = self._get_last_mtime(conn, file_path)  # Use file_path as URL
                 if current_mtime > last_mtime:
                     conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
-                        (file_path, file_name, file_docstring, "prose")  # Store docstring as prose
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (file_path, file_name, file_docstring, "prose:python")
                     )
                     conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
+                        "VALUES (?, ?)",
                         (file_path, current_mtime)
                     )
                     if last_mtime == 0.0:
@@ -4275,38 +4396,87 @@ class LocalCodeCorpusBlock(BaseBlock):
                     else:
                         updated += 1
 
-            # 2. Index functions and classes as "code"
+            # 2. Index functions and classes as "code:python"
+            #
+            # Strategy:
+            #   • Always index functions / async functions as before.
+            #   • For classes:
+            #       - If the class is small, index the whole class as one chunk.
+            #       - If the class is huge (more than max_class_lines), SKIP the class chunk
+            #         and let its methods (FunctionDef nodes inside) be the primary snippets.
             for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                # ----- Classes (maybe giant) -----
+                if isinstance(node, ast.ClassDef):
+                    # Try to get full class source
+                    try:
+                        class_src = ast.get_source_segment(content, node) or ""
+                    except Exception:
+                        class_src = ""
+
+                    if not class_src:
+                        continue
+
+                    class_lines = [ln for ln in class_src.splitlines() if ln.strip()]
+                    # If class is huge, don't index it as one giant blob.
+                    if len(class_lines) > max_class_lines:
+                        # Methods inside this class will still be indexed separately
+                        # as FunctionDef/AsyncFunctionDef nodes below.
+                        continue
+
+                    chunk_name = node.name
+                    chunk_content = class_src
+                    node_kind = "class"
+
+                # ----- Functions / async functions (including methods) -----
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     chunk_name = node.name
                     try:
-                        # ast.get_source_segment gets the full source, including decorators
                         chunk_content = ast.get_source_segment(content, node)
-                        if not chunk_content or len(chunk_content) < min_chars:
-                            continue
                     except Exception:
-                        continue  # Skip nodes we can't get source for
+                        continue
 
-                    # Use a unique URL/path for this chunk
-                    chunk_url = f"{file_path}::{chunk_name}"
-                    chunk_title = f"{file_name} :: {chunk_name}"
+                    if not chunk_content or len(chunk_content) < min_chars:
+                        continue
 
-                    # Check mtime for this *chunk*
-                    last_mtime = self._get_last_mtime(conn, chunk_url)
+                    node_kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
 
-                    if current_mtime > last_mtime:
-                        conn.execute(
-                            "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
-                            (chunk_url, chunk_title, chunk_content, "code")
-                        )
-                        conn.execute(
-                            "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
-                            (chunk_url, current_mtime)
-                        )
-                        if last_mtime == 0.0:
-                            indexed += 1
-                        else:
-                            updated += 1
+                else:
+                    continue  # other node types not indexed
+
+                if len(chunk_content) < min_chars:
+                    continue
+
+                # Add a small header to help search ("where did this come from?")
+                header_lines = [
+                    f"# file: {file_path}",
+                    f"# symbol: {chunk_name}",
+                    ""
+                ]
+                combined_content = "\n".join(header_lines) + chunk_content
+
+                # Use a unique URL/path for this chunk
+                chunk_url = f"{file_path}::{chunk_name}"
+                # Better titles for codesearch UI
+                chunk_title = f"{file_name} :: {node_kind} {chunk_name}"
+
+                # Check mtime for this *chunk*
+                last_mtime = self._get_last_mtime(conn, chunk_url)
+
+                if current_mtime > last_mtime:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (chunk_url, chunk_title, combined_content, "code:python")
+                    )
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
+                        "VALUES (?, ?)",
+                        (chunk_url, current_mtime)
+                    )
+                    if last_mtime == 0.0:
+                        indexed += 1
+                    else:
+                        updated += 1
 
             # If we didn't index any chunks, at least update the main file's mtime
             # to prevent re-parsing it every time if it hasn't changed.
@@ -4314,7 +4484,8 @@ class LocalCodeCorpusBlock(BaseBlock):
                 last_mtime = self._get_last_mtime(conn, file_path)
                 if current_mtime > last_mtime:
                     conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
+                        "VALUES (?, ?)",
                         (file_path, current_mtime)
                     )
 
@@ -4327,7 +4498,7 @@ class LocalCodeCorpusBlock(BaseBlock):
             print(f"Error processing {file_path}: {e}")
             return 0, 0
 
-    # --- NEW: Generic file processor ---
+    # --- Generic file processor ---
     def _process_generic_file(
             self,
             conn: sqlite3.Connection,
@@ -4337,7 +4508,15 @@ class LocalCodeCorpusBlock(BaseBlock):
             last_mtime: float,
             min_chars: int
     ) -> Tuple[int, int]:
-        """Indexes a non-Python file (e.g., .md, .txt) as a single document."""
+        """
+        Indexes a non-Python file.
+
+        Smarter behavior for Markdown:
+          - Extract fenced code blocks → 'code:lang' kind with path::codeN URL.
+          - Store remaining prose (if sufficiently long) as 'prose:md'.
+        For other extensions:
+          - Store whole file as 'code:lang' or 'prose:lang' based on extension.
+        """
         indexed, updated = 0, 0
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -4346,18 +4525,75 @@ class LocalCodeCorpusBlock(BaseBlock):
             if len(content) < min_chars:
                 return 0, 0
 
-            # Determine kind. Use "prose" for text/md, "code" for others
-            kind = "prose" if file_name.endswith(('.md', '.txt')) else "code"
+            # Markdown special handling
+            if file_name.endswith(".md"):
+                prose, code_blocks = self._extract_md_fences(content)
 
-            # Add to FTS database
+                # 1) Index code blocks individually as 'code:<lang>'
+                chunk_idx = 0
+                for lang, block in code_blocks:
+                    block = (block or "").strip()
+                    if len(block) < min_chars:
+                        continue
+
+                    chunk_idx += 1
+                    chunk_url = f"{file_path}::code{chunk_idx}"
+                    chunk_title = f"{file_name} :: code{chunk_idx}"
+
+                    # Use fence language if present, else fall back to 'code'
+                    kind = self._kind_for_lang(lang, base="code")
+
+                    # Optional header so codesearch text queries can see origin/lang
+                    header = []
+                    header.append(f"# from_markdown_file: {file_name}")
+                    if lang:
+                        header.append(f"# fenced_lang: {lang}")
+                    header.append("")
+                    block_with_header = "\n".join(header) + block
+
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (chunk_url, chunk_title, block_with_header, kind)
+                    )
+
+                # 2) Index remaining prose as 'prose:markdown'
+                if prose and len(prose) >= min_chars:
+                    prose_kind = "prose:markdown"
+                    conn.execute(
+                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        (file_path, file_name, prose, prose_kind)
+                    )
+
+                # 3) Update tracking table for the *file*
+                if chunk_idx > 0 or (prose and len(prose) >= min_chars):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
+                        "VALUES (?, ?)",
+                        (file_path, current_mtime)
+                    )
+                    if last_mtime == 0.0:
+                        indexed = 1
+                    else:
+                        updated = 1
+
+                return indexed, updated
+
+            # Non-Markdown: single document as before, but with language-aware kind
+            ext = os.path.splitext(file_name)[1].lower()
+            is_prose = ext in (".md", ".txt")
+            kind = self._kind_for_file(file_name, is_prose=is_prose)
+
             conn.execute(
-                "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO docs (url, title, content, kind) "
+                "VALUES (?, ?, ?, ?)",
                 (file_path, file_name, content, kind)
             )
 
-            # Update tracking database
             conn.execute(
-                "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) VALUES (?, ?)",
+                "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
+                "VALUES (?, ?)",
                 (file_path, current_mtime)
             )
 
@@ -4365,6 +4601,7 @@ class LocalCodeCorpusBlock(BaseBlock):
                 indexed = 1
             else:
                 updated = 1
+
         except Exception as e:
             print(f"Error processing generic file {file_path}: {e}")
 
@@ -4393,6 +4630,9 @@ class LocalCodeCorpusBlock(BaseBlock):
         skip_default_dirs = bool(params.get("skip_default_dirs", True))
         skip_venv_dirs = bool(params.get("skip_venv_dirs", True))
         extra_skip_dirs_raw = str(params.get("extra_skip_dirs", ""))
+
+        # NEW: configurable max_class_lines (overrides class default)
+        max_class_lines = int(params.get("max_class_lines", self.MAX_CLASS_LINES))
 
         skip_set = set()
         if skip_default_dirs:
@@ -4440,8 +4680,7 @@ class LocalCodeCorpusBlock(BaseBlock):
 
                     try:
                         current_mtime = os.path.getmtime(file_path)
-                        # --- MODIFIED: Use file_path for mtime check ---
-                        # For AST-parsed files, we check mtime *per chunk* inside _process_python_file
+                        # For AST-parsed files, we check mtime per chunk inside _process_python_file
                         # For generic files, we check here.
                         last_mtime = self._get_last_mtime(conn, file_path)
 
@@ -4455,16 +4694,12 @@ class LocalCodeCorpusBlock(BaseBlock):
                             total_skipped += 1
                             continue
 
-                        # --- MODIFIED: Route to specific processor ---
-                        indexed, updated = 0, 0
+                        # Route to specific processor
                         if is_py:
-                            # Use AST parser for Python files
-                            # This block now handles its own mtime checks per chunk
                             indexed, updated = self._process_python_file(
-                                conn, file_path, file, current_mtime, min_chars
+                                conn, file_path, file, current_mtime, min_chars, max_class_lines
                             )
                         else:
-                            # Use generic whole-file parser for others
                             indexed, updated = self._process_generic_file(
                                 conn, file_path, file, current_mtime, last_mtime, min_chars
                             )
@@ -4473,7 +4708,6 @@ class LocalCodeCorpusBlock(BaseBlock):
                         total_updated += updated
                         if indexed == 0 and updated == 0:
                             total_skipped += 1  # Skipped due to min_chars or other
-                        # --- END MODIFIED ---
 
                     except (IOError, OSError) as e:
                         if verbose: print(f"Error reading {file_path}: {e}")
@@ -4503,10 +4737,11 @@ class LocalCodeCorpusBlock(BaseBlock):
         meta = {
             "db_path": db_path,
             "scan_path": scan_path,
-            "files_indexed": total_indexed,  # Renamed to reflect chunks
-            "files_updated": total_updated,  # Renamed to reflect chunks
+            "files_indexed": total_indexed,  # actually chunks
+            "files_updated": total_updated,
             "files_skipped": total_skipped,
             "errors": total_errors,
+            "max_class_lines": max_class_lines,
         }
         return f"{base}\n\n[local_corpus_update]\n{out_msg}", meta
 
@@ -4521,11 +4756,12 @@ class LocalCodeCorpusBlock(BaseBlock):
             "skip_default_dirs": True,
             "skip_venv_dirs": True,
             "extra_skip_dirs": "",
+            # NEW:
+            "max_class_lines": self.MAX_CLASS_LINES,
         }
 
 
 BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
-
 
 # ======================= NewsBlock =========================================
 @dataclass
