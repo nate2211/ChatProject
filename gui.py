@@ -16,6 +16,7 @@ import threading
 # Import ALL blocks eagerly in the main thread.
 import blocks
 import pipeline  # Ensure pipeline is also registered
+from gui_elements import DatabasePane
 from registry import BLOCKS
 
 # [MODIFIED] Import models, _MODELS, and get_chat_model
@@ -298,7 +299,7 @@ class Worker(QObject):
                 params.update(extras.get(block_key, {}))
                 params.update(extras.get("all", {}))
 
-                if block_name == "pipeline":
+                if block_name == "pipeline" or block_name == "concat":
                     params["_gui_extras_passthrough"] = extras
 
                 payload_source = params.pop("_payload_source", "chain")
@@ -363,6 +364,7 @@ class Worker(QObject):
 class PromptChatGUI(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
+
         self.setWindowTitle(APP_TITLE)
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(950, 640)
@@ -372,10 +374,17 @@ class PromptChatGUI(QMainWindow):
         self.worker: Optional[Worker] = None
         self._stop_event = threading.Event()
 
+        # NEW: reference to the database pane
+        self.db_pane: Optional[DatabasePane] = None
+        # NEW: top-level tab widget switching between Prompt Chat and Database
+        self.main_tabs: Optional[QTabWidget] = None
+        self.main_ui_widget: Optional[QWidget] = None
+
         self._build_menu()
         self._build_body()
         self._refresh_block_list()
         self._load_state()
+        self._show_main_ui()  # Start on Prompt Chat tab
 
     # ---------------- UI building ----------------
     def _build_menu(self) -> None:
@@ -395,9 +404,15 @@ class PromptChatGUI(QMainWindow):
         run_action.setShortcut("Ctrl+Return")
         run_action.triggered.connect(self._on_run_clicked)
         run_menu.addAction(run_action)
+
         cancel_action = QAction("Cancel Run", self)
         cancel_action.triggered.connect(self._cancel_run)
         run_menu.addAction(cancel_action)
+
+        database_menu = menu.addMenu("Database")
+        open_db_action = QAction("Open Database", self)
+        open_db_action.triggered.connect(self._open_database)
+        database_menu.addAction(open_db_action)
 
         help_menu = menu.addMenu("Help")
         about_action = QAction("About", self)
@@ -405,12 +420,25 @@ class PromptChatGUI(QMainWindow):
         help_menu.addAction(about_action)
 
     def _build_body(self) -> None:
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        root_layout = QVBoxLayout(main_widget)
+        self.main_widget = QWidget()
+        self.setCentralWidget(self.main_widget)
+        self.root_layout = QVBoxLayout(self.main_widget)
+
+        # 🔹 Instead of a stacked layout, use a tab widget at the top
+        self.main_tabs = QTabWidget()
+        self.root_layout.addWidget(self.main_tabs)
+
+        # Build both panes and add them as tabs
+        self._build_main_ui()
+        self._build_database_ui()
+
+    def _build_main_ui(self) -> None:
+        """Builds the main UI for prompt/pipeline management."""
+        self.main_ui_widget = QWidget()
+        self.main_ui_layout = QVBoxLayout(self.main_ui_widget)
 
         top_level_splitter = QSplitter(Qt.Vertical)
-        root_layout.addWidget(top_level_splitter, 1)
+        self.main_ui_layout.addWidget(top_level_splitter, 1)
 
         # ---- Top: block list / pipeline / presets / model ----
         top = QGroupBox("Build Pipeline")
@@ -420,27 +448,34 @@ class PromptChatGUI(QMainWindow):
         # Left: Available blocks
         available_layout = QVBoxLayout()
         available_layout.addWidget(QLabel("Available Blocks"))
+
         self.blocks_list = QListWidget()
         self.blocks_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.blocks_list.itemDoubleClicked.connect(self._add_block_to_pipeline)
         self.blocks_list.currentItemChanged.connect(self._on_block_selected)
         available_layout.addWidget(self.blocks_list)
+
         top_layout.addLayout(available_layout, 1)
 
         # Middle: pipeline + up/down
         mid_buttons_layout = QVBoxLayout()
         mid_buttons_layout.addStretch(1)
+
         btn_add = QPushButton("Add ->")
         btn_add.clicked.connect(self._add_block_to_pipeline)
         mid_buttons_layout.addWidget(btn_add)
+
         btn_remove = QPushButton("<- Remove")
         btn_remove.clicked.connect(self._remove_block_from_pipeline)
         mid_buttons_layout.addWidget(btn_remove)
+
         mid_buttons_layout.addStretch(1)
         top_layout.addLayout(mid_buttons_layout)
 
+        # Pipeline list
         pipeline_layout = QVBoxLayout()
         pipeline_layout.addWidget(QLabel("Pipeline Stages (Run in Order)"))
+
         self.pipeline_list = QListWidget()
         self.pipeline_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
         pipeline_layout.addWidget(self.pipeline_list)
@@ -448,6 +483,7 @@ class PromptChatGUI(QMainWindow):
         pipeline_btns = QWidget()
         pipeline_btns_layout = QHBoxLayout(pipeline_btns)
         pipeline_btns_layout.setContentsMargins(0, 0, 0, 0)
+
         btn_up = QPushButton("Move Up")
         btn_up.clicked.connect(self._move_up)
         btn_down = QPushButton("Move Down")
@@ -455,52 +491,52 @@ class PromptChatGUI(QMainWindow):
         pipeline_btns_layout.addWidget(btn_up)
         pipeline_btns_layout.addWidget(btn_down)
         pipeline_btns_layout.addStretch(1)
-        pipeline_layout.addWidget(pipeline_btns)
 
+        pipeline_layout.addWidget(pipeline_btns)
         top_layout.addLayout(pipeline_layout, 1)
 
         # Right: presets + model + params + run controls
         right_controls_layout = QVBoxLayout()
 
-        # Presets
         right_controls_layout.addWidget(QLabel("Presets"))
         self.preset_combo = QComboBox()
         self._populate_presets_combo()
         self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
         right_controls_layout.addWidget(self.preset_combo)
 
-        # Preset buttons
         preset_btns = QWidget()
         preset_btns_layout = QHBoxLayout(preset_btns)
         preset_btns_layout.setContentsMargins(0, 0, 0, 0)
+
         self.save_preset_btn = QPushButton("Save Preset…")
         self.save_preset_btn.clicked.connect(self._save_preset)
+
         self.delete_preset_btn = QPushButton("Delete Preset")
         self.delete_preset_btn.clicked.connect(self._delete_preset)
+
         preset_btns_layout.addWidget(self.save_preset_btn)
         preset_btns_layout.addWidget(self.delete_preset_btn)
         right_controls_layout.addWidget(preset_btns)
 
-        # Model picker
         right_controls_layout.addWidget(QLabel("Chat Model (Select to see params)"))
         self.model_combo = QComboBox()
         self.model_combo.addItems(sorted(_MODELS.keys()))
         self.model_combo.currentTextChanged.connect(self._on_model_selected)
         right_controls_layout.addWidget(self.model_combo)
 
-        # Block/Model params list
         right_controls_layout.addWidget(QLabel("Block/Model Parameters (Double-click to add)"))
         self.block_params_list = QListWidget()
         self.block_params_list.itemDoubleClicked.connect(self._add_param_to_extras)
         right_controls_layout.addWidget(self.block_params_list, 1)
 
-        # Run controls
         run_controls_widget = QWidget()
         run_controls_hbox = QHBoxLayout(run_controls_widget)
         run_controls_hbox.setContentsMargins(0, 0, 0, 0)
+
         self.json_var = QCheckBox("Print JSON")
         self.run_btn = QPushButton("Run")
         self.run_btn.clicked.connect(self._on_run_clicked)
+
         run_controls_hbox.addWidget(self.json_var)
         run_controls_hbox.addStretch(1)
         run_controls_hbox.addWidget(self.run_btn)
@@ -536,7 +572,6 @@ class PromptChatGUI(QMainWindow):
 
         tabs = QTabWidget()
         prompt_output_splitter.addWidget(tabs)
-
         prompt_output_splitter.setSizes([300, 500])
 
         self.result_text = QPlainTextEdit()
@@ -550,8 +585,38 @@ class PromptChatGUI(QMainWindow):
 
         top_level_splitter.setSizes([250, 550])
 
-        self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage("Ready")
+        # 🔹 Add this whole Prompt Chat pane as a tab
+        self.main_tabs.addTab(self.main_ui_widget, "Prompt Chat")
+
+    def _build_database_ui(self) -> None:
+        """Build the database pane UI as a tab, using DatabasePane."""
+        self.db_pane = DatabasePane(APP_TITLE, self)
+        self.main_tabs.addTab(self.db_pane, "Database")
+
+    # ---------------- Database Helpers ----------------
+
+    def _open_database(self) -> None:
+        """Opens a file dialog to select an SQLite database and displays its contents."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open SQLite Database",
+            "",
+            "SQLite Files (*.db *.sqlite *.sqlite3)",
+        )
+        if file_path and self.db_pane:
+            ok = self.db_pane.load_database(file_path)
+            if ok:
+                self._show_database_ui()
+
+    def _show_main_ui(self) -> None:
+        """Select the Prompt Chat tab."""
+        if self.main_tabs and self.main_ui_widget:
+            self.main_tabs.setCurrentWidget(self.main_ui_widget)
+
+    def _show_database_ui(self) -> None:
+        """Select the Database tab."""
+        if self.main_tabs and self.db_pane:
+            self.main_tabs.setCurrentWidget(self.db_pane)
 
     def _populate_presets_combo(self, select_index: Optional[int] = None) -> None:
         """Refresh the presets combo from GUI_PRESETS."""

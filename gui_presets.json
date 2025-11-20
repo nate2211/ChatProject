@@ -25,7 +25,7 @@
       "code",
       "self_check"
     ],
-    "extras": "# 1. Scrape web, 2. Search DB, 3. Generate Code\n# This is a full, slow RAG pipeline.\n\n# 1. Scrape web and save to 'code_corpus.db'\ncodecorpus.query={payload}\ncodecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\ncodecorpus.max_pages=5\ncodecorpus.db_path=code_corpus.db\n\n# 2. Search 'code_corpus.db' for the same query\ncodesearch.query={payload}\ncodesearch.db_path=code_corpus.db\ncodesearch.export_key=code_context\ncodesearch.top_k=5\n\n# 3. Generate code using the search results\ncode.prompt={payload}\ncode.model=Salesforce/codet5p-220m-py\ncode.context_key=code_context\ncode.context_chars=1500\ncode.max_new_tokens=256\ncode.num_beams=4\ncode.max_time_sec=180.0",
+    "extras": "# 1. Scrape web, 2. Search DB, 3. Generate Code\n# This is a full, slow RAG pipeline.\n\n# 1. Scrape web and save to 'code_corpus.db'\ncodecorpus.query={payload}\ncodecorpus.site_include=stackoverflow.com,realpython.com,docs.python.org,geeksforgeeks.org\ncodecorpus.max_pages=5\ncodecorpus.db_path=code_corpus.db\n\n# 2. Search 'code_corpus.db' for the same query\ncodesearch.query={payload}\ncodesearch.db_path=code_corpus.db\ncodesearch.export_key=code_context\ncodesearch.top_k=5\n\n# 3. Generate code using the search results\ncode.prompt={payload}\ncode.context_key=code_context\n",
     "model": "lexicon"
   },
   {
