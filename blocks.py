@@ -3317,7 +3317,6 @@ class CodeBlock(BaseBlock):
             "max_chars": 0,
             "max_terms": 12,
 
-            # Model-specific params (for hf-llm, etc.)
             "max_new_tokens": 128,
             "temperature": 0.7,
             "top_p": 0.9,
