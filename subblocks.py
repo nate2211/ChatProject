@@ -135,34 +135,108 @@ class PromptQuerySubBlock(BaseSubBlock):
 
         for q in queries:
             q = q.strip()
-            if not q or q in seen: continue
+            if not q or q in seen:
+                continue
 
             toks = _tokenize_text(q)
-            if not toks: continue
+            if not toks:
+                continue
 
             # Filter: Too long
-            if len(toks) > 8: continue
+            if len(toks) > 8:
+                continue
 
             # Filter: Single Stopword
-            if len(toks) == 1 and toks[0].lower() in stops: continue
+            if len(toks) == 1 and toks[0].lower() in stops:
+                continue
 
             seen.add(q)
             out.append(q)
         return out
 
     def _hf_rewrite_queries(self, queries: List[str], params: Dict[str, Any]) -> List[str]:
-        if not queries or not params.get("hf_model"): return queries
+        if not queries or not params.get("hf_model"):
+            return queries
         # ... (Keep existing HF logic) ...
         return queries
 
+    def _build_bar_syntax_queries(self, query: str) -> List[str]:
+        """
+        Special handling for queries like:
+          "Lil Uzi Vert | Playboi Carti | Juice Wrld"
+
+        We treat each '|' separated chunk as an atomic phrase and build
+        permutations without breaking those phrases apart.
+        """
+        # Split on '|' and strip whitespace
+        groups = [g.strip() for g in query.split("|") if g.strip()]
+        if not groups:
+            return []
+
+        # Anchor = first phrase (e.g. "Lil Uzi Vert")
+        anchor = groups[0]
+
+        queries: List[str] = []
+
+        # 1) Full combo: all phrases together
+        full_combo = " ".join(groups)
+        if full_combo:
+            queries.append(full_combo)
+
+        # 2) Anchor alone
+        if anchor:
+            queries.append(anchor)
+
+        # 3) Anchor + each other phrase, and standalone phrases
+        for g in groups[1:]:
+            if not g:
+                continue
+            # Anchor + other phrase (e.g. "Lil Uzi Vert Playboi Carti")
+            queries.append(f"{anchor} {g}")
+            # Standalone phrase if it has at least 2 words
+            if len(g.split()) >= 2:
+                queries.append(g)
+
+        # Optional: you could also add combos of non-anchor groups, e.g.
+        # "Playboi Carti Juice Wrld". If you want that, uncomment:
+        #
+        # if len(groups) > 2:
+        #     for i in range(1, len(groups)):
+        #         for j in range(i + 1, len(groups)):
+        #             pair = f"{groups[i]} {groups[j]}"
+        #             queries.append(pair)
+
+        # Dedupe while preserving order
+        return list(dict.fromkeys(queries))
+
     def execute(self, value: Any, *, params: Dict[str, Any]) -> List[str]:
         query = str(value or "")
-        if not query: return []
+        if not query:
+            return []
 
         op = str(params.get("op", "clean_permutate")).lower()
+
+        # ---------- SPECIAL "A | B | C" SYNTAX ----------
+        if "|" in query and op == "clean_permutate":
+            # Use bar-syntax-aware grouping instead of normal segmentation
+            base_queries = self._build_bar_syntax_queries(query)
+
+            # We still want to run them through the usual filter + optional HF rewrite
+            original_tokens = _tokenize_text(query)
+            filtered = self._post_filter_queries(base_queries, original_tokens)
+            final = self._hf_rewrite_queries(filtered, params)
+
+            if not final:
+                return [query.strip()]
+
+            return final
+        # -------------------------------------------------
+
+        # Normal path (no '|' syntax or different op)
         tokens = _tokenize_text(query)
         clean_tokens = self._clean_tokens(tokens)
-        if not clean_tokens: clean_tokens = tokens
+        if not clean_tokens:
+            clean_tokens = tokens
 
         if op == "clean":
             return [" ".join(clean_tokens).strip()]
