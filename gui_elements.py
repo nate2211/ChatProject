@@ -183,6 +183,7 @@ class SQLiteTableModel(QAbstractTableModel):
 class DatabasePane(QWidget):
     """
     Reusable database pane widget with:
+    - Table selector (shows ALL tables in the DB)
     - Sorting (via header + dropdowns)
     - Searching (filter)
     - Resizable columns
@@ -193,9 +194,23 @@ class DatabasePane(QWidget):
     def __init__(self, app_title: str = "Database Viewer", parent=None):
         super().__init__(parent)
         self.app_title = app_title
+
         self.db_model: SQLiteTableModel | None = None
+        self.db_path_loaded: str | None = None
+        self.tables_loaded: List[str] = []
 
         layout = QVBoxLayout(self)
+
+        # ---------- Table Selector ----------
+        table_row = QHBoxLayout()
+        table_label = QLabel("Table:")
+        self.table_combo = QComboBox()
+        self.table_combo.currentIndexChanged.connect(self._switch_table)
+
+        table_row.addWidget(table_label)
+        table_row.addWidget(self.table_combo)
+        table_row.addStretch()
+        layout.addLayout(table_row)
 
         # ---------- Search Bar ----------
         self.search_bar = QLineEdit()
@@ -227,17 +242,14 @@ class DatabasePane(QWidget):
 
         # ---------- Table View ----------
         self.table_view = QTableView()
-        self.table_view.setSortingEnabled(True)  # enable column sorting
-        # Row-based selection, multi-select
+        self.table_view.setSortingEnabled(True)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         layout.addWidget(self.table_view)
 
-        # Resize behavior
         header = self.table_view.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Interactive)  # manual resizing
+        header.setSectionResizeMode(QHeaderView.Interactive)
         header.setStretchLastSection(True)
-
         self.table_view.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
         # ---------- Action Buttons ----------
@@ -254,14 +266,70 @@ class DatabasePane(QWidget):
         buttons_row.addWidget(self.delete_button)
         layout.addLayout(buttons_row)
 
-    # --- Search ---
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_tables(self, db_path: str) -> List[str]:
+        """Return all table names in the SQLite database."""
+        try:
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+            tables = [t[0] for t in cur.fetchall()]
+            conn.close()
+            return tables
+        except Exception as e:
+            print(f"Error fetching tables: {e}")
+            return []
+
+    def _populate_table_list(self, tables: List[str]):
+        """Fill the table selector dropdown with all tables."""
+        self.table_combo.blockSignals(True)
+        self.table_combo.clear()
+        for t in tables:
+            self.table_combo.addItem(t)
+        self.table_combo.blockSignals(False)
+
+    def _load_table(self, table_name: str):
+        """Build and attach a model for table_name."""
+        if not self.db_path_loaded:
+            return
+        if not table_name:
+            return
+
+        self.db_model = SQLiteTableModel(self.db_path_loaded, table_name)
+        self.table_view.setModel(self.db_model)
+
+        # refresh sort columns dropdown
+        self._populate_sort_columns()
+
+        # reset search box (optional, feels cleaner on table swap)
+        self.search_bar.blockSignals(True)
+        self.search_bar.setText("")
+        self.search_bar.blockSignals(False)
+
+        # initial sort + resize
+        if self.db_model.headers:
+            self.table_view.sortByColumn(0, Qt.AscendingOrder)
+        self.table_view.resizeColumnsToContents()
+
+    def _switch_table(self):
+        """Triggered when table dropdown changes."""
+        if not self.table_combo.count():
+            return
+        table_name = self.table_combo.currentText()
+        self._load_table(table_name)
+
+    # ------------------------------------------------------------------
+    # Search / Sort
+    # ------------------------------------------------------------------
+
     def _apply_search_filter(self, text: str):
         if self.db_model:
             self.db_model.apply_filter(text)
-            # re-apply current sort after filter change
             self._apply_sort()
 
-    # --- Sort via dropdowns ---
     def _apply_sort(self):
         if not self.db_model:
             return
@@ -274,9 +342,7 @@ class DatabasePane(QWidget):
         self.table_view.sortByColumn(col_index, order)
 
     def _populate_sort_columns(self):
-        """
-        Populate the 'Sort by' combo with column headers from the model.
-        """
+        """Populate sort dropdown with current model headers."""
         self.sort_column_combo.blockSignals(True)
         self.sort_column_combo.clear()
 
@@ -284,14 +350,15 @@ class DatabasePane(QWidget):
             for idx, name in enumerate(self.db_model.headers):
                 self.sort_column_combo.addItem(name, idx)
             self.sort_column_combo.setCurrentIndex(0)
+
         self.sort_column_combo.blockSignals(False)
 
-    # --- Helper: find URL column ---
+    # ------------------------------------------------------------------
+    # URL column helper
+    # ------------------------------------------------------------------
+
     def _url_column_index(self) -> int:
-        """
-        Return the column index for the 'url' column (case-insensitive),
-        or -1 if not found.
-        """
+        """Find 'url' column index (case-insensitive); -1 if missing."""
         if not self.db_model or not self.db_model.headers:
             return -1
         for i, h in enumerate(self.db_model.headers):
@@ -299,28 +366,25 @@ class DatabasePane(QWidget):
                 return i
         return -1
 
-    # --- Copy URL(s) ---
+    # ------------------------------------------------------------------
+    # Copy URL(s)
+    # ------------------------------------------------------------------
+
     def _copy_selected_urls(self):
         if not self.db_model:
             return
 
         url_col = self._url_column_index()
         if url_col < 0:
-            QMessageBox.warning(
-                self,
-                self.app_title,
-                "No 'url' column found in this table.",
-            )
+            QMessageBox.warning(self, self.app_title, "No 'url' column found in this table.")
             return
 
         selection_model = self.table_view.selectionModel()
         if not selection_model:
             return
 
-        # Collect unique selected row indices in view coords
         selected_rows = sorted({idx.row() for idx in selection_model.selectedRows()})
         if not selected_rows:
-            # if user has cells selected but not whole row, fallback to all indexes
             indexes = selection_model.selectedIndexes()
             if not indexes:
                 return
@@ -334,15 +398,10 @@ class DatabasePane(QWidget):
                 urls.append(str(val))
 
         if not urls:
-            QMessageBox.information(
-                self,
-                self.app_title,
-                "No URLs found in selected rows.",
-            )
+            QMessageBox.information(self, self.app_title, "No URLs found in selected rows.")
             return
 
-        clip = QApplication.clipboard()
-        clip.setText("\n".join(urls))
+        QApplication.clipboard().setText("\n".join(urls))
 
         QMessageBox.information(
             self,
@@ -350,7 +409,10 @@ class DatabasePane(QWidget):
             f"Copied {len(urls)} URL{'s' if len(urls) != 1 else ''} to clipboard.",
         )
 
-    # --- Delete ---
+    # ------------------------------------------------------------------
+    # Delete selected rows
+    # ------------------------------------------------------------------
+
     def _delete_selected_rows(self):
         if not self.db_model:
             return
@@ -377,46 +439,28 @@ class DatabasePane(QWidget):
 
         self.db_model.delete_rows(rows)
 
-        # Re-apply sort so the view stays consistent with dropdown
         self._apply_sort()
-        # Resize columns again if you like
         self.table_view.resizeColumnsToContents()
 
-    # --- Public API ---
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     def load_database(self, file_path: str) -> bool:
         """
-        Loads the database and displays the first table in the DB.
+        Loads the database, populates the table dropdown,
+        and loads the first table by default.
         """
-        try:
-            conn = sqlite3.connect(file_path)
-            cursor = conn.cursor()
-
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = cursor.fetchall()
-            conn.close()
-
-            if not tables:
-                QMessageBox.warning(self, self.app_title, "No tables found in the database.")
-                return False
-
-            table_name = tables[0][0]  # load first table
-
-            # Build the model
-            self.db_model = SQLiteTableModel(file_path, table_name)
-            self.table_view.setModel(self.db_model)
-
-            # Populate sort dropdown with column names
-            self._populate_sort_columns()
-
-            # Initial sort: first column ascending
-            if self.db_model.headers:
-                self.table_view.sortByColumn(0, Qt.AscendingOrder)
-
-            # Resize to content once
-            self.table_view.resizeColumnsToContents()
-
-            return True
-
-        except Exception as e:
-            QMessageBox.critical(self, self.app_title, f"Error loading database: {e}")
+        tables = self._fetch_tables(file_path)
+        if not tables:
+            QMessageBox.warning(self, self.app_title, "No tables found in the database.")
             return False
+
+        self.db_path_loaded = file_path
+        self.tables_loaded = tables
+
+        self._populate_table_list(tables)
+
+        # Load first table
+        self._load_table(tables[0])
+        return True

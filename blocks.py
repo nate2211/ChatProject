@@ -1055,15 +1055,35 @@ class CorpusBlock(BaseBlock):
             conn = sqlite3.connect(db_path)
             # Main table for doc storage
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS corpus_docs (
-                id INTEGER PRIMARY KEY,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                config TEXT NOT NULL, -- '20231101.en', 'wiki_api', etc.
-                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(title, config)
-            );
-            """)
+                         CREATE TABLE IF NOT EXISTS corpus_docs
+                         (
+                             id
+                             INTEGER
+                             PRIMARY
+                             KEY,
+                             title
+                             TEXT
+                             NOT
+                             NULL,
+                             content
+                             TEXT
+                             NOT
+                             NULL,
+                             config
+                             TEXT
+                             NOT
+                             NULL, -- '20231101.en', 'wiki_api', etc.
+                             fetched_at
+                             DATETIME
+                             DEFAULT
+                             CURRENT_TIMESTAMP,
+                             UNIQUE
+                         (
+                             title,
+                             config
+                         )
+                             );
+                         """)
             # FTS table to search
             conn.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS corpus_fts USING fts5(
@@ -1077,17 +1097,24 @@ class CorpusBlock(BaseBlock):
             """)
             # Triggers to keep them in sync
             conn.executescript("""
-            CREATE TRIGGER IF NOT EXISTS corpus_docs_ai AFTER INSERT ON corpus_docs BEGIN
+                               CREATE TRIGGER IF NOT EXISTS corpus_docs_ai AFTER INSERT ON corpus_docs
+                               BEGIN
               INSERT INTO corpus_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS corpus_docs_ad AFTER DELETE ON corpus_docs BEGIN
+                               END;
+                               CREATE TRIGGER IF NOT EXISTS corpus_docs_ad AFTER
+                               DELETE
+                               ON corpus_docs BEGIN
               INSERT INTO corpus_fts(corpus_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS corpus_docs_au AFTER UPDATE ON corpus_docs BEGIN
-              INSERT INTO corpus_fts(corpus_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
-              INSERT INTO corpus_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-            END;
-            """)
+                               END;
+                               CREATE TRIGGER IF NOT EXISTS corpus_docs_au AFTER
+                               UPDATE ON corpus_docs BEGIN
+                               INSERT
+                               INTO corpus_fts(corpus_fts, rowid, title, content)
+                               VALUES ('delete', old.id, old.title, old.content);
+                               INSERT INTO corpus_fts(rowid, title, content)
+                               VALUES (new.id, new.title, new.content);
+                               END;
+                               """)
             return conn
 
         def _save_many_to_db(docs: List[Dict[str, str]], config_key: str):
@@ -1114,14 +1141,14 @@ class CorpusBlock(BaseBlock):
                     # FTS query to get relevant rowids, matching *either* the specified config
                     # or the 'wiki_api' fallback config.
                     sql = """
-                    SELECT T.title, T.content 
-                    FROM corpus_docs AS T
-                    JOIN corpus_fts AS F ON T.id = F.rowid
-                    WHERE F.corpus_fts MATCH ? 
-                      AND (T.config = ? OR T.config = 'wiki_api')
-                    ORDER BY F.rank -- FTS rank
-                    LIMIT ?;
-                    """
+                          SELECT T.title, T.content
+                          FROM corpus_docs AS T
+                                   JOIN corpus_fts AS F ON T.id = F.rowid
+                          WHERE F.corpus_fts MATCH ?
+                            AND (T.config = ? OR T.config = 'wiki_api')
+                          ORDER BY F.rank -- FTS rank
+                              LIMIT ?; \
+                          """
                     # Fetch a larger candidate pool from DB to feed into BM25
                     fetch_limit = max(sample * 5, 50)
 
@@ -1700,7 +1727,8 @@ class WebCorpusBlock(BaseBlock):
         use_phrases = bool(params.get("lexicon_phrases", True))
 
         # compile regex
-        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
+                                                                         str) and regex_query.strip() else None
 
         # ---- Build list of queries to run (subpipeline OR raw) ----
         queries_to_run: Any
@@ -1760,13 +1788,22 @@ class WebCorpusBlock(BaseBlock):
         def _get_db_conn():
             conn = sqlite3.connect(db_path)
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS corpus (
-                url TEXT PRIMARY KEY,
-                title TEXT,
-                content TEXT,
-                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
+                         CREATE TABLE IF NOT EXISTS corpus
+                         (
+                             url
+                             TEXT
+                             PRIMARY
+                             KEY,
+                             title
+                             TEXT,
+                             content
+                             TEXT,
+                             fetched_at
+                             DATETIME
+                             DEFAULT
+                             CURRENT_TIMESTAMP
+                         );
+                         """)
             return conn
 
         def _save_to_db(url: str, title: str, content: str):
@@ -2067,9 +2104,9 @@ class WebCorpusBlock(BaseBlock):
                         await asyncio.sleep(pause)
                         async with sem:
                             async with session.get(
-                                u,
-                                headers={"User-Agent": user_agent},
-                                timeout=timeout,
+                                    u,
+                                    headers={"User-Agent": user_agent},
+                                    timeout=timeout,
                             ) as resp:
                                 if resp.status == 200:
                                     html_text = await resp.text()
@@ -2332,7 +2369,6 @@ class WebCorpusBlock(BaseBlock):
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
 
-
 # ---------------- WebCorpus (Playwright Hybrid) ----------------
 @dataclass
 class PlaywrightBlock(BaseBlock):
@@ -2472,7 +2508,8 @@ class PlaywrightBlock(BaseBlock):
         }
 
         # compile regex
-        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
+                                                                         str) and regex_query.strip() else None
 
         # ---- Helpers ----
         def _tokenize(t: str) -> List[str]:
@@ -2506,13 +2543,22 @@ class PlaywrightBlock(BaseBlock):
         def _get_db_conn():
             conn = sqlite3.connect(db_path)
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS corpus (
-                url TEXT PRIMARY KEY,
-                title TEXT,
-                content TEXT,
-                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
-            """)
+                         CREATE TABLE IF NOT EXISTS corpus
+                         (
+                             url
+                             TEXT
+                             PRIMARY
+                             KEY,
+                             title
+                             TEXT,
+                             content
+                             TEXT,
+                             fetched_at
+                             DATETIME
+                             DEFAULT
+                             CURRENT_TIMESTAMP
+                         );
+                         """)
             return conn
 
         def _save_to_db(url: str, title: str, content: str):
@@ -2619,7 +2665,8 @@ class PlaywrightBlock(BaseBlock):
 
         try:
             if verbose:
-                print(f"[PlaywrightBlock] Running targeted search on {len(sites_to_search)} known sites...", file=sys.stderr)
+                print(f"[PlaywrightBlock] Running targeted search on {len(sites_to_search)} known sites...",
+                      file=sys.stderr)
             for site in sites_to_search:
                 targeted_query = f"{query} site:{site}"
                 links = _hybrid_search(targeted_query, n=num_per_site)
@@ -2978,6 +3025,7 @@ class PlaywrightBlock(BaseBlock):
 
 
 BLOCKS.register("playwright", PlaywrightBlock)
+
 
 @dataclass
 class TensorBlock(BaseBlock):
@@ -3582,15 +3630,15 @@ class CodeBlock(BaseBlock):
         return {
             "prompt": "REQUIRED: Write a python function...",
             "context_key": "web_context",
-            "extra_context_keys": "",          # NEW: e.g. "code_search_context,other_key"
-            "context_chars": 0,                # 0 = full combined context
+            "extra_context_keys": "",  # NEW: e.g. "code_search_context,other_key"
+            "context_chars": 0,  # 0 = full combined context
             "model": "lexicon-adv",
             "max_input_chars": 8000,
             "wrap": True,
             "inject_tag": "code_solution",
             "lang": "python",
 
-            "subpipeline": "",                 # e.g. "code_chat"
+            "subpipeline": "",  # e.g. "code_chat"
             "code_chat.op": "passthrough",
 
             "style": "plain",
@@ -3651,11 +3699,18 @@ class CodeCorpusBlock(BaseBlock):
         """
         with sqlite3.connect(db_path) as conn:
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS indexed_urls (
-                url TEXT PRIMARY KEY,
-                last_scraped_time REAL NOT NULL
-            );
-            """)
+                         CREATE TABLE IF NOT EXISTS indexed_urls
+                         (
+                             url
+                             TEXT
+                             PRIMARY
+                             KEY,
+                             last_scraped_time
+                             REAL
+                             NOT
+                             NULL
+                         );
+                         """)
 
     def _get_last_scraped_time(self, conn: sqlite3.Connection, url: str) -> float:
         """Check the DB for the last scraped time of a URL."""
@@ -4194,7 +4249,6 @@ class CodeCorpusBlock(BaseBlock):
 BLOCKS.register("codecorpus", CodeCorpusBlock)
 
 
-
 @dataclass
 class CodeSearchBlock(BaseBlock):
     """
@@ -4362,7 +4416,6 @@ class CodeSearchBlock(BaseBlock):
         # Sort Descending
         results.sort(key=lambda x: x[0], reverse=True)
         return results
-
 
     # --- 3. Main Execution ---
 
@@ -4587,11 +4640,18 @@ class LocalCodeCorpusBlock(BaseBlock):
         """
         with sqlite3.connect(db_path) as conn:
             conn.execute("""
-            CREATE TABLE IF NOT EXISTS indexed_files (
-                path TEXT PRIMARY KEY,
-                last_indexed_mtime REAL NOT NULL
-            );
-            """)
+                         CREATE TABLE IF NOT EXISTS indexed_files
+                         (
+                             path
+                             TEXT
+                             PRIMARY
+                             KEY,
+                             last_indexed_mtime
+                             REAL
+                             NOT
+                             NULL
+                         );
+                         """)
 
     def _get_last_mtime(self, conn: sqlite3.Connection, file_path: str) -> float:
         """Check the DB for the last indexed modification time of a file or chunk."""
@@ -5041,6 +5101,7 @@ class LocalCodeCorpusBlock(BaseBlock):
 
 
 BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
+
 
 # ======================= NewsBlock =========================================
 @dataclass
@@ -5876,8 +5937,6 @@ BLOCKS.register("shopping", ShoppingBlock)
 
 # ======================= LinkTrackerBlock ==================================
 
-# ======================= LinkTrackerBlock ==================================
-
 @dataclass
 class LinkTrackerBlock(BaseBlock):
     """
@@ -5930,6 +5989,8 @@ class LinkTrackerBlock(BaseBlock):
         ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
     }
 
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+
     def __post_init__(self):
         # Lazy-opened SQLite connection; only used if use_database=True.
         self.db_conn: Optional[sqlite3.Connection] = None
@@ -5960,14 +6021,28 @@ class LinkTrackerBlock(BaseBlock):
             # Assets table (for discovered files)
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS assets (
-                    url          TEXT PRIMARY KEY,
-                    text         TEXT,
-                    source       TEXT,
-                    size         TEXT,
-                    status       TEXT,
-                    first_seen   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS assets
+                (
+                    url
+                    TEXT
+                    PRIMARY
+                    KEY,
+                    text
+                    TEXT,
+                    source
+                    TEXT,
+                    size
+                    TEXT,
+                    status
+                    TEXT,
+                    first_seen
+                    TIMESTAMP
+                    DEFAULT
+                    CURRENT_TIMESTAMP,
+                    last_checked
+                    TIMESTAMP
+                    DEFAULT
+                    CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -5978,9 +6053,16 @@ class LinkTrackerBlock(BaseBlock):
             # Pages table (for visited HTML pages – prevents re-crawling)
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS pages (
-                    url          TEXT PRIMARY KEY,
-                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS pages
+                (
+                    url
+                    TEXT
+                    PRIMARY
+                    KEY,
+                    last_scanned
+                    TIMESTAMP
+                    DEFAULT
+                    CURRENT_TIMESTAMP
                 )
                 """
             )
@@ -6085,20 +6167,67 @@ class LinkTrackerBlock(BaseBlock):
         """
         return [word.strip().lower() for word in query.split() if word.strip()]
 
+    def _seed_pages_from_required_sites(self, required_sites, queries, probe_cap_per_site=5):
+        out = []
+        synthetic_search_seeds = set()
+
+        # normalize domains/urls
+        norm_sites = []
+        for raw in required_sites or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            if "://" in s:
+                norm_sites.append(s.rstrip("/"))
+            else:
+                norm_sites.append("https://" + s.lstrip(".").rstrip("/"))
+
+        # root seeds
+        for s in norm_sites:
+            out.append(s + "/")
+
+        # search probes for multiple queries
+        if queries:
+            from urllib.parse import quote_plus
+
+            for s in norm_sites:
+                probes_added = 0
+                for qv in queries:
+                    if probes_added >= probe_cap_per_site:
+                        break
+                    qv = (qv or "").strip()
+                    if not qv:
+                        continue
+                    enc = quote_plus(qv)
+
+                    probes = [
+                        s + f"/search?q={enc}",
+                        s + f"/search?query={enc}",
+                        s + f"/?s={enc}",
+                    ]
+                    for p in probes:
+                        if probes_added >= probe_cap_per_site:
+                            break
+                        out.append(p)
+                        synthetic_search_seeds.add(p)
+                        probes_added += 1
+
+        return out, synthetic_search_seeds
+
     # ------------------------------------------------------------------ #
     # Network & JS Helpers (Async versions)
     # ------------------------------------------------------------------ #
     async def _fetch_page_with_network_sniff(
-        self,
-        page_url: str,
-        timeout: float,
-        ua: str,
-        log: List[str],
-        extensions: set,
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
+            self,
+            page_url: str,
+            timeout: float,
+            ua: str,
+            log: List[str],
+            extensions: set,
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
     ) -> Tuple[str, List[Dict[str, str]]]:
         try:
             from playwright.async_api import async_playwright
@@ -6111,6 +6240,7 @@ class LinkTrackerBlock(BaseBlock):
         html = ""
         found_items: List[Dict[str, str]] = []
         seen_network = set()
+        json_hits: List[Dict[str, Any]] = []
 
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
@@ -6153,6 +6283,23 @@ class LinkTrackerBlock(BaseBlock):
                 def handle_response(response):
                     try:
                         url = response.url
+                        ctype = response.headers.get("content-type", "").lower()
+                        # ------------------------------
+                        # A) Capture Archive JSON search payloads
+                        # ------------------------------
+                        if (
+                                "application/json" in ctype
+                                or "/metadata/" in url
+                        ):
+                            async def _grab_json():
+                                try:
+                                    data = await response.json()
+                                    json_hits.append({"url": url, "json": data})
+                                except Exception:
+                                    pass
+
+                            asyncio.create_task(_grab_json())
+                            return
 
                         # 1) Extension-based fast path
                         if any(url.lower().endswith(ext) for ext in extensions):
@@ -6167,13 +6314,12 @@ class LinkTrackerBlock(BaseBlock):
                                     }
                                 )
                                 return
-
                         # 2) Content-Type sniff (streams)
                         ctype = response.headers.get("content-type", "").lower()
                         if (
-                            "audio" in ctype
-                            or "video" in ctype
-                            or "application/octet-stream" in ctype
+                                "audio" in ctype
+                                or "video" in ctype
+                                or "application/octet-stream" in ctype
                         ):
                             cl_raw = response.headers.get("content-length", "0")
                             try:
@@ -6201,9 +6347,10 @@ class LinkTrackerBlock(BaseBlock):
                 try:
                     await page.goto(
                         page_url,
-                        wait_until="domcontentloaded",
+                        wait_until="networkidle",
                         timeout=sniff_goto_timeout,
                     )
+
                 except Exception as e:
                     log.append(
                         f"Network sniff: goto timeout on {page_url} ({e}). "
@@ -6222,25 +6369,28 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Playwright/Network Error on {page_url}: {e}")
 
-        return html, found_items
+        return html, found_items, json_hits
 
     async def _search_duckduckgo(
             self,
             q: str,
             max_results: int,
-            ua: str,  # We will ignore the passed UA and use a better one locally
+            ua: str,
             timeout: float,
             page_limit: int = 1,
             per_page: int = 50,
     ) -> List[str]:
-        import asyncio
-        import random
+        import asyncio, random
 
         pages: List[str] = []
         seen_urls: set[str] = set()
+        did_dump_debug = False  # NEW: only dump once per query
 
-        # Use a standard Chrome User-Agent to look like a real person
-        real_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        real_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
 
         headers = {
             "User-Agent": real_ua,
@@ -6249,8 +6399,8 @@ class LinkTrackerBlock(BaseBlock):
             "Referer": "https://duckduckgo.com/"
         }
 
-        max_results = max(1, min(max_results, 256))
-        page_limit = max(1, min(page_limit, 5))
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
         base_url = "https://html.duckduckgo.com/html/"
 
         try:
@@ -6259,45 +6409,64 @@ class LinkTrackerBlock(BaseBlock):
                     if len(pages) >= max_results:
                         break
 
-                    # ADDED: Random delay between paginations to avoid 403
                     if page_idx > 0:
                         sleep_time = random.uniform(2.0, 5.0)
                         print(f"[LinkTracker] Sleeping {sleep_time:.2f}s between search pages...")
                         await asyncio.sleep(sleep_time)
 
-                    offset = page_idx * 30  # DDG HTML usually steps by 30, not arbitrary per_page
+                    offset = page_idx * 30
+                    text = ""
+                    status = None
+                    final_url = base_url
 
                     try:
-                        # Data payload often works better than params for DDG HTML POST/GET
                         data = {'q': q, 's': str(offset), 'dc': str(offset)}
                         async with session.post(
                                 base_url,
                                 data=data,
                                 timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            if resp.status == 403:
+                            status = resp.status
+                            final_url = str(resp.url)
+
+                            if status == 403:
                                 print(f"[LinkTracker] 403 Forbidden on page {page_idx}. IP likely blocked temporarily.")
-                                return pages  # Return what we have so far
+                                if not pages and not did_dump_debug:
+                                    text = await resp.text()
+                                    preview = text[:2000].replace("\n", " ")
+                                    print(f"[LinkTracker][DDG][debug] 403 body preview: {preview}")
+                                    did_dump_debug = True
+                                return pages
 
                             resp.raise_for_status()
                             text = await resp.text()
+
                     except Exception as e:
                         print(f"[LinkTracker] DuckDuckGo request failed (page {page_idx}): {e}")
+                        if not pages and text and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            print(f"[LinkTracker][DDG][debug] Failed page HTML preview: {preview}")
+                            did_dump_debug = True
                         break
 
                     if "Unfortunately, bots use DuckDuckGo too." in text:
                         print("[LinkTracker] Bot detected by DDG.")
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            print(f"[LinkTracker][DDG][debug] Bot wall preview: {preview}")
+                            did_dump_debug = True
                         break
 
                     soup = BeautifulSoup(text, "html.parser")
 
                     found_new = False
                     for a in soup.select("a.result__a"):
-                        if len(pages) >= max_results: break
+                        if len(pages) >= max_results:
+                            break
                         href = a.get("href")
-                        if not href: continue
+                        if not href:
+                            continue
 
-                        # Handle DDG redirects
                         if "uddg=" in href:
                             try:
                                 href = unquote(href.split("uddg=", 1)[1].split("&", 1)[0])
@@ -6308,6 +6477,15 @@ class LinkTrackerBlock(BaseBlock):
                             seen_urls.add(href)
                             pages.append(href)
                             found_new = True
+
+                    # NEW: dump if this page yielded nothing and overall we still have nothing
+                    if not found_new and not pages and not did_dump_debug:
+                        preview = text[:2000].replace("\n", " ")
+                        print(
+                            f"[LinkTracker][DDG][debug] No results on page {page_idx} for query={q!r} "
+                            f"(status={status}, url={final_url}). HTML preview: {preview}"
+                        )
+                        did_dump_debug = True
 
                     if not found_new:
                         break
@@ -6324,14 +6502,7 @@ class LinkTrackerBlock(BaseBlock):
             timeout: float,
             page_limit: int = 1,
     ) -> List[str]:
-        """
-        Runs a Google CSE search, returns a list of URLs (async version).
-
-        n          = max total results you *want* (LinkTracker's search_results_cap)
-        page_limit = how many CSE pages to walk (10 results per page, max 10 pages)
-        """
-        import os
-        import json
+        import os, json
 
         cx = os.environ.get("GOOGLE_CSE_ID")
         key = os.environ.get("GOOGLE_API_KEY")
@@ -6339,25 +6510,26 @@ class LinkTrackerBlock(BaseBlock):
             print("[LinkTracker][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY env vars.")
             return []
 
-        # CSE hard limit: 100 results (10 per page, start=1..91)
         max_total = max(1, min(int(n), 100))
         per_page = min(10, max_total)
-        # How many pages we *can* actually fetch
         max_pages_by_n = (max_total + per_page - 1) // per_page
         pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
 
         out: List[str] = []
+        did_dump_debug = False  # NEW
 
         try:
             async with aiohttp.ClientSession() as session:
                 for page_idx in range(pages_to_fetch):
-                    # Stop early if we already hit desired total
                     if len(out) >= max_total:
                         break
 
                     start = 1 + page_idx * per_page
                     if start > 100:
-                        break  # CSE won't go past start=100
+                        break
+
+                    text = ""
+                    status = None
 
                     try:
                         async with session.get(
@@ -6375,35 +6547,23 @@ class LinkTrackerBlock(BaseBlock):
                             text = await resp.text()
 
                             if status != 200:
-                                # Try to parse JSON error for better logging
-                                reason = ""
-                                try:
-                                    data_err = json.loads(text)
-                                    err_obj = (data_err.get("error") or {})
-                                    reason = err_obj.get("message") or ""
-                                    errors = err_obj.get("errors") or []
-                                    if errors and isinstance(errors, list):
-                                        code = errors[0].get("reason") or ""
-                                        if code:
-                                            reason = (
-                                                f"{reason} (reason={code})"
-                                                if reason else code
-                                            )
-                                except Exception:
-                                    pass
-
-                                print(
-                                    f"[LinkTracker][GoogleCSE] HTTP {status} for query={q!r} "
-                                    f"start={start}. {'Error: ' + reason if reason else ''}"
-                                )
-                                # On HTTP error for one page, just stop further pages.
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][GoogleCSE][debug] HTTP {status} "
+                                        f"query={q!r} start={start}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
                                 break
 
-                            # Status 200, parse JSON
                             try:
                                 data = json.loads(text)
                             except json.JSONDecodeError as e:
                                 print(f"[LinkTracker][GoogleCSE] JSON decode error: {e}")
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Bad JSON preview: {preview}")
+                                    did_dump_debug = True
                                 break
 
                             err_obj = data.get("error")
@@ -6417,15 +6577,23 @@ class LinkTrackerBlock(BaseBlock):
                                     f"[LinkTracker][GoogleCSE] API error for query={q!r}, "
                                     f"start={start}: {msg} ({reason})"
                                 )
+
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Error JSON preview: {preview}")
+                                    did_dump_debug = True
                                 break
 
                             items = data.get("items") or []
                             if not items:
-                                # No more hits, stop paginating
                                 print(
                                     f"[LinkTracker][GoogleCSE] No items for query={q!r}, "
                                     f"start={start}. Stopping pagination."
                                 )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Empty items JSON preview: {preview}")
+                                    did_dump_debug = True
                                 break
 
                             for item in items:
@@ -6437,6 +6605,10 @@ class LinkTrackerBlock(BaseBlock):
 
                     except aiohttp.ClientError as e:
                         print(f"[LinkTracker][GoogleCSE] AIOHTTP error: {e}")
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            print(f"[LinkTracker][GoogleCSE][debug] ClientError body preview: {preview}")
+                            did_dump_debug = True
                         break
 
         except Exception as e:
@@ -6445,10 +6617,10 @@ class LinkTrackerBlock(BaseBlock):
         return out
 
     async def _fetch_page_html_plain(
-        self,
-        session: aiohttp.ClientSession,
-        page_url: str,
-        timeout: float,
+            self,
+            session: aiohttp.ClientSession,
+            page_url: str,
+            timeout: float,
     ) -> str:
         """Fetch page HTML via aiohttp only (async version)."""
         async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
@@ -6456,15 +6628,15 @@ class LinkTrackerBlock(BaseBlock):
             return await resp.text()
 
     async def _fetch_page_with_js(
-        self,
-        page_url: str,
-        timeout: float,
-        ua: str,
-        log: List[str],
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
+            self,
+            page_url: str,
+            timeout: float,
+            ua: str,
+            log: List[str],
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
     ) -> Tuple[str, List[Dict[str, str]]]:
         try:
             from playwright.async_api import async_playwright
@@ -6521,43 +6693,40 @@ class LinkTrackerBlock(BaseBlock):
                     wait_until="domcontentloaded",
                     timeout=js_timeout_ms,
                 )
-
+                await page.wait_for_timeout(int(timeout * 1000))
                 html = await page.content()
 
                 raw_links = await page.evaluate(
                     """
-                    () => {
-                      const out = []
-                      const seen = new Set()
+                       () => {
+                          const out = [];
+                          const seen = new Set();
 
-                      function push(el, url, tag) {
-                        if (!url || url.startsWith('blob:') || seen.has(url)) return
-                        seen.add(url)
-                        const text = (el.innerText || el.textContent || el.title || "").trim()
-                        out.push({ url, text, tag })
-                      }
-
-                      const selectors = [
-                        "a[href]",
-                        "video[src]",
-                        "video source[src]",
-                        "source[src]",
-                        "iframe[src]",
-                        "embed[src]"
-                      ]
-
-                      for (const sel of selectors) {
-                        document.querySelectorAll(sel).forEach(el => {
-                          let url = el.href || el.currentSrc || el.src
-                          if (!url && el.getAttribute) {
-                            url = el.getAttribute("src") || el.getAttribute("href")
+                          function push(el, url, tag) {
+                            if (!url || url.startsWith('blob:') || seen.has(url)) return;
+                            seen.add(url);
+                            const text = (el.innerText || el.textContent || el.title || "").trim();
+                            out.push({ url, text, tag });
                           }
-                          push(el, url, el.tagName.toLowerCase())
-                        })
-                      }
 
-                      return out
-                    }
+                          function walk(node) {
+                            if (!node) return;
+                            // normal elements
+                            node.querySelectorAll?.("a[href], video[src], video source[src], source[src], iframe[src], embed[src]")
+                              .forEach(el => {
+                                let url = el.href || el.currentSrc || el.src || el.getAttribute("href") || el.getAttribute("src");
+                                push(el, url, el.tagName.toLowerCase());
+                              });
+
+                            // shadow roots
+                            node.querySelectorAll?.("*").forEach(el => {
+                              if (el.shadowRoot) walk(el.shadowRoot);
+                            });
+                          }
+
+                          walk(document);
+                          return out;
+                        }
                     """
                 ) or []
 
@@ -6582,6 +6751,35 @@ class LinkTrackerBlock(BaseBlock):
             log.append(f"Playwright error on {page_url}: {e}")
 
         return html, links
+
+    def _extract_urls_from_json(self, obj: Any, out: set[str], limit: int = 500) -> None:
+        """
+        Recursively walk JSON-like data and collect http(s) URLs.
+        Bounded by `limit` to avoid explosions.
+        """
+        if len(out) >= limit:
+            return
+
+        if isinstance(obj, dict):
+            for v in obj.values():
+                self._extract_urls_from_json(v, out, limit)
+                if len(out) >= limit:
+                    return
+
+        elif isinstance(obj, list) or isinstance(obj, tuple):
+            for v in obj:
+                self._extract_urls_from_json(v, out, limit)
+                if len(out) >= limit:
+                    return
+
+        elif isinstance(obj, str):
+            # Find any embedded URLs in strings
+            for m in self._URL_RE.finditer(obj):
+                if len(out) >= limit:
+                    return
+                url = m.group(0).rstrip(".,;)]}")
+                if url.startswith("http"):
+                    out.add(url)
 
     # ------------------------------------------------------------------ #
     # Main execution (Async version)
@@ -6784,6 +6982,20 @@ class LinkTrackerBlock(BaseBlock):
                     sq = f"{sq} filetype:pdf".strip()
             return sq
 
+        def _is_search_url(u: str) -> bool:
+            try:
+                pu = urlparse(u)
+                path = (pu.path or "").lower()
+                q = (pu.query or "").lower()
+
+                if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
+                    return True
+                if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
+                    return True
+                return False
+            except Exception:
+                return False
+
         # --- 7. Search vs URL-list triage (subpipeline-aware) ------------
         candidate_pages: List[str] = []
         direct_asset_urls: List[str] = []
@@ -6861,43 +7073,99 @@ class LinkTrackerBlock(BaseBlock):
         # Deduplicate queries while preserving order
         queries_to_run = _dedupe(queries_to_run)
         query = queries_to_run[0] if queries_to_run else query_raw
-
         # --- 8. Search-based discovery (if not URL-list mode) ------------
         if not skip_search_engine and queries_to_run:
             ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
             seen_search_urls: set[str] = set()
 
-            for q in queries_to_run:
-                search_q = _augment_search_query(q, mode, required_sites)
+            explicit_site_seeds: set[str] = set()
+            synthetic_search_seeds: set[str] = set()
 
-                if engine == "google_cse":
-                    raw_pages = await self._search_google_cse(
-                        search_q,
-                        search_results_cap,
-                        timeout,
-                        page_limit=search_page_limit,
-                    )
+            if engine == "sites":
+                if not required_sites:
+                    print("[LinkTracker][sites] engine selected but site_require is empty; falling back to duckduckgo.")
+                    engine = "duckduckgo"
                 else:
-                    raw_pages = await self._search_duckduckgo(
-                        search_q,
-                        search_results_cap,
-                        ua,
-                        timeout,
-                        page_limit=search_page_limit,
-                        per_page=search_per_page,
+                    seed_urls, synthetic_search_seeds = self._seed_pages_from_required_sites(
+                        required_sites,
+                        queries_to_run
                     )
 
-                for u in raw_pages:
-                    if u in seen_search_urls:
-                        continue
-                    if _allowed_by_required_sites(u) or not required_sites:
+                    raw_pages = list(seed_urls) + list(synthetic_search_seeds)
+
+                    seed_set = set(seed_urls)  # roots only
+
+                    for u in raw_pages:
+                        u = str(u).strip()
+                        if not u or u in seen_search_urls:
+                            continue
+
+                        if _allowed_by_required_sites(u) or not required_sites:
+                            candidate_pages.append(u)
+                            seen_search_urls.add(u)
+
+                            # Only roots go in explicit_site_seeds
+                            if u in seed_set:
+                                explicit_site_seeds.add(u)
+
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+            elif engine == "duckduckgo":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_duckduckgo(
+                            sq,
+                            max_results=search_results_cap,
+                            ua=ua,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                            per_page=search_per_page,
+                        )
+                        if not urls:
+                            print(f"[search][ddg] 0 results for {sq!r}")
+                    except Exception as e:
+                        print(f"[search][ddg] error for {sq!r}: {e}")
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
                         candidate_pages.append(u)
                         seen_search_urls.add(u)
-                    if len(candidate_pages) >= max_pages_total:
-                        break
-                if len(candidate_pages) >= max_pages_total:
-                    break
 
+            elif engine == "google_cse":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_google_cse(
+                            sq,
+                            n=search_results_cap,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                        )
+                        if not urls:
+                            print(f"[search][cse] 0 results for {sq!r}")
+                    except Exception as e:
+                        print(f"[search][cse] error for {sq!r}: {e}")
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+
+            else:
+                print(f"[search] unknown engine={engine!r}; no search performed")
         # --- 9. Crawl / Page Scan ---
         found_assets: List[Dict[str, Any]] = []
         seen_asset_urls: set[str] = set()
@@ -6910,9 +7178,9 @@ class LinkTrackerBlock(BaseBlock):
         # 9a. Direct assets from URL list (DB-aware)
         if direct_asset_urls:
             async with aiohttp.ClientSession(
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                }
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                    }
             ) as session_direct:
                 for u in direct_asset_urls:
                     # DB skip
@@ -6929,9 +7197,9 @@ class LinkTrackerBlock(BaseBlock):
                     if verify_links:
                         try:
                             async with session_direct.head(
-                                u,
-                                allow_redirects=True,
-                                timeout=aiohttp.ClientTimeout(total=3),
+                                    u,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=3),
                             ) as h:
                                 if h.status == 200:
                                     status = "200 OK"
@@ -6957,7 +7225,22 @@ class LinkTrackerBlock(BaseBlock):
                         if use_database:
                             self._save_asset_to_database(asset)
 
-        # 9b. Page-worker for BFS (Async version)
+        def _should_persist_page(u: str) -> bool:
+            if engine != "sites":
+                return True
+
+            # never persist roots or synthetic probes
+            if u in explicit_site_seeds:
+                return False
+            if u in synthetic_search_seeds:
+                return False
+
+            # never persist any other search-like pages in sites mode
+            if _is_search_url(u):
+                return False
+
+            return True
+
         async def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
             local_log: List[str] = []
             local_js_links: List[Dict[str, str]] = []
@@ -6966,9 +7249,9 @@ class LinkTrackerBlock(BaseBlock):
             next_pages: List[str] = []
 
             async with aiohttp.ClientSession(
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                }
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                    }
             ) as session:
                 try:
                     links_on_page: List[Dict[str, str]] = []
@@ -6978,7 +7261,7 @@ class LinkTrackerBlock(BaseBlock):
                     sniff_parent_pages: List[str] = []
 
                     if use_network_sniff:
-                        sniff_html, sniff_items = await self._fetch_page_with_network_sniff(
+                        sniff_html, sniff_items, sniff_json = await self._fetch_page_with_network_sniff(
                             page_url,
                             timeout,
                             session.headers["User-Agent"],
@@ -6989,8 +7272,51 @@ class LinkTrackerBlock(BaseBlock):
                             block_domains,
                             blocked_domains,
                         )
-                        html = sniff_html or html
 
+                        html = sniff_html or html
+                        # ------------------------------------------------------------
+                        # NEW: Pull URLs out of sniffed JSON responses
+                        # ------------------------------------------------------------
+                        json_url_set: set[str] = set()
+                        try:
+                            # sniff_json is List[{ "url": <endpoint>, "json": <payload> }]
+                            for hit in sniff_json or []:
+                                data = hit.get("json")
+                                if data is None:
+                                    continue
+                                self._extract_urls_from_json(data, json_url_set, limit=500)
+                        except Exception as e:
+                            local_log.append(f"JSON sniff parse error on {page_url}: {e}")
+
+                        # De-dupe + bound
+                        if json_url_set:
+                            json_urls = list(json_url_set)
+                            json_urls = json_urls[:max_links_per_page]  # reuse existing cap
+
+                            # Treat JSON URLs like JS/DOM links (feed scan pipeline)
+                            for ju in json_urls:
+                                if not ju or not ju.startswith("http"):
+                                    continue
+                                if not _allowed_by_required_sites(ju):
+                                    continue
+
+                                # Skip static junk immediately
+                                jpath = _clean_path(ju)
+                                if any(jpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                    continue
+
+                                # Add as a "network_json" link
+                                links_on_page.append({
+                                    "url": ju,
+                                    "text": "[Network JSON URL]",
+                                    "tag": "network_json",
+                                })
+                                local_js_links.append({
+                                    "page": page_url,
+                                    "url": ju,
+                                    "text": "[Network JSON URL]",
+                                    "tag": "network_json",
+                                })
                         for si in sniff_items:
                             url = si.get("url", "")
                             if not url:
@@ -7044,6 +7370,10 @@ class LinkTrackerBlock(BaseBlock):
                             html = js_html
                         links_on_page.extend(js_links)
 
+                        if not js_links:
+                            # DEBUG: record a short HTML preview so we can see what bot-shell we got
+                            preview = (html or "")[:2000].replace("\n", " ")
+                            local_log.append(f"[debug] JS DOM preview (first 2000 chars): {preview}")
                         for jl in js_links:
                             local_js_links.append(
                                 {
@@ -7062,7 +7392,7 @@ class LinkTrackerBlock(BaseBlock):
                         except Exception as e:
                             local_log.append(f"Error fetching {page_url}: {e}")
                             # Even in error, mark as scanned so we don't hammer again
-                            if use_database:
+                            if use_database and _should_persist_page(page_url):
                                 try:
                                     self._mark_page_scanned(page_url)
                                 except Exception as ee:
@@ -7133,9 +7463,9 @@ class LinkTrackerBlock(BaseBlock):
                         if verify_links:
                             try:
                                 async with session.head(
-                                    full_url,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=3),
+                                        full_url,
+                                        allow_redirects=True,
+                                        timeout=aiohttp.ClientTimeout(total=3),
                                 ) as h:
                                     if h.status == 200:
                                         status = "200 OK"
@@ -7182,9 +7512,9 @@ class LinkTrackerBlock(BaseBlock):
                             if verify_links:
                                 try:
                                     async with session.head(
-                                        full_url,
-                                        allow_redirects=True,
-                                        timeout=aiohttp.ClientTimeout(total=3),
+                                            full_url,
+                                            allow_redirects=True,
+                                            timeout=aiohttp.ClientTimeout(total=3),
                                     ) as h:
                                         if h.status == 200:
                                             status = "200 OK"
@@ -7198,9 +7528,9 @@ class LinkTrackerBlock(BaseBlock):
 
                             if not verify_links or status == "200 OK":
                                 display_text = (
-                                    item.get("text")
-                                    or full_url.rsplit("/", 1)[-1]
-                                    or "[network asset]"
+                                        item.get("text")
+                                        or full_url.rsplit("/", 1)[-1]
+                                        or "[network asset]"
                                 )
                                 display_text = display_text[:100]
                                 asset = {
@@ -7233,8 +7563,12 @@ class LinkTrackerBlock(BaseBlock):
                                 if not _term_overlap_ok(haystack):
                                     continue
 
-                            next_pages.append(full_url)
+                            if engine == "sites":
+                                # search-style pages are ONLY allowed if they were seeded
+                                if _is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                    continue
 
+                            next_pages.append(full_url)
                     if depth < max_depth and sniff_parent_pages:
                         for parent_url in sniff_parent_pages:
                             if not _allowed_by_required_sites(parent_url):
@@ -7242,14 +7576,14 @@ class LinkTrackerBlock(BaseBlock):
                             next_pages.append(parent_url)
 
                     # Mark page as scanned (successful HTML parse)
-                    if use_database:
+                    if use_database and _should_persist_page(page_url):
                         try:
                             self._mark_page_scanned(page_url)
                         except Exception as ee:
                             local_log.append(f"Error marking page scanned {page_url}: {ee}")
                 except Exception as e:
                     local_log.append(f"Error scanning {page_url}: {e}")
-                    if use_database:
+                    if use_database and _should_persist_page(page_url):
                         try:
                             self._mark_page_scanned(page_url)
                         except Exception as ee:
@@ -7439,13 +7773,13 @@ class LinkTrackerBlock(BaseBlock):
             "mode": "docs",  # media, docs, archives, custom
             "scan_limit": 5,
             "search_results_cap": 256,
-            "search_page_limit": 1,   # NEW: how many search pages per query
-            "search_per_page": 50,    # NEW: DDG results per HTML page
+            "search_page_limit": 1,  # NEW: how many search pages per query
+            "search_per_page": 50,  # NEW: DDG results per HTML page
             "verify": True,
             "extensions": ".pdf,.txt",
             "url_keywords": "archive,download",
             "engine": "duckduckgo",  # or: google_cse
-            "site_require": "",      # e.g. 'archive.org,ca.archive.org'
+            "site_require": "",  # e.g. 'archive.org,ca.archive.org'
             "use_js": False,
             "return_all_js_links": False,
             "max_links_per_page": 500,
@@ -7469,7 +7803,6 @@ class LinkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("linktracker", LinkTrackerBlock)
-
 
 
 # ======================= YouTubeDataBlock ==================================
@@ -7729,7 +8062,6 @@ class YouTubeDataBlock(BaseBlock):
 BLOCKS.register("youtube", YouTubeDataBlock)
 
 
-
 # ======================= VideoLinkTrackerBlock =============================
 
 @dataclass
@@ -7799,20 +8131,21 @@ class VideoLinkTrackerBlock(BaseBlock):
     # Search helpers
     # ------------------------------------------------------------------ #
 
-    async def _search_duckduckgo(self, session: aiohttp.ClientSession, q: str, n: int, ua: str, timeout: float) -> List[str]:
+    async def _search_duckduckgo(self, session: aiohttp.ClientSession, q: str, n: int, ua: str, timeout: float) -> List[
+        str]:
         """Runs a DuckDuckGo search, returns a list of URLs (async version). Enhanced with error handling and loop prevention."""
         pages: List[str] = []
         seen_urls = set()
-        max_iterations = n * 2 # safety limit
+        max_iterations = n * 2  # safety limit
         iteration_count = 0
 
         try:
             async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session:
                 try:
                     async with session.get(
-                        "https://html.duckduckgo.com/html/",
-                        params={"q": q},
-                        timeout=timeout,
+                            "https://html.duckduckgo.com/html/",
+                            params={"q": q},
+                            timeout=timeout,
                     ) as resp:
                         resp.raise_for_status()
                         text = await resp.text()
@@ -7820,25 +8153,25 @@ class VideoLinkTrackerBlock(BaseBlock):
                         for a in soup.select(".result__a"):
                             iteration_count += 1
                             if iteration_count > max_iterations or len(pages) >= n:
-                                break # safety limit
+                                break  # safety limit
 
                             try:
                                 href = a.get("href")
                                 if href and "uddg=" in href:
                                     href = unquote(href.split("uddg=")[1].split("&")[0])
-                                    if href not in seen_urls: # skip duplicates
+                                    if href not in seen_urls:  # skip duplicates
                                         pages.append(href)
                                         seen_urls.add(href)
                             except Exception as e:
                                 print(f"Error processing DDG result: {e}")  # log
-                                continue # Try next result
+                                continue  # Try next result
                 except aiohttp.ClientError as e:
-                    print(f"AIOHTTP error: {e}") # log
+                    print(f"AIOHTTP error: {e}")  # log
                 except Exception as e:
-                    print(f"General error during DDG fetch: {e}") # log
+                    print(f"General error during DDG fetch: {e}")  # log
 
         except Exception as e:
-             print(f"FATAL error in _search_duckduckgo: {e}")
+            print(f"FATAL error in _search_duckduckgo: {e}")
 
         return pages
 
@@ -7856,9 +8189,9 @@ class VideoLinkTrackerBlock(BaseBlock):
             async with aiohttp.ClientSession() as session:
                 try:
                     async with session.get(
-                        "https://www.googleapis.com/customsearch/v1",
-                        params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
-                        timeout=timeout,
+                            "https://www.googleapis.com/customsearch/v1",
+                            params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
+                            timeout=timeout,
                     ) as resp:
                         resp.raise_for_status()
                         data = await resp.json()
@@ -7869,12 +8202,12 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 out.append(u)
                         return out[:n]
                 except aiohttp.ClientError as e:
-                    print(f"AIOHTTP error: {e}") # log
+                    print(f"AIOHTTP error: {e}")  # log
                 except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {e}") # log
+                    print(f"JSON decode error: {e}")  # log
 
         except Exception as e:
-            print(f"FATAL error in _search_google_cse: {e}") # log
+            print(f"FATAL error in _search_google_cse: {e}")  # log
             return out[:n]
 
     # ------------------------------------------------------------------ #
@@ -7942,13 +8275,13 @@ class VideoLinkTrackerBlock(BaseBlock):
             return await resp.text()
 
     async def _fetch_page_with_js(
-        self,
-        pw_context: BrowserContext,
-        page_url: str,
-        timeout: float,
-        log: List[str],
-        use_network_sniff: bool = False,
-        sniff_sink: Optional[List[Dict[str, str]]] = None,
+            self,
+            pw_context: BrowserContext,
+            page_url: str,
+            timeout: float,
+            log: List[str],
+            use_network_sniff: bool = False,
+            sniff_sink: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[str, List[Dict[str, str]]]:
         """
         Use Playwright to:
@@ -8110,7 +8443,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             # If it's synchronous, it might block the event loop.
             # For this example, we'll treat it as a synchronous call for simplicity,
             # but in a real async system, it should be awaited or run in an executor.
-            pr = self.run_sub_pipeline( # Changed to await if run_sub_pipeline is async
+            pr = self.run_sub_pipeline(  # Changed to await if run_sub_pipeline is async
                 initial_value=query_raw,
                 pipeline_param_name="subpipeline",
                 parent_params=params,
@@ -8206,9 +8539,9 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             # --- Core crawl function (per page) ------------------------
             async def crawl_page(
-                page_url: str,
-                depth_left: int,
-                pw_context: Optional[BrowserContext],  # BrowserContext or None
+                    page_url: str,
+                    depth_left: int,
+                    pw_context: Optional[BrowserContext],  # BrowserContext or None
             ) -> List[str]:
                 nonlocal pages_processed
 
@@ -8311,8 +8644,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if (not is_video) and depth_left > 0:
                             if self._is_content_child_candidate(full_url, netloc, path):
                                 if (
-                                    full_url not in visited_pages
-                                    and len(page_child_candidates) < child_page_limit
+                                        full_url not in visited_pages
+                                        and len(page_child_candidates) < child_page_limit
                                 ):
                                     page_child_candidates.append(full_url)
 
@@ -8320,7 +8653,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if (not is_video) and smart_sniff:
                             try:
                                 async with session.head(
-                                    full_url, allow_redirects=True, timeout=3
+                                        full_url, allow_redirects=True, timeout=3
                                 ) as h:
                                     head_done = True
                                     status = (
@@ -8330,13 +8663,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                                     )
                                     content_type = (h.headers.get("Content-Type") or "").lower()
                                     if any(
-                                        content_type.startswith(pfx)
-                                        for pfx in self.VIDEO_CONTENT_PREFIXES
+                                            content_type.startswith(pfx)
+                                            for pfx in self.VIDEO_CONTENT_PREFIXES
                                     ):
                                         is_video = True
                                     if (
-                                        content_type in self.HLS_CONTENT_TYPES
-                                        or content_type in self.DASH_CONTENT_TYPES
+                                            content_type in self.HLS_CONTENT_TYPES
+                                            or content_type in self.DASH_CONTENT_TYPES
                                     ):
                                         is_video = True
                             except Exception:
@@ -8348,7 +8681,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             continue
 
                         haystack = (
-                            (link.get("text", "") or "") + " " + full_url
+                                (link.get("text", "") or "") + " " + full_url
                         ).lower().replace("%20", " ")
 
                         # NEW: min_term_overlap-based filtering
@@ -8363,7 +8696,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if verify_links and not head_done:
                             try:
                                 async with session.head(
-                                    full_url, allow_redirects=True, timeout=3
+                                        full_url, allow_redirects=True, timeout=3
                                 ) as h:
                                     status = (
                                         f"{h.status} OK"
@@ -8377,8 +8710,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                             found_assets.append(
                                 {
                                     "text": (link.get("text", "") or path.split("/")[-1])[
-                                        :100
-                                    ],
+                                            :100
+                                            ],
                                     "url": full_url,
                                     "source_page": page_url,
                                     "tag": link["tag"],
@@ -8490,9 +8823,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                         pw_context = await browser.new_context(user_agent=ua)
 
                         while (
-                            pages_to_crawl_tuples
-                            and pages_processed < max_pages_total
-                            and len(found_assets) < max_assets
+                                pages_to_crawl_tuples
+                                and pages_processed < max_pages_total
+                                and len(found_assets) < max_assets
                         ):
                             page_url, depth = pages_to_crawl_tuples.pop(0)
                             if page_url in visited_pages:
@@ -8503,9 +8836,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                             if depth < max_depth:
                                 for child_url in child_candidates:
                                     if (
-                                        child_url not in visited_pages
-                                        and len(pages_to_crawl_tuples)
-                                        < (max_pages_total - pages_processed)
+                                            child_url not in visited_pages
+                                            and len(pages_to_crawl_tuples)
+                                            < (max_pages_total - pages_processed)
                                     ):
                                         pages_to_crawl_tuples.append(
                                             (child_url, depth + 1)
@@ -8516,9 +8849,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                 else:
                     # Run without Playwright context
                     while (
-                        pages_to_crawl_tuples
-                        and pages_processed < max_pages_total
-                        and len(found_assets) < max_assets
+                            pages_to_crawl_tuples
+                            and pages_processed < max_pages_total
+                            and len(found_assets) < max_assets
                     ):
                         page_url, depth = pages_to_crawl_tuples.pop(0)
                         if page_url in visited_pages:
@@ -8529,9 +8862,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if depth < max_depth:
                             for child_url in child_candidates:
                                 if (
-                                    child_url not in visited_pages
-                                    and len(pages_to_crawl_tuples)
-                                    < (max_pages_total - pages_processed)
+                                        child_url not in visited_pages
+                                        and len(pages_to_crawl_tuples)
+                                        < (max_pages_total - pages_processed)
                                 ):
                                     pages_to_crawl_tuples.append(
                                         (child_url, depth + 1)
@@ -8590,9 +8923,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                             else "(unknown)"
                         )
                         lines.append(
-                            f"- <{nl.get('tag','network_sniff')}> "
+                            f"- <{nl.get('tag', 'network_sniff')}> "
                             f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
-                            f"(ctype={nl.get('content_type','?')})"
+                            f"(ctype={nl.get('content_type', '?')})"
                         )
 
                 return "\n".join(lines), {
@@ -8649,9 +8982,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                         else "(unknown)"
                     )
                     lines.append(
-                        f"- <{nl.get('tag','network_sniff')}> "
+                        f"- <{nl.get('tag', 'network_sniff')}> "
                         f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
-                        f"(ctype={nl.get('content_type','?')})"
+                        f"(ctype={nl.get('content_type', '?')})"
                     )
 
             return "\n".join(lines), {
@@ -8704,10 +9037,8 @@ class VideoLinkTrackerBlock(BaseBlock):
         }
 
 
-
 # Register the block
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
-
 
 
 # ======================= TorOnionBlock =============================
