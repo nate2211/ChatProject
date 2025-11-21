@@ -6225,106 +6225,91 @@ class LinkTrackerBlock(BaseBlock):
         return html, found_items
 
     async def _search_duckduckgo(
-        self,
-        q: str,
-        max_results: int,
-        ua: str,
-        timeout: float,
-        page_limit: int = 1,
-        per_page: int = 50,
+            self,
+            q: str,
+            max_results: int,
+            ua: str,  # We will ignore the passed UA and use a better one locally
+            timeout: float,
+            page_limit: int = 1,
+            per_page: int = 50,
     ) -> List[str]:
-        """
-        DuckDuckGo HTML search with simple pagination.
+        import asyncio
+        import random
 
-        Args:
-          q           : query string
-          max_results : global cap across all pages
-          ua          : user-agent
-          timeout     : per-request timeout
-          page_limit  : how many pages to fetch (1 = first page only)
-          per_page    : how many results we *try* to get per page
-        """
         pages: List[str] = []
         seen_urls: set[str] = set()
 
-        max_results = max(1, min(max_results, 256))
-        page_limit = max(1, min(page_limit, 10))       # safety guard
-        per_page = max(1, min(per_page, max_results))  # can't exceed max_results
+        # Use a standard Chrome User-Agent to look like a real person
+        real_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
 
+        headers = {
+            "User-Agent": real_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://duckduckgo.com/"
+        }
+
+        max_results = max(1, min(max_results, 256))
+        page_limit = max(1, min(page_limit, 5))
         base_url = "https://html.duckduckgo.com/html/"
 
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session:
+            async with aiohttp.ClientSession(headers=headers) as session:
                 for page_idx in range(page_limit):
                     if len(pages) >= max_results:
                         break
 
-                    # DuckDuckGo HTML uses 's' as an offset into results.
-                    # We'll step by 'per_page' each time.
-                    offset = page_idx * per_page
+                    # ADDED: Random delay between paginations to avoid 403
+                    if page_idx > 0:
+                        sleep_time = random.uniform(2.0, 5.0)
+                        print(f"[LinkTracker] Sleeping {sleep_time:.2f}s between search pages...")
+                        await asyncio.sleep(sleep_time)
+
+                    offset = page_idx * 30  # DDG HTML usually steps by 30, not arbitrary per_page
 
                     try:
-                        async with session.get(
-                            base_url,
-                            params={"q": q, "s": str(offset)},
-                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        # Data payload often works better than params for DDG HTML POST/GET
+                        data = {'q': q, 's': str(offset), 'dc': str(offset)}
+                        async with session.post(
+                                base_url,
+                                data=data,
+                                timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
+                            if resp.status == 403:
+                                print(f"[LinkTracker] 403 Forbidden on page {page_idx}. IP likely blocked temporarily.")
+                                return pages  # Return what we have so far
+
                             resp.raise_for_status()
                             text = await resp.text()
                     except Exception as e:
                         print(f"[LinkTracker] DuckDuckGo request failed (page {page_idx}): {e}")
                         break
 
-                    # Detect anomaly / CAPTCHA page
-                    if (
-                        "Unfortunately, bots use DuckDuckGo too." in text
-                        or "anomaly-modal__title" in text
-                    ):
-                        print("[LinkTracker] DDG anomaly / bot challenge detected. Aborting DDG search.")
+                    if "Unfortunately, bots use DuckDuckGo too." in text:
+                        print("[LinkTracker] Bot detected by DDG.")
                         break
 
                     soup = BeautifulSoup(text, "html.parser")
 
-                    # Primary: classic result links
+                    found_new = False
                     for a in soup.select("a.result__a"):
-                        if len(pages) >= max_results:
-                            break
+                        if len(pages) >= max_results: break
                         href = a.get("href")
-                        if not href:
-                            continue
-                        try:
-                            if "uddg=" in href:
-                                href = href.split("uddg=", 1)[1].split("&", 1)[0]
-                                href = unquote(href)
-                        except Exception as e:
-                            print(f"[LinkTracker] DuckDuckGo search error: {e}")
-                            continue
-                        if not href.startswith("http"):
-                            continue
-                        if href in seen_urls:
-                            continue
-                        seen_urls.add(href)
-                        pages.append(href)
+                        if not href: continue
 
-                    # Fallback: any http(s) links if primary yielded too few
-                    if len(pages) < max_results:
-                        for a in soup.find_all("a", href=True):
-                            if len(pages) >= max_results:
-                                break
-                            href = a["href"]
-                            if not href.startswith("http"):
-                                continue
-                            if "duckduckgo.com" in href:
-                                continue
-                            if href in seen_urls:
-                                continue
+                        # Handle DDG redirects
+                        if "uddg=" in href:
+                            try:
+                                href = unquote(href.split("uddg=", 1)[1].split("&", 1)[0])
+                            except:
+                                pass
+
+                        if href.startswith("http") and href not in seen_urls:
                             seen_urls.add(href)
                             pages.append(href)
+                            found_new = True
 
-                    # If we got nothing new from the very first page, dump a snippet for debug
-                    if offset == 0 and not pages:
-                        print("[LinkTracker] DDG returned 0 links, dumping first 2000 chars of HTML:")
-                        print(text[:2000])
+                    if not found_new:
                         break
 
         except Exception as e:
