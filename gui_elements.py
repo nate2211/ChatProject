@@ -119,22 +119,26 @@ class SQLiteTableModel(QAbstractTableModel):
 
     # ---------- Filtering ----------
     def apply_filter(self, text: str):
-        """Filters rows by substring match across all columns."""
-        self.current_filter = text.lower()
+        """Filters rows by substring match across all columns (incl. url)."""
+        needle = (text or "").strip().lower()
+        self.current_filter = needle
 
         self.layoutAboutToBeChanged.emit()
-        if not text:
+        if not needle:
             self.filtered_rows = self.data_rows[:]
             self.filtered_rowids = self.rowids[:]
         else:
             new_rows: List[List[Any]] = []
             new_rowids: List[int] = []
             for row, rid in zip(self.data_rows, self.rowids):
-                if any(text in str(cell).lower() for cell in row):
+                # case-insensitive match across ALL columns including 'url'
+                if any(needle in str(cell).lower() for cell in row):
                     new_rows.append(row)
                     new_rowids.append(rid)
+
             self.filtered_rows = new_rows
             self.filtered_rowids = new_rowids
+
         self.layoutChanged.emit()
 
     # ---------- Deletion ----------
