@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import functools
+import gzip
 import html
 import json
 import os
@@ -15,11 +16,12 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Any, Dict, Tuple, List, Optional, Set
 import json as _json
 import os as _os
 import time
-from urllib.parse import urlencode, urlparse, urljoin, unquote
+from urllib.parse import urlencode, urlparse, urljoin, unquote, quote_plus
 
 import aiohttp
 import feedparser
@@ -6303,49 +6305,90 @@ class LinkTrackerBlock(BaseBlock):
 
         page = await context.new_page()
 
-        def handle_response(response):
+        def handle_response(response: Response):
             try:
                 url = response.url
-                ctype = response.headers.get("content-type", "").lower()
+                if not url or url.startswith("blob:") or url in seen_network:
+                    return
 
-                # Capture JSON payloads (archive, metadata endpoints)
-                if "application/json" in ctype or "/metadata/" in url:
+                # Clean URL for checking
+                parsed = urlparse(url)
+                path = parsed.path.lower() or "/"
+                url_lower = url.lower()
+
+                # 1. IMMEDIATE JUNK FILTER (The Fix)
+                # Explicitly ignore common non-video web assets
+                junk_extensions = {
+                    ".js", ".css", ".json", ".html", ".svg", ".png",
+                    ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2",
+                    ".ttf", ".map", ".vtt", ".srt"
+                }
+                if any(path.endswith(ext) for ext in junk_extensions):
+                    return
+
+                seen_network.add(url)
+                netloc = parsed.netloc
+
+                if self._looks_like_ad(netloc, path):
+                    return
+
+                ctype = (response.headers.get("content-type") or "").lower()
+
+                # 2. Content-Type Filtering
+                # If it says it's javascript or css, kill it immediately
+                if "javascript" in ctype or "css" in ctype or "text/html" in ctype:
+                    return
+
+                # 3. JSON Handling (Keep specific metadata, ignore generic)
+                if "application/json" in ctype or "/metadata/" in url_lower:
+                    # Only grab JSON if it looks like a video manifest or metadata api
+                    if not any(x in url_lower for x in ["player", "manifest", "api", "metadata"]):
+                        return
+
                     async def _grab_json():
                         try:
                             data = await response.json()
                             json_hits.append({"url": url, "json": data})
                         except Exception:
                             pass
+
                     asyncio.create_task(_grab_json())
+                    # Do not add JSON to found_items (video assets)
                     return
 
-                # Extension fast path
-                if any(url.lower().endswith(ext) for ext in extensions):
-                    if url not in seen_network:
-                        seen_network.add(url)
-                        found_items.append({
-                            "url": url,
-                            "text": "[Network File]",
-                            "tag": "network_sniff",
-                            "size": response.headers.get("content-length", "?"),
-                        })
+                    # 4. Strict Video Detection
+                is_video = False
+
+                # Check extension matches strictly video formats
+                if any(path.endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                    is_video = True
+
+                # Check content-type matches strictly video/stream formats
+                if not is_video and ctype:
+                    if any(ctype.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES):
+                        is_video = True
+                    if ctype in self.HLS_CONTENT_TYPES or ctype in self.DASH_CONTENT_TYPES:
+                        is_video = True
+
+                # 5. URL Keyword Heuristic (Last Resort for streams without extensions)
+                # Only if we haven't found it yet, and it looks like a stream URL
+                if not is_video:
+                    if any(k in url_lower for k in [".m3u8", "videoplayback", "manifest.mpd"]):
+                        is_video = True
+
+                if not is_video:
                     return
 
-                # Content-type sniff
-                if ("audio" in ctype) or ("video" in ctype) or ("application/octet-stream" in ctype):
-                    cl_raw = response.headers.get("content-length", "0")
-                    try:
-                        cl = int(cl_raw)
-                    except Exception:
-                        cl = 0
-                    if cl > 50000 and url not in seen_network:
-                        seen_network.add(url)
-                        found_items.append({
-                            "url": url,
-                            "text": f"[Network Stream] ({ctype})",
-                            "tag": "network_sniff",
-                            "size": str(cl),
-                        })
+                # It's a probable video link
+                sniff_link = {
+                    "url": url,
+                    "text": "[Network Video]",
+                    "tag": "network_sniff",
+                    "content_type": ctype,
+                    "size": response.headers.get("content-length", "?"),
+                }
+                found_items.append(sniff_link)
+
             except Exception:
                 return
 
@@ -6703,30 +6746,185 @@ class LinkTrackerBlock(BaseBlock):
             resp.raise_for_status()
             return await resp.text()
 
-    def _extract_urls_from_json(self, obj: Any, out: set[str], limit: int = 500) -> None:
-        if len(out) >= limit:
-            return
+    async def _fetch_bytes(self, session, url, timeout) -> bytes:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            if r.status != 200:
+                return b""
+            return await r.read()
 
-        if isinstance(obj, dict):
-            for v in obj.values():
-                self._extract_urls_from_json(v, out, limit)
-                if len(out) >= limit:
-                    return
+    def _looks_like_sitemap(self, url: str) -> bool:
+        u = url.lower()
+        return any(u.endswith(x) for x in [".xml", ".xml.gz", "sitemap", "sitemap.xml", "sitemap_index.xml"])
 
-        elif isinstance(obj, (list, tuple)):
-            for v in obj:
-                self._extract_urls_from_json(v, out, limit)
-                if len(out) >= limit:
-                    return
+    def _decompress_if_needed(self, url: str, raw: bytes) -> str:
+        if not raw:
+            return ""
+        if url.lower().endswith(".gz"):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                return ""
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
 
-        elif isinstance(obj, str):
-            for m in self._URL_RE.finditer(obj):
-                if len(out) >= limit:
-                    return
-                url = m.group(0).rstrip(".,;)]}")
-                if url.startswith("http"):
-                    out.add(url)
+    def _parse_sitemap_any(self, xml_text: str) -> tuple[list[str], list[str]]:
+        """
+        Returns (sitemap_urls, page_urls).
+        Handles both <urlset> and <sitemapindex>.
+        """
+        if not xml_text.strip():
+            return [], []
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return [], []
 
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}", 1)[0] + "}"
+
+        sitemap_urls = []
+        page_urls = []
+
+        if root.tag.endswith("sitemapindex"):
+            for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
+                if sm.text and sm.text.strip().startswith("http"):
+                    sitemap_urls.append(sm.text.strip())
+
+        if root.tag.endswith("urlset"):
+            for loc in root.findall(f".//{ns}url/{ns}loc"):
+                if loc.text and loc.text.strip().startswith("http"):
+                    page_urls.append(loc.text.strip())
+
+        return sitemap_urls, page_urls
+
+    def _score_site_url(self, u: str, keywords: list[str], targets: set[str]) -> int:
+        """
+        Higher score = better candidate.
+        Prefer detail/item/download pages.
+        """
+        path = urlparse(u).path.lower()
+        score = 0
+
+        # Prefer pages that look like content/detail
+        for tok, w in [
+            ("/details/", 8),
+            ("/item/", 6),
+            ("/watch/", 4),
+            ("/download/", 9),
+            ("/track/", 4),
+            ("/file/", 4),
+            ("/audio/", 3),
+            ("/video/", 3),
+            ("/docs/", 2),
+        ]:
+            if tok in path:
+                score += w
+
+        # Penalize search/hub
+        for tok, w in [
+            ("/search", -6),
+            ("/tag/", -3),
+            ("/category/", -3),
+            ("/browse", -3),
+            ("/archives", -2),
+        ]:
+            if tok in path:
+                score += w
+
+        # Prefer direct assets
+        if any(path.endswith(ext) for ext in targets):
+            score += 10
+
+        # Keyword hits
+        low = u.lower().replace("%20", " ")
+        score += sum(2 for k in keywords if k and k in low)
+
+        return score
+
+    def _archive_ident_to_downloads(self, ident: str) -> list[str]:
+        # This is a heuristic; archive's /download/{ident}/{file} is best,
+        # but we don't know file names yet. So we use metadata endpoint to get them.
+        return [
+            f"https://archive.org/metadata/{ident}",
+            f"https://archive.org/download/{ident}/",
+            f"https://archive.org/details/{ident}",
+        ]
+    async def _crawl_sitemaps_for_site(
+            self,
+            session,
+            root: str,
+            sm_urls: list[str],
+            timeout: float,
+            keywords: list[str],
+            targets: set[str],
+            per_site_cap: int,
+            global_seen: set[str],
+    ) -> list[str]:
+        """
+        Recursively crawl sitemapindex + urlset, return best-scoring URLs.
+        """
+        to_visit = list(dict.fromkeys(sm_urls))
+        visited_sm = set()
+        collected = []
+
+        while to_visit and len(collected) < per_site_cap * 5:
+            sm = to_visit.pop(0)
+            if sm in visited_sm:
+                continue
+            visited_sm.add(sm)
+
+            raw = await self._fetch_bytes(session, sm, timeout)
+            xml = self._decompress_if_needed(sm, raw)
+            child_sms, pages = self._parse_sitemap_any(xml)
+
+            for c in child_sms:
+                if c not in visited_sm and self._looks_like_sitemap(c):
+                    to_visit.append(c)
+
+            for p in pages:
+                if p in global_seen:
+                    continue
+                global_seen.add(p)
+                collected.append(p)
+
+        # Score + pick top
+        collected.sort(key=lambda u: self._score_site_url(u, keywords, targets), reverse=True)
+        return collected[:per_site_cap]
+
+    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
+        """
+        Detect common pagination patterns.
+        """
+        out = []
+        for a in soup.select("a[rel=next], a.next, a:-soup-contains('Next'), a:-soup-contains('Older')"):
+            href = a.get("href")
+            if href:
+                out.append(urljoin(base_url, href))
+        return out[:3]
+
+    def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
+        """
+        Prefer “result cards” over nav/footer.
+        """
+        out = []
+        # common search result containers
+        containers = soup.select(
+            "article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]"
+        )
+        for a in containers:
+            href = a.get("href")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            host = urlparse(full).netloc.lower()
+            if site_host in host:
+                out.append(full)
+            if len(out) >= 200:
+                break
+        return list(dict.fromkeys(out))
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -6997,49 +7195,75 @@ class LinkTrackerBlock(BaseBlock):
                 seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
                     required_sites=required_sites,
                     queries=queries_to_run,
-                    probe_cap_per_site=max(5, len(queries_to_run) * 2),
-                    sitemap_cap_per_site=8,
-                    hub_cap_per_site=6,
+                    probe_cap_per_site=max(8, len(queries_to_run) * 3),
+                    sitemap_cap_per_site=12,
+                    hub_cap_per_site=10,
                 )
                 synthetic_search_seeds = syn_seeds
                 explicit_site_seeds = exp_seeds
-                candidate_pages.extend(seed_pages)
-                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
 
-                per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
-                expanded: list[str] = []
+                per_site_cap = max(5, max_pages_total // max(1, len(required_sites)))
+                global_seen = set()
 
                 async with aiohttp.ClientSession(headers={"User-Agent": ua_search}) as seed_sess:
                     for site in required_sites:
                         root = f"https://{site.strip().lstrip('.')}".rstrip("/") + "/"
+                        host = urlparse(root).netloc.lower()
+
+                        # --- 1) robots ---
                         robots_url = root + "robots.txt"
-                        try:
-                            robots_txt = await self._fetch_text(seed_sess, robots_url, timeout)
-                            sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
-                        except Exception:
-                            sm_urls = []
+                        robots_txt = await self._fetch_text(seed_sess, robots_url, timeout)
+                        sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
 
+                        # fallback common sitemaps
                         if not sm_urls:
-                            sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:4]
+                            sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:8]
 
-                        site_added = 0
-                        for sm in sm_urls[:4]:
+                        # --- 2) recursive sitemap crawl ---
+                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
+                            seed_sess, root, sm_urls, timeout, keywords, targets,
+                            per_site_cap=per_site_cap,
+                            global_seen=global_seen,
+                        )
+
+                        # --- 3) expand hub/search seeds ---
+                        hub_like = [u for u in seed_pages if site in u and _is_search_url(u)]
+                        expanded_from_hubs = []
+                        for hub in hub_like[:3]:
                             try:
-                                xml_txt = await self._fetch_text(seed_sess, sm, timeout)
-                                urls = self._extract_urls_from_sitemap_xml(xml_txt, cap=750)
+                                html_hub = await self._fetch_page_html_plain(seed_sess, hub, timeout)
+                                soup = BeautifulSoup(html_hub or "", "html.parser")
+
+                                expanded_from_hubs.extend(self._extract_internal_result_links(soup, hub, host))
+
+                                for nxt in self._extract_next_page_links(soup, hub):
+                                    html_nxt = await self._fetch_page_html_plain(seed_sess, nxt, timeout)
+                                    soup_nxt = BeautifulSoup(html_nxt or "", "html.parser")
+                                    expanded_from_hubs.extend(self._extract_internal_result_links(soup_nxt, nxt, host))
                             except Exception:
-                                urls = []
+                                pass
 
-                            for u in urls:
-                                if site_added >= per_site_cap:
-                                    break
-                                if _allowed_by_required_sites(u) and (not keywords or _term_overlap_ok(u)):
-                                    expanded.append(u)
-                                    site_added += 1
+                        # Score hubs too
+                        expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
+                        expanded_from_hubs.sort(
+                            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
+                        )
+                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
 
-                if expanded:
-                    candidate_pages.extend(expanded)
-                    candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+                        # --- 4) combine sources, keep best ---
+                        merged = list(dict.fromkeys(
+                            [root] + best_from_sitemaps + expanded_from_hubs + [u for u in seed_pages if site in u]
+                        ))
+
+                        merged.sort(key=lambda u: self._score_site_url(u, keywords, targets), reverse=True)
+
+                        for u in merged:
+                            if len(candidate_pages) >= max_pages_total:
+                                break
+                            if _allowed_by_required_sites(u) and (not keywords or _term_overlap_ok(u)):
+                                candidate_pages.append(u)
+
+                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
 
             elif engine == "duckduckgo":
                 for qv in queries_to_run:
@@ -7186,14 +7410,35 @@ class LinkTrackerBlock(BaseBlock):
                             pw_context, page_url, timeout, local_log, targets
                         )
                         html = sniff_html or html
-
+                        if "archive.org/metadata/" in page_url:
+                            try:
+                                meta = json.loads(html) if html.strip().startswith("{") else {}
+                                files = meta.get("files") or []
+                                for f in files:
+                                    name = f.get("name", "")
+                                    if not name:
+                                        continue
+                                    low = name.lower()
+                                    if any(low.endswith(ext) for ext in targets):
+                                        dl = f"https://archive.org/download/{meta.get('metadata', {}).get('identifier', '')}/{name}"
+                                        links_on_page.append({"url": dl, "text": name, "tag": "archive_file"})
+                            except Exception:
+                                pass
                         # Pull URLs from sniffed JSON
                         json_url_set: set[str] = set()
                         try:
-                            for hit in sniff_json or []:
-                                data = hit.get("json")
-                                if data is not None:
-                                    self._extract_urls_from_json(data, json_url_set, limit=500)
+                            if sniff_json:
+                                for hit in sniff_json:
+                                    data = hit.get("json") or {}
+                                    # Archive advancedsearch structure:
+                                    docs = (((data.get("response") or {}).get("docs")) or [])
+                                    for d in docs:
+                                        ident = d.get("identifier")
+                                        if ident:
+                                            for u2 in self._archive_ident_to_downloads(ident):
+                                                if _allowed_by_required_sites(u2):
+                                                    links_on_page.append({"url": u2, "text": "[Archive identifier]",
+                                                                          "tag": "archive_ident"})
                         except Exception as e:
                             local_log.append(f"JSON sniff parse error on {page_url}: {e}")
 
@@ -7908,164 +8153,295 @@ class VideoLinkTrackerBlock(BaseBlock):
     Modes via 'source' param:
       • source="search"  (default): run web search to find hub pages.
       • source="payload": parse input payload (e.g., WebCorpus output) for hub URLs.
+      • engine="sites": target specific sites for sitemap/pagination-based crawling.
 
     Features:
       • DuckDuckGo / Google CSE search with optional site: filters.
+      • Site-specific sitemap and pagination crawling (engine="sites").
       • Optional JS rendering via Playwright (use_js=true).
       • Optional Playwright network sniffing (use_network_sniff=true) to capture
-        video URLs seen in real network responses.
+        video URLs seen in real network responses, including JSON payloads.
       • Ad / tracking filters to skip obvious junk.
       • Optional shallow second-level crawl (controlled by max_depth).
       • Stream-aware detection (.mp4, .m3u8, 'videoplayback', etc.)
       • Optional HEAD-based Content-Type sniffing (smart_sniff).
       • Hard safety limits (max_pages_total, max_assets).
-      • NEW: min_term_overlap:
-          - videotracker.min_term_overlap=N
-          Require at least N distinct keyword tokens (from the query) to appear
-          in the URL/text haystack. For "lil uzi vert", setting
-          min_term_overlap=2 or 3 biases strongly to pages *about* Lil Uzi Vert.
-      • NEW: subpipeline (optional):
-          - videotracker.subpipeline="prompt_query"
-          - videotracker.subpipeline="prompt_query|sitemap"
-          - videotracker.subpipeline="prompt_query|xml"
-        If the final sub-block returns:
-          • List[str] of URLs → treat as hub pages to crawl (sitemap/xml).
-          • List[str] of queries → run search for each (prompt_query).
+      • min_term_overlap for keyword matching.
+      • subpipeline support for dynamic queries/URLs.
+      • Database integration to avoid re-processing known assets/pages.
+      • Playwright resource and domain blocking.
     """
 
     # --- Constants --------------------------------------------------------
     VIDEO_EXTENSIONS = {
         ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".m3u8", ".mpd",
+        ".ogv", ".ts", ".3gp", ".f4v", ".swf", ".divx", ".xvid", ".m4v",
     }
     VIDEO_PLATFORMS = {
         "youtube.com/embed/", "youtube-nocookie.com/embed/",
         "player.vimeo.com/video/", "dailymotion.com/embed/video/",
         "rumble.com/embed/", "v.redd.it", "/player.html", "/player/",
+        "streamable.com/", "gfycat.com/ifr/", "clips.twitch.tv/",
+        "tiktok.com/embed/", "bilibili.com/player/", "ok.ru/videoembed/",
     }
     STREAM_HINT_KEYWORDS = {
         "videoplayback", "hls", "dash", "manifest", "master.m3u8",
-        "index.m3u8", "playlist.m3u8",
+        "index.m3u8", "playlist.m3u8", "chunklist.m3u8", "video.mpd",
+        "stream", "cdn", "transcode", "delivery", "blob",
     }
-    VIDEO_CONTENT_PREFIXES = {"video/"}
+    VIDEO_CONTENT_PREFIXES = {"video/", "application/vnd.apple.mpegurl", "application/dash+xml"}
     HLS_CONTENT_TYPES = {"application/x-mpegurl", "application/vnd.apple.mpegurl"}
     DASH_CONTENT_TYPES = {"application/dash+xml"}
+
     AD_HOST_SUBSTRINGS = {
         "doubleclick", "googlesyndication", "adservice", "adserver",
         "adsystem", "adnxs", "trk.", "tracking", "analytics",
-        "metrics", "scorecardresearch",
+        "metrics", "scorecardresearch", "ads.", "ad.", "pixel.", "stat.",
     }
     AD_PATH_KEYWORDS = {
         "/ads/", "/adserver/", "/banner/", "/banners/", "/promo/",
         "/promotions/", "/tracking/", "/click/", "/impression", "/pixel",
+        "/sponsor/", "/advert/", "/popunder/", "/popup/",
     }
     JUNK_FILENAME_KEYWORDS = {
         "sprite", "icon", "favicon", "logo", "tracking",
-        "pixel", "blank", "placeholder",
+        "pixel", "blank", "placeholder", "thumbnail", "preview",
+        "captcha", "ads", "promo", "bg", "image", ".gif", ".webp",
+    }
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp",
     }
 
-    # ------------------------------------------------------------------ #
-    # Search helpers
-    # ------------------------------------------------------------------ #
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
 
-    async def _search_duckduckgo(self, session: aiohttp.ClientSession, q: str, n: int, ua: str, timeout: float) -> List[
-        str]:
-        """Runs a DuckDuckGo search, returns a list of URLs (async version). Enhanced with error handling and loop prevention."""
-        pages: List[str] = []
-        seen_urls = set()
-        max_iterations = n * 2  # safety limit
-        iteration_count = 0
+    def __post_init__(self):
+        self.db_conn: Optional[sqlite3.Connection] = None
 
+    # ------------------------------------------------------------------ #
+    # Database helpers (Copied from LinkTrackerBlock, updated to use log)
+    # ------------------------------------------------------------------ #
+    def _initialize_database(self, db_path: str, log: List[str]) -> None:
         try:
-            async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session:
-                try:
-                    async with session.get(
-                            "https://html.duckduckgo.com/html/",
-                            params={"q": q},
-                            timeout=timeout,
-                    ) as resp:
-                        resp.raise_for_status()
-                        text = await resp.text()
-                        soup = BeautifulSoup(text, "html.parser")
-                        for a in soup.select(".result__a"):
-                            iteration_count += 1
-                            if iteration_count > max_iterations or len(pages) >= n:
-                                break  # safety limit
+            if self.db_conn:
+                return
 
-                            try:
-                                href = a.get("href")
-                                if href and "uddg=" in href:
-                                    href = unquote(href.split("uddg=")[1].split("&")[0])
-                                    if href not in seen_urls:  # skip duplicates
-                                        pages.append(href)
-                                        seen_urls.add(href)
-                            except Exception as e:
-                                print(f"Error processing DDG result: {e}")  # log
-                                continue  # Try next result
-                except aiohttp.ClientError as e:
-                    print(f"AIOHTTP error: {e}")  # log
-                except Exception as e:
-                    print(f"General error during DDG fetch: {e}")  # log
+            db_path = str(db_path or "video_corpus.db")
+            existed = Path(db_path).exists()
+
+            self.db_conn = sqlite3.connect(db_path)
+            cur = self.db_conn.cursor()
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assets
+                (
+                    url TEXT PRIMARY KEY,
+                    text TEXT,
+                    source TEXT,
+                    size TEXT,
+                    status TEXT,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pages
+                (
+                    url TEXT PRIMARY KEY,
+                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
+
+            self.db_conn.commit()
+            log.append(f"[VideoLinkTracker] {'Using existing' if existed else 'Database created and initialized'} at {db_path}")
 
         except Exception as e:
-            print(f"FATAL error in _search_duckduckgo: {e}")
+            log.append(f"[VideoLinkTracker] Error initializing/opening database: {e}")
+            if self.db_conn:
+                self.db_conn.close()
+                self.db_conn = None
 
-        return pages
-
-    async def _search_google_cse(self, session: aiohttp.ClientSession, q: str, n: int, timeout: float) -> List[str]:
-        """Runs a Google CSE search, returns a list of URLs (async version). Enhanced with error handling."""
-        import os
-
-        cx = os.environ.get("GOOGLE_CSE_ID")
-        key = os.environ.get("GOOGLE_API_KEY")
-        if not (cx and key):
-            return []
-
-        out: List[str] = []
+    def _is_url_in_database(self, url: str, log: List[str]) -> bool:
+        if not self.db_conn:
+            return False
         try:
-            async with aiohttp.ClientSession() as session:
-                try:
-                    async with session.get(
-                            "https://www.googleapis.com/customsearch/v1",
-                            params={"q": q, "cx": cx, "key": key, "num": min(10, n)},
-                            timeout=timeout,
-                    ) as resp:
-                        resp.raise_for_status()
-                        data = await resp.json()
-                        items = data.get("items") or []
-                        for item in items:
-                            u = item.get("link")
-                            if u:
-                                out.append(u)
-                        return out[:n]
-                except aiohttp.ClientError as e:
-                    print(f"AIOHTTP error: {e}")  # log
-                except json.JSONDecodeError as e:
-                    print(f"JSON decode error: {e}")  # log
-
+            cur = self.db_conn.cursor()
+            cur.execute("SELECT 1 FROM assets WHERE url = ?", (url,))
+            return cur.fetchone() is not None
         except Exception as e:
-            print(f"FATAL error in _search_google_cse: {e}")  # log
-            return out[:n]
+            log.append(f"[VideoLinkTracker] Error checking URL in database: {e}")
+            return False
 
+    def _save_asset_to_database(self, asset: Dict[str, Any], log: List[str]) -> None:
+        if not self.db_conn:
+            return
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO assets
+                    (url, text, source, size, status, last_checked)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    asset.get("url", ""),
+                    asset.get("text", ""),
+                    asset.get("source", ""),
+                    asset.get("size", ""),
+                    asset.get("status", ""),
+                ),
+            )
+            self.db_conn.commit()
+        except Exception as e:
+            log.append(f"[VideoLinkTracker] Error saving asset to database: {e}")
+
+    def _is_page_scanned(self, url: str, log: List[str]) -> bool:
+        if not self.db_conn:
+            return False
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
+            return cur.fetchone() is not None
+        except Exception as e:
+            log.append(f"[VideoLinkTracker] Error checking page in database: {e}")
+            return False
+
+    def _mark_page_scanned(self, url: str, log: List[str]) -> None:
+        if not self.db_conn:
+            return
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                """
+                INSERT OR REPLACE INTO pages (url, last_scanned)
+                VALUES (?, CURRENT_TIMESTAMP)
+                """,
+                (url,),
+            )
+            self.db_conn.commit()
+        except Exception as e:
+            log.append(f"[VideoLinkTracker] Error marking page as scanned: {e}")
+
+    async def _fetch_text(
+            self,
+            session: aiohttp.ClientSession,
+            url: str,
+            timeout: float,
+            log: Optional[List[str]] = None,
+            *,
+            method: str = "GET",
+            max_bytes: int = 2_000_000,  # 2 MB safety cap
+            retries: int = 2,
+            allow_redirects: bool = True,
+    ) -> str:
+        """
+        Fetch text from a URL safely.
+
+        - Uses provided aiohttp session.
+        - Retries a couple times with small exponential backoff.
+        - Caps max downloaded bytes.
+        - Lets aiohttp handle gzip/br/deflate decompression automatically.
+        """
+        if log is None:
+            log = []
+
+        if not url:
+            return ""
+
+        # Normalize method
+        method = (method or "GET").upper()
+        if method not in ("GET", "HEAD"):
+            method = "GET"
+
+        last_err: Optional[Exception] = None
+
+        for attempt in range(retries + 1):
+            try:
+                tmo = aiohttp.ClientTimeout(total=timeout)
+                async with session.request(
+                        method,
+                        url,
+                        timeout=tmo,
+                        allow_redirects=allow_redirects,
+                ) as resp:
+                    # Non-200 isn't always fatal for robots/sitemaps, but log it
+                    if resp.status >= 400:
+                        log.append(f"[VideoLinkTracker] _fetch_text HTTP {resp.status} for {url}")
+                        return ""
+
+                    # Stream + cap bytes
+                    buf = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            log.append(f"[VideoLinkTracker] _fetch_text truncated (> {max_bytes} bytes): {url}")
+                            break
+
+                    # Best-effort decode
+                    ctype = (resp.headers.get("content-type") or "").lower()
+                    # Prefer server-reported charset
+                    charset = resp.charset or "utf-8"
+
+                    try:
+                        text = buf.decode(charset, errors="ignore")
+                    except Exception:
+                        text = buf.decode("utf-8", errors="ignore")
+
+                    # If it's HTML-ish or text/xml/json => return as-is
+                    if any(x in ctype for x in ("text/", "xml", "json", "html")) or not ctype:
+                        return text
+
+                    # Otherwise still return decoded bytes (robots.txt can be weirdly typed)
+                    return text
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = e
+                if attempt < retries:
+                    # small exponential backoff with jitter
+                    backoff = 0.5 * (2 ** attempt)
+                    backoff += random.uniform(0.0, 0.25)
+                    log.append(
+                        f"[VideoLinkTracker] _fetch_text retry {attempt + 1}/{retries} after {backoff:.2f}s: {url} ({e})")
+                    await asyncio.sleep(backoff)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+
+        if last_err:
+            log.append(f"[VideoLinkTracker] _fetch_text failed for {url}: {last_err}")
+        return ""
     # ------------------------------------------------------------------ #
-    # Keyword / URL heuristics (these are pure functions, no async needed)
+    # Keyword / URL heuristics (Original VideoLinkTracker methods, with minor tweaks)
     # ------------------------------------------------------------------ #
     def _get_keywords_from_query(self, query: str) -> List[str]:
-        try:
-            stops = _STOPWORDS
-        except NameError:
-            stops = {"the", "a", "an", "is", "to", "for", "of"}
         tokens = [
             t
             for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", query.lower())
-            if t not in stops and len(t) > 2
+            if t not in _STOPWORDS and len(t) > 2
         ]
-        # preserve order, dedupe
         return list(dict.fromkeys(tokens))
 
     def _clean_domain(self, u: str) -> str:
         try:
             netloc = urlparse(u).netloc.lower()
             return netloc.split(":")[0]
+        except Exception:
+            return ""
+
+    def _clean_path(self, u: str) -> str:
+        try:
+            return urlparse(u).path.lower()
         except Exception:
             return ""
 
@@ -8081,10 +8457,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             return True
         return False
 
-    def _is_probable_video_url(self, full_url: str, path: str, url_lower: str) -> bool:
-        if any(path.endswith(ext) for ext in self.VIDEO_EXTENSIONS):
-            return True
-        if path.endswith(".m3u8") or path.endswith(".mpd"):
+    def _is_probable_video_url(self, full_url: str, path_lower: str, url_lower: str) -> bool:
+        if any(path_lower.endswith(ext) for ext in self.VIDEO_EXTENSIONS):
             return True
         if any(platform in url_lower for platform in self.VIDEO_PLATFORMS):
             return True
@@ -8098,102 +8472,568 @@ class VideoLinkTrackerBlock(BaseBlock):
             return False
         content_hints = [
             "/details/", "/video/", "/videos/", "/watch/",
-            "/title/", "/entry/", "/post/",
+            "/title/", "/entry/", "/post/", "/show/", "/episode/",
         ]
         return any(h in p for h in content_hints)
 
+    def _is_search_url(self, u: str) -> bool:
+        try:
+            pu = urlparse(u)
+            path = (pu.path or "").lower()
+            q = (pu.query or "").lower()
+            if any(tok in path for tok in ["/search", "/results", "/query", "search.php", "/find"]):
+                return True
+            if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword", "term"]):
+                return True
+            return False
+        except Exception:
+            return False
+
     # ------------------------------------------------------------------ #
-    # Fetch helpers
+    # Fetch helpers (Original, adapted for AIOHTTP)
     # ------------------------------------------------------------------ #
     async def _fetch_page_html_plain(self, session: aiohttp.ClientSession, page_url: str, timeout: float) -> str:
-        async with session.get(page_url, timeout=timeout) as resp:
+        async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
             resp.raise_for_status()
             return await resp.text()
 
-    async def _fetch_page_with_js(
+    async def _fetch_bytes(
             self,
-            pw_context: BrowserContext,
+            session: aiohttp.ClientSession,
+            url: str,
+            timeout: float,
+            log: Optional[List[str]] = None,
+            *,
+            max_bytes: int = 4_000_000,  # 4MB cap for huge sitemaps
+            retries: int = 2,
+    ) -> bytes:
+        if log is None:
+            log = []
+        last_err = None
+
+        for attempt in range(retries + 1):
+            try:
+                tmo = aiohttp.ClientTimeout(total=timeout)
+                async with session.get(url, timeout=tmo, allow_redirects=True) as r:
+                    if r.status >= 400:
+                        log.append(f"[VideoLinkTracker] _fetch_bytes HTTP {r.status} for {url}")
+                        return b""
+
+                    buf = bytearray()
+                    async for chunk in r.content.iter_chunked(128 * 1024):
+                        if not chunk:
+                            continue
+                        buf.extend(chunk)
+                        if len(buf) > max_bytes:
+                            log.append(f"[VideoLinkTracker] _fetch_bytes truncated (> {max_bytes} bytes): {url}")
+                            break
+                    return bytes(buf)
+
+            except (aiohttp.ClientError, asyncio.TimeoutError, asyncio.CancelledError) as e:
+                last_err = e
+                if attempt < retries:
+                    backoff = 0.5 * (2 ** attempt) + random.uniform(0, 0.25)
+                    log.append(
+                        f"[VideoLinkTracker] _fetch_bytes retry {attempt + 1}/{retries} after {backoff:.2f}s: {url} ({e})")
+                    await asyncio.sleep(backoff)
+                    continue
+                break
+            except Exception as e:
+                last_err = e
+                break
+
+        if last_err:
+            log.append(f"[VideoLinkTracker] _fetch_bytes failed for {url}: {last_err}")
+        return b""
+
+    def _decompress_if_needed(self, url: str, raw: bytes) -> str:
+        if not raw:
+            return ""
+        if url.lower().endswith(".gz"):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                return ""
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------ #
+    # Sitemap / Site Crawling Helpers (Copied/Adapted from LinkTrackerBlock)
+    # ------------------------------------------------------------------ #
+    def _looks_like_sitemap(self, url: str) -> bool:
+        u = url.lower()
+        return any(u.endswith(x) for x in [".xml", ".xml.gz", "sitemap", "sitemap.xml", "sitemap_index.xml", "feed"])
+
+    def _extract_sitemap_urls_from_robots(self, text: str) -> list[str]:
+        urls = []
+        for line in (text or "").splitlines():
+            if line.lower().startswith("sitemap:"):
+                u = line.split(":", 1)[1].strip()
+                if u.startswith("http"):
+                    urls.append(u)
+        return urls
+
+    def _parse_sitemap_any(self, xml_text: str) -> tuple[list[str], list[str]]:
+        """
+        Returns (sitemap_urls, page_urls).
+        Handles both <urlset> and <sitemapindex>.
+        """
+        if not xml_text.strip():
+            return [], []
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return [], []
+
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}", 1)[0] + "}"
+
+        sitemap_urls = []
+        page_urls = []
+
+        if root.tag.endswith("sitemapindex"):
+            for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
+                if sm.text and sm.text.strip().startswith("http"):
+                    sitemap_urls.append(sm.text.strip())
+
+        if root.tag.endswith("urlset"):
+            for loc in root.findall(f".//{ns}url/{ns}loc"):
+                if loc.text and loc.text.strip().startswith("http"):
+                    page_urls.append(loc.text.strip())
+
+        return sitemap_urls, page_urls
+
+    def _score_site_url(self, u: str, keywords: list[str]) -> int:
+        """
+        Higher score = better candidate.
+        Prioritize video-related pages.
+        """
+        path = urlparse(u).path.lower()
+        url_lower = u.lower()
+        score = 0
+
+        # Prefer pages that look like video content/detail
+        for tok, w in [
+            ("/watch/", 10), ("/video/", 10), ("/videos/", 9), ("/stream/", 9),
+            ("/embed/", 8), ("/player/", 8), ("/details/", 7), ("/post/", 5),
+            ("/episode/", 7), ("/show/", 7),
+        ]:
+            if tok in path:
+                score += w
+
+        # Prefer direct video assets or manifests
+        if self._is_probable_video_url(u, path, url_lower):
+            score += 15
+
+        # Penalize search/hub that are not specific enough
+        for tok, w in [
+            ("/search", -8), ("/tag/", -5), ("/category/", -5), ("/browse", -5),
+            ("/archives", -3), ("/index.", -2),
+        ]:
+            if tok in path:
+                score += w
+
+        # Keyword hits
+        low = url_lower.replace("%20", " ")
+        score += sum(3 for k in keywords if k and k in low)
+
+        return score
+
+    def _archive_ident_to_downloads(self, ident: str) -> list[str]:
+        # This is a heuristic; archive's /download/{ident}/{file} is best,
+        # but we don't know file names yet. So we use metadata endpoint to get them.
+        return [
+            f"https://archive.org/metadata/{ident}",
+            f"https://archive.org/download/{ident}/",
+            f"https://archive.org/details/{ident}",
+        ]
+
+    async def _crawl_sitemaps_for_site(
+            self,
+            session: aiohttp.ClientSession,
+            root: str,
+            sm_urls: list[str],
+            timeout: float,
+            keywords: list[str],
+            per_site_cap: int,
+            global_seen: set[str],
+            log: List[str], # Added log
+    ) -> list[str]:
+        """
+        Recursively crawl sitemapindex + urlset, return best-scoring URLs.
+        """
+        to_visit = list(dict.fromkeys(sm_urls))
+        visited_sm = set()
+        collected = []
+
+        while to_visit and len(collected) < per_site_cap * 5:  # Allow collecting more than cap to score later
+            sm = to_visit.pop(0)
+            if sm in visited_sm:
+                continue
+            visited_sm.add(sm)
+
+            raw = await self._fetch_bytes(session, sm, timeout)
+            xml = self._decompress_if_needed(sm, raw)
+            child_sms, pages = self._parse_sitemap_any(xml)
+
+            for c in child_sms:
+                if c not in visited_sm and self._looks_like_sitemap(c):
+                    to_visit.append(c)
+
+            for p in pages:
+                if p in global_seen:
+                    continue
+                global_seen.add(p)
+                collected.append(p)
+
+        # Score + pick top
+        collected.sort(key=lambda u: self._score_site_url(u, keywords), reverse=True)
+        return collected[:per_site_cap]
+
+    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
+        """
+        Detect common pagination patterns.
+        """
+        out = []
+        # Common selectors for "next" or "older" links
+        for a in soup.select(
+                "a[rel=next], a.next, a.pagination__next, a:-soup-contains('Next'), a:-soup-contains('Older')"):
+            href = a.get("href")
+            if href:
+                out.append(urljoin(base_url, href))
+        return out[:3]  # Limit to a few next pages to avoid endless loops
+
+    def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
+        """
+        Prefer “result cards” over nav/footer, filtering for internal links.
+        """
+        out = []
+        # common search result containers or content links
+        selectors = [
+            "article a[href]", ".result a[href]", ".search-result a[href]",
+            ".item a[href]", "li a[href]", "div.post-content a[href]",
+            "h2 a[href]", "h3 a[href]", "h4 a[href]",
+        ]
+        for a in soup.select(", ".join(selectors)):
+            href = a.get("href")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            try:
+                host = urlparse(full).netloc.lower()
+            except Exception:
+                continue
+            if site_host in host:  # Ensure it's internal to the site
+                out.append(full)
+            if len(out) >= 200:  # Cap per page
+                break
+        return list(dict.fromkeys(out))
+
+    def _seed_pages_from_required_sites(
+            self,
+            required_sites: List[str],
+            queries: List[str],
+            probe_cap_per_site: int = 5,
+            sitemap_cap_per_site: int = 8,
+            hub_cap_per_site: int = 6,
+    ) -> Tuple[List[str], Set[str], Set[str]]:
+        """
+        Generates initial URLs for site-specific crawling.
+        """
+        out: List[str] = []
+        synthetic_search_seeds: set[str] = set()
+        explicit_site_seeds: set[str] = set()
+
+        norm_sites = []
+        for raw in required_sites or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            norm_sites.append(s.rstrip("/") if "://" in s else "https://" + s.lstrip(".").rstrip("/"))
+
+        # 1) roots
+        for s in norm_sites:
+            u = s + "/"
+            out.append(u)
+            explicit_site_seeds.add(u)
+
+        # 2) robots + common sitemap
+        common_sitemaps = [
+            "/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml",
+            "/sitemap-index.xml", "/sitemap.php", "/sitemap.txt", "/feed/", "/rss/",
+        ]
+        for s in norm_sites:
+            u = s + "/robots.txt"
+            out.append(u);
+            explicit_site_seeds.add(u)
+            added = 0
+            for sm in common_sitemaps:
+                if added >= sitemap_cap_per_site:
+                    break
+                u = s + sm
+                out.append(u);
+                explicit_site_seeds.add(u)
+                added += 1
+
+        # 3) hub guesses
+        hub_paths = [
+            "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
+            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
+            "/videos/", "/player/", "/watch/", "/embed/",
+        ]
+        for s in norm_sites:
+            added = 0
+            for hp in hub_paths:
+                if added >= hub_cap_per_site:
+                    break
+                u = s + hp
+                out.append(u);
+                explicit_site_seeds.add(u)
+                added += 1
+
+        # probes
+        def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
+            host = urlparse(base).netloc.lower()
+            if "archive.org" in host:
+                return [
+                    base + f"/search.php?query={enc_query}",
+                    base + f"/advancedsearch.php?q={enc_query}",
+                    base + (f"/advancedsearch.php?q={enc_query}"
+                            f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"),
+                    base + f"/details/{enc_query}",
+                    base + f"/browse.php?field=subject&query={enc_query}",
+                ]
+            return []
+
+        if queries:
+            for s in norm_sites:
+                probes_added = 0
+                for qv in queries:
+                    if probes_added >= probe_cap_per_site:
+                        break
+                    qv = (qv or "").strip()
+                    if not qv:
+                        continue
+                    enc = quote_plus(qv)
+
+                    probes = [
+                        s + f"/search?q={enc}",
+                        s + f"/search?query={enc}",
+                        s + f"/?s={enc}",
+                        s + f"/?k={enc}",
+                        s + f"/search/{enc}",
+                        s + f"/video/search?q={enc}",  # Video specific
+                    ]
+                    probes.extend(_extra_probes_for_site(s, enc))
+
+                    for p in probes:
+                        out.append(p)
+                        synthetic_search_seeds.add(p)
+                        probes_added += 1
+                        if probes_added >= probe_cap_per_site and "archive.org" not in s:
+                            break
+
+        return out, synthetic_search_seeds, explicit_site_seeds
+
+    # ------------------------------------------------------------------ #
+    # Playwright shared context (Copied from LinkTrackerBlock, adapted for VideoLinkTracker)
+    # ------------------------------------------------------------------ #
+    async def _open_playwright_context(
+            self,
+            ua: str,
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
+            log: List[str],
+    ) -> Tuple[Any, Any, Any]:
+        """
+        Open a single chromium browser+context for this run.
+        Route blocking is installed once.
+        """
+        if async_playwright is None:
+            log.append("Playwright not installed.")
+            return None, None, None
+
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return True
+            return False
+
+        try:
+            p = await async_playwright().start()
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(user_agent=ua)
+
+            if block_resources or block_domains:
+                async def route_blocker(route, request):
+                    rtype = (request.resource_type or "").lower()
+                    try:
+                        host = urlparse(request.url).netloc.lower()
+                    except Exception:
+                        host = ""
+
+                    if block_domains and _host_matches_blocked(host):
+                        await route.abort()
+                        return
+
+                    if block_resources and rtype in blocked_resource_types:
+                        await route.abort()
+                        return
+
+                    await route.continue_()
+
+                await context.route("**/*", route_blocker)
+
+            log.append("Playwright shared context ready.")
+            return p, browser, context
+        except Exception as e:
+            log.append(f"Error initializing Playwright: {e}")
+            return None, None, None
+
+    async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        try:
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
+            if p:
+                await p.stop()
+            log.append("Playwright shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright context: {e}")
+
+    # ------------------------------------------------------------------ #
+    # Network sniff + JS extraction using shared context (Adapted for VideoLinkTracker)
+    # ------------------------------------------------------------------ #
+    async def _pw_fetch_with_sniff(
+            self,
+            context: BrowserContext,
             page_url: str,
             timeout: float,
             log: List[str],
-            use_network_sniff: bool = False,
-            sniff_sink: Optional[List[Dict[str, str]]] = None,
+    ) -> Tuple[str, List[Dict[str, str]], List[Dict[str, Any]]]:
+        """
+        Use ONE new PW page from shared context.
+        Capture:
+          - html content
+          - network-sniffed video assets
+          - json_hits (for /metadata/ etc.)
+        """
+        if not context:
+            return "", [], []
+
+        html = ""
+        found_items: List[Dict[str, str]] = []
+        json_hits: List[Dict[str, Any]] = []
+        seen_network = set()
+
+        page: Optional[Page] = None
+        try:
+            page = await context.new_page()
+
+            def handle_response(response: Response):
+                try:
+                    url = response.url
+                    if not url or url.startswith("blob:") or url in seen_network:
+                        return
+                    seen_network.add(url)
+
+                    parsed = urlparse(url)
+                    netloc = parsed.netloc
+                    path = parsed.path or "/"
+                    url_lower = url.lower()
+
+                    if self._looks_like_ad(netloc, path):
+                        return
+
+                    ctype = (response.headers.get("content-type") or "").lower()
+
+                    # Capture JSON payloads (archive, metadata endpoints)
+                    if "application/json" in ctype or "/metadata/" in url_lower or url_lower.endswith(".json"):
+                        async def _grab_json():
+                            try:
+                                data = await response.json()
+                                json_hits.append({"url": url, "json": data})
+                            except Exception:
+                                pass
+
+                        asyncio.create_task(_grab_json())
+                        # Don't return, as JSON might also be a video manifest
+                        # (e.g., DASH .mpd is XML/JSON-like)
+
+                    is_video = self._is_probable_video_url(url, path.lower(), url_lower)
+
+                    if not is_video and ctype:
+                        if any(ctype.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES):
+                            is_video = True
+                        if ctype in self.HLS_CONTENT_TYPES or ctype in self.DASH_CONTENT_TYPES:
+                            is_video = True
+
+                    if not is_video:
+                        return
+
+                    # It's a probable video link
+                    sniff_link = {
+                        "url": url,
+                        "text": "[Network Video]",
+                        "tag": "network_sniff",
+                        "content_type": ctype,
+                        "size": response.headers.get("content-length", "?"),
+                    }
+                    found_items.append(sniff_link)
+
+                except Exception:
+                    return
+
+            page.on("response", handle_response)
+
+            sniff_goto_timeout = max(15000, int(timeout * 1000))
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=sniff_goto_timeout)
+            await page.wait_for_timeout(int(timeout * 1000))  # Allow more time for network to settle
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
+
+            log.append(f"Network sniff finished on {page_url}. Found {len(found_items)} network assets.")
+            return html, found_items, json_hits
+        except Exception as e:
+            log.append(f"Playwright network sniff error on {page_url}: {e}")
+            return html, found_items, json_hits
+        finally:
+            if page and not page.is_closed():
+                await page.close()
+
+    async def _pw_fetch_js_links(
+            self,
+            context: BrowserContext,
+            page_url: str,
+            timeout: float,
+            log: List[str],
     ) -> Tuple[str, List[Dict[str, str]]]:
         """
-        Use Playwright to:
-          • Render the page.
-          • Optionally sniff network responses for video URLs.
-          • Collect DOM links (video, a[href], iframe, embed, etc.).
-
-        Returns (html, links) where links is a list of {url,text,tag}.
+        Render via shared PW context, return html + JS-found links (video-specific).
         """
+        if not context:
+            return "", []
+
         html = ""
         links: List[Dict[str, str]] = []
         page: Optional[Page] = None
-        from urllib.parse import urlparse as _urlparse_local  # avoid shadowing
 
         try:
-            page = await pw_context.new_page()
+            page = await context.new_page()
+            js_timeout_ms = int(max(timeout, 10.0) * 1000)
 
-            if use_network_sniff:
-                seen_sniff = set()
-
-                async def handle_response(response: Response):
-                    try:
-                        url = response.url
-                        if not url or url.startswith("blob:"):
-                            return
-                        if url in seen_sniff:
-                            return
-
-                        parsed = _urlparse_local(url)
-                        netloc = parsed.netloc
-                        path = parsed.path or "/"
-                        url_lower = url.lower()
-
-                        # Skip obvious ad/tracking hosts
-                        if self._looks_like_ad(netloc, path):
-                            return
-
-                        # Heuristic: is this probably video?
-                        is_video = self._is_probable_video_url(url, path.lower(), url_lower)
-                        ctype = (response.headers.get("content-type") or "").lower()
-
-                        if not is_video and ctype:
-                            if any(ctype.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES):
-                                is_video = True
-                            if ctype in self.HLS_CONTENT_TYPES or ctype in self.DASH_CONTENT_TYPES:
-                                is_video = True
-
-                        if not is_video:
-                            return
-
-                        seen_sniff.add(url)
-
-                        sniff_link = {
-                            "url": url,
-                            "text": "[Network Video]",
-                            "tag": "network_sniff",
-                        }
-                        links.append(sniff_link)
-
-                        if sniff_sink is not None:
-                            sniff_sink.append(
-                                {
-                                    "page": page_url,
-                                    "url": url,
-                                    "text": "[Network Video]",
-                                    "tag": "network_sniff",
-                                    "content_type": ctype,
-                                }
-                            )
-                    except Exception:
-                        # In a real application, log the exception
-                        return
-
-                page.on("response", handle_response)
-
-            js_timeout_ms = int(min(timeout, 10.0) * 1000)
             await page.goto(page_url, wait_until="domcontentloaded", timeout=js_timeout_ms)
             html = await page.content()
 
@@ -8210,13 +9050,14 @@ class VideoLinkTrackerBlock(BaseBlock):
                     out.push({ url, text, tag });
                   }
 
+                  // Prioritize video-related elements
                   const selectors = [
                     "video[src]",
                     "video source[src]",
-                    "source[src]",
-                    "a[href]",
+                    "source[src]", // For generic media sources
                     "iframe[src]",
-                    "embed[src]"
+                    "embed[src]",
+                    "a[href]", // General links
                   ];
 
                   for (const sel of selectors) {
@@ -8228,7 +9069,6 @@ class VideoLinkTrackerBlock(BaseBlock):
                       push(el, url, el.tagName.toLowerCase());
                     });
                   }
-
                   return out;
                 }
                 """
@@ -8246,9 +9086,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                     }
                 )
 
-            log.append(
-                f"Rendered JS DOM + gathered {len(links)} JS/network links for: {page_url}"
-            )
+            log.append(f"Rendered JS DOM + gathered {len(links)} JS links for: {page_url}")
+
         except Exception as e:
             log.append(f"Playwright error on {page_url}: {e}")
         finally:
@@ -8258,605 +9097,1207 @@ class VideoLinkTrackerBlock(BaseBlock):
         return html, links
 
     # ------------------------------------------------------------------ #
-    # Main execution
+    # Search engines (Original VideoLinkTracker methods, updated to use log)
+    # ------------------------------------------------------------------ #
+    async def _search_duckduckgo(
+            self,
+            q: str,
+            max_results: int,
+            ua: str,
+            timeout: float,
+            log: List[str], # Moved log to before default params
+            page_limit: int = 1,
+            per_page: int = 50,
+    ) -> List[str]:
+        import random
+
+        pages: List[str] = []
+        seen_urls: set[str] = set()
+        did_dump_debug = False
+
+        real_ua = ua  # Use the provided UA
+        if not real_ua or "promptchat" in real_ua.lower():  # Fallback to a common browser UA
+            real_ua = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/115.0.0.0 Safari/537.36"
+            )
+
+        headers = {
+            "User-Agent": real_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://duckduckgo.com/",
+            "Origin": "https://duckduckgo.com",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        }
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+        base_url = "https://html.duckduckgo.com/html/"
+
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                for page_idx in range(page_limit):
+                    if len(pages) >= max_results:
+                        break
+
+                    if page_idx > 0:
+                        st = random.uniform(2.0, 5.0)
+                        log.append(f"[VideoLinkTracker][DDG] Sleeping {st:.2f}s between search pages...")
+                        await asyncio.sleep(st)
+
+                    offset = page_idx * 30
+                    text = ""
+                    status = None
+                    final_url = base_url
+
+                    try:
+                        data = {"q": q, "s": str(offset), "dc": str(offset)}
+                        async with session.post(
+                                base_url,
+                                data=data,
+                                timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            final_url = str(resp.url)
+
+                            if status == 403:
+                                log.append(f"[VideoLinkTracker][DDG] 403 Forbidden on page {page_idx}.")
+                                if not pages and not did_dump_debug:
+                                    text = await resp.text()
+                                    preview = text[:2000].replace("\n", " ")
+                                    log.append(f"[VideoLinkTracker][DDG][debug] 403 body preview: {preview}")
+                                    did_dump_debug = True
+                                return pages
+
+                            resp.raise_for_status()
+                            text = await resp.text()
+
+                    except Exception as e:
+                        log.append(f"[VideoLinkTracker] DuckDuckGo request failed (page {page_idx}): {e}")
+                        if not pages and text and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            log.append(f"[VideoLinkTracker][DDG][debug] Failed page HTML preview: {preview}")
+                            did_dump_debug = True
+                        break
+
+                    if "Unfortunately, bots use DuckDuckGo too." in text:
+                        log.append("[VideoLinkTracker] Bot detected by DDG.")
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            log.append(f"[VideoLinkTracker][DDG][debug] Bot wall preview: {preview}")
+                            did_dump_debug = True
+                        break
+
+                    soup = BeautifulSoup(text, "html.parser")
+                    found_new = False
+
+                    for a in soup.select("a.result__a"):
+                        if len(pages) >= max_results:
+                            break
+                        href = a.get("href")
+                        if not href:
+                            continue
+
+                        if "uddg=" in href:
+                            try:
+                                href = unquote(href.split("uddg=", 1)[1].split("&", 1)[0])
+                            except Exception:
+                                pass
+
+                        if href.startswith("http") and href not in seen_urls:
+                            seen_urls.add(href)
+                            pages.append(href)
+                            found_new = True
+
+                    if not found_new:
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            log.append(
+                                f"[VideoLinkTracker][DDG][debug] No results on page {page_idx} "
+                                f"for query={q!r} (status={status}, url={final_url}). "
+                                f"HTML preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            log.append(f"[VideoLinkTracker] DDG outer error: {e}")
+
+        return pages[:max_results]
+
+    async def _search_google_cse(
+            self,
+            q: str,
+            n: int,
+            timeout: float,
+            log: List[str], # Moved log to before default params
+            page_limit: int = 1,
+    ) -> List[str]:
+        import os
+
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        key = os.environ.get("GOOGLE_API_KEY")
+        if not (cx and key):
+            log.append("[VideoLinkTracker][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY env vars.")
+            return []
+
+        max_total = max(1, min(int(n), 100))
+        per_page = min(10, max_total)
+        max_pages_by_n = (max_total + per_page - 1) // per_page
+        pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(pages_to_fetch):
+                    if len(out) >= max_total:
+                        break
+
+                    start = 1 + page_idx * per_page
+                    if start > 100:
+                        break
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                                "https://www.googleapis.com/customsearch/v1",
+                                params={
+                                    "q": q,
+                                    "cx": cx,
+                                    "key": key,
+                                    "num": per_page,
+                                    "start": start,
+                                },
+                                timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            if status != 200:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(
+                                        f"[VideoLinkTracker][GoogleCSE][debug] HTTP {status} "
+                                        f"query={q!r} start={start}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                log.append(f"[VideoLinkTracker][GoogleCSE] JSON decode error: {e}")
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(f"[VideoLinkTracker][GoogleCSE][debug] Bad JSON preview: {preview}")
+                                    did_dump_debug = True
+                                break
+
+                            err_obj = data.get("error")
+                            if err_obj:
+                                msg = err_obj.get("message") or "Unknown CSE error"
+                                reason = ""
+                                errors = err_obj.get("errors") or []
+                                if errors and isinstance(errors, list):
+                                    reason = errors[0].get("reason") or ""
+                                log.append(
+                                    f"[VideoLinkTracker][GoogleCSE] API error for query={q!r}, "
+                                    f"start={start}: {msg} ({reason})"
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(f"[VideoLinkTracker][GoogleCSE][debug] Error JSON preview: {preview}")
+                                    did_dump_debug = True
+                                break
+
+                            items = data.get("items") or []
+                            if not items:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(f"[VideoLinkTracker][GoogleCSE][debug] Empty items JSON preview: {preview}")
+                                    did_dump_debug = True
+                                break
+
+                            for item in items:
+                                u = item.get("link")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_total:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        log.append(f"[VideoLinkTracker][GoogleCSE] AIOHTTP error: {e}")
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            log.append(f"[VideoLinkTracker][GoogleCSE][debug] ClientError body preview: {preview}")
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][GoogleCSE] General error: {e}")
+
+        return out
+
+    def _allowed_by_required_sites(self, u: str, sites_list: List[str], global_mode: bool = False) -> bool:
+        """
+        Checks if a URL matches the required site list.
+        """
+        # If global mode is on, or list is empty/wildcard, allow everything
+        if global_mode or not sites_list or sites_list == ["*"]:
+            return True
+
+        # Clean the domain of the candidate URL
+        d = self._clean_domain(u)
+
+        # Check if any required site string is present in the candidate domain
+        return any(req in d for req in sites_list)
+
+    def _term_overlap_ok_check(self, haystack: str, kw_list: List[str], min_overlap: int) -> bool:
+        """
+        Checks if the haystack contains at least min_overlap keywords.
+        """
+        if not kw_list:
+            return True
+
+        h = haystack.lower()
+        hits = 0
+
+        for k in kw_list:
+            # Verify k is not empty and exists in the haystack
+            if k and k in h:
+                hits += 1
+                if hits >= min_overlap:
+                    return True
+
+        return False
+    # ------------------------------------------------------------------ #
+    # Main execution (Rewritten from LinkTrackerBlock, adapted for VideoLinkTracker)
     # ------------------------------------------------------------------ #
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        from bs4 import BeautifulSoup
-        from urllib.parse import urlparse as _urlparse
-
-        # --- Parameters & OPTIONAL subpipeline -----------------------------
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
-        source = str(params.get("source", "search")).lower()
+        subpipeline = params.get("subpipeline", None)
 
-        # NEW: optional subpipeline (prompt_query, sitemap, xml, etc.)
-        subpipe_name = str(params.get("subpipeline", "") or "").strip()
-        pipeline_urls: List[str] = []
+        log: List[str] = [] # Initialize log list
+
+        # DB
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "video_corpus.db")
+        if use_database:
+            self._initialize_database(db_path, log) # Pass log
+
+        # Subpipeline
+        pipeline_result: Any = query_raw
         pipeline_queries: List[str] = []
+        pipeline_urls: List[str] = []
 
-        if subpipe_name:
-            # Only run subpipeline if the parameter exists & is non-empty
-            # Assuming run_sub_pipeline is also async or can be awaited if it performs I/O
-            # If it's synchronous, it might block the event loop.
-            # For this example, we'll treat it as a synchronous call for simplicity,
-            # but in a real async system, it should be awaited or run in an executor.
-            pr = self.run_sub_pipeline(  # Changed to await if run_sub_pipeline is async
+        if subpipeline:
+            subpipe_out: Any = self.run_sub_pipeline(
                 initial_value=query_raw,
                 pipeline_param_name="subpipeline",
                 parent_params=params,
+                collect=True,
             )
 
-            if isinstance(pr, list):
-                for item in pr:
-                    s = str(item or "").strip()
-                    if not s:
-                        continue
-                    if s.startswith("http://") or s.startswith("https://"):
-                        pipeline_urls.append(s)
-                    else:
-                        pipeline_queries.append(s)
-            elif isinstance(pr, str):
-                # Allow subpipeline to rewrite the query string if it wants
-                s = pr.strip()
-                if s:
-                    query_raw = s
+            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
+                pipeline_result = subpipe_out.get("final")
+                pipeline_queries = list(subpipe_out.get("queries") or [])
+                pipeline_urls = list(subpipe_out.get("urls") or [])
+            else:
+                pipeline_result = subpipe_out
 
-        sites_raw = str(params.get("sites", "")).split(",")
-        sites = [s.strip().lower() for s in sites_raw if s.strip()]
-        global_mode = not sites
-        if global_mode:
-            sites = ["*"]
-
+        # Config
+        source = str(params.get("source", "search")).lower()
         scan_limit = int(params.get("scan_limit", 3))
+        max_pages_total = max(1, int(params.get("max_pages_total", 20)))
+
         timeout = float(params.get("timeout", 8.0))
-        ua = str(params.get("user_agent", "promptchat/VideoLinkTracker"))
-        engine = str(params.get("engine", "duckduckgo")).lower()
         verify_links = bool(params.get("verify", False))
+        engine = str(params.get("engine", "duckduckgo")).lower()  # Can be "duckduckgo", "google_cse", "sites"
+
         use_js = bool(params.get("use_js", False))
-        smart_sniff = bool(params.get("smart_sniff", False))
         return_all_js_links = bool(params.get("return_all_js_links", False))
-        max_depth = int(params.get("max_depth", 0))
-        child_page_limit = int(params.get("child_page_limit", 4))
-        max_pages_total = int(params.get("max_pages_total", 20))
         max_links_per_page = int(params.get("max_links_per_page", 200))
-        max_assets = int(params.get("max_assets", 100))
+        search_results_cap = int(params.get("search_results_cap", 256))
 
-        # NEW: network-sniff toggles
+        search_page_limit = int(params.get("search_page_limit", 1))
+        search_per_page = int(params.get("search_per_page", 50))
+
         use_network_sniff = bool(params.get("use_network_sniff", False))
-        return_network_sniff_links = bool(
-            params.get("return_network_sniff_links", False)
-        )
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
 
-        # NEW: min_term_overlap
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
 
-        # Old behavior: only error if no query AND no subpipeline
-        if not query_raw and source == "search" and not subpipe_name:
-            return "", {
-                "error": "VideoLinkTracker: No query provided for 'search' source."
-            }
+        # 'sites' param is now 'site_require' in LinkTracker
+        site_require_raw = str(params.get("sites", "") or params.get("site_require", "")).split(",")
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        global_mode = not required_sites  # If no sites are specified, it's global mode
+        if global_mode:
+            required_sites = ["*"]  # Internal representation for global mode
 
-        # Keywords are always extracted from the *original* query text
-        keywords = self._get_keywords_from_query(query_raw)
-        log: List[str] = []
-        found_assets: List[Dict[str, Any]] = []
-        seen_urls: set[str] = set()
-        visited_pages: set[str] = set()
-        pages_to_crawl_tuples: List[Tuple[str, int]] = []  # (url, depth)
-        pages_processed = 0
-        all_js_links: List[Dict[str, str]] = []
-        all_network_links: List[Dict[str, str]] = []  # network-sniff hits
+        max_depth = max(0, int(params.get("max_depth", 0)))
+        child_page_limit = int(params.get("child_page_limit", 4))
+        max_assets = int(params.get("max_assets", 100))
+        ua = str(params.get("user_agent", "promptchat/VideoLinkTracker"))
+        smart_sniff = bool(params.get("smart_sniff", False)) # Get smart_sniff from params
 
-        # Use aiohttp.ClientSession for HTTP requests
-        async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session:
+        # PW blocking params
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+                                     t.strip().lower()
+                                     for t in str(params.get("blocked_resource_types", "")).split(",")
+                                     if t.strip()
+                                 } or {"image", "stylesheet", "font"}
 
-            def _allowed_by_required_sites(u: str) -> bool:
-                if global_mode or not sites or sites == ["*"]:
-                    return True
-                d = self._clean_domain(u)
-                return any(req in d for req in sites)
+        block_domains = bool(params.get("block_domains", True))
+        user_blocked_domains = {
+            d.strip().lower()
+            for d in str(params.get("blocked_domains", "")).split(",")
+            if d.strip()
+        }
 
-            def _term_overlap_ok(haystack: str) -> bool:
-                """
-                Require at least min_term_overlap distinct keyword hits in haystack.
-                ex: query 'lil uzi vert' → tokens: ['lil','uzi','vert'].
-                With min_term_overlap=2, any two of those must appear in URL/text.
-                """
-                if not keywords:
-                    return True
-                h = haystack.lower()
-                hits = 0
-                for k in keywords:
-                    if k and k in h:
-                        hits += 1
-                        if hits >= min_term_overlap:
-                            return True
-                return False
+        default_blocked_domains = {
+            "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+            "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
+            "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
+            "cloudflareinsights.com", "stats.g.doubleclick.net",
+            "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
+        }
 
-            # --- Core crawl function (per page) ------------------------
-            async def crawl_page(
-                    page_url: str,
-                    depth_left: int,
-                    pw_context: Optional[BrowserContext],  # BrowserContext or None
-            ) -> List[str]:
-                nonlocal pages_processed
+        blocked_domains: set[str] = set()
+        if block_domains:
+            blocked_domains = default_blocked_domains.union(user_blocked_domains)
 
-                page_child_candidates: List[str] = []
+        # Keywords
+        keywords: List[str] = self._get_keywords_from_query(query_raw)
+        if not keywords and query_raw:  # Ensure query_raw itself is a keyword if no tokens found
+            keywords = [query_raw.lower()]
 
-                if page_url in visited_pages or depth_left < 0:
-                    return page_child_candidates
-                if pages_processed >= max_pages_total or len(found_assets) >= max_assets:
-                    return page_child_candidates
+        # Triage initial URLs
+        candidate_pages: List[str] = []
+        direct_asset_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine_for_payload = False
 
-                visited_pages.add(page_url)
-                pages_processed += 1
+        if pipeline_urls:
+            skip_search_engine_for_payload = True
+            queries_to_run = ["<URL list>"]  # Placeholder for logging
 
-                links_on_page: List[Dict[str, str]] = []
-                html = ""
+            unique_urls = list(dict.fromkeys([str(u).strip() for u in pipeline_urls if str(u).strip()]))
+            for u in unique_urls:
+                if global_mode or self._allowed_by_required_sites_check(u, required_sites):
+                    path = self._clean_path(u)
+                    url_lower = u.lower()
 
-                try:
-                    if use_js and pw_context:
-                        # Playwright + optional network sniff
-                        html, js_links = await self._fetch_page_with_js(
-                            pw_context,
-                            page_url,
-                            timeout,
-                            log,
-                            use_network_sniff=use_network_sniff,
-                            sniff_sink=all_network_links,
-                        )
-                        links_on_page.extend(js_links)
-                        for jl in js_links:
-                            all_js_links.append({**jl, "page": page_url})
-
-                        if not html:
-                            try:
-                                html = await self._fetch_page_html_plain(session, page_url, timeout)
-                            except Exception as e:
-                                log.append(f"Error fetching {page_url} (fallback): {e}")
-                                if not links_on_page:
-                                    return page_child_candidates
-                        soup = BeautifulSoup(html, "html.parser")
-                    else:
-                        html = await self._fetch_page_html_plain(session, page_url, timeout)
-                        soup = BeautifulSoup(html, "html.parser")
-                except Exception as e:
-                    log.append(f"Error fetching/parsing {page_url}: {e}")
-                    return page_child_candidates
-
-                # Add <a> links
-                link_count = 0
-                for a in soup.find_all("a", href=True):
-                    links_on_page.append(
-                        {"url": a["href"], "text": a.get_text(strip=True), "tag": "a"}
-                    )
-                    link_count += 1
-                    if link_count >= max_links_per_page:
-                        break
-
-                # Add <video> / <source> links if room
-                if link_count < max_links_per_page:
-                    for v in soup.find_all("video"):
-                        if v.get("src"):
-                            links_on_page.append(
-                                {
-                                    "url": v["src"],
-                                    "text": v.get("title", ""),
-                                    "tag": "video",
-                                }
-                            )
-                        for s in v.find_all("source", src=True):
-                            links_on_page.append(
-                                {
-                                    "url": s["src"],
-                                    "text": s.get("title", ""),
-                                    "tag": "source",
-                                }
-                            )
-
-                # --- Filter / classify links on this page ----------------
-                for link in links_on_page:
-                    if len(found_assets) >= max_assets:
-                        break
-                    try:
-                        full_url = urljoin(page_url, link["url"])
-                        parsed = urlparse(full_url)
-                        netloc = parsed.netloc
-                        path = parsed.path or "/"
-                        url_lower = full_url.lower()
-
-                        if self._looks_like_ad(netloc, path):
-                            continue
-
-                        head_done = False
-                        status = "unverified"
-                        content_type = None
-
-                        is_video = self._is_probable_video_url(
-                            full_url, path.lower(), url_lower
-                        )
-
-                        # Child-page candidates for deeper crawl (non-video content pages)
-                        if (not is_video) and depth_left > 0:
-                            if self._is_content_child_candidate(full_url, netloc, path):
-                                if (
-                                        full_url not in visited_pages
-                                        and len(page_child_candidates) < child_page_limit
-                                ):
-                                    page_child_candidates.append(full_url)
-
-                        # Optional HEAD-based sniff
-                        if (not is_video) and smart_sniff:
-                            try:
-                                async with session.head(
-                                        full_url, allow_redirects=True, timeout=3
-                                ) as h:
-                                    head_done = True
-                                    status = (
-                                        f"{h.status} OK"
-                                        if h.status == 200
-                                        else f"Dead ({h.status})"
-                                    )
-                                    content_type = (h.headers.get("Content-Type") or "").lower()
-                                    if any(
-                                            content_type.startswith(pfx)
-                                            for pfx in self.VIDEO_CONTENT_PREFIXES
-                                    ):
-                                        is_video = True
-                                    if (
-                                            content_type in self.HLS_CONTENT_TYPES
-                                            or content_type in self.DASH_CONTENT_TYPES
-                                    ):
-                                        is_video = True
-                            except Exception:
-                                status = "Timeout/Error"
-
-                        if not is_video:
-                            continue
-                        if full_url in seen_urls:
-                            continue
-
-                        haystack = (
-                                (link.get("text", "") or "") + " " + full_url
-                        ).lower().replace("%20", " ")
-
-                        # NEW: min_term_overlap-based filtering
-                        if keywords and not _term_overlap_ok(haystack):
-                            continue
-
-                        if not _allowed_by_required_sites(full_url):
-                            continue
-
-                        seen_urls.add(full_url)
-
-                        if verify_links and not head_done:
-                            try:
-                                async with session.head(
-                                        full_url, allow_redirects=True, timeout=3
-                                ) as h:
-                                    status = (
-                                        f"{h.status} OK"
-                                        if h.status == 200
-                                        else f"Dead ({h.status})"
-                                    )
-                            except Exception:
-                                status = "Timeout/Error"
-
-                        if (not verify_links) or "OK" in status:
-                            found_assets.append(
-                                {
-                                    "text": (link.get("text", "") or path.split("/")[-1])[
-                                            :100
-                                            ],
-                                    "url": full_url,
-                                    "source_page": page_url,
-                                    "tag": link["tag"],
-                                    "status": status,
-                                }
-                            )
-                    except Exception:
-                        # In a real application, log the exception
+                    if self._is_probable_video_url(u, path, url_lower):
+                        if self._term_overlap_ok_check(u, keywords, min_term_overlap):
+                            direct_asset_urls.append(u)
                         continue
 
-                return page_child_candidates
+                    if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        continue
 
-            # ------------------------------------------------------------------
-            # Step 1: Discovery (Populate Crawl Queue)
-            # ------------------------------------------------------------------
+                    if not keywords or self._term_overlap_ok_check(u, keywords, min_term_overlap):
+                        candidate_pages.append(u)
 
-            # NEW: if sitemap/xml subpipeline returned URLs, treat them as hub pages
-            if pipeline_urls:
-                limited = pipeline_urls[:scan_limit] if scan_limit > 0 else pipeline_urls
-                for u in limited:
-                    if _allowed_by_required_sites(u):
-                        pages_to_crawl_tuples.append((u, 0))
+            candidate_pages = candidate_pages[:max_pages_total]
+
+        if (not skip_search_engine_for_payload) and pipeline_queries:
+            for qv in pipeline_queries:
+                qv_s = str(qv).strip()
+                if qv_s:
+                    queries_to_run.append(qv_s)
+
+        if not pipeline_urls and not pipeline_queries:
+            if isinstance(pipeline_result, list) and pipeline_result:
+                for qv in pipeline_result:
+                    qv_s = str(qv).strip()
+                    if qv_s:
+                        queries_to_run.append(qv_s)
+            else:
+                base_q: Optional[str] = None
+                if isinstance(pipeline_result, str) and pipeline_result.strip():
+                    base_q = pipeline_result.strip()
+                elif query_raw:
+                    base_q = query_raw
+                if base_q:
+                    queries_to_run.append(base_q)
+
+        if not queries_to_run and query_raw and not skip_search_engine_for_payload:
+            queries_to_run = [query_raw]
+
+        queries_to_run = list(dict.fromkeys(queries_to_run))  # Dedupe queries
+        current_display_query = queries_to_run[0] if queries_to_run else query_raw
+
+        # Helpers for internal use
+        def _allowed_by_required_sites_check(u: str, sites_list: List[str]) -> bool:
+            if global_mode or not sites_list or sites_list == ["*"]:
+                return True
+            d = self._clean_domain(u)
+            return any(req in d for req in sites_list)
+
+        def _term_overlap_ok_check(haystack: str, kw_list: List[str], min_overlap: int) -> bool:
+            if not kw_list:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in kw_list:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_overlap:
+                        return True
+            return False
+
+        def _augment_search_query(q: str, required_sites_for_search: List[str]) -> str:
+            sq = q.strip()
+            site_clauses = []
+            if not global_mode:
+                for raw in required_sites_for_search or []:
+                    s = (raw or "").strip().lower()
+                    if not s or s == "*":
+                        continue
+                    if "://" in s:
+                        s = s.split("://", 1)[1]
+                    s = s.split("/", 1)[0].lstrip(".")
+                    if s:
+                        site_clauses.append(f"site:{s}")
+
+            if site_clauses:
+                sites_expr = " OR ".join(site_clauses)
+                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+            q_lower = sq.lower()
+            # Add video-specific terms if not already present, for better search results
+            if not any(x in q_lower for x in ["video", "mp4", "m3u8", "stream"]):
+                sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
+            return sq
+
+        # Search discovery (Adapted from LinkTrackerBlock)
+        explicit_site_seeds: set[str] = set()
+        synthetic_search_seeds: set[str] = set()
+
+        if not skip_search_engine_for_payload and queries_to_run:
+            ua_search = ua
+            seen_search_urls: set[str] = set()
 
             if source == "payload":
-                log.append("Reading hub pages from payload...")
+                log.append("Reading hub pages from payload...") # Changed print to log.append
 
                 payload_str = str(payload)
-                urls_from_payload = re.findall(
-                    r"#.*?(https?://[^\s<\]]+)", payload_str
-                )
-                urls_from_payload.extend(
-                    re.findall(r"\[.*?\]\((https?://[^\s)]+)\)", payload_str)
-                )
+                urls_from_payload = re.findall(r"#.*?(https?://[^\s<\]]+)", payload_str)
+                urls_from_payload.extend(re.findall(r"\[.*?\]\((https?://[^\s)]+)\)", payload_str))
                 if not urls_from_payload:
-                    urls_from_payload.extend(
-                        re.findall(r"\b(https?://[^\s<\]]+)\b", payload_str)
-                    )
+                    urls_from_payload.extend(re.findall(r"\b(https?://[^\s<\]]+)\b", payload_str))
 
                 seen_payload_urls = set()
-                candidate_pages: List[str] = []
 
                 for u in urls_from_payload:
                     u = u.strip().rstrip(")")
                     if u not in seen_payload_urls:
-                        if _allowed_by_required_sites(u):
+                        if global_mode or _allowed_by_required_sites_check(u, required_sites):
                             candidate_pages.append(u)
                             seen_payload_urls.add(u)
 
-                log.append(f"Found {len(candidate_pages)} unique URLs in payload.")
+                log.append(f"Found {len(candidate_pages)} unique URLs in payload.") # Changed print to log.append
                 if scan_limit > 0:
                     candidate_pages = candidate_pages[:scan_limit]
 
-                for url in candidate_pages:
-                    pages_to_crawl_tuples.append((url, 0))
+            elif engine == "sites" and required_sites and not global_mode:  # Only for specific sites
+                log.append(f"Finding hub pages via site-specific crawling for: {', '.join(required_sites)}") # Changed print to log.append
+                seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
+                    required_sites=required_sites,
+                    queries=queries_to_run,
+                    probe_cap_per_site=max(8, len(queries_to_run) * 3),
+                    sitemap_cap_per_site=12,
+                    hub_cap_per_site=10,
+                )
+                synthetic_search_seeds = syn_seeds
+                explicit_site_seeds = exp_seeds
 
-            else:  # source == "search"
-                log.append("Finding hub pages via built-in search...")
+                per_site_cap = max(5, max_pages_total // max(1, len(required_sites)))
+                global_seen_for_sitemaps = set()  # To avoid re-fetching sitemaps/pages across sites
 
-                # Queries from prompt_query subpipeline OR fallback to raw query
-                search_queries: List[str] = []
-                if pipeline_queries:
-                    search_queries = pipeline_queries
-                elif query_raw:
-                    search_queries = [query_raw]
+                async with aiohttp.ClientSession(headers={"User-Agent": ua_search}) as seed_sess:
+                    for site_domain in required_sites:
+                        root = f"https://{site_domain.strip().lstrip('.')}".rstrip("/") + "/"
+                        host = urlparse(root).netloc.lower()
 
-                if not search_queries and not pipeline_urls:
-                    log.append("No query or subpipeline-derived search queries; skipping search.")
-                else:
-                    for site_domain in sites:
-                        for q in search_queries:
-                            if not q:
-                                continue
-                            search_q = (
-                                f"site:{site_domain} {q}"
-                                if not global_mode
-                                else q
-                            )
-                            log.append(f"Searching {engine} for: {search_q}")
+                        # --- 1) robots ---
+                        robots_url = root + "robots.txt"
+                        robots_txt = await self._fetch_text(seed_sess, robots_url, timeout)
+                        sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
 
-                            if engine == "google_cse":
-                                hub_pages = await self._search_google_cse(
-                                    session, search_q, scan_limit, timeout
-                                )
-                            else:
-                                hub_pages = await self._search_duckduckgo(
-                                    session, search_q, scan_limit, ua, timeout
-                                )
+                        # fallback common sitemaps
+                        if not sm_urls:
+                            sm_urls = [u for u in seed_pages if "sitemap" in u and site_domain in u][:8]
 
-                            if not hub_pages:
-                                log.append(f"No hub pages found for: {search_q}")
-                            else:
-                                for page_url in hub_pages[:scan_limit]:
-                                    if page_url not in visited_pages:
-                                        pages_to_crawl_tuples.append((page_url, 0))
+                        # --- 2) recursive sitemap crawl ---
+                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
+                            seed_sess, root, sm_urls, timeout, keywords,
+                            per_site_cap=per_site_cap,
+                            global_seen=global_seen_for_sitemaps,
+                            log=log, # Pass log
+                        )
 
-                            if global_mode:
-                                # For global mode, we only need to run once per query
+                        # --- 3) expand hub/search seeds ---
+                        hub_like = [u for u in seed_pages if site_domain in u and self._is_search_url(u)]
+                        expanded_from_hubs = []
+                        for hub in hub_like[:3]:  # Limit initial hubs to crawl
+                            try:
+                                html_hub = await self._fetch_page_html_plain(seed_sess, hub, timeout)
+                                soup = BeautifulSoup(html_hub or "", "html.parser")
+
+                                expanded_from_hubs.extend(self._extract_internal_result_links(soup, hub, host))
+
+                                for nxt in self._extract_next_page_links(soup, hub):
+                                    html_nxt = await self._fetch_page_html_plain(seed_sess, nxt, timeout)
+                                    soup_nxt = BeautifulSoup(html_nxt or "", "html.parser")
+                                    expanded_from_hubs.extend(self._extract_internal_result_links(soup_nxt, nxt, host))
+                            except Exception as e: # Catch exception and log
+                                log.append(f"[VideoLinkTracker][sites] Error expanding hub {hub}: {e}")
+                                pass
+
+                        # Score + pick top from hubs
+                        expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
+                        expanded_from_hubs.sort(
+                            key=lambda u: self._score_site_url(u, keywords), reverse=True
+                        )
+                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
+
+                        # --- 4) combine sources, keep best ---
+                        merged = list(dict.fromkeys(
+                            [root] + best_from_sitemaps + expanded_from_hubs + [u for u in seed_pages if
+                                                                                site_domain in u]
+                        ))
+
+                        merged.sort(key=lambda u: self._score_site_url(u, keywords), reverse=True)
+
+                        for u in merged:
+                            if len(candidate_pages) >= max_pages_total:
                                 break
+                            if _allowed_by_required_sites_check(u, required_sites) and \
+                                    (not keywords or _term_overlap_ok_check(u, keywords, min_term_overlap)):
+                                candidate_pages.append(u)
 
-            # ------------------------------------------------------------------
-            # Step 2: Deep Scan (Wrapper around crawl_page)
-            # ------------------------------------------------------------------
-            browser = None
-            pw_context = None
-            try:
-                if use_js:
-                    async with async_playwright() as p:
-                        browser = await p.firefox.launch(headless=True)
-                        pw_context = await browser.new_context(user_agent=ua)
+                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
 
-                        while (
-                                pages_to_crawl_tuples
-                                and pages_processed < max_pages_total
-                                and len(found_assets) < max_assets
-                        ):
-                            page_url, depth = pages_to_crawl_tuples.pop(0)
-                            if page_url in visited_pages:
+            elif engine == "duckduckgo":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, required_sites)
+                    log.append(f"Searching DuckDuckGo for: {sq}") # Changed print to log.append
+                    try:
+                        urls = await self._search_duckduckgo(
+                            sq,
+                            max_results=search_results_cap,
+                            ua=ua_search,
+                            timeout=timeout,
+                            log=log, # Pass log
+                            page_limit=search_page_limit,
+                            per_page=search_per_page,
+                        )
+                    except Exception as e:
+                        log.append(f"[search][ddg] error for {sq!r}: {e}") # Changed print to log.append
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if _allowed_by_required_sites_check(u, required_sites):
+                            candidate_pages.append(u)
+                            seen_search_urls.add(u)
+
+            elif engine == "google_cse":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, required_sites)
+                    log.append(f"Searching Google CSE for: {sq}") # Changed print to log.append
+                    try:
+                        urls = await self._search_google_cse(
+                            sq,
+                            n=search_results_cap,
+                            timeout=timeout,
+                            log=log, # Pass log
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        log.append(f"[search][cse] error for {sq!r}: {e}") # Changed print to log.append
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if _allowed_by_required_sites_check(u, required_sites):
+                            candidate_pages.append(u)
+                            seen_search_urls.add(u)
+
+            else:
+                log.append(f"[search] Unknown engine={engine!r} or no search queries; no search performed.") # Changed print to log.append
+
+        # Crawl state
+        found_assets: List[Dict[str, Any]] = []
+        seen_asset_urls: set[str] = set()
+        visited_pages: set[str] = set()
+
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
+
+        # Direct assets (from pipeline_urls)
+        if direct_asset_urls:
+            async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session_direct:
+                for u in direct_asset_urls:
+                    if use_database and self._is_url_in_database(u, log): # Pass log
+                        log.append(f"Skipping {u} (already in database)") # Changed print to log.append
+                        continue
+                    if u in seen_asset_urls:
+                        continue
+                    seen_asset_urls.add(u)
+
+                    status = "unverified"
+                    size = "?"
+                    if verify_links:
+                        try:
+                            async with session_direct.head(
+                                    u, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=3)
+                            ) as h:
+                                if h.status == 200:
+                                    status = "200 OK"
+                                    cl = h.headers.get("Content-Length")
+                                    if cl:
+                                        size = f"{int(cl) // 1024} KB"
+                                else:
+                                    status = f"Dead ({h.status})"
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not verify_links or "OK" in status:
+                        filename = self._clean_path(u).rsplit("/", 1)[-1] or "[asset]"
+                        asset = {"text": filename[:100], "url": u, "source_page": "<urls>", "size": size,
+                                 "status": status, "tag": "direct_asset"}
+                        found_assets.append(asset)
+                        if use_database:
+                            self._save_asset_to_database(asset, log) # Pass log
+
+        def _should_persist_page(u: str) -> bool:
+            if engine == "sites":
+                # Don't persist ephemeral search/seed pages for 'sites' engine
+                if u in explicit_site_seeds or u in synthetic_search_seeds:
+                    return False
+                if self._is_search_url(u):
+                    return False
+            return True
+
+        # --- Shared Playwright context, if needed ---
+        pw_needed = use_js or use_network_sniff
+        pw_p = pw_browser = pw_context = None
+        if pw_needed:
+            pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                ua=ua,
+                block_resources=block_resources,
+                blocked_resource_types=blocked_resource_types,
+                block_domains=block_domains,
+                blocked_domains=blocked_domains,
+                log=log, # Pass log
+            )
+
+        async def _process_page(page_url: str, depth: int, smart_sniff_param: bool) -> Dict[str, Any]: # Added smart_sniff_param
+            local_log: List[str] = []
+            local_js_links: List[Dict[str, str]] = []
+            local_network_links: List[Dict[str, str]] = []
+            local_assets: List[Dict[str, Any]] = []
+            next_pages: List[str] = []
+
+            async with aiohttp.ClientSession(headers={"User-Agent": ua}) as session:
+                try:
+                    links_on_page: List[Dict[str, str]] = []
+                    html = ""
+
+                    sniff_items: List[Dict[str, str]] = []
+                    sniff_json_hits: List[Dict[str, Any]] = []
+                    sniff_parent_pages: List[str] = []
+
+                    # 1) Network sniff (shared PW)
+                    if use_network_sniff and pw_context:
+                        sniff_html, sniff_items, sniff_json_hits = await self._pw_fetch_with_sniff(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        html = sniff_html or html
+
+                        # Process JSON hits, especially for archive.org metadata
+                        if sniff_json_hits:
+                            for hit in sniff_json_hits:
+                                data = hit.get("json") or {}
+                                # Example: archive.org advancedsearch results
+                                docs = (((data.get("response") or {}).get("docs")) or [])
+                                for d in docs:
+                                    ident = d.get("identifier")
+                                    if ident:
+                                        for u2 in self._archive_ident_to_downloads(ident):
+                                            if _allowed_by_required_sites_check(u2, required_sites):
+                                                links_on_page.append(
+                                                    {"url": u2, "text": "[Archive identifier]", "tag": "archive_ident"})
+                                # Example: generic JSON with URLs
+                                for match in self._URL_RE.finditer(json.dumps(data)):
+                                    json_url = match.group(0)
+                                    if _allowed_by_required_sites_check(json_url, required_sites):
+                                        links_on_page.append(
+                                            {"url": json_url, "text": "[JSON URL]", "tag": "json_extract"})
+
+                        for si in sniff_items:
+                            url = si.get("url", "")
+                            if not url:
                                 continue
+                            local_network_links.append({
+                                "page": page_url,
+                                "url": url,
+                                "text": si.get("text", ""),
+                                "tag": si.get("tag", "network_sniff"),
+                                "size": si.get("size", "?"),
+                                "content_type": si.get("content_type", "?"),
+                            })
+                            # Also add to JS links for aggregated return if needed
+                            local_js_links.append({
+                                "page": page_url,
+                                "url": url,
+                                "text": si.get("text", ""),
+                                "tag": si.get("tag", "network_sniff"),
+                            })
+                            links_on_page.append({
+                                "url": url,
+                                "text": si.get("text") or "[Network Stream]",
+                                "tag": "network_sniff"
+                            })
+                            # Extract parent directories of sniffed assets as potential next pages
+                            try:
+                                parsed = urlparse(url)
+                                path = parsed.path or ""
+                                if "/" in path:
+                                    parent_path = path.rsplit("/", 1)[0] + "/"
+                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+                                    if _allowed_by_required_sites_check(parent_url, required_sites):
+                                        sniff_parent_pages.append(parent_url)
+                            except Exception:
+                                pass
 
-                            child_candidates = await crawl_page(page_url, depth, pw_context)
+                    # 2) JS render/gather (shared PW)
+                    if use_js and pw_context:
+                        js_html, js_links = await self._pw_fetch_js_links(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        if js_html:
+                            html = js_html
+                        links_on_page.extend(js_links)
 
-                            if depth < max_depth:
-                                for child_url in child_candidates:
-                                    if (
-                                            child_url not in visited_pages
-                                            and len(pages_to_crawl_tuples)
-                                            < (max_pages_total - pages_processed)
-                                    ):
-                                        pages_to_crawl_tuples.append(
-                                            (child_url, depth + 1)
-                                        )
+                        for jl in js_links:
+                            local_js_links.append({
+                                "page": page_url,
+                                "url": jl.get("url", ""),
+                                "text": jl.get("text", ""),
+                                "tag": jl.get("tag", ""),
+                            })
 
-                        if browser and browser.is_connected():
-                            await browser.close()
-                else:
-                    # Run without Playwright context
-                    while (
-                            pages_to_crawl_tuples
-                            and pages_processed < max_pages_total
-                            and len(found_assets) < max_assets
-                    ):
-                        page_url, depth = pages_to_crawl_tuples.pop(0)
-                        if page_url in visited_pages:
+                    # 3) Plain HTML if PW didn't fill html
+                    if not html:
+                        try:
+                            html = await self._fetch_page_html_plain(session, page_url, timeout)
+                        except Exception as e:
+                            local_log.append(f"Error fetching {page_url} (plain HTML): {e}")
+                            if use_database and _should_persist_page(page_url):
+                                self._mark_page_scanned(page_url, log)  # Pass log
+                            return {
+                                "page": page_url,
+                                "assets": local_assets,
+                                "next_pages": next_pages,
+                                "js_links": local_js_links,
+                                "network_links": local_network_links,
+                                "log": local_log,
+                            }
+
+                    soup = BeautifulSoup(html or "", "html.parser")
+
+                    page_title = ""
+                    try:
+                        if soup.title and soup.title.string:
+                            page_title = soup.title.string
+                    except Exception:
+                        page_title = ""
+
+                    page_haystack = (page_title or "") + " " + page_url
+                    page_has_keywords = _term_overlap_ok_check(page_haystack, keywords, min_term_overlap)
+
+                    # Plain <a>, <video>, <source>, <iframe>, <embed> links
+                    link_count = 0
+                    for tag_name in ["a", "video", "source", "iframe", "embed"]:
+                        for el in soup.find_all(tag_name):
+                            url = None
+                            text = ""
+                            if tag_name == "a" and el.get("href"):
+                                url = el["href"]
+                                text = el.get_text(strip=True)
+                            elif tag_name in ["video", "iframe", "embed"] and el.get("src"):
+                                url = el["src"]
+                                text = el.get("title", "") or el.get("alt", "")
+                            elif tag_name == "source" and el.get("src"):
+                                url = el["src"]
+                                text = el.get("title", "") or el.get("alt", "")
+
+                            if url:
+                                links_on_page.append({
+                                    "url": url,
+                                    "text": text,
+                                    "tag": tag_name,
+                                })
+                                link_count += 1
+                                if link_count >= max_links_per_page:
+                                    break
+                        if link_count >= max_links_per_page:
+                            break
+
+                    # Scan links for video assets
+                    for link in links_on_page:
+                        raw_link = link["url"]
+                        full_url = urljoin(page_url, raw_link)
+                        parsed_asset_url = urlparse(full_url)
+                        asset_netloc = parsed_asset_url.netloc
+                        asset_path = parsed_asset_url.path.lower()
+                        asset_url_lower = full_url.lower()
+
+                        if self._looks_like_ad(asset_netloc, asset_path):
                             continue
 
-                        child_candidates = await crawl_page(page_url, depth, None)
+                        # ==================== START FIX 1: ALLOW CDN DOMAINS ====================
+                        # Network sniffs are often on external CDNs (e.g. b-cdn.net, cdn77.org).
+                        # We MUST skip the 'required_sites' check for them, otherwise they get blocked.
+                        is_sniff = link.get("tag") == "network_sniff"
 
-                        if depth < max_depth:
-                            for child_url in child_candidates:
-                                if (
-                                        child_url not in visited_pages
-                                        and len(pages_to_crawl_tuples)
-                                        < (max_pages_total - pages_processed)
-                                ):
-                                    pages_to_crawl_tuples.append(
-                                        (child_url, depth + 1)
-                                    )
-            except Exception as e:
-                log.append(f"FATAL CRAWL ERROR: {e}")
-                if browser and browser.is_connected():
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
+                        if not is_sniff:
+                            # Only enforce domain rules for standard links found in HTML
+                            if not self._allowed_by_required_sites(full_url, required_sites, global_mode):
+                                continue
+                        if use_database and self._is_url_in_database(full_url, log): # Pass log
+                            local_log.append(f"Skipping asset {full_url} (already in database)")
+                            continue
 
-            # ------------------------------------------------------------------
-            # Step 3: Format Output
-            # ------------------------------------------------------------------
-            display_sites = (
-                "[payload]"
-                if source == "payload"
-                else ("[all]" if global_mode else ", ".join(sites))
-            )
+                        is_video = self._is_probable_video_url(full_url, asset_path, asset_url_lower)
 
-            # Display query: prefer raw, otherwise first prompt_query variant
-            display_query = query_raw
-            if not display_query and pipeline_queries:
-                display_query = pipeline_queries[0]
+                        if not is_video and smart_sniff_param:  # Use smart_sniff_param
+                            try:
+                                async with session.head(full_url, allow_redirects=True, timeout=3) as h:
+                                    content_type = (h.headers.get("Content-Type") or "").lower()
+                                    if any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES):
+                                        is_video = True
+                                    if content_type in self.HLS_CONTENT_TYPES or content_type in self.DASH_CONTENT_TYPES:
+                                        is_video = True
+                            except Exception:
+                                pass  # Head request failed, move on
 
-            if not found_assets:
-                base_text = (
-                    f"### VideoTracker: No video assets found.\n"
-                    f"Source: {source} | Scanned {display_sites} for query: {display_query}\n"
-                    f"Required keywords: {keywords}\n"
-                    f"min_term_overlap: {min_term_overlap}\n"
-                    f"Log: {log}\n"
-                )
-                lines = [base_text]
+                        if not is_video:
+                            continue  # Not a video, skip
 
-                if return_all_js_links and all_js_links:
-                    lines.append("\n### All JS-Gathered Links (debug)\n")
-                    for jl in all_js_links:
-                        host = (
-                            _urlparse(jl["page"]).netloc
-                            if jl.get("page")
-                            else "(unknown)"
-                        )
-                        lines.append(
-                            f"- <{jl.get('tag')}> "
-                            f"[{jl.get('text')}]({jl.get('url')}) @ {host}"
-                        )
+                        if keywords and not page_has_keywords:
+                            if link.get("tag") == "network_sniff":
+                                pass  # Always keep network sniffs found on relevant pages
+                            else:
+                                haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace("%20",
+                                                                                                                " ")
+                                if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
+                                    continue
 
-                if return_network_sniff_links and all_network_links:
-                    lines.append("\n### All Network-Sniffed Video Links (debug)\n")
-                    for nl in all_network_links:
-                        host = (
-                            _urlparse(nl.get("page", "")).netloc
-                            if nl.get("page")
-                            else "(unknown)"
-                        )
-                        lines.append(
-                            f"- <{nl.get('tag', 'network_sniff')}> "
-                            f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
-                            f"(ctype={nl.get('content_type', '?')})"
-                        )
+                        status = "unverified"
+                        size = "?"
+                        if verify_links:
+                            try:
+                                async with session.head(
+                                        full_url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=3)
+                                ) as h:
+                                    if h.status == 200:
+                                        status = "200 OK"
+                                        cl = h.headers.get("Content-Length")
+                                        if cl:
+                                            size = f"{int(cl) // 1024} KB"
+                                    else:
+                                        status = f"Dead ({h.status})"
+                            except Exception:
+                                status = "Timeout/Error"
 
-                return "\n".join(lines), {
-                    "count": 0,
-                    "keywords_used": keywords,
-                    "min_term_overlap": min_term_overlap,
-                    "sites": [] if global_mode else sites,
-                    "global_mode": global_mode,
-                    "log": log,
-                    "js_links": all_js_links,
-                    "network_sniff_links": all_network_links,
-                    "source": source,
-                    "subpipeline": subpipe_name,
+                        if not verify_links or "OK" in status:
+                            display_text = (link.get("text", "") or asset_path.rsplit("/", 1)[-1] or "[video asset]")[
+                                           :100]
+                            asset = {"text": display_text, "url": full_url, "source_page": page_url, "size": size,
+                                     "status": status, "tag": link["tag"]}
+                            local_assets.append(asset)
+                            if use_database:
+                                self._save_asset_to_database(asset, log) # Pass log
+
+                    # Next-level pages
+                    if depth < max_depth:
+                        for link in links_on_page:
+                            raw_link = link.get("url") or ""
+                            if not raw_link:
+                                continue
+                            full_url = urljoin(page_url, raw_link)
+                            if not _allowed_by_required_sites_check(full_url, required_sites):
+                                continue
+
+                            lpath = urlparse(full_url).path.lower()
+                            if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue  # Skip common non-content extensions
+
+                            if self._is_probable_video_url(full_url, lpath, full_url.lower()):
+                                continue  # Don't crawl assets as pages
+
+                            if keywords and not page_has_keywords:
+                                haystack = (link.get("text", "") or "") + " " + full_url
+                                if not _term_overlap_ok_check(haystack, keywords, min_term_overlap):
+                                    continue
+
+                            if engine == "sites":
+                                if self._is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                    continue  # Don't follow generic search results outside explicit seeds
+
+                            if self._is_content_child_candidate(full_url, urlparse(full_url).netloc,
+                                                                urlparse(full_url).path):
+                                if len(next_pages) < child_page_limit:
+                                    next_pages.append(full_url)
+                            elif len(next_pages) < child_page_limit // 2:  # Lower priority for non-content candidates
+                                next_pages.append(full_url)
+
+                    if depth < max_depth and sniff_parent_pages:
+                        for parent_url in sniff_parent_pages:
+                            if _allowed_by_required_sites_check(parent_url, required_sites):
+                                if len(next_pages) < child_page_limit:  # Add to next_pages if space
+                                    next_pages.append(parent_url)
+
+                    if use_database and _should_persist_page(page_url):
+                        self._mark_page_scanned(page_url, log) # Pass log
+
+                except Exception as e:
+                    local_log.append(f"Error scanning {page_url}: {e}")
+                    if use_database and _should_persist_page(page_url):
+                        self._mark_page_scanned(page_url, log)  # Pass log
+
+                return {
+                    "page": page_url,
+                    "assets": local_assets,
+                    "next_pages": list(dict.fromkeys(next_pages)),  # Dedupe next pages
+                    "js_links": local_js_links,
+                    "network_links": local_network_links,
+                    "log": local_log,
                 }
 
-            # Sort assets for nicer display (shorter URLs first)
-            found_assets.sort(key=lambda a: len(a["url"]))
+        # BFS frontier
+        frontier: List[str] = []
+        site_buckets = {s: [] for s in required_sites if s != "*"}  # Exclude global mode marker
 
-            lines = [f"### VideoTracker Found {len(found_assets)} Assets"]
-            lines.append(
-                f"_Source: {source} | Query: {display_query} | Sites: {display_sites} | "
-                f"Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
-                f"Pages: {pages_processed}_"
+        # Initialize frontier from candidate_pages
+        for u in candidate_pages:
+            if not _allowed_by_required_sites_check(u, required_sites):
+                continue
+            if required_sites and not global_mode:
+                d = self._clean_domain(u)
+                found_bucket = False
+                for s in required_sites:
+                    if s != "*" and s in d:
+                        site_buckets[s].append(u)
+                        found_bucket = True
+                        break
+                if not found_bucket:  # If it's not strictly in a required site, but global mode is off, skip.
+                    continue
+            else:  # Global mode, or no required sites set
+                frontier.append(u)
+
+        if required_sites and not global_mode:
+            per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
+            for s, bucket in site_buckets.items():
+                # Sort bucket by score before adding to frontier to prioritize better pages
+                bucket.sort(key=lambda u: self._score_site_url(u, keywords), reverse=True)
+                frontier.extend(bucket[:per_site_cap])
+
+        frontier = list(dict.fromkeys(frontier))[:max_pages_total]  # Initial dedupe and cap
+
+        current_depth = 0
+
+        while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total and len(
+                found_assets) < max_assets:
+            remaining_page_slots = max_pages_total - len(visited_pages)
+            remaining_asset_slots = max_assets - len(found_assets)
+
+            batch: List[str] = []
+            for u in frontier:
+                if len(batch) >= remaining_page_slots:
+                    break
+                if u in visited_pages:
+                    continue
+                if use_database and self._is_page_scanned(u, log): # Pass log
+                    visited_pages.add(u)  # Mark as visited to avoid re-adding to batch
+                    log.append(f"Skipping page {u} (already scanned in database)")
+                    continue
+                batch.append(u)
+
+            if not batch:
+                break
+
+            # Pass smart_sniff to _process_page
+            results = await asyncio.gather(*[_process_page(url, current_depth, smart_sniff) for url in batch])
+            next_frontier: List[str] = []
+
+            for res in results:
+                page_url = res["page"]
+                visited_pages.add(page_url)
+
+                log.extend(res["log"])
+                all_js_links.extend(res["js_links"])
+                all_network_links.extend(res["network_links"])
+
+                for asset in res["assets"]:
+                    a_url = asset["url"]
+                    if a_url and a_url not in seen_asset_urls:
+                        seen_asset_urls.add(a_url)
+                        if len(found_assets) < max_assets:
+                            found_assets.append(asset)
+                        else:
+                            log.append(f"Max assets reached, skipped: {a_url}")
+                            break  # Break from inner asset loop
+
+                for nxt in res["next_pages"]:
+                    if nxt not in visited_pages:
+                        next_frontier.append(nxt)
+
+            current_depth += 1
+            frontier = list(dict.fromkeys(next_frontier))  # Dedupe and prepare for next iteration
+
+        # Close shared PW
+        if pw_needed:
+            await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # Output (Original VideoLinkTracker format)
+        display_sites = (
+            "[payload]"
+            if source == "payload"
+            else ("[all]" if global_mode else ", ".join(required_sites))
+        )
+
+        if not found_assets:
+            base_text = (
+                f"### VideoTracker: No video assets found.\n"
+                f"Source: {source} | Scanned {display_sites} for query: {current_display_query}\n"
+                f"Required keywords: {keywords}\n"
+                f"min_term_overlap: {min_term_overlap}\n"
+                f"Engine: {engine}\n"
             )
-            lines.append("")
-
-            for asset in found_assets:
-                lines.append(f"- **[{asset['text']}]({asset['url']})**")
-                lines.append(
-                    f"  - *Tag: <{asset['tag']}> | "
-                    f"Source: {_urlparse(asset['source_page']).netloc} | "
-                    f"Status: {asset['status']}*"
-                )
+            lines = [base_text]
 
             if return_all_js_links and all_js_links:
                 lines.append("\n### All JS-Gathered Links (debug)\n")
                 for jl in all_js_links:
-                    host = (
-                        _urlparse(jl["page"]).netloc
-                        if jl.get("page")
-                        else "(unknown)"
-                    )
+                    host = urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
                     lines.append(
-                        f"- <{jl.get('tag')}> "
-                        f"[{jl.get('text')}]({jl.get('url')}) @ {host}"
+                        f"- <{jl.get('tag')}> [{jl.get('text')}]({jl.get('url')}) @ {host}"
                     )
 
             if return_network_sniff_links and all_network_links:
                 lines.append("\n### All Network-Sniffed Video Links (debug)\n")
                 for nl in all_network_links:
-                    host = (
-                        _urlparse(nl.get("page", "")).netloc
-                        if nl.get("page")
-                        else "(unknown)"
-                    )
+                    host = urlparse(nl.get("page", "")).netloc if nl.get("page") else "(unknown)"
                     lines.append(
                         f"- <{nl.get('tag', 'network_sniff')}> "
                         f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
                         f"(ctype={nl.get('content_type', '?')})"
                     )
+            lines.append(f"\n### Log:\n" + "\n".join(log))
 
             return "\n".join(lines), {
-                "found": len(found_assets),
-                "scanned_sites": [] if global_mode else sites,
-                "global_mode": global_mode,
-                "assets": found_assets,
+                "count": 0,
                 "keywords_used": keywords,
                 "min_term_overlap": min_term_overlap,
-                "pages_processed": pages_processed,
+                "sites": [] if global_mode else required_sites,
+                "global_mode": global_mode,
                 "log": log,
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "source": source,
-                "subpipeline": subpipe_name,
+                "subpipeline": subpipeline,
+                "engine": engine,
             }
 
+        found_assets.sort(key=lambda a: len(a["url"]))
+
+        lines = [f"### VideoTracker Found {len(found_assets)} Assets"]
+        lines.append(
+            f"_Source: {source} | Query: {current_display_query} | Sites: {display_sites} | "
+            f"Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
+            f"Pages: {len(visited_pages)} | Engine: {engine}_"
+        )
+        lines.append("")
+
+        for asset in found_assets:
+            lines.append(f"- **[{asset['text']}]({asset['url']})**")
+            lines.append(
+                f"  - *Tag: <{asset['tag']}> | "
+                f"Source: {urlparse(asset['source_page']).netloc} | "
+                f"Status: {asset['status']} | Size: {asset.get('size', '?')}*"
+            )
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                lines.append(
+                    f"- <{jl.get('tag')}> [{jl.get('text')}]({jl.get('url')}) @ {host}"
+                )
+
+        if return_network_sniff_links and all_network_links:
+            lines.append("\n### All Network-Sniffed Video Links (debug)\n")
+            for nl in all_network_links:
+                host = urlparse(nl.get("page", "")).netloc if nl.get("page") else "(unknown)"
+                lines.append(
+                    f"- <{nl.get('tag', 'network_sniff')}> "
+                    f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
+                    f"(ctype={nl.get('content_type', '?')})"
+                )
+        lines.append(f"\n### Log:\n" + "\n".join(log))
+
+
+        return "\n".join(lines), {
+            "found": len(found_assets),
+            "scanned_sites": [] if global_mode else required_sites,
+            "global_mode": global_mode,
+            "assets": found_assets,
+            "keywords_used": keywords,
+            "min_term_overlap": min_term_overlap,
+            "pages_processed": len(visited_pages),
+            "js_links": all_js_links,
+            "network_sniff_links": all_network_links,
+            "source": source,
+            "subpipeline": subpipeline,
+            "engine": engine,
+        }
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        """
-        Synchronous entrypoint expected by the pipeline.
-
-        Internally runs the async implementation via asyncio.run().
-        """
-
-        # Simple case: no event loop already running in this thread
         return asyncio.run(self._execute_async(payload, params=params))
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "lil uzi vert live performance",
             "source": "search",  # or "payload"
-            "sites": "",  # e.g. "youtube.com,vimeo.com"; empty = global
+            "sites": "",  # e.g. "youtube.com,vimeo.com"; empty = global. Renamed from 'site_require' in LinkTracker.
             "scan_limit": 5,
             "timeout": 8.0,
             "user_agent": "promptchat/VideoLinkTracker",
-            "engine": "duckduckgo",  # or "google_cse"
+            "engine": "duckduckgo",  # or "google_cse", or "sites"
             "verify": False,
             "use_js": False,
             "smart_sniff": False,
@@ -8868,12 +10309,20 @@ class VideoLinkTrackerBlock(BaseBlock):
             "max_assets": 100,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
-            "min_term_overlap": 2,
+            "min_term_overlap": 1,
             "subpipeline": "",
+            "use_database": False,
+            "db_path": "video_corpus.db",
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",  # Comma-separated list of domains to block (e.g., "ads.example.com")
+            "search_results_cap": 256,  # Max results from search engine
+            "search_page_limit": 1,  # Max pages to fetch from search engine
+            "search_per_page": 50,  # Results per page for DuckDuckGo
         }
 
 
-# Register the block
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
 
 

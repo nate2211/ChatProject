@@ -249,11 +249,27 @@ class DatabasePane(QWidget):
         self.table_view.setSortingEnabled(True)
         self.table_view.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+        # --- Smooth scrolling + better long-URL viewing ---
+        # Per-pixel scroll feels "smooth" on wheels/trackpads
+        self.table_view.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table_view.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+
+        # Increase scroll step a bit so it doesn't feel sluggish
+        self.table_view.verticalScrollBar().setSingleStep(24)
+        self.table_view.horizontalScrollBar().setSingleStep(24)
+
+        # Don't wrap cells; keep URLs on one line
+        self.table_view.setWordWrap(False)
+
+        # Don't truncate with "..."; allow horizontal scroll to reveal full text
+        self.table_view.setTextElideMode(Qt.ElideNone)
+
         layout.addWidget(self.table_view)
 
         header = self.table_view.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Interactive)
-        header.setStretchLastSection(True)
+        header.setStretchLastSection(False)
         self.table_view.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
         # ---------- Action Buttons ----------
@@ -379,6 +395,8 @@ class DatabasePane(QWidget):
             return
 
         url_col = self._url_column_index()
+        if url_col >= 0:
+            self.table_view.setColumnWidth(url_col, 520)
         if url_col < 0:
             QMessageBox.warning(self, self.app_title, "No 'url' column found in this table.")
             return

@@ -229,5 +229,21 @@
     ],
     "extras": "# Scrapes the web, analyzes the text, then chats.\nwebcorpus.query={payload}\nwebcorpus.max_fetch=20\nwebcorpus.timeout=15.0\nwebcorup.num_results=20\nwebcorpus.lexicon_key=web_lexicon\nwebcorpus.context_key=web_context\nwebcorpus.min_term_overlap=2\nwebcorpus.subpipeline=prompt_query\nplaywright.query={payload}\nplaywright.lexicon_key=web_lexicon\nplaywright.context_key=web_context\nplaywright.min_term_overlap=2\nplaywright.num_per_site=10\nplaywright.num_general=20\nplaywright.subpipeline=prompt_query\nintelligence.code_concepts_key=intel_code\nintelligence.prose_concepts_key=intel_prose\ncorpus.query={payload}\ncorpus.db_path=webcorpus.db\nchat.lexicon_key=intel_prose\nchat.style=bullets\nchat.max_bullets=20\nchat.subpipeline=english_chat\nprompt.context_key=web_context\nprompt.leixcon_key=web_lexicon\nhf-llm.max_new_tokens=1000\n",
     "model": "hf-llm"
+  },
+  {
+    "name": "Desktop Linktracker",
+    "blocks": [
+      "linktracker"
+    ],
+    "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=archive.org\nlinktracker.engine=sites\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.min_term_overlap=3\nlinktracker.max_depth=20\nlinktracker.max_pages_total=200\nlinktracker.max_links_per_page=1000\nlinktracker.timeout=50\nlinktracker.subpipeline=prompt_query|xml|sitemap\nlinktracker.block_resources=true\nlinktracker.block_domains=true\nlinktracker.search_results_cap=1000\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100",
+    "model": "lexicon"
+  },
+  {
+    "name": "Desktop Videotracker",
+    "blocks": [
+      "videotracker"
+    ],
+    "extras": "videotracker.query={payload}\nvideotracker.source=search\nvideotracker.sites=\nvideotracker.scan_limit=10\nvideotracker.timeout=8.0\nvideotracker.engine=duckduckgo\nvideotracker.verify=true\nvideotracker.use_js=true\nvideotracker.return_all_js_links=true\nvideotracker.smart_sniff=true\nvideotracker.max_depth=4\nvideotracker.child_page_limit=8\nvideotracker.max_pages_total=20\nvideotracker.max_links_per_page=60\nvideotracker.max_assets=200\nvideotracker.use_network_sniff=true\nvideotracker.return_network_sniff_links=true\nvideotracker.min_term_overlap=2\nvideotracker.subpipeline=xml|sitemap\nvideotracker.use_database=false\nvideotracker.db_path=video_corpus.db\nvideotracker.block_resources=true\nvideotracker.blocked_resource_types=image,stylesheet,font\nvideotracker.block_domains=true\nvideotracker.blocked_domains=\nvideotracker.search_results_cap=256\nvideotracker.search_page_limit=5\nvideotracker.search_per_page=50",
+    "model": "lexicon"
   }
 ]
