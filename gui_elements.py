@@ -107,10 +107,42 @@ class SQLiteTableModel(QAbstractTableModel):
     def sort(self, column: int, order: Qt.SortOrder):
         self.layoutAboutToBeChanged.emit()
         reverse = order == Qt.DescendingOrder
-        # sort rows and rowids in lockstep
+
         combined = list(zip(self.filtered_rows, self.filtered_rowids))
-        combined.sort(key=lambda pair: pair[0][column], reverse=reverse)
-        self.filtered_rows, self.filtered_rowids = map(list, zip(*combined)) if combined else ([], [])
+
+        def safe_cell(row: List[Any], col: int) -> Any:
+            """Get cell or None if missing."""
+            if row is None:
+                return None
+            return row[col] if col < len(row) else None
+
+        def sort_key(pair):
+            row = pair[0]
+            val = safe_cell(row, column)
+
+            # Normalize None / empty to always sort last (or first if reverse)
+            if val is None or val == "":
+                # (1, ...) means "missing"
+                return (1, "")
+
+            # Try numeric sort if it looks like a number
+            try:
+                # Accept ints/floats or numeric strings
+                num = float(val)
+                return (0, num)
+            except Exception:
+                pass
+
+            # Fallback: case-insensitive string sort
+            return (0, str(val).lower())
+
+        combined.sort(key=sort_key, reverse=reverse)
+
+        if combined:
+            self.filtered_rows, self.filtered_rowids = map(list, zip(*combined))
+        else:
+            self.filtered_rows, self.filtered_rowids = [], []
+
         self.layoutChanged.emit()
 
     def flags(self, index):
