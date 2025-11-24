@@ -1684,7 +1684,7 @@ class WebCorpusBlock(BaseBlock):
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        import os, re, time, hashlib, json
+        import os, re, time, hashlib, json, sys, traceback
         import sqlite3
         from math import log
         from typing import List, Dict, Tuple
@@ -1735,6 +1735,12 @@ class WebCorpusBlock(BaseBlock):
         q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
                                                                          str) and regex_query.strip() else None
 
+        meta: Dict[str, Any] = {
+            "engine": engine,
+            "query": query_raw,
+            "errors": []
+        }
+
         # ---- Build list of queries to run (subpipeline OR raw) ----
         queries_to_run: Any
 
@@ -1764,7 +1770,7 @@ class WebCorpusBlock(BaseBlock):
                 "queries_run": [],
             }
 
-        meta: Dict[str, Any] = {"queries_run": queries_to_run}
+        meta["queries_run"] = queries_to_run
 
         # ---- Helpers ----
         def _tokenize(t: str) -> List[str]:
@@ -1822,7 +1828,8 @@ class WebCorpusBlock(BaseBlock):
                         (url, title, content)
                     )
             except Exception as e:
-                print(f"[WebCorpusBlock] DB save failed for {url}: {e}")
+                # Non-critical, just log to stderr
+                print(f"[WebCorpusBlock] DB save failed for {url}: {e}", file=sys.stderr)
 
         def _load_from_db(url: str) -> Tuple[str, str] | None:
             if not use_db_cache:
@@ -1834,7 +1841,7 @@ class WebCorpusBlock(BaseBlock):
                     if row:
                         return row[0], row[1]  # title, content
             except Exception as e:
-                print(f"[WebCorpusBlock] DB load failed for {url}: {e}")
+                print(f"[WebCorpusBlock] DB load failed for {url}: {e}", file=sys.stderr)
             return None
 
         # ---- File Cache (used by async fetch) ----
@@ -1868,9 +1875,8 @@ class WebCorpusBlock(BaseBlock):
                 )
                 return clean_text or ""
             except ImportError:
-                print(
-                    "[WebCorpusBlock] ERROR: `trafilatura` not installed. Please `pip install trafilatura`. Falling back to bs4."
-                )
+                # Not an error per se, just a warning
+                pass
             except Exception:
                 pass
 
@@ -1918,6 +1924,8 @@ class WebCorpusBlock(BaseBlock):
 
         # ---- Search backends ----
         def search_duckduckgo(q: str, n: int) -> List[str]:
+            errors = []
+            # 1. Try DDGS library (curl_cffi based)
             try:
                 from ddgs import DDGS  # pip install duckduckgo_search
                 with DDGS() as ddgs:
@@ -1926,17 +1934,22 @@ class WebCorpusBlock(BaseBlock):
                         u = r.get("href") or r.get("url")
                         if u:
                             out.append(u)
-                    return out
-            except Exception:
-                pass
+                    if out:
+                        return out
+            except Exception as e:
+                errors.append(f"DDGS lib failed: {e}")
 
+            # 2. Fallback: HTML scraping via requests
             import requests
             urls = []
             try:
+                # Ensure we have a valid User-Agent to avoid immediate 403
+                ua_fallback = user_agent if "Mozilla" in user_agent else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
                 r = requests.get(
-                    "https://duckduckgo.com/html/",
+                    "https://html.duckduckgo.com/html/",
                     params={"q": q},
-                    headers={"User-Agent": user_agent},
+                    headers={"User-Agent": ua_fallback},
                     timeout=(timeout_sec, read_timeout)
                 )
                 if r.status_code == 200:
@@ -1948,13 +1961,19 @@ class WebCorpusBlock(BaseBlock):
                             urls.append(href)
                             if len(urls) >= n:
                                 break
-            except Exception:
-                pass
+                else:
+                    errors.append(f"DDG HTML fallback failed: status {r.status_code}")
+            except Exception as e:
+                errors.append(f"DDG HTML fallback exception: {e}")
+
+            if errors:
+                meta["errors"].extend(errors)
             return urls
 
         def search_serpapi(q: str, n: int) -> List[str]:
             key = os.environ.get("SERPAPI_KEY")
             if not key:
+                meta["errors"].append("SERPAPI_KEY missing")
                 return []
             import requests
             try:
@@ -1971,13 +1990,15 @@ class WebCorpusBlock(BaseBlock):
                     if u:
                         out.append(u)
                 return out[:n]
-            except Exception:
+            except Exception as e:
+                meta["errors"].append(f"SerpApi failed: {e}")
                 return []
 
         def search_google_cse(q: str, n: int) -> List[str]:
             cx = os.environ.get("GOOGLE_CSE_ID")
             key = os.environ.get("GOOGLE_API_KEY")
             if not (cx and key):
+                meta["errors"].append("GOOGLE_CSE_ID or GOOGLE_API_KEY missing")
                 return []
             import requests
             out = []
@@ -1997,22 +2018,32 @@ class WebCorpusBlock(BaseBlock):
                             out.append(u)
                     if len(out) >= n:
                         break
-            except Exception:
+            except Exception as e:
+                meta["errors"].append(f"Google CSE failed: {e}")
                 return out[:n]
             return out[:n]
 
         # ---- Run searches for each query ----
         all_urls: List[str] = []
+        search_errors = []
+
         for q in queries_to_run:
             if not q:
                 continue
-            if engine == "serpapi":
-                urls = search_serpapi(q, num_results)
-            elif engine == "google_cse":
-                urls = search_google_cse(q, num_results)
-            else:
-                urls = search_duckduckgo(q, num_results)
-            all_urls.extend(urls)
+            try:
+                if engine == "serpapi":
+                    urls = search_serpapi(q, num_results)
+                elif engine == "google_cse":
+                    urls = search_google_cse(q, num_results)
+                else:
+                    urls = search_duckduckgo(q, num_results)
+                all_urls.extend(urls)
+            except Exception as e:
+                tb = traceback.format_exc()
+                search_errors.append(f"Search error for '{q}': {e}\n{tb}")
+
+        if search_errors:
+            meta["errors"].extend(search_errors)
 
         # Filter by site allow/deny, dedupe domains
         seen = set()
@@ -2038,6 +2069,7 @@ class WebCorpusBlock(BaseBlock):
                 import aiohttp
             except ImportError:
                 # Fallback: sync fetch if aiohttp is not available
+                meta["errors"].append("aiohttp not found, falling back to requests")
                 import requests
                 for u in urls:
                     # DB first
@@ -2175,13 +2207,17 @@ class WebCorpusBlock(BaseBlock):
                     if "exc" in exc_holder:
                         raise exc_holder["exc"]
         except Exception as e:
+            tb = traceback.format_exc()
             base = "" if payload is None else str(payload)
             meta.update({
                 "rows": 0,
                 "note": f"fetch failed: {e}",
+                "traceback": tb,
                 "engine": engine,
                 "query": query_raw,
             })
+            # Append to errors list in meta if it exists
+            meta.setdefault("errors", []).append(f"Fetch error: {e}")
             return base, meta
 
         if not docs_raw:
@@ -2195,6 +2231,8 @@ class WebCorpusBlock(BaseBlock):
                 "neg": neg,
                 "must_terms": must_terms,
                 "sites": {"include": site_include, "exclude": site_exclude},
+                "urls_found": len(all_urls),
+                "urls_filtered": len(urls)
             })
             return base, meta
 
@@ -2369,7 +2407,6 @@ class WebCorpusBlock(BaseBlock):
             "db_path": "webcorpus.db",
             "use_db_cache": True,
         }
-
 
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
@@ -11109,3 +11146,1327 @@ class TorOnionBlock(BaseBlock):
 
 
 BLOCKS.register("toronion", TorOnionBlock)
+
+
+@dataclass
+class DirectLinkTrackerBlock(BaseBlock):
+    """
+    Expand from direct content links (file hosters / detail pages / folders).
+    NOW accepts a query to guide filtering/ranking.
+
+    Query sources (priority):
+      1) params["query"]
+      2) payload (if payload is a non-url string)
+      3) empty => no keyword filtering
+
+    With direct expansion enabled, this block will:
+      • start from the direct URL(s)
+      • auto-derive api.get / metadata / parent dirs /f/ / onlyfiles.txt
+      • read onlyfiles.txt for tons of siblings
+      • crawl deeper to pull more file IDs
+      • collect all matching media assets
+      • rank/return the ones most aligned with the query
+    """
+
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite", "icon", "favicon", "logo", "tracking", "pixel",
+        "blank", "placeholder",
+    }
+
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
+    }
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+
+    MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
+    MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
+
+    # PATCH #4: broaden pillows id patterns + raw hex tokens
+    _PILLOWS_ID_RE = re.compile(
+        r"(?:/f/|/api/get/|/get/)([a-f0-9]{24,64})|"
+        r"\b([a-f0-9]{32})\b",
+        re.IGNORECASE
+    )
+
+    js_sniffer = submanagers.JSSniffer()
+    network_sniffer = submanagers.NetworkSniffer()
+
+    def __post_init__(self):
+        self.db_conn: Optional[sqlite3.Connection] = None
+
+    # ------------------------------------------------------------------ #
+    # DB helpers (same schema as LinkTrackerBlock)
+    # ------------------------------------------------------------------ #
+    def _initialize_database(self, db_path: str) -> None:
+        try:
+            if self.db_conn:
+                return
+
+            db_path = str(db_path or "link_corpus.db")
+            existed = Path(db_path).exists()
+
+            self.db_conn = sqlite3.connect(db_path)
+            cur = self.db_conn.cursor()
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assets
+                (
+                    url TEXT PRIMARY KEY,
+                    text TEXT,
+                    source TEXT,
+                    size TEXT,
+                    status TEXT,
+                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pages
+                (
+                    url TEXT PRIMARY KEY,
+                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
+            self.db_conn.commit()
+
+            print(f"[DirectLinkTracker] {'Using existing' if existed else 'Database created'} at {db_path}")
+        except Exception as e:
+            print(f"[DirectLinkTracker] Error initializing DB: {e}")
+            if self.db_conn:
+                self.db_conn.close()
+                self.db_conn = None
+
+    def _is_url_in_database(self, url: str) -> bool:
+        if not self.db_conn:
+            return False
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute("SELECT 1 FROM assets WHERE url = ?", (url,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def _is_page_scanned(self, url: str) -> bool:
+        if not self.db_conn:
+            return False
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def _extract_froste_song_id(self, u: str) -> Optional[str]:
+        try:
+            p = urlparse(u)
+            parts = [x for x in (p.path or "").split("/") if x]
+            if len(parts) >= 2 and parts[-2] == "song":
+                return parts[-1]
+        except Exception:
+            pass
+        return None
+
+    def _extract_urls_from_index_line(self, line: str) -> List[str]:
+        """
+        Generic: pull any http(s) URL embedded anywhere in a plaintext index line.
+        Handles 'label - url', 'label | url', multiple urls, or bare urls.
+        """
+        if not line:
+            return []
+        urls = self._URL_RE.findall(line)
+        cleaned = []
+        for u in urls:
+            u = u.strip().rstrip(").,;\"'")  # common trailing junk
+            if u:
+                cleaned.append(u)
+        return cleaned
+
+    def _label_from_index_line(self, line: str, url: str) -> str:
+        """
+        Try to infer a human-friendly label from the non-url part of the line.
+        """
+        line = (line or "").strip()
+        if url and url in line:
+            line_wo_url = line.replace(url, "").strip()
+        else:
+            line_wo_url = line
+
+        # common separators
+        for sep in [" - ", " | ", "\t", "  "]:
+            if sep in line_wo_url:
+                left = line_wo_url.split(sep, 1)[0].strip()
+                if left:
+                    return left[:100]
+
+        # fallback to filename from url
+        try:
+            return url.rsplit("/", 1)[-1][:100]
+        except Exception:
+            return (line_wo_url or url or "[asset]")[:100]
+
+    def _mark_page_scanned(self, url: str) -> None:
+        if not self.db_conn:
+            return
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO pages (url, last_scanned) VALUES (?, CURRENT_TIMESTAMP)",
+                (url,),
+            )
+            self.db_conn.commit()
+        except Exception:
+            pass
+
+    def _looks_nonempty_size(self, cl: Optional[str]) -> bool:
+        try:
+            if not cl:
+                return True  # unknown → allow, but will be rechecked
+            return int(cl) > 16 * 1024  # >16KB
+        except Exception:
+            return True
+
+    # PATCH #4: raw-hex aware extraction
+    def _extract_ids_from_text(self, text: str) -> Set[str]:
+        ids = set()
+        for m in self._PILLOWS_ID_RE.finditer(text or ""):
+            g1, g2 = m.group(1), m.group(2)
+            if g1:
+                ids.add(g1)
+            if g2:
+                ids.add(g2)
+        return ids
+
+    def _save_asset_to_database(self, asset: Dict[str, Any]) -> None:
+        if not self.db_conn:
+            return
+        try:
+            cur = self.db_conn.cursor()
+            cur.execute("SELECT first_seen FROM assets WHERE url = ?", (asset.get("url", ""),))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """
+                    UPDATE assets
+                    SET status=?, last_checked=CURRENT_TIMESTAMP, size=?, source=?
+                    WHERE url=?
+                    """,
+                    (
+                        asset.get("status", ""),
+                        asset.get("size", ""),
+                        asset.get("source", ""),
+                        asset.get("url", ""),
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO assets(url,text,source,size,status,last_checked)
+                    VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        asset.get("url", ""),
+                        asset.get("text", ""),
+                        asset.get("source", ""),
+                        asset.get("size", ""),
+                        asset.get("status", ""),
+                    ),
+                )
+            self.db_conn.commit()
+        except Exception:
+            pass
+
+    def _extract_urls_from_index_line(self, line: str) -> List[str]:
+        """
+        Generic: pull any http(s) URL embedded anywhere in a plaintext index line.
+        Handles 'label - url', 'label | url', multiple urls, or bare urls.
+        """
+        if not line:
+            return []
+        urls = self._URL_RE.findall(line)
+        cleaned = []
+        for u in urls:
+            u = u.strip().rstrip(").,;\"'")  # common trailing junk
+            if u:
+                cleaned.append(u)
+        return cleaned
+
+    def _label_from_index_line(self, line: str, url: str) -> str:
+        """
+        Try to infer a human-friendly label from the non-url part of the line.
+        """
+        line = (line or "").strip()
+        if url and url in line:
+            line_wo_url = line.replace(url, "").strip()
+        else:
+            line_wo_url = line
+
+        # common separators
+        for sep in [" - ", " | ", "\t", "  "]:
+            if sep in line_wo_url:
+                left = line_wo_url.split(sep, 1)[0].strip()
+                if left:
+                    return left[:100]
+
+        # fallback to filename from url
+        try:
+            return url.rsplit("/", 1)[-1][:100]
+        except Exception:
+            return (line_wo_url or url or "[asset]")[:100]
+    # ------------------------------------------------------------------ #
+    # Query / keyword helpers
+    # ------------------------------------------------------------------ #
+    def _extract_keywords_from_query(self, query: str) -> List[str]:
+        return [w.strip().lower() for w in (query or "").split() if w.strip()]
+
+    def _resolve_query_text(self, payload: Any, params: Dict[str, Any]) -> str:
+        """
+        Priority:
+          params["query"] > payload (if payload is non-url str)
+        """
+        q = str(params.get("query", "") or "").strip()
+        if q:
+            return q
+
+        if isinstance(payload, str):
+            p = payload.strip()
+            if p and not p.startswith("http"):
+                return p
+
+        return ""
+
+    # ------------------------------------------------------------------ #
+    # Direct expansion helpers
+    # ------------------------------------------------------------------ #
+    def _extract_direct_id(self, u: str) -> Optional[str]:
+        """
+        Pull a likely file id from known direct patterns:
+          /f/<id>  or  /file/<id>
+        """
+        try:
+            p = urlparse(u)
+            parts = [x for x in (p.path or "").split("/") if x]
+            if len(parts) >= 2 and parts[-2] in {"f", "file"}:
+                return parts[-1]
+        except Exception:
+            pass
+        return None
+
+    def _expand_direct_seed(self, seed_url: str) -> List[str]:
+        out: List[str] = []
+        try:
+            p = urlparse(seed_url)
+            base = f"{p.scheme}://{p.netloc}"
+
+            fid = self._extract_direct_id(seed_url)
+
+            # ✅ ALWAYS keep the seed itself
+            out.append(seed_url)
+
+            # parent folder + seed itself
+            if fid:
+                out.append(f"{base}/f/")
+
+                if "pillows.su" in p.netloc.lower():
+                    api_base = base.replace("://pillows.su", "://api.pillows.su")
+                    out.extend([
+                        f"{api_base}/api/get/{fid}",
+                        f"{api_base}/api/get/{fid}.ogg",
+                        f"{api_base}/api/get/{fid}.mp3",
+                        f"{api_base}/api/get/{fid}.wav",
+                        f"{api_base}/api/get/{fid}.flac",
+                        f"{api_base}/api/metadata/{fid}.json",
+                        f"{api_base}/api/metadata/{fid}.txt",
+                    ])
+
+            if "pillows.su" in p.netloc.lower():
+                out.extend([
+                    f"{base}/onlyfiles.txt",
+                    f"{base}/recent",
+                    f"{base}/search",
+                ])
+            if "music.froste.lol" in p.netloc.lower():
+                sid = self._extract_froste_song_id(seed_url)
+
+                if sid:
+                    # predictable direct assets you already sniffed
+                    out.extend([
+                        f"{base}/song/{sid}/file",
+                        f"{base}/song/{sid}/download",
+                    ])
+
+                # likely hubs / listings
+                out.extend([
+                    f"{base}/",  # homepage often lists recent
+                    f"{base}/recent",
+                    f"{base}/songs",
+                    f"{base}/search",
+                    f"{base}/artists",
+                    f"{base}/albums",
+                    f"{base}/trending",
+                ])
+        except Exception:
+            pass
+
+        seen = set()
+        cleaned: List[str] = []
+        for u in out:
+            if u and u not in seen:
+                seen.add(u)
+                cleaned.append(u)
+        return cleaned
+
+    def _looks_like_content_page(self, u: str) -> bool:
+        p = self._clean_path(u)
+        for tok in [
+            "/f/", "/file/", "/folder/", "/view/", "/download/",
+            "/d/", "/details/", "/item/",
+            # NEW froste-ish
+            "/song/", "/album/", "/artist/", "/playlist/"
+        ]:
+            if tok in p:
+                return True
+        if re.search(r"/[a-z0-9]{6,}$", p):
+            return True
+        return False
+
+    def _pillows_id_from_f_url(self, u: str) -> Optional[str]:
+        try:
+            p = urlparse(u)
+            parts = [x for x in (p.path or "").split("/") if x]
+            if len(parts) >= 2 and parts[-2] in {"f", "file"}:
+                return parts[-1]
+        except Exception:
+            pass
+        return None
+    # ------------------------------------------------------------------ #
+    # URL / expansion helpers
+    # ------------------------------------------------------------------ #
+    def _is_mega_link(self, u: str) -> bool:
+        try:
+            pu = urlparse(u)
+            host = (pu.netloc or "").lower().split(":")[0]
+            path = (pu.path or "").lower()
+            frag = (pu.fragment or "").lower()
+            full_low = u.lower()
+
+            if host in self.MEGA_HOSTS:
+                if any(m in path for m in self.MEGA_PATH_MARKERS):
+                    return True
+                if frag.startswith(("f!", "!")) or "file/" in frag or "folder/" in frag:
+                    return True
+                return True
+            if "mega.nz/#" in full_low or "mega.co.nz/#" in full_low:
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _clean_domain(self, u: str) -> str:
+        try:
+            return urlparse(u).netloc.lower().split(":")[0]
+        except Exception:
+            return ""
+
+    def _clean_path(self, u: str) -> str:
+        try:
+            return urlparse(u).path.lower()
+        except Exception:
+            return ""
+
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+        for u in urls:
+            m = re_seq.search(u)
+            if not m:
+                continue
+            num_s, ext = m.group(1), m.group(2)
+            try:
+                width = len(num_s)
+                val = int(num_s)
+                for i in range(1, 4):
+                    nxt = f"{val + i:0{width}d}"
+                    new_u = u[:m.start(1)] + nxt + u[m.end(1):]
+                    generated.add(new_u)
+            except ValueError:
+                pass
+        return list(generated)
+
+    def _parent_dir_url(self, u: str) -> Optional[str]:
+        try:
+            pu = urlparse(u)
+            path = pu.path or "/"
+            if "/" not in path.strip("/"):
+                return f"{pu.scheme}://{pu.netloc}/"
+            parent = path.rsplit("/", 1)[0] + "/"
+            return f"{pu.scheme}://{pu.netloc}{parent}"
+        except Exception:
+            return None
+
+    def _looks_like_content_page(self, u: str) -> bool:
+        p = self._clean_path(u)
+        for tok in ["/f/", "/file/", "/folder/", "/view/", "/download/", "/d/", "/details/", "/item/"]:
+            if tok in p:
+                return True
+        if re.search(r"/[a-z0-9]{6,}$", p):
+            return True
+        return False
+
+    async def _try_fetch_metadata(self, session, meta_url: str, timeout: float) -> Dict[str, Any]:
+        try:
+            async with session.get(meta_url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status != 200:
+                    return {}
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                txt = await r.text()
+                if "json" in ctype or txt.strip().startswith("{"):
+                    return await r.json()
+        except Exception:
+            pass
+        return {}
+
+    def _extract_seed_urls(self, payload: Any, params: Dict[str, Any]) -> List[str]:
+        seeds: List[str] = []
+
+        if isinstance(params.get("urls"), list):
+            seeds.extend([str(x).strip() for x in params["urls"] if str(x).strip()])
+
+        if isinstance(payload, str):
+            seeds.extend(self._URL_RE.findall(payload))
+        elif isinstance(payload, list):
+            seeds.extend([str(x).strip() for x in payload if str(x).strip()])
+
+        q = str(params.get("query", "") or "").strip()
+        if q.startswith("http"):
+            seeds.append(q)
+
+        out = []
+        seen = set()
+        for u in seeds:
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Playwright shared context
+    # ------------------------------------------------------------------ #
+    async def _open_playwright_context(
+        self,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: set[str],
+        block_domains: bool,
+        blocked_domains: set[str],
+        log: List[str],
+    ):
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
+            return None, None, None
+
+        from urllib.parse import urlparse as _urlparse
+
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if host == bd or host.endswith("." + bd):
+                    return True
+            return False
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=ua)
+
+        if block_resources or block_domains:
+
+            async def route_blocker(route, request):
+                rtype = (request.resource_type or "").lower()
+                host = _urlparse(request.url).netloc.lower()
+                if block_domains and _host_matches_blocked(host):
+                    return await route.abort()
+                if block_resources and rtype in blocked_resource_types:
+                    return await route.abort()
+                return await route.continue_()
+
+            await context.route("**/*", route_blocker)
+
+        log.append("Playwright shared context ready.")
+        return p, browser, context
+
+    async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        try:
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
+            if p:
+                await p.stop()
+            log.append("Playwright shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright context: {e}")
+
+    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
+        return await self.network_sniffer.sniff(
+            context, page_url, timeout=timeout, log=log, extensions=extensions,
+        )
+
+    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
+        return await self.js_sniffer.sniff(
+            context, page_url, timeout=timeout, log=log, extensions=extensions,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Fetch helpers
+    # ------------------------------------------------------------------ #
+    async def _fetch_page_html_plain(self, session, page_url: str, timeout: float) -> str:
+        async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            resp.raise_for_status()
+            return await resp.text()
+
+    # ------------------------------------------------------------------ #
+    # Main execution
+    # ------------------------------------------------------------------ #
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        seed_urls = self._extract_seed_urls(payload, params)
+        query_text = self._resolve_query_text(payload, params)
+        query_label = query_text or (seed_urls[0] if seed_urls else "<no seeds>")
+
+        # DB optional
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "link_corpus.db")
+        if use_database:
+            self._initialize_database(db_path)
+
+        # Config
+        mode = str(params.get("mode", "docs")).lower()
+
+        # PATCH #2: healthier defaults for heavy hosts (pillows)
+        default_pages = 200 if any("pillows.su" in s for s in seed_urls) else (len(seed_urls) or 5)
+        max_pages_total = max(1, int(params.get("max_pages_total", default_pages)))
+
+        default_depth = 2 if any("pillows.su" in s for s in seed_urls) else 1
+        max_depth = max(0, int(params.get("max_depth", default_depth)))
+
+        timeout = float(params.get("timeout", 6.0))
+        verify_links = bool(params.get("verify", True))
+
+        use_js = bool(params.get("use_js", False))
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 800))
+
+        min_term_overlap = max(1, int(params.get("min_term_overlap", 1)))
+
+        custom_ext = str(params.get("extensions", "")).split(",")
+
+        expand_direct = bool(params.get("expand_direct", True))
+        best_n = int(params.get("best_n", 50))
+
+        # --- Keyword handling ---
+        url_keywords = str(params.get("url_keywords", "")).split(",")
+        keywords = [k.strip().lower() for k in url_keywords if k.strip()]
+
+        strict_keywords = bool(params.get("strict_keywords", False))
+        if query_text:
+            if strict_keywords:
+                whole = query_text.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                for w in self._extract_keywords_from_query(query_text):
+                    if w not in keywords:
+                        keywords.append(w)
+
+        # Required sites optional
+        site_require_raw = str(params.get("site_require", "")).split(",")
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if not required_sites:
+                return True
+            d = self._clean_domain(u)
+            return any(req in d for req in required_sites)
+
+        def _term_overlap_ok(haystack: str) -> bool:
+            if not keywords:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in keywords:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_term_overlap:
+                        return True
+            return False
+
+        def _score_for_keywords(haystack: str) -> int:
+            if not keywords:
+                return 0
+            h = haystack.lower()
+            return sum(1 for k in keywords if k and k in h)
+
+        # Targets based on mode
+        targets: Set[str] = set()
+        if mode == "media":
+            targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
+        elif mode == "docs":
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx", ".txt"])
+        elif mode == "archives":
+            targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
+
+        for e in custom_ext:
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
+
+        if not targets:
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx", ".txt"])
+
+        # logging + state
+        log: List[str] = []
+        found_assets: List[Dict[str, Any]] = []
+        seen_asset_urls: set[str] = set()
+        visited_pages: set[str] = set()
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
+
+        # --- Shared Playwright context if needed ---
+        pw_needed = use_js or use_network_sniff
+        pw_p = pw_browser = pw_context = None
+        if pw_needed:
+            block_resources = bool(params.get("block_resources", False))
+            blocked_resource_types = {
+                t.strip().lower()
+                for t in str(params.get("blocked_resource_types", "")).split(",")
+                if t.strip()
+            } or {"image", "stylesheet", "font"}
+
+            block_domains = bool(params.get("block_domains", True))
+            user_blocked_domains = {
+                d.strip().lower()
+                for d in str(params.get("blocked_domains", "")).split(",")
+                if d.strip()
+            }
+            default_blocked_domains = {
+                "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+                "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
+                "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
+                "cloudflareinsights.com", "stats.g.doubleclick.net",
+                "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
+            }
+            blocked_domains: set[str] = default_blocked_domains.union(user_blocked_domains) if block_domains else set()
+
+            pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                ua="Mozilla/5.0 PromptChat/DirectLinkTracker",
+                block_resources=block_resources,
+                blocked_resource_types=blocked_resource_types,
+                block_domains=block_domains,
+                blocked_domains=blocked_domains,
+                log=log,
+            )
+
+        async def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
+            local_log: List[str] = []
+            local_assets: List[Dict[str, Any]] = []
+            local_js_links: List[Dict[str, str]] = []
+            local_network_links: List[Dict[str, str]] = []
+            next_pages: List[str] = []
+
+            async with aiohttp.ClientSession(
+                headers={"User-Agent": "Mozilla/5.0 PromptChat/DirectLinkTracker"}
+            ) as session:
+                html = ""
+                links_on_page: List[Dict[str, str]] = []
+                sniff_items: List[Dict[str, str]] = []
+
+                try:
+                    # 1) Network sniff
+                    if use_network_sniff and pw_context:
+                        sniff_html, sniff_items, sniff_json = await self._pw_fetch_with_sniff(
+                            pw_context, page_url, timeout, local_log, targets
+                        )
+
+                        html = sniff_html or html
+                        for si in sniff_items:
+                            u = si.get("url")
+                            if not u:
+                                continue
+                            local_network_links.append({
+                                "page": page_url, "url": u,
+                                "text": si.get("text", ""), "tag": si.get("tag", "network_sniff"),
+                                "size": si.get("size", "?")
+                            })
+                            local_js_links.append({
+                                "page": page_url, "url": u,
+                                "text": si.get("text", ""), "tag": si.get("tag", "network_sniff")
+                            })
+
+                    # 2) JS gather
+                    if use_js and pw_context:
+                        js_html, js_links = await self._pw_fetch_js_links(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        if js_html:
+                            html = js_html
+                        links_on_page.extend(js_links)
+                        for jl in js_links:
+                            local_js_links.append({
+                                "page": page_url, "url": jl.get("url", ""),
+                                "text": jl.get("text", ""), "tag": jl.get("tag", "")
+                            })
+
+                    # 3) Plain if needed
+                    if not html:
+                        html = await self._fetch_page_html_plain(session, page_url, timeout)
+
+                    # metadata handling
+                    if page_url.endswith(".json") and "/api/metadata/" in page_url:
+                        meta = await self._try_fetch_metadata(session, page_url, timeout)
+                        if meta:
+                            local_js_links.append({
+                                "page": page_url,
+                                "url": page_url,
+                                "text": f"[metadata] {meta.get('title') or meta.get('name') or ''}".strip(),
+                                "tag": "metadata"
+                            })
+                            harvested_ids = self._extract_ids_from_text(str(meta))
+                            for hid in harvested_ids:
+                                base = page_url.split("/api/metadata/")[0].replace("://api.", "://")
+                                api_base = base.replace("://pillows.su", "://api.pillows.su")
+                                next_pages.append(f"{base}/f/{hid}")
+                                next_pages.append(f"{api_base}/api/get/{hid}")
+
+                    # onlyfiles.txt shortcut (pillows-aware)
+                    if page_url.endswith("onlyfiles.txt"):
+                        try:
+                            for line in (html or "").splitlines():
+                                line = line.strip()
+                                if not line:
+                                    continue
+
+                                urls_in_line = self._extract_urls_from_index_line(line)
+                                if not urls_in_line:
+                                    continue
+
+                                for u2 in urls_in_line:
+                                    if not u2.startswith("http"):
+                                        continue
+                                    if not _allowed_by_required_sites(u2):
+                                        continue
+
+                                    host2 = self._clean_domain(u2)
+                                    path2 = self._clean_path(u2)
+
+                                    label2 = self._label_from_index_line(line, u2)
+                                    # A haystack that actually includes the query-relevant text
+                                    hay2 = f"{label2} {u2} {line} {page_url}"
+
+                                    # If we have keywords, require overlap (but allow small fallback)
+                                    if keywords and not _term_overlap_ok(hay2):
+                                        # keep a tiny fallback so strict queries don't go empty
+                                        if len(next_pages) < 20:
+                                            next_pages.append(u2)
+                                        continue
+
+                                    # --- pillows/pillowcase special: onlyfiles gives /f/<id> pages ---
+                                    if ("pillows.su" in host2 or "pillowcase.su" in host2) and (
+                                            "/f/" in path2 or "/file/" in path2
+                                    ):
+                                        fid2 = self._pillows_id_from_f_url(u2)
+                                        if fid2:
+                                            base = f"{urlparse(u2).scheme}://{urlparse(u2).netloc}"
+                                            api_base = base.replace("://pillows.su", "://api.pillows.su") \
+                                                .replace("://pillowcase.su", "://api.pillows.su")
+
+                                            for ext in targets:
+                                                asset_url = f"{api_base}/api/get/{fid2}{ext}"
+
+                                                # score synthesized asset using query + label + url
+                                                synth_hay = f"{label2} {asset_url} {line} {page_url}"
+                                                score2 = _score_for_keywords(synth_hay)
+
+                                                asset = {
+                                                    "text": label2,
+                                                    "url": asset_url,
+                                                    "source": page_url,
+                                                    "size": "?",
+                                                    "status": "indexed",
+                                                    "tag": "onlyfiles_synth",
+                                                    "score": score2,
+                                                    "onlyfiles": True,
+                                                }
+
+                                                # If keywords exist, enforce min_term_overlap on synth too
+                                                if not keywords or score2 >= min_term_overlap:
+                                                    local_assets.append(asset)
+                                                    if use_database:
+                                                        self._save_asset_to_database(asset)
+                                            continue  # do not crawl /f/ page; already expanded
+
+                                    # --- normal file URL in onlyfiles ---
+                                    if any(path2.endswith(ext) for ext in targets):
+                                        score2 = _score_for_keywords(hay2)
+
+                                        asset = {
+                                            "text": label2,
+                                            "url": u2,
+                                            "source": page_url,
+                                            "size": "?",
+                                            "status": "indexed",
+                                            "tag": "onlyfiles",
+                                            "score": score2,
+                                            "onlyfiles": True,
+                                        }
+
+                                        if not keywords or score2 >= min_term_overlap:
+                                            local_assets.append(asset)
+                                            if use_database:
+                                                self._save_asset_to_database(asset)
+                                    else:
+                                        next_pages.append(u2)
+
+                        except Exception as e:
+                            local_log.append(f"onlyfiles parse error: {e}")
+
+                        return {
+                            "page": page_url,
+                            "assets": local_assets,
+                            "next_pages": next_pages,
+                            "js_links": local_js_links,
+                            "network_links": local_network_links,
+                            "log": local_log
+                        }
+
+                    soup = BeautifulSoup(html or "", "html.parser")
+
+                    title = ""
+                    if soup.title and soup.title.string:
+                        title = soup.title.string.strip()
+
+                    # collect <a> hrefs
+                    link_count = 0
+                    for a in soup.find_all("a", href=True):
+                        links_on_page.append({
+                            "url": a["href"],
+                            "text": a.get_text(strip=True),
+                            "tag": "a",
+                        })
+                        link_count += 1
+                        if link_count >= max_links_per_page:
+                            break
+
+                    # PATCH #1: harvest ids AFTER <a> extraction
+                    harvested_ids = self._extract_ids_from_text(html)
+                    for lk in links_on_page:
+                        harvested_ids |= self._extract_ids_from_text(lk.get("url", ""))
+
+                    # turn ids into candidate URLs
+                    for hid in harvested_ids:
+                        if "pillows.su" in self._clean_domain(page_url):
+                            base = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+                            api_base = base.replace("://pillows.su", "://api.pillows.su")
+                            next_pages.append(f"{base}/f/{hid}")
+                            next_pages.append(f"{api_base}/api/get/{hid}")
+                            next_pages.append(f"{api_base}/api/metadata/{hid}.json")
+
+                    # Scan for assets in links
+                    for link in links_on_page:
+                        raw = link.get("url", "")
+                        full_url = urljoin(page_url, raw)
+                        if not full_url.startswith("http"):
+                            continue
+                        if not _allowed_by_required_sites(full_url):
+                            continue
+
+                        path = self._clean_path(full_url)
+                        is_mega = self._is_mega_link(full_url)
+
+                        if not is_mega and any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            continue
+                        if not is_mega and not any(path.endswith(ext) for ext in targets):
+                            continue
+
+                        if use_database and self._is_url_in_database(full_url):
+                            continue
+
+                        status = "unverified"
+                        size = "?"
+                        if verify_links and not is_mega:
+                            try:
+                                async with session.head(
+                                    full_url,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=3)
+                                ) as h:
+                                    if h.status == 200:
+                                        cl = h.headers.get("Content-Length")
+                                        ctype = (h.headers.get("Content-Type") or "").lower()
+
+                                        if not self._looks_nonempty_size(cl):
+                                            continue  # skip empties
+
+                                        if mode == "media" and ("audio" not in ctype and "octet-stream" not in ctype):
+                                            continue
+
+                                        status = "200 OK"
+                                        if cl:
+                                            size = f"{int(cl) // 1024} KB"
+                                    else:
+                                        continue
+                            except Exception:
+                                continue
+                        elif is_mega:
+                            status = "MEGA link"
+
+                        text = (link.get("text") or path.rsplit("/", 1)[-1] or "[asset]")[:100]
+                        hay = f"{text} {full_url} {title} {page_url}"
+                        score = _score_for_keywords(hay)
+
+                        asset = {
+                            "text": text,
+                            "url": full_url,
+                            "source": page_url,
+                            "size": size,
+                            "status": status,
+                            "tag": "mega" if is_mega else link.get("tag", "a"),
+                            "score": score,
+                        }
+                        local_assets.append(asset)
+                        if use_database:
+                            self._save_asset_to_database(asset)
+
+                    # include sniffed items as assets too
+                    for item in sniff_items:
+                        u = item.get("url")
+                        if not u or not _allowed_by_required_sites(u):
+                            continue
+                        pth = self._clean_path(u)
+                        if not any(pth.endswith(ext) for ext in targets):
+                            continue
+                        if use_database and self._is_url_in_database(u):
+                            continue
+
+                        status = "sniffed"
+                        size = item.get("size", "?")
+                        if verify_links:
+                            try:
+                                async with session.head(
+                                    u,
+                                    allow_redirects=True,
+                                    timeout=aiohttp.ClientTimeout(total=3),
+                                ) as h:
+                                    if h.status != 200:
+                                        continue
+                                    status = "200 OK"
+                            except Exception:
+                                continue
+
+                        hay = f"{item.get('text','')} {u} {title} {page_url}"
+                        score = _score_for_keywords(hay)
+
+                        asset = {
+                            "text": (item.get("text") or u.rsplit("/", 1)[-1] or "[asset]")[:100],
+                            "url": u,
+                            "source": page_url,
+                            "size": size,
+                            "status": status,
+                            "tag": "network_sniff",
+                            "score": score,
+                        }
+                        local_assets.append(asset)
+                        if use_database:
+                            self._save_asset_to_database(asset)
+
+                    # Next pages
+                    if depth < max_depth:
+                        base_host = self._clean_domain(page_url)
+                        for link in links_on_page:
+                            raw = link.get("url", "")
+                            nxt = urljoin(page_url, raw)
+                            if not nxt.startswith("http"):
+                                continue
+                            if not _allowed_by_required_sites(nxt):
+                                continue
+                            if self._clean_domain(nxt) != base_host:
+                                continue
+                            if any(self._clean_path(nxt).endswith(ext) for ext in targets):
+                                continue
+                            if not self._looks_like_content_page(nxt):
+                                continue
+
+                            if keywords:
+                                nxt_hay = (link.get("text", "") + " " + nxt).lower()
+                                if _term_overlap_ok(nxt_hay):
+                                    next_pages.append(nxt)
+                                else:
+                                    if len(next_pages) < 20:
+                                        next_pages.append(nxt)
+                            else:
+                                next_pages.append(nxt)
+
+                        parent = self._parent_dir_url(page_url)
+                        if parent and parent.startswith("http") and _allowed_by_required_sites(parent):
+                            next_pages.append(parent)
+
+                except Exception as e:
+                    local_log.append(f"Error scanning {page_url}: {e}")
+
+                if use_database:
+                    try:
+                        self._mark_page_scanned(page_url)
+                    except Exception:
+                        pass
+
+                return {
+                    "page": page_url,
+                    "assets": local_assets,
+                    "next_pages": next_pages,
+                    "js_links": local_js_links,
+                    "network_links": local_network_links,
+                    "log": local_log
+                }
+
+        # ------------------------------------------------------------------ #
+        # initial frontier
+        # ------------------------------------------------------------------ #
+        frontier: List[str] = []
+        for s in seed_urls:
+            if not _allowed_by_required_sites(s):
+                continue
+            if expand_direct:
+                expanded = self._expand_direct_seed(s) or []  # <-- guard
+                frontier.extend(expanded)
+            else:
+                frontier.append(s)
+
+        predicted = self._predict_next_in_sequence(frontier)
+        for p in predicted:
+            if _allowed_by_required_sites(p):
+                frontier.append(p)
+
+        for s in list(frontier):
+            parent = self._parent_dir_url(s)
+            if parent and _allowed_by_required_sites(parent):
+                frontier.append(parent)
+
+        frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+
+        current_depth = 0
+        while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
+            remaining = max_pages_total - len(visited_pages)
+            batch: List[str] = []
+            for u in frontier:
+                if len(batch) >= remaining:
+                    break
+                if u in visited_pages:
+                    continue
+                if use_database and self._is_page_scanned(u):
+                    visited_pages.add(u)
+                    log.append(f"Skipping page {u} (already scanned in DB)")
+                    continue
+                batch.append(u)
+
+            if not batch:
+                break
+
+            results = await asyncio.gather(*[_process_page(u, current_depth) for u in batch])
+            next_frontier: List[str] = []
+
+            for res in results:
+                visited_pages.add(res["page"])
+                log.extend(res["log"])
+                all_js_links.extend(res["js_links"])
+                all_network_links.extend(res["network_links"])
+
+                for a in res["assets"]:
+                    u = a.get("url", "")
+                    if u and u not in seen_asset_urls:
+                        seen_asset_urls.add(u)
+                        found_assets.append(a)
+
+                for nxt in res["next_pages"]:
+                    if nxt not in visited_pages:
+                        next_frontier.append(nxt)
+
+            current_depth += 1
+            frontier = list(dict.fromkeys(next_frontier))[:max_pages_total]
+
+        if pw_needed:
+            await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # PATCH #5: re-score onlyfiles assets with better haystack
+        if keywords:
+            for a in found_assets:
+                if a.get("onlyfiles"):
+                    hay = f"{a.get('text','')} {a.get('url','')} {a.get('source','')}"
+                    a["score"] = _score_for_keywords(hay)
+
+            found_assets.sort(key=lambda a: a.get("score", 0), reverse=True)
+
+            # fallback if everything is zero
+            if found_assets and found_assets[0].get("score", 0) == 0:
+                log.append("No keyword hits; falling back to unfiltered ordering.")
+                # keep current order (discovery order)
+
+        # PATCH #3: canonical ID dedupe (pillows format variants)
+        def _pillows_canonical_key(u: str) -> str:
+            return re.sub(r"\.(mp3|ogg|wav|flac|m4a)$", "", (u or "").lower())
+
+        deduped: List[Dict[str, Any]] = []
+        seen_keys: Set[str] = set()
+        for a in found_assets:
+            key = _pillows_canonical_key(a.get("url", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            deduped.append(a)
+        found_assets = deduped
+
+        if best_n and best_n > 0:
+            found_assets = found_assets[:best_n]
+
+        from urllib.parse import urlparse as _urlparse
+
+        if not found_assets:
+            base_text = (
+                "### DirectLinkTracker: No specific assets found.\n"
+                f"Seeded from {len(seed_urls)} direct URLs.\n"
+                f"Query: {query_text or '[none]'}\n"
+                f"Scanned {len(visited_pages)} pages for extensions: {sorted(list(targets))}.\n"
+                f"Keywords used: {keywords}\n"
+                f"Required sites: {required_sites or '[none]'}\n"
+                f"min_term_overlap: {min_term_overlap}\n"
+                f"max_depth: {max_depth}\n"
+                f"expand_direct: {expand_direct}\n"
+            )
+            lines = [base_text]
+
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                    lines.append(f"- **[{jl.get('text') or '(no text)'}]({jl.get('url')})**")
+                    lines.append(f"  - *Tag: <{jl.get('tag') or 'a'}> | From page: {host}*")
+
+            if return_network_sniff_links and all_network_links:
+                lines.append("\n### All Network-Sniffed Assets (debug)\n")
+                for nl in all_network_links:
+                    host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                    lines.append(f"- **[{nl.get('text') or '(no text)'}]({nl.get('url')})**")
+                    lines.append(
+                        f"  - *Tag: <{nl.get('tag', 'network_sniff')}> | From page: {host} | Size: {nl.get('size', '?')}*"
+                    )
+
+            return "\n".join(lines), {
+                "count": 0,
+                "seed_urls": seed_urls,
+                "query": query_text,
+                "keywords_used": keywords,
+                "min_term_overlap": min_term_overlap,
+                "required_sites": required_sites,
+                "js_links": all_js_links,
+                "network_sniff_links": all_network_links,
+                "log": log,
+            }
+
+        lines = [f"### DirectLinkTracker Found {len(found_assets)} Assets"]
+        lines.append(
+            f"_Mode: {mode} | Query: {query_text or '[none]'} | Seed: {seed_urls[0] if seed_urls else '[none]'} | "
+            f"Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
+            f"Required Sites: {required_sites or '[none]'} | max_depth: {max_depth} | "
+            f"expand_direct: {expand_direct} | best_n: {best_n}_"
+        )
+        lines.append("")
+
+        for asset in found_assets:
+            score = asset.get("score", 0)
+            lines.append(f"- **[{asset['text']}]({asset['url']})**" + (f"  *(score={score})*" if keywords else ""))
+            lines.append(
+                f"  - *Size: {asset['size']} | Status: {asset['status']} | "
+                f"Source: {_urlparse(asset['source']).netloc}*"
+            )
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                lines.append(f"- **[{jl.get('text') or '(no text)'}]({jl.get('url')})**")
+                lines.append(f"  - *Tag: <{jl.get('tag') or 'a'}> | From page: {host}*")
+
+        if return_network_sniff_links and all_network_links:
+            lines.append("\n### All Network-Sniffed Assets (debug)\n")
+            for nl in all_network_links:
+                host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                lines.append(f"- **[{nl.get('text') or '(no text)'}]({nl.get('url')})**")
+                lines.append(
+                    f"  - *Tag: <{nl.get('tag', 'network_sniff')}> | From page: {host} | Size: {nl.get('size', '?')}*"
+                )
+
+        return "\n".join(lines), {
+            "found": len(found_assets),
+            "seed_urls": seed_urls,
+            "query": query_text,
+            "scanned_pages": len(visited_pages),
+            "assets": found_assets,
+            "keywords_used": keywords,
+            "min_term_overlap": min_term_overlap,
+            "required_sites": required_sites,
+            "expand_direct": expand_direct,
+            "best_n": best_n,
+            "js_links": all_js_links,
+            "network_sniff_links": all_network_links,
+            "log": log,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "urls": ["https://pillows.su/f/5ddab82d178fa5cde9f55823aaa30329"],
+            "query": "aphex twin interview pdf",
+            "timeout": 6,
+            "mode": "docs",
+            "extensions": ".pdf,.txt",
+            "url_keywords": "",
+            "strict_keywords": False,
+            "verify": True,
+            # PATCH #2 defaults now auto-bump on pillows;
+            # still override explicitly if you want:
+            "max_depth": 2,
+            "max_pages_total": 200,
+            "max_links_per_page": 800,
+            "use_js": False,
+            "use_network_sniff": False,
+            "return_all_js_links": False,
+            "return_network_sniff_links": False,
+            "min_term_overlap": 1,
+            "site_require": "",
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",
+            "expand_direct": True,
+            "best_n": 50,
+        }
+
+
+BLOCKS.register("directlinktracker", DirectLinkTrackerBlock)

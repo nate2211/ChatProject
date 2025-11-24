@@ -1,12 +1,16 @@
 # ========================================================
 # ================  gui.py  (Thread Fix) =================
 # ========================================================
+
+
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
 import pathlib
+import platform
 import sys
 import traceback
 from pathlib import Path
@@ -21,6 +25,22 @@ from registry import BLOCKS
 
 # [MODIFIED] Import models, _MODELS, and get_chat_model
 import models
+if getattr(sys, 'frozen', False):
+    # 1. FIX SSL CERTIFICATES (For DuckDuckGo & Requests)
+    # We force the app to use the certificate bundle packed inside the exe
+    cert_path = os.path.join(sys._MEIPASS, 'certifi', 'cacert.pem')
+    if os.path.exists(cert_path):
+        os.environ['REQUESTS_CA_BUNDLE'] = cert_path
+        os.environ['SSL_CERT_FILE'] = cert_path
+
+    # 2. FORCE PLAYWRIGHT TO USE GLOBAL BROWSERS
+    # By default, frozen Playwright only looks in local folders. We point it back to global.
+    if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+        if sys.platform == 'win32':
+            # Windows Default: %LOCALAPPDATA%\ms-playwright
+            base = os.environ.get('LOCALAPPDATA')
+            if base:
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = os.path.join(base, "ms-playwright")
 
 try:
     from models import _MODELS, get_chat_model
@@ -39,9 +59,25 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, Qt
 
+# --- PATH HELPERS FOR PYINSTALLER ---
+def get_base_path():
+    """ Returns the path to bundled resources (temp folder if frozen). """
+    if getattr(sys, 'frozen', False):
+        return Path(sys._MEIPASS)
+    return Path(__file__).parent
+
+def get_user_dir():
+    """ Returns the directory where the executable lives (for saving data). """
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+# Define paths
+BUNDLED_PRESET_FILE = get_base_path() / "gui_presets.json"
+USER_PRESET_FILE = get_user_dir() / "gui_presets.json"
+STATE_FILE = get_user_dir() / ".promptchat_gui_state.json"
+
 APP_TITLE = "PromptChat GUI"
-STATE_FILE = Path(".promptchat_gui_state.json")
-PRESET_FILE = Path(__file__).parent / "gui_presets.json"
 
 # DARK_STYLESHEET (omitted for brevity)
 DARK_STYLESHEET = """
@@ -132,19 +168,6 @@ DARK_STYLESHEET = """
 # ======================= PRESETS =========================================
 
 def load_presets() -> List[Dict[str, Any]]:
-    """
-    Loads presets from 'gui_presets.json'.
-
-    In-memory structure always has a placeholder as index 0:
-        {
-          "name": "--- Select a Preset ---",
-          "blocks": [],
-          "extras": "",
-          "model": "lexicon"
-        }
-
-    The disk file stores ONLY user presets (index >= 1).
-    """
     placeholder = {
         "name": "--- Select a Preset ---",
         "blocks": [],
@@ -152,40 +175,35 @@ def load_presets() -> List[Dict[str, Any]]:
         "model": "lexicon",
     }
 
-    if PRESET_FILE.exists():
+    presets = [placeholder]
+
+    # 1. Load Bundled Presets (Read-Only defaults included in EXE)
+    if BUNDLED_PRESET_FILE.exists():
         try:
-            with open(PRESET_FILE, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if not isinstance(raw, list):
-                return [placeholder]
-
-            cleaned: List[Dict[str, Any]] = []
-            for entry in raw:
-                if not isinstance(entry, Dict):
-                    continue
-                name = str(entry.get("name", "")).strip()
-                if not name:
-                    continue
-                blocks = entry.get("blocks", [])
-                if not isinstance(blocks, list):
-                    blocks = []
-                extras = str(entry.get("extras", "") or "")
-                model = str(entry.get("model", "lexicon") or "lexicon")
-                cleaned.append(
-                    {
-                        "name": name,
-                        "blocks": blocks,
-                        "extras": extras,
-                        "model": model,
-                    }
-                )
-            if cleaned:
-                return [placeholder] + cleaned
+            with open(BUNDLED_PRESET_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    # Filter logic...
+                    for entry in data:
+                        if isinstance(entry, dict) and entry.get("name"):
+                            presets.append(entry)
         except Exception as e:
-            print(f"Error loading gui_presets.json: {e}", file=sys.stderr)
+            print(f"Error loading bundled presets: {e}", file=sys.stderr)
 
-    # Fallback: just the placeholder
-    return [placeholder]
+    # 2. Load User Presets (Read-Write file next to EXE)
+    if USER_PRESET_FILE.exists():
+        try:
+            with open(USER_PRESET_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, list):
+                # Append user presets, potentially deduping based on name if desired
+                for entry in raw:
+                    if isinstance(entry, dict) and entry.get("name"):
+                        presets.append(entry)
+        except Exception as e:
+            print(f"Error loading user presets: {e}", file=sys.stderr)
+
+    return presets
 
 
 GUI_PRESETS: List[Dict[str, Any]] = load_presets()
@@ -193,15 +211,15 @@ GUI_PRESETS: List[Dict[str, Any]] = load_presets()
 
 def save_presets_to_disk() -> None:
     """
-    Writes GUI_PRESETS[1:] (user presets) to 'gui_presets.json'.
-    We never store the placeholder on disk.
+    Writes GUI_PRESETS[1:] (user presets) to the user's local 'gui_presets.json'.
     """
     try:
-        data_to_save = GUI_PRESETS[1:]  # skip placeholder
-        PRESET_FILE.write_text(
-            json.dumps(data_to_save, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        # logic to filter out built-in presets if you want,
+        # for now we just save everything except placeholder
+        data_to_save = GUI_PRESETS[1:]
+
+        with open(USER_PRESET_FILE, "w", encoding="utf-8") as f:
+            json.dump(data_to_save, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"Error saving gui_presets.json: {e}", file=sys.stderr)
 
