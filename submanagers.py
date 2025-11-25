@@ -13,6 +13,7 @@ import random  # For random delays
 import json  # For JSON parsing in NetworkSniffer and JSSniffer
 import xml.etree.ElementTree as ET
 
+from loggers import DEBUG_LOGGER
 
 try:
     from playwright.async_api import BrowserContext, Response, Page, Request, async_playwright
@@ -129,24 +130,25 @@ class NetworkSniffer:
             "application/x-mpegurl", "application/vnd.apple.mpegurl"
         })
         dash_types: Set[str] = field(default_factory=lambda: {
-            "application/dash+xml", "application/vnd.mpeg.dash.mpd"  # Added common DASH type
+            "application/dash+xml", "application/vnd.mpeg.dash.mpd"
         })
 
         deny_content_substrings: Set[str] = field(default_factory=lambda: {
             "javascript", "css", "text/html", "font/"
         })
         deny_resource_types: Set[str] = field(default_factory=lambda: {
-            "stylesheet", "font", "manifest", "other"  # Manifest resource type can be too broad for direct asset
+            "stylesheet", "font", "manifest", "other"
         })
 
         # ------------------ stream hint sets ------------------ #
 
         video_stream_hints: Set[str] = field(default_factory=lambda: {
             ".m3u8", "manifest.mpd", "master.m3u8", "chunklist.m3u8",
-            "videoplayback", "dash", "hls", "stream", "cdn"  # Added generic stream/cdn hints
+            "videoplayback", "dash", "hls", "stream", "cdn"
         })
         audio_stream_hints: Set[str] = field(default_factory=lambda: {
-            "audio", "sound", "stream", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"
+            "audio", "sound", "stream", ".mp3", ".m4a", ".aac",
+            ".flac", ".ogg", ".opus"
         })
 
         # ------------------ ad/tracker sets ------------------ #
@@ -165,7 +167,8 @@ class NetworkSniffer:
 
         enable_json_sniff: bool = True
         json_url_hints: Set[str] = field(default_factory=lambda: {
-            "player", "manifest", "api", "metadata", "m3u8", "mpd", "playlist", "video", "audio"
+            "player", "manifest", "api", "metadata", "m3u8", "mpd",
+            "playlist", "video", "audio"
         })
         json_content_types: Set[str] = field(default_factory=lambda: {
             "application/json", "text/json"
@@ -173,7 +176,27 @@ class NetworkSniffer:
 
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
-        self.logger = logger
+        # Default to global DEBUG_LOGGER so logs land in the GUI
+        self.logger = logger or DEBUG_LOGGER
+        # Initial log (no per-run `log` list yet, so pass None)
+        self._log("[NetworkSniffer] NetworkSniffer initialized", None)
+
+    # ------------------------------ logging helper ------------------------------ #
+
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        """
+        Unified logging:
+          - Append to the per-run `log` list if provided.
+          - Emit to the global logger (which shows up in the GUI Log tab).
+        """
+        try:
+            if log_list is not None:
+                log_list.append(msg)
+            if self.logger is not None:
+                self.logger.log_message(msg)
+        except Exception:
+            # Never let logging kill sniffing
+            pass
 
     # ------------------------------ helpers ------------------------------ #
 
@@ -262,31 +285,33 @@ class NetworkSniffer:
 
     # ------------------ manifest parsing ------------------ #
 
-    # HLS: Matches lines ending with .ts, .mp4, or .m3u8, or generic URLs without #.
-    # More robust for actual media segments or sub-playlists.
-    _HLS_URL_RE = re.compile(r'(?:\n|^)(?!#EXTINF|#EXT-X-)([^#\s]+\.(?:ts|mp4|m3u8)(?:\?[^#\s]*)?)$',
-                             re.MULTILINE | re.IGNORECASE)
-    _HLS_GENERIC_URL_RE = re.compile(r'(?:\n|^)(?!#)(https?://[^#\s]+)$',
-                                     re.MULTILINE | re.IGNORECASE)  # Fallback for generic URLs
+    _HLS_URL_RE = re.compile(
+        r'(?:\n|^)(?!#EXTINF|#EXT-X-)([^#\s]+\.(?:ts|mp4|m3u8)(?:\?[^#\s]*)?)$',
+        re.MULTILINE | re.IGNORECASE
+    )
+    _HLS_GENERIC_URL_RE = re.compile(
+        r'(?:\n|^)(?!#)(https?://[^#\s]+)$',
+        re.MULTILINE | re.IGNORECASE
+    )
 
     def _parse_hls_manifest(self, manifest_text: str, base_url: str) -> List[str]:
         out = []
         for m in self._HLS_URL_RE.finditer(manifest_text or ""):
             out.append(_canonicalize_url(urljoin(base_url, m.group(1).strip())))
 
-        # Fallback for more generic URLs if specific ones are not found
         if not out:
             for m in self._HLS_GENERIC_URL_RE.finditer(manifest_text or ""):
                 out.append(_canonicalize_url(urljoin(base_url, m.group(1).strip())))
 
         return out
 
-    # MPD: Looks for media, initialization, sourceURL, and href attributes in XML-like structures.
-    _MPD_URL_RE = re.compile(r'(?:media|initialization|sourceURL|href)\s*=\s*["\']([^"\']+)["\']', re.I)
+    _MPD_URL_RE = re.compile(
+        r'(?:media|initialization|sourceURL|href)\s*=\s*["\']([^"\']+)["\']',
+        re.I
+    )
 
     def _parse_mpd_manifest(self, manifest_text: str, base_url: str) -> List[str]:
         out = []
-        # Attempt XML parsing first for more robust extraction
         try:
             root = ET.fromstring(manifest_text)
             for el in root.iter():
@@ -295,13 +320,11 @@ class NetworkSniffer:
                         u = el.attrib[attr_name].strip()
                         if u:
                             out.append(_canonicalize_url(urljoin(base_url, u)))
-            if out:  # If XML parsing found something, use it
+            if out:
                 return out
         except Exception:
-            # Fallback to regex if XML parsing fails
             pass
 
-        # Fallback regex parsing
         for m in self._MPD_URL_RE.finditer(manifest_text or ""):
             u = m.group(1).strip()
             if not u:
@@ -310,35 +333,32 @@ class NetworkSniffer:
         return out
 
     async def _expand_manifest(
-            self,
-            response: Response,
-            manifest_kind: str,
-            url: str,
-            log: Optional[List[str]],
+        self,
+        response: Response,
+        manifest_kind: str,
+        url: str,
+        log: Optional[List[str]],
     ) -> List[str]:
         try:
             txt = await response.text()
         except Exception as e:
-            if log is not None:
-                log.append(f"[Sniffer] Manifest read failed: {url} ({e})")
+            self._log(f"[NetworkSniffer] Manifest read failed: {url} ({e})", log)
             return []
 
         if manifest_kind == "hls":
             derived = self._parse_hls_manifest(txt, url)
-        else:  # manifest_kind == "dash"
+        else:
             derived = self._parse_mpd_manifest(txt, url)
 
-        if log is not None:
-            log.append(f"[Sniffer] Expanded {manifest_kind} manifest: {url} -> {len(derived)} derived")
-
+        self._log(
+            f"[NetworkSniffer] Expanded {manifest_kind} manifest: {url} -> {len(derived)} derived",
+            log
+        )
         return derived
 
     # ------------------ output normalization ------------------ #
 
     def _normalize_item(self, it: Dict[str, Any]) -> Dict[str, str]:
-        """
-        Legacy schema output only.
-        """
         return {
             "url": str(it.get("url") or ""),
             "text": str(it.get("text") or ""),
@@ -351,38 +371,33 @@ class NetworkSniffer:
     # ------------------------------ public ------------------------------ #
 
     async def sniff(
-            self,
-            context: BrowserContext,
-            page_url: str,
-            *,
-            timeout: Optional[float] = None,
-            log: Optional[List[str]] = None,
-            extensions: Optional[Set[str]] = None,  # Target extensions for filtering
+        self,
+        context: BrowserContext,
+        page_url: str,
+        *,
+        timeout: Optional[float] = None,
+        log: Optional[List[str]] = None,
+        extensions: Optional[Set[str]] = None,
     ) -> Tuple[str, List[Dict[str, str]], List[Dict[str, Any]]]:
 
         if context is None:
-            if log is not None:
-                log.append("[Sniffer] No Playwright context; skipping sniff.")
+            self._log("[NetworkSniffer] No Playwright context; skipping sniff.", log)
             return "", [], []
-        if Page is None:  # Ensure Playwright classes are available
-            if log is not None:
-                log.append("[Sniffer] Playwright classes not found; skipping sniff.")
+        if Page is None:
+            self._log("[NetworkSniffer] Playwright classes not found; skipping sniff.", log)
             return "", [], []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
-        canonical_page_url = _canonicalize_url(page_url)  # Canonicalize page_url itself
+        canonical_page_url = _canonicalize_url(page_url)
 
         found_items: List[Dict[str, Any]] = []
         json_hits: List[Dict[str, Any]] = []
         derived_items: List[Dict[str, Any]] = []
 
-        seen_network: Set[str] = set()  # Stores canonical URLs
-        seen_derived: Set[str] = set()  # Stores canonical URLs
+        seen_network: Set[str] = set()
+        seen_derived: Set[str] = set()
 
-        # Track blob/media placeholders (internal shape, normalized later)
         blob_placeholders: List[Dict[str, Any]] = []
-
-        # Track requests for resource_type to aid blob detection and filtering
         req_types: Dict[str, str] = {}
 
         page: Page = await context.new_page()
@@ -392,16 +407,15 @@ class NetworkSniffer:
         max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
         max_manifests = int(self.cfg.max_manifests_to_expand)
 
-        manifests_to_expand: List[Tuple[Response, str, str]] = []  # (resp, kind, url)
+        manifests_to_expand: List[Tuple[Response, str, str]] = []
 
-        if log is not None:
-            log.append(f"[Sniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)")
+        self._log(
+            f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)",
+            log
+        )
 
-        # -------- request tracking (helps blob recovery & resource type filtering) -------- #
         def handle_request(req: Request):
             try:
-                # Store original URL (not canonicalized yet) -> resource_type
-                # Canonicalization happens at response time for consistency
                 req_types[req.url] = req.resource_type
             except Exception:
                 pass
@@ -415,23 +429,18 @@ class NetworkSniffer:
                 data = await resp.json()
                 json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
             except Exception as e:
-                if log is not None:
-                    log.append(f"[Sniffer] Failed to parse JSON from {url}: {e}")
+                self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
 
         def handle_response(response: Response):
             try:
                 url = response.url
-                canonical_url = _canonicalize_url(url)  # Canonicalize response URL early
+                canonical_url = _canonicalize_url(url)
 
                 if not canonical_url or canonical_url in seen_network:
                     return
 
-                # Check for blob URLs first as they don't have typical netloc/path
                 is_blob = canonical_url.startswith("blob:")
-
-                # Get resource type from request (using original URL)
-                # This helps filter out unwanted types like stylesheets/fonts even if ctype is ambiguous
-                resource_type = req_types.get(url, "")  # Use original URL for req_types lookup
+                resource_type = req_types.get(url, "")
 
                 if not is_blob:
                     parsed = urlparse(canonical_url)
@@ -440,30 +449,35 @@ class NetworkSniffer:
                     url_lower = canonical_url.lower()
 
                     if self._is_junk_by_extension(path):
-                        if log is not None: log.append(f"[Sniffer] Skipped junk ext: {canonical_url}")
+                        self._log(f"[NetworkSniffer] Skipped junk ext: {canonical_url}", log)
                         return
                     if self._looks_like_ad(netloc, path):
-                        if log is not None: log.append(f"[Sniffer] Skipped ad: {canonical_url}")
+                        self._log(f"[NetworkSniffer] Skipped ad: {canonical_url}", log)
                         return
 
-                seen_network.add(canonical_url)  # Mark canonical URL as seen
+                seen_network.add(canonical_url)
 
                 ctype = (response.headers.get("content-type") or "").lower()
                 url_lower = canonical_url.lower()
 
                 if (not is_blob) and ctype and self._deny_by_content_type(ctype):
-                    if log is not None: log.append(f"[Sniffer] Skipped denied ctype: {canonical_url} ({ctype})")
+                    self._log(
+                        f"[NetworkSniffer] Skipped denied ctype: {canonical_url} ({ctype})",
+                        log
+                    )
                     return
 
                 if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
-                    if log is not None: log.append(f"[Sniffer] Skipped denied rtype: {canonical_url} ({resource_type})")
+                    self._log(
+                        f"[NetworkSniffer] Skipped denied rtype: {canonical_url} ({resource_type})",
+                        log
+                    )
                     return
 
                 if (not is_blob) and self._should_sniff_json(url_lower, ctype):
                     asyncio.create_task(handle_json(response, canonical_url))
                     return
 
-                # --------- blob media placeholder detection --------- #
                 if is_blob:
                     if resource_type == "media":
                         blob_placeholders.append({
@@ -474,35 +488,44 @@ class NetworkSniffer:
                             "content_type": ctype or "?",
                             "size": response.headers.get("content-length", "?"),
                         })
-                        # Add a JSON hit for context
                         if len(json_hits) < max_json:
                             json_hits.append({
                                 "url": canonical_url,
                                 "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
                                 "source_page": canonical_page_url
                             })
-                    return  # Blobs are handled, no further classification
+                        self._log(
+                            f"[NetworkSniffer] Detected blob media: {canonical_url}",
+                            log
+                        )
+                    return
 
                 parsed = urlparse(canonical_url)
                 path = (parsed.path or "/").lower()
 
                 kind = (
-                        self._classify_by_extension(path)
-                        or (self._classify_by_content_type(ctype) if ctype else None)
-                        or self._classify_by_stream_hint(url_lower)
+                    self._classify_by_extension(path)
+                    or (self._classify_by_content_type(ctype) if ctype else None)
+                    or self._classify_by_stream_hint(url_lower)
                 )
                 if not kind:
-                    if log is not None: log.append(f"[Sniffer] Skipped unknown kind: {canonical_url}")
+                    self._log(f"[NetworkSniffer] Skipped unknown kind: {canonical_url}", log)
                     return
 
                 if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
-                    if log is not None: log.append(f"[Sniffer] Skipped by extensions: {canonical_url} (kind={kind})")
+                    self._log(
+                        f"[NetworkSniffer] Skipped by extensions: {canonical_url} (kind={kind})",
+                        log
+                    )
                     return
 
                 mkind = self._is_manifest(canonical_url, ctype)
                 if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
                     manifests_to_expand.append((response, mkind, canonical_url))
-                    if log is not None: log.append(f"[Sniffer] Identified manifest: {canonical_url} (kind={mkind})")
+                    self._log(
+                        f"[NetworkSniffer] Identified manifest: {canonical_url} (kind={mkind})",
+                        log
+                    )
 
                 if len(found_items) >= max_items:
                     return
@@ -515,32 +538,37 @@ class NetworkSniffer:
                     "content_type": ctype or "?",
                     "size": response.headers.get("content-length", "?"),
                 })
-                if log is not None: log.append(f"[Sniffer] Added item: {canonical_url} (kind={kind})")
+                self._log(f"[NetworkSniffer] Added item: {canonical_url} (kind={kind})", log)
 
             except Exception as e:
-                # Log specific errors within handle_response for debugging
-                if log is not None:
-                    log.append(f"[Sniffer][handle_response] Error processing {response.url}: {e}")
-                if self.logger:
-                    self.logger.log_message(f"[Sniffer][handle_response] Error processing {response.url}: {e}")
+                self._log(
+                    f"[NetworkSniffer][handle_response] Error processing {response.url}: {e}",
+                    log
+                )
                 return
 
         page.on("response", handle_response)
 
         sniff_goto_timeout = max(15000, int(tmo * 1000))
         try:
-            await page.goto(canonical_page_url, wait_until="domcontentloaded", timeout=sniff_goto_timeout)
+            await page.goto(
+                canonical_page_url,
+                wait_until="domcontentloaded",
+                timeout=sniff_goto_timeout
+            )
         except Exception as e:
-            if log is not None:
-                log.append(f"[Sniffer] goto timeout on {canonical_page_url}: {e}")
-            if self.logger:
-                self.logger.log_message(f"[Sniffer] goto timeout on {canonical_page_url}: {e}")
+            self._log(
+                f"[NetworkSniffer] goto timeout on {canonical_page_url}: {e}",
+                log
+            )
 
         await page.wait_for_timeout(int(tmo * 1000))
 
-        # --------- expand manifests AFTER wait --------- #
         if manifests_to_expand:
-            if log is not None: log.append(f"[Sniffer] Expanding {len(manifests_to_expand)} manifests...")
+            self._log(
+                f"[NetworkSniffer] Expanding {len(manifests_to_expand)} manifests...",
+                log
+            )
 
             async def expand_one(resp: Response, mkind: str, murl: str):
                 derived_urls = await self._expand_manifest(resp, mkind, murl, log)
@@ -553,20 +581,27 @@ class NetworkSniffer:
                     seen_derived.add(u)
 
                     dk = self._classify_by_extension(
-                        urlparse(u).path or "") or "video"  # Assume video for manifest segments
+                        urlparse(u).path or ""
+                    ) or "video"
                     if not self._is_allowed_by_extensions(u, extensions, dk):
-                        if log is not None: log.append(f"[Sniffer] Derived skipped by extensions: {u} (kind={dk})")
+                        self._log(
+                            f"[NetworkSniffer] Derived skipped by extensions: {u} (kind={dk})",
+                            log
+                        )
                         continue
 
                     derived_items.append({
                         "url": u,
-                        "text": f"[Network {dk.capitalize()} Segment]",  # More specific label
+                        "text": f"[Network {dk.capitalize()} Segment]",
                         "tag": "network_sniff",
                         "kind": dk,
                         "content_type": mkind,
                         "size": "?",
                     })
-                    if log is not None: log.append(f"[Sniffer] Added derived item: {u} (kind={dk})")
+                    self._log(
+                        f"[NetworkSniffer] Added derived item: {u} (kind={dk})",
+                        log
+                    )
 
                     if len(json_hits) < max_json:
                         json_hits.append({
@@ -576,41 +611,38 @@ class NetworkSniffer:
                         })
 
             await asyncio.gather(*[
-                expand_one(resp, mkind, murl) for (resp, mkind, murl) in manifests_to_expand
+                expand_one(resp, mkind, murl)
+                for (resp, mkind, murl) in manifests_to_expand
             ])
-            if log is not None: log.append(
-                f"[Sniffer] Finished manifest expansion. Total derived: {len(derived_items)}")
+
+            self._log(
+                f"[NetworkSniffer] Finished manifest expansion. Total derived: {len(derived_items)}",
+                log
+            )
 
         try:
             html = await page.content()
         except Exception as e:
-            if log is not None: log.append(f"[Sniffer] Failed to get page content: {e}")
+            self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
             html = ""
 
         try:
             await page.close()
         except Exception as e:
-            if log is not None: log.append(f"[Sniffer] Failed to close page: {e}")
+            self._log(f"[NetworkSniffer] Failed to close page: {e}", log)
 
         merged_items_any = found_items + derived_items + blob_placeholders
         merged_items = [self._normalize_item(it) for it in merged_items_any if it.get("url")]
 
-        if log is not None:
-            log.append(
-                f"[Sniffer] Finished sniff for {canonical_page_url}: "
-                f"media={len(found_items)} derived={len(derived_items)} blob={len(blob_placeholders)} "
-                f"json_hits={len(json_hits)} (Total output: {len(merged_items)})"
-            )
-
-        if self.logger:
-            self.logger.log_message(
-                f"[Sniffer] Finished {canonical_page_url}. "
-                f"media={len(found_items)} derived={len(derived_items)} blob={len(blob_placeholders)} "
-                f"json_hits={len(json_hits)} (Total output: {len(merged_items)})"
-            )
+        summary = (
+            f"[NetworkSniffer] Finished sniff for {canonical_page_url}: "
+            f"media={len(found_items)} derived={len(derived_items)} "
+            f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
+            f"(Total output: {len(merged_items)})"
+        )
+        self._log(summary, log)
 
         return html, merged_items, json_hits
-
 
 # ======================================================================
 # JSSniffer
@@ -620,23 +652,7 @@ class JSSniffer:
     """
     Shared-context Playwright JS DOM link sniffer.
 
-    Keeps original behavior:
-      - extension filtering
-      - optional shadow DOM walking
-      - logging
-      - same sniff() signature you’re calling
-
-    Adds hijack-detection upgrades:
-      ✔ JS event listener detection (incl. shadow DOM) (inline only for now)
-      ✔ data-* attribute extraction (specific + generic url-ish)
-      ✔ script-tag JSON scanning for URLs/manifests
-      ✔ onclick pattern extraction
-      ✔ redirect detection
-      ✔ shadow DOM listener scanning
-      ✔ optional safe click simulation fallback
-      ✔ In-browser URL resolution for robustness.
-
-    IMPORTANT: Output schema is normalized to legacy JS-link style:
+    Output schema is normalized to legacy JS-link style:
       link = {url, text, tag}
     """
 
@@ -644,7 +660,7 @@ class JSSniffer:
     class Config:
         timeout: float = 8.0
         max_links: int = 500
-        wait_after_goto_ms: int = 500  # Added small default wait
+        wait_after_goto_ms: int = 500
         include_shadow_dom: bool = True
 
         selectors: List[str] = field(default_factory=lambda: [
@@ -652,9 +668,9 @@ class JSSniffer:
             "video[src]",
             "video source[src]",
             "source[src]",
-            "audio[src]",  # Added audio
-            "audio source[src]",  # Added audio source
-            "img[src]",  # Added images
+            "audio[src]",
+            "audio source[src]",
+            "img[src]",
             "iframe[src]",
             "embed[src]",
         ])
@@ -679,26 +695,27 @@ class JSSniffer:
         data_url_keys: Set[str] = field(default_factory=lambda: {
             "data-href", "data-url", "data-src", "data-video", "data-video-url",
             "data-file", "data-stream", "data-mp4", "data-m3u8", "data-mpd",
-            "data-audio", "data-audio-url", "data-image", "data-poster", "data-media-url"  # Added generic
+            "data-audio", "data-audio-url", "data-image", "data-poster",
+            "data-media-url"
         })
 
         onclick_url_regexes: List[str] = field(default_factory=lambda: [
-            r"""['"]((?:https?:)?//[^'"]+)['"]""",  # Generic URL in quotes
+            r"""['"]((?:https?:)?//[^'"]+)['"]""",
             r"""location\.href\s*=\s*['"]([^'"]+)['"]""",
             r"""window\.open\(\s*['"]([^'"]+)['"]""",
             r"""window\.location\.assign\(\s*['"]([^'"]+)['"]\)""",
             r"""window\.location\.replace\(\s*['"]([^'"]+)['"]\)""",
-            r"""decodeURIComponent\s*\(\s*['"]([^'"]+)['"]\)""",  # Handle encoded URLs
+            r"""decodeURIComponent\s*\(\s*['"]([^'"]+)['"]\)""",
         ])
 
         redirect_hints: Set[str] = field(default_factory=lambda: {
             "location.href", "window.location", "window.open", "document.location",
-            "location.replace", "location.assign", "navigate", "redirect"  # Added more keywords
+            "location.replace", "location.assign", "navigate", "redirect"
         })
 
         script_json_hints: Set[str] = field(default_factory=lambda: {
             "url", "src", "file", "video", "audio", "stream", "manifest",
-            "m3u8", "mpd", "playlist", "dash", "hls", "media"  # Added more keywords
+            "m3u8", "mpd", "playlist", "dash", "hls", "media"
         })
 
         enable_click_simulation: bool = False
@@ -706,14 +723,33 @@ class JSSniffer:
         click_timeout_ms: int = 2500
         click_target_selectors: List[str] = field(default_factory=lambda: [
             "a[href]", "button", "[role=button]", "[onclick]",
-            "div[role=link]", "span[role=link]"  # Added more interactive elements
+            "div[role=link]", "span[role=link]"
         ])
 
     def __init__(self, config: Optional["JSSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
-        self.logger = logger
+        # Default to global DEBUG_LOGGER so logs show in GUI
+        self.logger = logger or DEBUG_LOGGER
+        self._log("JSSniffer initialized", None)
 
     # ------------------------- helpers ------------------------- #
+
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        """
+        Unified logging:
+          - Prefix with [JSSniffer]
+          - Append to the per-run log_list if provided
+          - Emit to global DEBUG_LOGGER
+        """
+        full = f"[JSSniffer] {msg}"
+        try:
+            if log_list is not None:
+                log_list.append(full)
+            if self.logger is not None:
+                self.logger.log_message(full)
+        except Exception:
+            # Logging must never break sniffing
+            pass
 
     def _is_junk_url(self, url: str) -> bool:
         if not url:
@@ -734,10 +770,10 @@ class JSSniffer:
         return None
 
     def _is_allowed_by_extensions(
-            self,
-            url: str,
-            extensions: Optional[Set[str]],
-            kind: Optional[str]
+        self,
+        url: str,
+        extensions: Optional[Set[str]],
+        kind: Optional[str]
     ) -> bool:
         if not extensions:
             return True
@@ -748,14 +784,12 @@ class JSSniffer:
         if any(p.endswith(ext.lower()) for ext in extensions):
             return True
 
-        if kind in ("video", "audio"):  # Broadly accept video/audio if no specific extensions
+        if kind in ("video", "audio"):
             return True
 
         return False
 
     def _abs_url_js(self, base: str, u: str) -> str:
-        # This function is now primarily for Python-side fallback,
-        # as JS side will do the resolution.
         try:
             return urljoin(base, u)
         except Exception:
@@ -763,7 +797,7 @@ class JSSniffer:
 
     def _normalize_link(self, url: str, text: str, tag: str) -> Dict[str, str]:
         return {
-            "url": url,  # Canonicalized later in VideoLinkTrackerBlock
+            "url": url,
             "text": text or "",
             "tag": tag or "a",
         }
@@ -771,44 +805,40 @@ class JSSniffer:
     # ------------------------- main sniff ------------------------- #
 
     async def sniff(
-            self,
-            context: BrowserContext,
-            page_url: str,
-            *,
-            timeout: Optional[float] = None,
-            log: Optional[List[str]] = None,
-            extensions: Optional[Set[str]] = None,  # Target extensions for filtering
+        self,
+        context: BrowserContext,
+        page_url: str,
+        *,
+        timeout: Optional[float] = None,
+        log: Optional[List[str]] = None,
+        extensions: Optional[Set[str]] = None,
     ) -> Tuple[str, List[Dict[str, str]]]:
 
         if context is None:
-            if log is not None:
-                log.append("[JSSniffer] No Playwright context; skipping JS sniff.")
+            self._log("No Playwright context; skipping JS sniff.", log)
             return "", []
-        if Page is None:  # Ensure Playwright classes are available
-            if log is not None:
-                log.append("[JSSniffer] Playwright classes not found; skipping JS sniff.")
+        if Page is None:
+            self._log("Playwright classes not found; skipping JS sniff.", log)
             return "", []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
-        canonical_page_url = _canonicalize_url(page_url)  # Canonicalize page_url itself
+        canonical_page_url = _canonicalize_url(page_url)
 
         html = ""
         links: List[Dict[str, str]] = []
-        seen_urls_in_js: Set[str] = set()  # Tracks URLs resolved IN JAVASCRIPT
+        seen_urls_in_js: Set[str] = set()
 
         page: Page = await context.new_page()
         js_timeout_ms = int(max(tmo, 10.0) * 1000)
         wait_after_ms = int(self.cfg.wait_after_goto_ms)
 
         selector_js = ", ".join(self.cfg.selectors)
-        include_shadow = "true" if self.cfg.include_shadow_dom else "false"
         data_keys_js = list(self.cfg.data_url_keys)
-        onclick_regexes_js = [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes]  # Escape for JS
+        onclick_regexes_js = [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes]
         redirect_hints_js = list(self.cfg.redirect_hints)
         script_json_hints_js = list(self.cfg.script_json_hints)
 
-        if log is not None:
-            log.append(f"[JSSniffer] Start: {canonical_page_url} timeout={tmo}s")
+        self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
 
         try:
             await page.goto(canonical_page_url, wait_until="domcontentloaded", timeout=js_timeout_ms)
@@ -831,21 +861,21 @@ class JSSniffer:
                   } = args;
 
                   const out = [];
-                  const seen = new Set(); // Stores absolute, resolved URLs
+                  const seen = new Set();
 
                   function absUrl(u) {
                     if (!u) return "";
                     try {
                       return new URL(u, baseUrl).href;
                     } catch {
-                      return u; // Return original if resolution fails
+                      return u;
                     }
                   }
 
                   function push(el, url, tag, reason=null) {
-                    url = absUrl(String(url).trim()); // Resolve absolute URL
+                    url = absUrl(String(url).trim());
                     if (!url || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('data:') || seen.has(url)) {
-                        return;
+                      return;
                     }
                     seen.add(url);
                     const text = (el.innerText || el.textContent || el.title || "").trim();
@@ -862,7 +892,6 @@ class JSSniffer:
                     for (const attr of el.attributes || []) {
                       const n = attr.name.toLowerCase();
                       const v = attr.value;
-                      // Generic data- attribute with a URL-like value
                       if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://"))) {
                         push(el, v, el.tagName.toLowerCase(), "data-generic");
                       }
@@ -879,20 +908,16 @@ class JSSniffer:
                         while ((m = r.exec(oc)) !== null) {
                           if (m[1]) push(el, m[1], el.tagName.toLowerCase(), "onclick");
                         }
-                      } catch (e) {
-                        // console.error("Regex error:", e);
-                      }
+                      } catch (e) {}
                     }
                     const ocl = oc.toLowerCase();
                     for (const h of redirectHints) {
                       if (ocl.includes(h)) {
-                        // For redirect hints, try to extract any URL from the onclick string itself
                         const urlMatch = ocl.match(/(https?:)?\\/\\/[^\\s'"]+/);
                         if (urlMatch) {
-                            push(el, urlMatch[0], el.tagName.toLowerCase(), "redirect-hint-url");
+                          push(el, urlMatch[0], el.tagName.toLowerCase(), "redirect-hint-url");
                         } else {
-                            // If no specific URL, record the onclick content as a hint
-                            push(el, oc, el.tagName.toLowerCase(), "redirect-hint");
+                          push(el, oc, el.tagName.toLowerCase(), "redirect-hint");
                         }
                         break;
                       }
@@ -904,17 +929,15 @@ class JSSniffer:
                     for (const k of inlineEvents) {
                       const v = el.getAttribute?.(k);
                       if (v) {
-                        // Attempt to extract URLs from the inline script, similar to onclick
                         for (const rx of onclickRegexes) {
-                            try {
-                                const r = new RegExp(rx, "ig");
-                                let m;
-                                while ((m = r.exec(v)) !== null) {
-                                    if (m[1]) push(el, m[1], el.tagName.toLowerCase(), `inline-listener-${k}`);
-                                }
-                            } catch {}
+                          try {
+                            const r = new RegExp(rx, "ig");
+                            let m;
+                            while ((m = r.exec(v)) !== null) {
+                              if (m[1]) push(el, m[1], el.tagName.toLowerCase(), `inline-listener-${k}`);
+                            }
+                          } catch {}
                         }
-                        // push(el, v, el.tagName.toLowerCase(), `inline-listener-${k}`); // Option to record raw script
                       }
                     }
                   }
@@ -932,7 +955,7 @@ class JSSniffer:
                       push(el, url, el.tagName.toLowerCase(), "dom");
                       sniffDataAttrs(el);
                       sniffOnclick(el);
-                      sniffInlineListeners(el); // Check for inline listeners
+                      sniffInlineListeners(el);
                     });
 
                     if (includeShadow) {
@@ -948,22 +971,20 @@ class JSSniffer:
                       const txt = (s.textContent || "").trim();
                       if (!txt) continue;
 
-                      // Extract raw URLs from script text
                       const urls = txt.match(/(https?:)?\\/\\/[^\\s'"]{6,}/ig) || [];
                       for (const u of urls) push(s, u, "script", "script-raw-url");
 
-                      // Attempt JSON parsing if text looks like JSON
                       if (txt.startsWith("{") || txt.startsWith("[")) {
                         try {
                           const data = JSON.parse(txt);
                           const stack = [data];
-                          const visitedObjects = new WeakSet(); // Prevent circular references
+                          const visitedObjects = new WeakSet();
                           while (stack.length) {
                             const cur = stack.pop();
                             if (!cur || typeof cur !== "object" || visitedObjects.has(cur)) continue;
                             visitedObjects.add(cur);
 
-                            if (typeof cur === "string") { // Handle string values that might be URLs
+                            if (typeof cur === "string") {
                               const low = cur.toLowerCase();
                               if (low.includes("http") || low.includes("m3u8") || low.includes("mpd")) {
                                 push(s, cur, "script", "script-json-string");
@@ -977,17 +998,14 @@ class JSSniffer:
                             if (typeof cur === "object") {
                               for (const [k,v] of Object.entries(cur)) {
                                 const kl = k.toLowerCase();
-                                // If key is a hint, and value is a string, push it
                                 if (scriptJsonHints.some(h => kl.includes(h))) {
                                   if (typeof v === "string") push(s, v, "script", "script-json-key");
                                 }
-                                stack.push(v); // Push value for further recursive scanning
+                                stack.push(v);
                               }
                             }
                           }
-                        } catch (e) {
-                          // console.error("JSON parse error in script:", e);
-                        }
+                        } catch (e) {}
                       }
                     }
                   }
@@ -1005,27 +1023,24 @@ class JSSniffer:
                     "onclickRegexes": onclick_regexes_js,
                     "redirectHints": redirect_hints_js,
                     "scriptJsonHints": script_json_hints_js,
-                    "baseUrl": canonical_page_url  # Pass base URL for in-JS resolution
+                    "baseUrl": canonical_page_url,
                 }
             ) or {}
 
             raw_links = raw_payload.get("items") or []
-            if log is not None: log.append(f"[JSSniffer] Raw links from DOM/scripts: {len(raw_links)}")
+            self._log(f"Raw links from DOM/scripts: {len(raw_links)}", log)
 
-            # ------------------------------------------------------------
-            # Optional safe click simulation (limited)
-            # ------------------------------------------------------------
+            # Optional click simulation
             if self.cfg.enable_click_simulation:
-                if log is not None: log.append(f"[JSSniffer] Starting click simulation...")
+                self._log("Starting click simulation…", log)
                 try:
                     click_sel = ", ".join(self.cfg.click_target_selectors)
                     handles = await page.query_selector_all(click_sel)
                     handles = handles[: int(self.cfg.max_click_targets)]
-                    if log is not None: log.append(f"[JSSniffer] Found {len(handles)} click targets.")
+                    self._log(f"Found {len(handles)} click targets.", log)
 
                     for h_idx, h in enumerate(handles):
                         try:
-                            # Use evaluate to get element properties to filter before clicking
                             el_info = await h.evaluate("""el => ({
                                 tagName: el.tagName.toLowerCase(),
                                 hasHref: !!el.href,
@@ -1034,23 +1049,28 @@ class JSSniffer:
                                 isVisible: el.offsetParent !== null
                             })""")
 
-                            # Skip invisible elements or those likely to just navigate away immediately
-                            if not el_info['isVisible'] or el_info['tagName'] == 'a' and el_info['hasHref']:
-                                if log is not None: log.append(
-                                    f"[JSSniffer] Skipping click on {el_info['tagName']} (visible={el_info['isVisible']}, hasHref={el_info['hasHref']}).")
+                            if (not el_info['isVisible'] or
+                                (el_info['tagName'] == 'a' and el_info['hasHref'])):
+                                self._log(
+                                    f"Skipping click on {el_info['tagName']} "
+                                    f"(visible={el_info['isVisible']}, hasHref={el_info['hasHref']}).",
+                                    log
+                                )
                                 continue
 
-                            if log is not None: log.append(f"[JSSniffer] Clicking target {h_idx + 1}/{len(handles)}...")
+                            self._log(
+                                f"Clicking target {h_idx + 1}/{len(handles)}…",
+                                log
+                            )
                             await h.scroll_into_view_if_needed(timeout=1000)
                             await h.click(timeout=int(self.cfg.click_timeout_ms))
-                            await page.wait_for_timeout(300)  # Give some time for JS to react
+                            await page.wait_for_timeout(300)
 
-                            # Re-scan for new links after click
                             click_raw = await page.evaluate(
                                 """
                                 (baseUrl) => {
                                   const out = [];
-                                  const seen = new Set(); // Local seen for this click scan
+                                  const seen = new Set();
                                   function absUrl(u) {
                                     if (!u) return "";
                                     try { return new URL(u, baseUrl).href; } catch { return u; }
@@ -1058,7 +1078,7 @@ class JSSniffer:
                                   document.querySelectorAll("a[href], video[src], audio[src], img[src], source[src]")
                                     .forEach(el => {
                                       let url = el.href || el.currentSrc || el.src ||
-                                                  el.getAttribute("href") || el.getAttribute("src");
+                                                el.getAttribute("href") || el.getAttribute("src");
                                       url = absUrl(String(url).trim());
                                       if (!url || seen.has(url)) return;
                                       seen.add(url);
@@ -1067,76 +1087,73 @@ class JSSniffer:
                                   return out;
                                 }
                                 """,
-                                canonical_page_url  # Pass base URL for in-JS resolution
+                                canonical_page_url
                             ) or []
                             for it in click_raw:
                                 raw_links.append({
-                                    "url": it.get("url"),  # Already absolute and resolved in JS
+                                    "url": it.get("url"),
                                     "text": "",
                                     "tag": it.get("tag") or "a",
-                                    "reason": "click-sim"
+                                    "reason": "click-sim",
                                 })
-                            if log is not None: log.append(
-                                f"[JSSniffer] Click {h_idx + 1} yielded {len(click_raw)} new links.")
+                            self._log(
+                                f"Click {h_idx + 1} yielded {len(click_raw)} new links.",
+                                log
+                            )
 
                         except Exception as click_e:
-                            if log is not None:
-                                log.append(f"[JSSniffer] Error during click sim for target {h_idx + 1}: {click_e}")
+                            self._log(
+                                f"Error during click sim for target {h_idx + 1}: {click_e}",
+                                log
+                            )
                             continue
                 except Exception as e:
-                    if log is not None:
-                        log.append(f"[JSSniffer] Overall click-sim error: {e}")
+                    self._log(f"Overall click-sim error: {e}", log)
 
-            # ------------------------------------------------------------
-            # Filter + enforce limits + normalize legacy output
-            # ------------------------------------------------------------
+            # Filter + normalize
             max_links = int(self.cfg.max_links)
 
             for item in raw_links:
                 if len(links) >= max_links:
                     break
 
-                url = (item.get("url") or "").strip()  # This URL is ALREADY absolute and resolved from JS
+                url = (item.get("url") or "").strip()
                 if not url:
                     continue
 
-                # The `seen_urls_in_js` set (from `page.evaluate`) helps with initial filtering
-                # but we need a Python-side `seen` set for canonicalized URLs from different sources
                 canonical_url_py = _canonicalize_url(url)
-                if canonical_url_py in seen_urls_in_js:  # Re-use the JS-side seen for efficiency
+                if canonical_url_py in seen_urls_in_js:
                     continue
-                seen_urls_in_js.add(canonical_url_py)  # Add canonical URL to the Python-side seen set
+                seen_urls_in_js.add(canonical_url_py)
 
-                if self._is_junk_url(url):  # Check against junk prefixes (e.g., blob:, javascript:)
-                    if log is not None: log.append(f"[JSSniffer] Skipped junk URL: {url}")
+                if self._is_junk_url(url):
+                    self._log(f"Skipped junk URL: {url}", log)
                     continue
 
                 kind = self._classify_kind(url)
                 if not self._is_allowed_by_extensions(url, extensions, kind):
-                    if log is not None: log.append(f"[JSSniffer] Skipped by extensions: {url} (kind={kind})")
+                    self._log(
+                        f"Skipped by extensions: {url} (kind={kind})",
+                        log
+                    )
                     continue
 
-                # legacy JS-link shape ONLY (URL is already canonicalized by this point)
                 links.append(self._normalize_link(
-                    url=canonical_url_py,  # Use the canonicalized URL for output
+                    url=canonical_url_py,
                     text=(item.get("text") or "").strip(),
                     tag=(item.get("tag") or "a"),
                 ))
-                if log is not None: log.append(f"[JSSniffer] Added JS item: {canonical_url_py}")
+                self._log(f"Added JS item: {canonical_url_py}", log)
 
-            if log is not None:
-                log.append(f"[JSSniffer] Done: {len(links)} links for {canonical_page_url}")
+            self._log(f"Done: {len(links)} links for {canonical_page_url}", log)
 
         except Exception as e:
-            if log is not None:
-                log.append(f"[JSSniffer] Overall error on {canonical_page_url}: {e}")
-            if self.logger:
-                self.logger.log_message(f"[JSSniffer] Overall error on {canonical_page_url}: {e}")
+            self._log(f"Overall error on {canonical_page_url}: {e}", log)
 
         try:
             await page.close()
         except Exception as e:
-            if log is not None: log.append(f"[JSSniffer] Failed to close page: {e}")
+            self._log(f"Failed to close page: {e}", log)
 
         return html, links
 

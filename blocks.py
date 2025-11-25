@@ -6006,13 +6006,13 @@ class LinkTrackerBlock(BaseBlock):
     MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
     MEGA_QUERY_MARKERS = ("mega.nz",)  # fallback
 
-    js_sniffer = submanagers.JSSniffer()
-    network_sniffer = submanagers.NetworkSniffer()
 
     def __post_init__(self):
         # Store/submanager are initialized per-run when use_database=True
         self.db: Optional[submanagers.DatabaseSubmanager] = None
         self.store: Optional[LinkTrackerStore] = None
+        self.js_sniffer = submanagers.JSSniffer()
+        self.network_sniffer = submanagers.NetworkSniffer()
 
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
@@ -8062,13 +8062,14 @@ class VideoLinkTrackerBlock(BaseBlock):
         re.IGNORECASE,
     )
 
-    network_sniffer = submanagers.NetworkSniffer()
-    js_sniffer = submanagers.JSSniffer()
+
 
     def __post_init__(self):
         # DB plumbing (NEW)
         self.db: Optional[submanagers.DatabaseSubmanager] = None
         self.store: Optional[VideoTrackerStore] = None
+        self.network_sniffer = submanagers.NetworkSniffer()
+        self.js_sniffer = submanagers.JSSniffer()
 
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
@@ -10280,12 +10281,11 @@ class DirectLinkTrackerBlock(BaseBlock):
         re.IGNORECASE
     )
 
-    js_sniffer = submanagers.JSSniffer()
-    network_sniffer = submanagers.NetworkSniffer()
 
     def __post_init__(self):
         self.db_conn: Optional[sqlite3.Connection] = None
-
+        self.js_sniffer = submanagers.JSSniffer()
+        self.network_sniffer = submanagers.NetworkSniffer()
     # ------------------------------------------------------------------ #
     # DB helpers (same schema as LinkTrackerBlock)
     # ------------------------------------------------------------------ #

@@ -16,15 +16,13 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import threading
-
-# Import ALL blocks eagerly in the main thread.
 import blocks
-import pipeline  # Ensure pipeline is also registered
+import pipeline
 from gui_elements import DatabasePane
+from loggers import DEBUG_LOGGER
 from registry import BLOCKS
-
-# [MODIFIED] Import models, _MODELS, and get_chat_model
 import models
+
 if getattr(sys, 'frozen', False):
     # 1. FIX SSL CERTIFICATES (For DuckDuckGo & Requests)
     # We force the app to use the certificate bundle packed inside the exe
@@ -59,6 +57,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, Qt
 
+
 # --- PATH HELPERS FOR PYINSTALLER ---
 def get_base_path():
     """ Returns the path to bundled resources (temp folder if frozen). """
@@ -71,6 +70,8 @@ def get_user_dir():
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
     return Path(__file__).parent
+
+
 
 # Define paths
 BUNDLED_PRESET_FILE = get_base_path() / "gui_presets.json"
@@ -317,6 +318,8 @@ class Worker(QObject):
                 params.update(extras.get(block_key, {}))
                 params.update(extras.get("all", {}))
 
+                params['stop_event'] = self.stop_event
+
                 if block_name == "pipeline" or block_name == "concat":
                     params["_gui_extras_passthrough"] = extras
 
@@ -359,16 +362,12 @@ class Worker(QObject):
                     self.status_update.emit(f"Failed on block '{block_name}'. Stopping pipeline.")
                     break
 
-            final_output_only = extras.get("all", {}).get("final_output_only", False)
 
             if self.print_json:
                 out = json.dumps(results_json, indent=2, ensure_ascii=False)
-            elif final_output_only:
-                out = current_payload
             else:
                 out = (
                     f"--- FINAL OUTPUT ---\n{current_payload}\n\n"
-                    "--- RUN LOG ---\n" + "".join(results_md).lstrip()
                 )
             self.finished.emit(True, out, combined_meta)
         except Exception as e:
@@ -404,6 +403,8 @@ class PromptChatGUI(QMainWindow):
         self._load_state()
         self._show_main_ui()  # Start on Prompt Chat tab
 
+        DEBUG_LOGGER.message_signal.connect(self._append_debug_message)
+        DEBUG_LOGGER.log_message("[Debug] Debug logger initialized.")
     # ---------------- UI building ----------------
     def _build_menu(self) -> None:
         menu = self.menuBar()
@@ -601,6 +602,12 @@ class PromptChatGUI(QMainWindow):
         self.meta_text.setLineWrapMode(QPlainTextEdit.NoWrap)
         tabs.addTab(self.meta_text, "Metadata")
 
+        # NEW: Debug Log pane
+        self.debug_text = QPlainTextEdit()
+        self.debug_text.setReadOnly(True)
+        self.debug_text.setLineWrapMode(QPlainTextEdit.NoWrap)
+        tabs.addTab(self.debug_text, "Log")
+
         top_level_splitter.setSizes([250, 550])
 
         # 🔹 Add this whole Prompt Chat pane as a tab
@@ -611,6 +618,12 @@ class PromptChatGUI(QMainWindow):
         self.db_pane = DatabasePane(APP_TITLE, self)
         self.main_tabs.addTab(self.db_pane, "Database")
 
+    @pyqtSlot(str)
+    def _append_debug_message(self, msg: str) -> None:
+        """
+        Slot that appends debug messages to the Debug Log pane.
+        """
+        self.debug_text.appendPlainText(msg)
     # ---------------- Database Helpers ----------------
 
     def _open_database(self) -> None:
@@ -1047,8 +1060,28 @@ class PromptChatGUI(QMainWindow):
 
     def _cancel_run(self) -> None:
         if self.run_thread and self.run_thread.isRunning():
+            # If we already requested a cancel, try to terminate forcefullly
+            if self._stop_event.is_set():
+                reply = QMessageBox.question(
+                    self,
+                    "Force Stop?",
+                    "The process is taking time to cancel gracefully. Force stop? (Data may be lost)",
+                    QMessageBox.Yes | QMessageBox.No
+                )
+                if reply == QMessageBox.Yes:
+                    self.run_thread.terminate()
+                    self.run_thread.wait()
+                    self._set_running(False)
+                    self.statusBar().showMessage("Run forcibly terminated.")
+                    self.result_text.appendPlainText("\n[System] Run forcibly terminated by user.")
+                return
+
+            # Standard Graceful Cancel
             self._stop_event.set()
-            self.statusBar().showMessage("Cancel requested…")
+            self.statusBar().showMessage("Stopping after current step finishes...")
+            self.result_text.appendPlainText("\n[System] Cancellation requested. Finishing current batch...")
+
+            # Optional: In newer Qt, this helps interrupt wait conditions
             self.run_thread.requestInterruption()
         else:
             self.statusBar().showMessage("Nothing to cancel.")
@@ -1069,6 +1102,7 @@ class PromptChatGUI(QMainWindow):
     def _clear_outputs(self) -> None:
         self.result_text.clear()
         self.meta_text.clear()
+        self.debug_text.clear()
 
     @pyqtSlot()
     def _on_thread_finished(self):
@@ -1140,10 +1174,13 @@ def main() -> int:
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
 
     app = QApplication(sys.argv)
+
+    # 🔹 Make sure our global logger lives in the Qt main thread
+    DEBUG_LOGGER.moveToThread(app.thread())
+
     window = PromptChatGUI()
     window.show()
     return app.exec_()
-
 
 if __name__ == "__main__":
     project_root = Path(__file__).resolve().parent
