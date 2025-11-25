@@ -38,6 +38,7 @@ import re as _re
 from dotenv import load_dotenv
 
 import submanagers
+from stores import LinkTrackerStore, VideoTrackerStore
 
 load_dotenv()
 # ---------------- Paths & helpers ----------------
@@ -5984,9 +5985,10 @@ class LinkTrackerBlock(BaseBlock):
     """
     Async, search + crawl + media/doc/archives finder.
 
-    Same features as your original, but:
-      • use_js and use_network_sniff share one Playwright browser context
-        for the entire execute() call.
+    Same features as your original, but now:
+      • All sqlite access goes through DatabaseSubmanager + LinkTrackerStore.
+      • No direct sqlite3 usage in this block.
+      • Schema + queries are store-owned.
     """
 
     JUNK_FILENAME_KEYWORDS = {
@@ -6006,59 +6008,33 @@ class LinkTrackerBlock(BaseBlock):
 
     js_sniffer = submanagers.JSSniffer()
     network_sniffer = submanagers.NetworkSniffer()
+
     def __post_init__(self):
-        self.db_conn: Optional[sqlite3.Connection] = None
+        # Store/submanager are initialized per-run when use_database=True
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[LinkTrackerStore] = None
 
     # ------------------------------------------------------------------ #
-    # Database helpers
+    # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
-    def _initialize_database(self, db_path: str) -> None:
-        try:
-            if self.db_conn:
-                return
+    def _initialize_database(self, db_path: str, logger=None) -> None:
+        """
+        Create and open DBSubmanager + LinkTrackerStore, install schema.
+        Idempotent.
+        """
+        if self.db and self.store:
+            return
 
-            db_path = str(db_path or "link_corpus.db")
-            existed = Path(db_path).exists()
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "link_corpus.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
 
-            self.db_conn = sqlite3.connect(db_path)
-            cur = self.db_conn.cursor()
+        self.store = LinkTrackerStore(db=self.db)
+        self.store.ensure_schema()
 
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assets
-                (
-                    url TEXT PRIMARY KEY,
-                    text TEXT,
-                    source TEXT,
-                    size TEXT,
-                    status TEXT,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pages
-                (
-                    url TEXT PRIMARY KEY,
-                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
-
-            self.db_conn.commit()
-            print(f"[LinkTracker] {'Using existing' if existed else 'Database created and initialized'} at {db_path}")
-
-        except Exception as e:
-            print(f"[LinkTracker] Error initializing/opening database: {e}")
-            if self.db_conn:
-                self.db_conn.close()
-                self.db_conn = None
-
+    # ------------------------------------------------------------------ #
+    # URL helpers
+    # ------------------------------------------------------------------ #
     def _is_mega_link(self, u: str) -> bool:
         try:
             pu = urlparse(u)
@@ -6072,564 +6048,13 @@ class LinkTrackerBlock(BaseBlock):
                     return True
                 if frag.startswith("f!") or frag.startswith("!") or "file/" in frag or "folder/" in frag:
                     return True
-                return True  # any mega host counts
-            # old-style mega links can appear in fragment on non-host strings
+                return True
             if "mega.nz/#" in full_low or "mega.co.nz/#" in full_low:
                 return True
 
             return False
         except Exception:
             return False
-    def _is_url_in_database(self, url: str) -> bool:
-        if not self.db_conn:
-            return False
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT 1 FROM assets WHERE url = ?", (url,))
-            return cur.fetchone() is not None
-        except Exception as e:
-            print(f"[LinkTracker] Error checking URL in database: {e}")
-            return False
-
-    # ------------------------------------------------------------------ #
-    # Advanced Database Logic
-    # ------------------------------------------------------------------ #
-    def _fetch_proven_hubs(self, required_sites: List[str], min_hits: int = 1) -> List[str]:
-        """
-        Identify 'Hubs': Source pages that have historically yielded
-        valid (200 OK) assets. We should re-crawl these.
-        """
-        if not self.db_conn:
-            return []
-
-        cur = self.db_conn.cursor()
-
-        # Filter by site if needed
-        site_clause = ""
-        args = []
-        if required_sites:
-            clauses = []
-            for s in required_sites:
-                clauses.append("source LIKE ?")
-                args.append(f"%{s}%")
-            site_clause = "AND (" + " OR ".join(clauses) + ")"
-
-        # Find sources with the most '200 OK' assets
-        q = f"""
-            SELECT source, COUNT(*) as hit_count
-            FROM assets
-            WHERE status = '200 OK' 
-            AND source LIKE 'http%'
-            {site_clause}
-            GROUP BY source
-            HAVING hit_count >= ?
-            ORDER BY hit_count DESC
-            LIMIT 50
-        """
-        args.append(min_hits)
-
-        hubs = []
-        try:
-            for row in cur.execute(q, args).fetchall():
-                hubs.append(row[0])
-        except Exception as e:
-            print(f"[LinkTracker][db] Error fetching hubs: {e}")
-
-        return hubs
-
-    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
-        """
-        Intelligent Fuzzing:
-        If we have '.../page_1.pdf', generate '.../page_2.pdf'.
-        """
-        generated = set()
-
-        # Regex to find numbers at the end of filenames or just before extension
-        # e.g., "part1.rar", "img-004.jpg"
-        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
-
-        for u in urls:
-            match = re_seq.search(u)
-            if match:
-                original_num_str = match.group(1)
-                ext = match.group(2)
-
-                try:
-                    # Detect padding (e.g., 01 vs 1)
-                    width = len(original_num_str)
-                    val = int(original_num_str)
-
-                    # Generate next 3 numbers
-                    for i in range(1, 4):
-                        next_val = val + i
-                        # Format with same zero-padding
-                        next_str = f"{next_val:0{width}d}"
-
-                        # Replace in URL
-                        new_url = u[:match.start(1)] + next_str + u[match.end(1):]
-                        generated.add(new_url)
-                except ValueError:
-                    pass
-
-        return list(generated)
-
-    def _save_asset_to_database(self, asset: Dict[str, Any]) -> None:
-        if not self.db_conn:
-            return
-        try:
-            cur = self.db_conn.cursor()
-
-            # Check if exists to preserve 'first_seen'
-            cur.execute("SELECT first_seen FROM assets WHERE url = ?", (asset.get("url", ""),))
-            row = cur.fetchone()
-
-            if row:
-                # Update existing
-                cur.execute(
-                    """
-                    UPDATE assets 
-                    SET status = ?, last_checked = CURRENT_TIMESTAMP, size = ?, source = ?
-                    WHERE url = ?
-                    """,
-                    (
-                        asset.get("status", ""),
-                        asset.get("size", ""),
-                        asset.get("source", ""),
-                        asset.get("url", ""),
-                    )
-                )
-            else:
-                # Insert new
-                cur.execute(
-                    """
-                    INSERT INTO assets
-                        (url, text, source, size, status, last_checked)
-                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        asset.get("url", ""),
-                        asset.get("text", ""),
-                        asset.get("source", ""),
-                        asset.get("size", ""),
-                        asset.get("status", ""),
-                    ),
-                )
-            self.db_conn.commit()
-        except Exception as e:
-            print(f"[LinkTracker] Error saving asset to database: {e}")
-
-    def _is_page_scanned(self, url: str) -> bool:
-        if not self.db_conn:
-            return False
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
-            return cur.fetchone() is not None
-        except Exception as e:
-            print(f"[LinkTracker] Error checking page in database: {e}")
-            return False
-    def _fetch_db_seed_assets(
-        self,
-        limit: int = 200,
-        require_keywords: Optional[List[str]] = None,
-        required_sites: Optional[List[str]] = None,
-        max_age_days: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Pull recent-ish assets from DB to use as seeds.
-        Returns rows as dicts: {url,text,source,last_checked}
-        """
-        if not self.db_conn:
-            return []
-
-        require_keywords = [k.lower() for k in (require_keywords or []) if k]
-        required_sites = [s.lower() for s in (required_sites or []) if s]
-
-        cur = self.db_conn.cursor()
-
-        where = []
-        args: list[Any] = []
-
-        if max_age_days is not None:
-            where.append("last_checked >= datetime('now', ?)")
-            args.append(f"-{int(max_age_days)} days")
-
-        # optional keyword filter on url/text/source
-        if require_keywords:
-            kw_clauses = []
-            for k in require_keywords:
-                kw_clauses.append("(url LIKE ? OR text LIKE ? OR source LIKE ?)")
-                like = f"%{k}%"
-                args.extend([like, like, like])
-            where.append("(" + " OR ".join(kw_clauses) + ")")
-
-        # optional required sites filter on domain
-        if required_sites:
-            site_clauses = []
-            for s in required_sites:
-                site_clauses.append("url LIKE ?")
-                args.append(f"%{s}%")
-            where.append("(" + " OR ".join(site_clauses) + ")")
-
-        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-
-        q = f"""
-            SELECT url, text, source, last_checked
-            FROM assets
-            {where_sql}
-            ORDER BY last_checked DESC
-            LIMIT ?
-        """
-        args.append(int(limit))
-
-        out: List[Dict[str, Any]] = []
-        try:
-            for url, text, source, last_checked in cur.execute(q, args).fetchall():
-                out.append({
-                    "url": url,
-                    "text": text or "",
-                    "source": source or "",
-                    "last_checked": last_checked,
-                })
-        except Exception as e:
-            print(f"[LinkTracker][db] seed fetch error: {e}")
-            return []
-
-        return out
-
-    def _seed_pages_from_database(
-        self,
-        db_assets: List[Dict[str, Any]],
-        targets: set[str],
-        max_pages_total: int,
-        required_sites: List[str],
-        keywords: List[str],
-        min_term_overlap: int,
-    ) -> Tuple[List[str], List[str]]:
-        """
-        Convert asset rows into:
-          - direct_asset_urls: assets that already match targets
-          - candidate_pages: pages to crawl for more assets
-
-        We prefer:
-          • asset.source (parent)
-          • parent directory of asset.url
-          • detail-like pages (archive /details/ etc.)
-        """
-        candidate_pages: List[str] = []
-        direct_asset_urls: List[str] = []
-
-        def _allowed(u: str) -> bool:
-            if not required_sites:
-                return True
-            try:
-                d = urlparse(u).netloc.lower().split(":")[0]
-            except Exception:
-                return False
-            return any(req in d for req in required_sites)
-
-        def _term_ok(h: str) -> bool:
-            if not keywords:
-                return True
-            hlow = h.lower()
-            hits = sum(1 for k in keywords if k and k in hlow)
-            return hits >= min_term_overlap
-
-        for row in db_assets:
-            u = (row.get("url") or "").strip()
-            src = (row.get("source") or "").strip()
-
-            if not u:
-                continue
-
-            # if asset already matches targets: queue as direct
-            upath = urlparse(u).path.lower()
-            if any(upath.endswith(ext) for ext in targets):
-                if _allowed(u) and _term_ok(u + " " + (row.get("text") or "")):
-                    direct_asset_urls.append(u)
-                # even if direct, still try parent pages
-                # so don't "continue"
-
-            # prefer source as a page seed
-            if src.startswith("http") and _allowed(src) and _term_ok(src):
-                candidate_pages.append(src)
-
-            # parent directory seed
-            try:
-                parsed = urlparse(u)
-                parent_path = (parsed.path or "/").rsplit("/", 1)[0] + "/"
-                parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
-                if _allowed(parent_url) and _term_ok(parent_url):
-                    candidate_pages.append(parent_url)
-            except Exception:
-                pass
-
-            # archive detail/metadata adjacency
-            try:
-                host = urlparse(u).netloc.lower()
-                if "archive.org" in host:
-                    # if it's /download/, jump to /details/ & /metadata/
-                    parts = urlparse(u).path.split("/")
-                    if len(parts) >= 3:
-                        ident = parts[2]
-                        for au in self._archive_ident_to_downloads(ident):
-                            if _allowed(au) and _term_ok(au):
-                                candidate_pages.append(au)
-            except Exception:
-                pass
-
-        # dedupe + cap
-        def _dedupe(seq: List[str]) -> List[str]:
-            seen = set()
-            out = []
-            for s in seq:
-                if s and s not in seen:
-                    seen.add(s)
-                    out.append(s)
-            return out
-
-        candidate_pages = _dedupe(candidate_pages)[:max_pages_total]
-        direct_asset_urls = _dedupe(direct_asset_urls)
-
-        return candidate_pages, direct_asset_urls
-    def _mark_page_scanned(self, url: str) -> None:
-        if not self.db_conn:
-            return
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO pages (url, last_scanned)
-                VALUES (?, CURRENT_TIMESTAMP)
-                """,
-                (url,),
-            )
-            self.db_conn.commit()
-        except Exception as e:
-            print(f"[LinkTracker] Error marking page as scanned: {e}")
-
-    # ------------------------------------------------------------------ #
-    # Keyword / query helpers
-    # ------------------------------------------------------------------ #
-    def _extract_keywords_from_query(self, query: str) -> List[str]:
-        return [word.strip().lower() for word in query.split() if word.strip()]
-
-    def _seed_pages_from_required_sites(
-        self,
-        required_sites,
-        queries,
-        probe_cap_per_site=5,
-        sitemap_cap_per_site=8,
-        hub_cap_per_site=6,
-    ):
-        out: List[str] = []
-        synthetic_search_seeds: set[str] = set()
-        explicit_site_seeds: set[str] = set()
-
-        norm_sites = []
-        for raw in required_sites or []:
-            s = (raw or "").strip()
-            if not s:
-                continue
-            norm_sites.append(s.rstrip("/") if "://" in s else "https://" + s.lstrip(".").rstrip("/"))
-
-        # 1) roots
-        for s in norm_sites:
-            u = s + "/"
-            out.append(u)
-            explicit_site_seeds.add(u)
-
-        # 2) robots + common sitemap
-        common_sitemaps = [
-            "/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml",
-            "/sitemap-index.xml", "/sitemap.php", "/sitemap.txt",
-        ]
-        for s in norm_sites:
-            u = s + "/robots.txt"
-            out.append(u); explicit_site_seeds.add(u)
-            added = 0
-            for sm in common_sitemaps:
-                if added >= sitemap_cap_per_site:
-                    break
-                u = s + sm
-                out.append(u); explicit_site_seeds.add(u)
-                added += 1
-
-        # 3) hub guesses
-        hub_paths = [
-            "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
-            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
-        ]
-        for s in norm_sites:
-            added = 0
-            for hp in hub_paths:
-                if added >= hub_cap_per_site:
-                    break
-                u = s + hp
-                out.append(u); explicit_site_seeds.add(u)
-                added += 1
-
-        # probes
-        from urllib.parse import quote_plus, urlparse as _urlparse
-
-        def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
-            host = _urlparse(base).netloc.lower()
-            if "archive.org" in host:
-                return [
-                    base + f"/search.php?query={enc_query}",
-                    base + f"/advancedsearch.php?q={enc_query}",
-                    base + (f"/advancedsearch.php?q={enc_query}"
-                            f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"),
-                    base + f"/details/{enc_query}",
-                    base + f"/browse.php?field=subject&query={enc_query}",
-                ]
-            return []
-
-        if queries:
-            for s in norm_sites:
-                probes_added = 0
-                for qv in queries:
-                    if probes_added >= probe_cap_per_site:
-                        break
-                    qv = (qv or "").strip()
-                    if not qv:
-                        continue
-                    enc = quote_plus(qv)
-
-                    probes = [
-                        s + f"/search?q={enc}",
-                        s + f"/search?query={enc}",
-                        s + f"/?s={enc}",
-                        s + f"/search/{enc}",
-                    ]
-                    probes.extend(_extra_probes_for_site(s, enc))
-
-                    for p in probes:
-                        out.append(p)
-                        synthetic_search_seeds.add(p)
-                        probes_added += 1
-                        if probes_added >= probe_cap_per_site and "archive.org" not in s:
-                            break
-
-        return out, synthetic_search_seeds, explicit_site_seeds
-
-    async def _fetch_text(self, session, url, timeout):
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-            if r.status != 200:
-                return ""
-            return await r.text()
-
-    def _extract_sitemap_urls_from_robots(self, text: str) -> list[str]:
-        urls = []
-        for line in (text or "").splitlines():
-            if line.lower().startswith("sitemap:"):
-                u = line.split(":", 1)[1].strip()
-                if u.startswith("http"):
-                    urls.append(u)
-        return urls
-
-    def _extract_urls_from_sitemap_xml(self, xml_text: str, cap: int = 2000) -> list[str]:
-        urls = []
-        if not xml_text:
-            return urls
-        for m in re.finditer(r"<loc>\s*(https?://[^<\s]+)\s*</loc>", xml_text, re.I):
-            urls.append(m.group(1))
-            if len(urls) >= cap:
-                break
-        return urls
-
-    # ------------------------------------------------------------------ #
-    # Playwright shared context manager
-    # ------------------------------------------------------------------ #
-    async def _open_playwright_context(
-        self,
-        ua: str,
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
-        log: List[str],
-    ):
-        """
-        Open a single chromium browser+context for this run.
-        Route blocking is installed once.
-        """
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            log.append("Playwright not installed.")
-            return None, None, None
-
-        from urllib.parse import urlparse as _urlparse
-
-        def _host_matches_blocked(host: str) -> bool:
-            host = host.split(":", 1)[0].lower()
-            for bd in blocked_domains:
-                bd = bd.lower()
-                if not bd:
-                    continue
-                if host == bd or host.endswith("." + bd):
-                    return True
-            return False
-
-        p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(user_agent=ua)
-
-        if block_resources or block_domains:
-            async def route_blocker(route, request):
-                rtype = (request.resource_type or "").lower()
-                try:
-                    host = _urlparse(request.url).netloc.lower()
-                except Exception:
-                    host = ""
-
-                if block_domains and _host_matches_blocked(host):
-                    await route.abort()
-                    return
-
-                if block_resources and rtype in blocked_resource_types:
-                    await route.abort()
-                    return
-
-                await route.continue_()
-
-            await context.route("**/*", route_blocker)
-
-        log.append("Playwright shared context ready.")
-        return p, browser, context
-
-    async def _close_playwright_context(self, p, browser, context, log: List[str]):
-        try:
-            if context:
-                await context.close()
-            if browser:
-                await browser.close()
-            if p:
-                await p.stop()
-            log.append("Playwright shared context closed.")
-        except Exception as e:
-            log.append(f"Error closing Playwright context: {e}")
-
-    # ------------------------------------------------------------------ #
-    # Network sniff + JS extraction using shared context
-    # ------------------------------------------------------------------ #
-    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions = None):
-        return await self.network_sniffer.sniff(
-            context, page_url,
-            timeout=timeout,
-            log=log,
-            extensions=extensions,
-        )
-
-    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions = None):
-        return await self.js_sniffer.sniff(
-            context,
-            page_url,
-            timeout=timeout,
-            log=log,
-            extensions=extensions,
-        )
 
     # ------------------------------------------------------------------ #
     # Search engines (unchanged)
@@ -6883,6 +6308,15 @@ class LinkTrackerBlock(BaseBlock):
 
         return out
 
+    # ------------------------------------------------------------------ #
+    # Page fetch helpers
+    # ------------------------------------------------------------------ #
+    async def _fetch_text(self, session, url, timeout):
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+            if r.status != 200:
+                return ""
+            return await r.text()
+
     async def _fetch_page_html_plain(
         self,
         session: aiohttp.ClientSession,
@@ -6899,6 +6333,9 @@ class LinkTrackerBlock(BaseBlock):
                 return b""
             return await r.read()
 
+    # ------------------------------------------------------------------ #
+    # Sitemap helpers
+    # ------------------------------------------------------------------ #
     def _looks_like_sitemap(self, url: str) -> bool:
         u = url.lower()
         return any(u.endswith(x) for x in [".xml", ".xml.gz", "sitemap", "sitemap.xml", "sitemap_index.xml"])
@@ -6917,10 +6354,6 @@ class LinkTrackerBlock(BaseBlock):
             return ""
 
     def _parse_sitemap_any(self, xml_text: str) -> tuple[list[str], list[str]]:
-        """
-        Returns (sitemap_urls, page_urls).
-        Handles both <urlset> and <sitemapindex>.
-        """
         if not xml_text.strip():
             return [], []
         try:
@@ -6947,15 +6380,13 @@ class LinkTrackerBlock(BaseBlock):
 
         return sitemap_urls, page_urls
 
+    # ------------------------------------------------------------------ #
+    # Scoring / pagination helpers
+    # ------------------------------------------------------------------ #
     def _score_site_url(self, u: str, keywords: list[str], targets: set[str]) -> int:
-        """
-        Higher score = better candidate.
-        Prefer detail/item/download pages.
-        """
         path = urlparse(u).path.lower()
         score = 0
 
-        # Prefer pages that look like content/detail
         for tok, w in [
             ("/details/", 8),
             ("/item/", 6),
@@ -6970,7 +6401,6 @@ class LinkTrackerBlock(BaseBlock):
             if tok in path:
                 score += w
 
-        # Penalize search/hub
         for tok, w in [
             ("/search", -6),
             ("/tag/", -3),
@@ -6981,38 +6411,57 @@ class LinkTrackerBlock(BaseBlock):
             if tok in path:
                 score += w
 
-        # Prefer direct assets
         if any(path.endswith(ext) for ext in targets):
             score += 10
 
-        # Keyword hits
         low = u.lower().replace("%20", " ")
         score += sum(2 for k in keywords if k and k in low)
 
         return score
 
+    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
+        out = []
+        for a in soup.select("a[rel=next], a.next, a:-soup-contains('Next'), a:-soup-contains('Older')"):
+            href = a.get("href")
+            if href:
+                out.append(urljoin(base_url, href))
+        return out[:3]
+
+    def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
+        out = []
+        containers = soup.select(
+            "article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]"
+        )
+        for a in containers:
+            href = a.get("href")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            host = urlparse(full).netloc.lower()
+            if site_host in host:
+                out.append(full)
+            if len(out) >= 200:
+                break
+        return list(dict.fromkeys(out))
+
     def _archive_ident_to_downloads(self, ident: str) -> list[str]:
-        # This is a heuristic; archive's /download/{ident}/{file} is best,
-        # but we don't know file names yet. So we use metadata endpoint to get them.
         return [
             f"https://archive.org/metadata/{ident}",
             f"https://archive.org/download/{ident}/",
             f"https://archive.org/details/{ident}",
         ]
+
     async def _crawl_sitemaps_for_site(
-            self,
-            session,
-            root: str,
-            sm_urls: list[str],
-            timeout: float,
-            keywords: list[str],
-            targets: set[str],
-            per_site_cap: int,
-            global_seen: set[str],
+        self,
+        session,
+        root: str,
+        sm_urls: list[str],
+        timeout: float,
+        keywords: list[str],
+        targets: set[str],
+        per_site_cap: int,
+        global_seen: set[str],
     ) -> list[str]:
-        """
-        Recursively crawl sitemapindex + urlset, return best-scoring URLs.
-        """
         to_visit = list(dict.fromkeys(sm_urls))
         visited_sm = set()
         collected = []
@@ -7037,41 +6486,93 @@ class LinkTrackerBlock(BaseBlock):
                 global_seen.add(p)
                 collected.append(p)
 
-        # Score + pick top
         collected.sort(key=lambda u: self._score_site_url(u, keywords, targets), reverse=True)
         return collected[:per_site_cap]
 
-    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
-        """
-        Detect common pagination patterns.
-        """
-        out = []
-        for a in soup.select("a[rel=next], a.next, a:-soup-contains('Next'), a:-soup-contains('Older')"):
-            href = a.get("href")
-            if href:
-                out.append(urljoin(base_url, href))
-        return out[:3]
+    # ------------------------------------------------------------------ #
+    # Playwright shared context manager (unchanged)
+    # ------------------------------------------------------------------ #
+    async def _open_playwright_context(
+        self,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: set[str],
+        block_domains: bool,
+        blocked_domains: set[str],
+        log: List[str],
+    ):
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
+            return None, None, None
 
-    def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
-        """
-        Prefer “result cards” over nav/footer.
-        """
-        out = []
-        # common search result containers
-        containers = soup.select(
-            "article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]"
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return True
+            return False
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=ua)
+
+        if block_resources or block_domains:
+            async def route_blocker(route, request):
+                rtype = (request.resource_type or "").lower()
+                try:
+                    host = urlparse(request.url).netloc.lower()
+                except Exception:
+                    host = ""
+
+                if block_domains and _host_matches_blocked(host):
+                    await route.abort()
+                    return
+
+                if block_resources and rtype in blocked_resource_types:
+                    await route.abort()
+                    return
+
+                await route.continue_()
+
+            await context.route("**/*", route_blocker)
+
+        log.append("Playwright shared context ready.")
+        return p, browser, context
+
+    async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        try:
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
+            if p:
+                await p.stop()
+            log.append("Playwright shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright context: {e}")
+
+    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
+        return await self.network_sniffer.sniff(
+            context, page_url,
+            timeout=timeout,
+            log=log,
+            extensions=extensions,
         )
-        for a in containers:
-            href = a.get("href")
-            if not href:
-                continue
-            full = urljoin(base_url, href)
-            host = urlparse(full).netloc.lower()
-            if site_host in host:
-                out.append(full)
-            if len(out) >= 200:
-                break
-        return list(dict.fromkeys(out))
+
+    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
+        return await self.js_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+            extensions=extensions,
+        )
+
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -7079,13 +6580,15 @@ class LinkTrackerBlock(BaseBlock):
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
         subpipeline = params.get("subpipeline", None)
 
-        # DB
+        # ------------------- DB setup ------------------- #
         use_database = bool(params.get("use_database", False))
         db_path = params.get("db_path", "link_corpus.db")
         if use_database:
-            self._initialize_database(db_path)
+            self._initialize_database(db_path, logger=getattr(self, "logger", None))
 
-        # Subpipeline
+        store = self.store  # local alias (may be None)
+
+        # ----------------- Subpipeline ------------------ #
         pipeline_result: Any = query_raw
         pipeline_queries: List[str] = []
         pipeline_urls: List[str] = []
@@ -7105,7 +6608,7 @@ class LinkTrackerBlock(BaseBlock):
             else:
                 pipeline_result = subpipe_out
 
-        # Config
+        # ------------------- Config --------------------- #
         mode = str(params.get("mode", "docs")).lower()
         scan_limit = int(params.get("scan_limit", 5))
         max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
@@ -7161,8 +6664,8 @@ class LinkTrackerBlock(BaseBlock):
         if block_domains:
             blocked_domains = default_blocked_domains.union(user_blocked_domains)
 
-        # Targets
-        targets = set()
+        # ------------------- Targets -------------------- #
+        targets: set[str] = set()
         if mode == "media":
             targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
         elif mode == "docs":
@@ -7181,7 +6684,7 @@ class LinkTrackerBlock(BaseBlock):
         if not targets:
             targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
 
-        # Keywords
+        # ------------------- Keywords ------------------- #
         keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
         strict_keywords = bool(params.get("strict_keywords", False))
 
@@ -7191,11 +6694,11 @@ class LinkTrackerBlock(BaseBlock):
                 if whole and whole not in keywords:
                     keywords.append(whole)
             else:
-                for qt in self._extract_keywords_from_query(query_raw):
+                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
                     if qt not in keywords:
                         keywords.append(qt)
 
-        # Helpers
+        # -------------------- Helpers ------------------- #
         def _clean_domain(u: str) -> str:
             try:
                 return urlparse(u).netloc.lower().split(":")[0]
@@ -7274,7 +6777,7 @@ class LinkTrackerBlock(BaseBlock):
                     out.append(s)
             return out
 
-        # Triage
+        # -------------------- Triage -------------------- #
         candidate_pages: List[str] = []
         direct_asset_urls: List[str] = []
         queries_to_run: List[str] = []
@@ -7290,7 +6793,6 @@ class LinkTrackerBlock(BaseBlock):
                     continue
                 path = _clean_path(u)
 
-                # MEGA counts as direct asset
                 if self._is_mega_link(u):
                     direct_asset_urls.append(u)
                     continue
@@ -7335,54 +6837,43 @@ class LinkTrackerBlock(BaseBlock):
         queries_to_run = _dedupe(queries_to_run)
         query = queries_to_run[0] if queries_to_run else query_raw
 
-        # Search discovery
+        # ---------------- Search discovery --------------- #
         explicit_site_seeds: set[str] = set()
         synthetic_search_seeds: set[str] = set()
 
         if not skip_search_engine and queries_to_run:
             ua_search = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
             seen_search_urls: set[str] = set()
-            # ------------------ UPDATED ENGINE: database ------------------ #
+
+            # -------- Engine: database (Store-backed) -------- #
             if engine == "database":
-                if not use_database or not self.db_conn:
+                if not use_database or not store:
                     print("[LinkTracker][db] engine=database requires use_database=True.")
                 else:
                     print("[LinkTracker] Running Advanced Database Intelligence...")
 
-                    # Tunables
                     db_seed_limit = int(params.get("db_seed_limit", 250))
-                    db_seed_max_age_days = params.get("db_seed_max_age_days", None)  # If set, ignores old stuff
+                    db_seed_max_age_days = params.get("db_seed_max_age_days", None)
 
-                    # 1. Fetch Known Assets (The "Bookmarks" strategy)
-                    # We fetch more than limit to allow for filtering
-                    db_assets = self._fetch_db_seed_assets(
+                    db_assets = store.fetch_db_seed_assets(
                         limit=db_seed_limit * 2,
                         require_keywords=keywords,
                         required_sites=required_sites,
                         max_age_days=db_seed_max_age_days,
                     )
 
-                    # Separate assets into direct targets and context
-                    # We want to verify existing assets
-                    proven_urls = [row['url'] for row in db_assets if row['url']]
-
-                    # 2. Predictive Sequencing (The "Smart" strategy)
-                    # Try to guess future files based on past successes
+                    proven_urls = [row["url"] for row in db_assets if row.get("url")]
                     predicted_urls = self._predict_next_in_sequence(proven_urls)
                     if predicted_urls:
                         print(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
-                        # Add these to direct check list
                         direct_asset_urls.extend(predicted_urls)
 
-                    # 3. High-Yield Hub Discovery (The "Recrawl" strategy)
-                    # Find pages that gave us results in the past and scan them again
-                    proven_hubs = self._fetch_proven_hubs(required_sites, min_hits=1)
+                    proven_hubs = store.fetch_proven_hubs(required_sites, min_hits=1)
                     if proven_hubs:
                         print(f"[db] identified {len(proven_hubs)} high-yield hubs for re-crawling.")
                         candidate_pages.extend(proven_hubs)
 
-                    # 4. Standard Context Seeding
-                    cand_from_db, direct_from_db = self._seed_pages_from_database(
+                    cand_from_db, direct_from_db = store.seed_pages_from_database(
                         db_assets=db_assets,
                         targets=targets,
                         max_pages_total=max_pages_total,
@@ -7394,11 +6885,13 @@ class LinkTrackerBlock(BaseBlock):
                     candidate_pages.extend(cand_from_db)
                     direct_asset_urls.extend(direct_from_db)
 
-                    # Dedupe and prioritize
                     candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
                     direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
 
-                    print(f"[db] Execution Plan: Checking {len(direct_asset_urls)} assets ({len(predicted_urls)} predicted) & Crawling {len(candidate_pages)} hubs.")
+                    print(f"[db] Execution Plan: Checking {len(direct_asset_urls)} assets "
+                          f"({len(predicted_urls)} predicted) & Crawling {len(candidate_pages)} hubs.")
+
+            # -------- Engine: sites -------- #
             if engine == "sites" and required_sites:
                 seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
                     required_sites=required_sites,
@@ -7418,23 +6911,19 @@ class LinkTrackerBlock(BaseBlock):
                         root = f"https://{site.strip().lstrip('.')}".rstrip("/") + "/"
                         host = urlparse(root).netloc.lower()
 
-                        # --- 1) robots ---
                         robots_url = root + "robots.txt"
                         robots_txt = await self._fetch_text(seed_sess, robots_url, timeout)
                         sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
 
-                        # fallback common sitemaps
                         if not sm_urls:
                             sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:8]
 
-                        # --- 2) recursive sitemap crawl ---
                         best_from_sitemaps = await self._crawl_sitemaps_for_site(
                             seed_sess, root, sm_urls, timeout, keywords, targets,
                             per_site_cap=per_site_cap,
                             global_seen=global_seen,
                         )
 
-                        # --- 3) expand hub/search seeds ---
                         hub_like = [u for u in seed_pages if site in u and _is_search_url(u)]
                         expanded_from_hubs = []
                         for hub in hub_like[:3]:
@@ -7451,18 +6940,15 @@ class LinkTrackerBlock(BaseBlock):
                             except Exception:
                                 pass
 
-                        # Score hubs too
                         expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
                         expanded_from_hubs.sort(
                             key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
                         )
                         expanded_from_hubs = expanded_from_hubs[:per_site_cap]
 
-                        # --- 4) combine sources, keep best ---
                         merged = list(dict.fromkeys(
                             [root] + best_from_sitemaps + expanded_from_hubs + [u for u in seed_pages if site in u]
                         ))
-
                         merged.sort(key=lambda u: self._score_site_url(u, keywords, targets), reverse=True)
 
                         for u in merged:
@@ -7473,6 +6959,7 @@ class LinkTrackerBlock(BaseBlock):
 
                 candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
 
+            # -------- Engine: duckduckgo -------- #
             elif engine == "duckduckgo":
                 for qv in queries_to_run:
                     sq = _augment_search_query(qv, mode, required_sites)
@@ -7499,6 +6986,7 @@ class LinkTrackerBlock(BaseBlock):
                         candidate_pages.append(u)
                         seen_search_urls.add(u)
 
+            # -------- Engine: google_cse -------- #
             elif engine == "google_cse":
                 for qv in queries_to_run:
                     sq = _augment_search_query(qv, mode, required_sites)
@@ -7523,10 +7011,10 @@ class LinkTrackerBlock(BaseBlock):
                         candidate_pages.append(u)
                         seen_search_urls.add(u)
 
-            else:
+            elif engine not in ("database", "sites"):
                 print(f"[search] unknown engine={engine!r}; no search performed")
 
-        # Crawl state
+        # ---------------- Crawl state ------------------ #
         found_assets: List[Dict[str, Any]] = []
         seen_asset_urls: set[str] = set()
         visited_pages: set[str] = set()
@@ -7535,13 +7023,13 @@ class LinkTrackerBlock(BaseBlock):
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
 
-        # Direct assets (URL list)
+        # ---------------- Direct assets ---------------- #
         if direct_asset_urls:
             async with aiohttp.ClientSession(
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"}
             ) as session_direct:
                 for u in direct_asset_urls:
-                    if use_database and self._is_url_in_database(u):
+                    if use_database and store and store.asset_exists(u):
                         log.append(f"Skipping {u} (already in database)")
                         continue
                     if u in seen_asset_urls:
@@ -7569,8 +7057,8 @@ class LinkTrackerBlock(BaseBlock):
                         filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
                         asset = {"text": filename[:100], "url": u, "source": "<urls>", "size": size, "status": status}
                         found_assets.append(asset)
-                        if use_database:
-                            self._save_asset_to_database(asset)
+                        if use_database and store:
+                            store.upsert_asset(asset)
 
         def _should_persist_page(u: str) -> bool:
             if engine != "sites":
@@ -7581,7 +7069,7 @@ class LinkTrackerBlock(BaseBlock):
                 return False
             return True
 
-        # --- Shared Playwright context, if needed ---
+        # --- Shared Playwright context, if needed --- #
         pw_needed = use_js or use_network_sniff
         pw_p = pw_browser = pw_context = None
         if pw_needed:
@@ -7618,6 +7106,8 @@ class LinkTrackerBlock(BaseBlock):
                             pw_context, page_url, timeout, local_log, targets
                         )
                         html = sniff_html or html
+
+                        # Archive metadata special-casing
                         if "archive.org/metadata/" in page_url:
                             try:
                                 meta = json.loads(html) if html.strip().startswith("{") else {}
@@ -7632,56 +7122,46 @@ class LinkTrackerBlock(BaseBlock):
                                         links_on_page.append({"url": dl, "text": name, "tag": "archive_file"})
                             except Exception:
                                 pass
-                        # Pull URLs from sniffed JSON
-                        json_url_set: set[str] = set()
+
+                        # Pull identifiers from sniffed JSON
                         try:
                             if sniff_json:
                                 for hit in sniff_json:
                                     data = hit.get("json") or {}
-                                    # Archive advancedsearch structure:
                                     docs = (((data.get("response") or {}).get("docs")) or [])
                                     for d in docs:
                                         ident = d.get("identifier")
                                         if ident:
                                             for u2 in self._archive_ident_to_downloads(ident):
                                                 if _allowed_by_required_sites(u2):
-                                                    links_on_page.append({"url": u2, "text": "[Archive identifier]",
-                                                                          "tag": "archive_ident"})
+                                                    links_on_page.append({
+                                                        "url": u2,
+                                                        "text": "[Archive identifier]",
+                                                        "tag": "archive_ident"
+                                                    })
                         except Exception as e:
                             local_log.append(f"JSON sniff parse error on {page_url}: {e}")
 
-                        if json_url_set:
-                            for ju in list(json_url_set)[:max_links_per_page]:
-                                if not ju.startswith("http"):
-                                    continue
-                                if not _allowed_by_required_sites(ju):
-                                    continue
-                                jpath = _clean_path(ju)
-                                if any(jpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                                    continue
-                                links_on_page.append({"url": ju, "text": "[Network JSON URL]", "tag": "network_json"})
-                                local_js_links.append({"page": page_url, "url": ju, "text": "[Network JSON URL]", "tag": "network_json"})
-
                         for si in sniff_items:
-                            url = si.get("url", "")
-                            if not url:
+                            url_hit = si.get("url", "")
+                            if not url_hit:
                                 continue
                             local_network_links.append({
                                 "page": page_url,
-                                "url": url,
+                                "url": url_hit,
                                 "text": si.get("text", ""),
                                 "tag": si.get("tag", "network_sniff"),
                                 "size": si.get("size", "?"),
                             })
                             local_js_links.append({
                                 "page": page_url,
-                                "url": url,
+                                "url": url_hit,
                                 "text": si.get("text", ""),
                                 "tag": si.get("tag", "network_sniff"),
                             })
 
                             try:
-                                parsed = urlparse(url)
+                                parsed = urlparse(url_hit)
                                 path = parsed.path or ""
                                 if "/" in path:
                                     parent_path = path.rsplit("/", 1)[0] + "/"
@@ -7718,11 +7198,8 @@ class LinkTrackerBlock(BaseBlock):
                             html = await self._fetch_page_html_plain(session, page_url, timeout)
                         except Exception as e:
                             local_log.append(f"Error fetching {page_url}: {e}")
-                            if use_database and _should_persist_page(page_url):
-                                try:
-                                    self._mark_page_scanned(page_url)
-                                except Exception as ee:
-                                    local_log.append(f"Error marking page scanned {page_url}: {ee}")
+                            if use_database and store and _should_persist_page(page_url):
+                                store.mark_page_scanned(page_url)
                             return {
                                 "page": page_url,
                                 "assets": local_assets,
@@ -7764,10 +7241,9 @@ class LinkTrackerBlock(BaseBlock):
 
                         is_mega = self._is_mega_link(full_url)
 
-                        # Allow MEGA even without extension match
                         if not is_mega and not any(path.endswith(ext) for ext in targets):
                             continue
-                        if use_database and self._is_url_in_database(full_url):
+                        if use_database and store and store.asset_exists(full_url):
                             local_log.append(f"Skipping asset {full_url} (already in database)")
                             continue
 
@@ -7810,8 +7286,8 @@ class LinkTrackerBlock(BaseBlock):
                                 "tag": tag,
                             }
                             local_assets.append(asset)
-                            if use_database:
-                                self._save_asset_to_database(asset)
+                            if use_database and store:
+                                store.upsert_asset(asset)
 
                     # Network-sniffed assets (already in sniff_items)
                     if sniff_items:
@@ -7821,7 +7297,7 @@ class LinkTrackerBlock(BaseBlock):
                                 continue
                             if not _allowed_by_required_sites(full_url):
                                 continue
-                            if use_database and self._is_url_in_database(full_url):
+                            if use_database and store and store.asset_exists(full_url):
                                 local_log.append(f"Skipping sniffed asset {full_url} (already in database)")
                                 continue
 
@@ -7844,10 +7320,16 @@ class LinkTrackerBlock(BaseBlock):
 
                             if not verify_links or status == "200 OK":
                                 display_text = (item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]")[:100]
-                                asset = {"text": display_text, "url": full_url, "source": page_url, "size": size, "status": status}
+                                asset = {
+                                    "text": display_text,
+                                    "url": full_url,
+                                    "source": page_url,
+                                    "size": size,
+                                    "status": status
+                                }
                                 local_assets.append(asset)
-                                if use_database:
-                                    self._save_asset_to_database(asset)
+                                if use_database and store:
+                                    store.upsert_asset(asset)
 
                     # Next-level pages
                     if depth < max_depth:
@@ -7879,17 +7361,14 @@ class LinkTrackerBlock(BaseBlock):
                             if _allowed_by_required_sites(parent_url):
                                 next_pages.append(parent_url)
 
-                    if use_database and _should_persist_page(page_url):
-                        try:
-                            self._mark_page_scanned(page_url)
-                        except Exception as ee:
-                            local_log.append(f"Error marking page scanned {page_url}: {ee}")
+                    if use_database and store and _should_persist_page(page_url):
+                        store.mark_page_scanned(page_url)
 
                 except Exception as e:
                     local_log.append(f"Error scanning {page_url}: {e}")
-                    if use_database and _should_persist_page(page_url):
+                    if use_database and store and _should_persist_page(page_url):
                         try:
-                            self._mark_page_scanned(page_url)
+                            store.mark_page_scanned(page_url)
                         except Exception as ee:
                             local_log.append(f"Error marking page scanned {page_url}: {ee}")
 
@@ -7902,7 +7381,7 @@ class LinkTrackerBlock(BaseBlock):
                     "log": local_log,
                 }
 
-        # BFS frontier
+        # ---------------- BFS frontier ----------------- #
         frontier: List[str] = []
         site_buckets = {s: [] for s in required_sites} if required_sites else {}
 
@@ -7935,7 +7414,7 @@ class LinkTrackerBlock(BaseBlock):
                     break
                 if u in visited_pages:
                     continue
-                if use_database and self._is_page_scanned(u):
+                if use_database and store and store.page_scanned(u):
                     visited_pages.add(u)
                     log.append(f"Skipping page {u} (already scanned in database)")
                     continue
@@ -7972,7 +7451,7 @@ class LinkTrackerBlock(BaseBlock):
         if pw_needed:
             await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
 
-        # Output format
+        # ---------------- Output formatting ------------- #
         from urllib.parse import urlparse as _urlparse
 
         if not found_assets:
@@ -8030,8 +7509,8 @@ class LinkTrackerBlock(BaseBlock):
         for asset in found_assets:
             lines.append(f"- **[{asset['text']}]({asset['url']})**")
             lines.append(
-                f"  - *Size: {asset['size']} | Status: {asset['status']} | "
-                f"Source: {_urlparse(asset['source']).netloc}*"
+                f"  - *Size: {asset.get('size','?')} | Status: {asset.get('status','?')} | "
+                f"Source: {_urlparse(asset.get('source','')).netloc if asset.get('source') else '(unknown)'}*"
             )
 
         if return_all_js_links and all_js_links:
@@ -8069,6 +7548,138 @@ class LinkTrackerBlock(BaseBlock):
             "queries_run": queries_to_run,
         }
 
+    # ------------------------------------------------------------------ #
+    # Predictive sequencing (unchanged)
+    # ------------------------------------------------------------------ #
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+
+        for u in urls:
+            match = re_seq.search(u)
+            if match:
+                original_num_str = match.group(1)
+                try:
+                    width = len(original_num_str)
+                    val = int(original_num_str)
+                    for i in range(1, 4):
+                        next_val = val + i
+                        next_str = f"{next_val:0{width}d}"
+                        new_url = u[:match.start(1)] + next_str + u[match.end(1):]
+                        generated.add(new_url)
+                except ValueError:
+                    pass
+
+        return list(generated)
+
+    # ------------------------------------------------------------------ #
+    # Sites seeding helpers (unchanged)
+    # ------------------------------------------------------------------ #
+    def _seed_pages_from_required_sites(
+        self,
+        required_sites,
+        queries,
+        probe_cap_per_site=5,
+        sitemap_cap_per_site=8,
+        hub_cap_per_site=6,
+    ):
+        out: List[str] = []
+        synthetic_search_seeds: set[str] = set()
+        explicit_site_seeds: set[str] = set()
+
+        norm_sites = []
+        for raw in required_sites or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            norm_sites.append(s.rstrip("/") if "://" in s else "https://" + s.lstrip(".").rstrip("/"))
+
+        for s in norm_sites:
+            u = s + "/"
+            out.append(u)
+            explicit_site_seeds.add(u)
+
+        common_sitemaps = [
+            "/sitemap.xml", "/sitemap_index.xml", "/sitemap/sitemap.xml",
+            "/sitemap-index.xml", "/sitemap.php", "/sitemap.txt",
+        ]
+        for s in norm_sites:
+            u = s + "/robots.txt"
+            out.append(u); explicit_site_seeds.add(u)
+            added = 0
+            for sm in common_sitemaps:
+                if added >= sitemap_cap_per_site:
+                    break
+                u = s + sm
+                out.append(u); explicit_site_seeds.add(u)
+                added += 1
+
+        hub_paths = [
+            "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
+            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
+        ]
+        for s in norm_sites:
+            added = 0
+            for hp in hub_paths:
+                if added >= hub_cap_per_site:
+                    break
+                u = s + hp
+                out.append(u); explicit_site_seeds.add(u)
+                added += 1
+
+        def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
+            host = urlparse(base).netloc.lower()
+            if "archive.org" in host:
+                return [
+                    base + f"/search.php?query={enc_query}",
+                    base + f"/advancedsearch.php?q={enc_query}",
+                    base + (f"/advancedsearch.php?q={enc_query}"
+                            f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"),
+                    base + f"/details/{enc_query}",
+                    base + f"/browse.php?field=subject&query={enc_query}",
+                ]
+            return []
+
+        if queries:
+            for s in norm_sites:
+                probes_added = 0
+                for qv in queries:
+                    if probes_added >= probe_cap_per_site:
+                        break
+                    qv = (qv or "").strip()
+                    if not qv:
+                        continue
+                    enc = quote_plus(qv)
+
+                    probes = [
+                        s + f"/search?q={enc}",
+                        s + f"/search?query={enc}",
+                        s + f"/?s={enc}",
+                        s + f"/search/{enc}",
+                    ]
+                    probes.extend(_extra_probes_for_site(s, enc))
+
+                    for p in probes:
+                        out.append(p)
+                        synthetic_search_seeds.add(p)
+                        probes_added += 1
+                        if probes_added >= probe_cap_per_site and "archive.org" not in s:
+                            break
+
+        return out, synthetic_search_seeds, explicit_site_seeds
+
+    def _extract_sitemap_urls_from_robots(self, text: str) -> list[str]:
+        urls = []
+        for line in (text or "").splitlines():
+            if line.lower().startswith("sitemap:"):
+                u = line.split(":", 1)[1].strip()
+                if u.startswith("http"):
+                    urls.append(u)
+        return urls
+
+    # ------------------------------------------------------------------ #
+    # Sync wrapper
+    # ------------------------------------------------------------------ #
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         return asyncio.run(self._execute_async(payload, params=params))
 
@@ -8108,7 +7719,6 @@ class LinkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("linktracker", LinkTrackerBlock)
-
 # ======================= YouTubeDataBlock ==================================
 @dataclass
 class YouTubeDataBlock(BaseBlock):
@@ -8366,6 +7976,8 @@ class YouTubeDataBlock(BaseBlock):
 BLOCKS.register("youtube", YouTubeDataBlock)
 
 
+
+
 # ======================= VideoLinkTrackerBlock =============================
 
 @dataclass
@@ -8394,7 +8006,7 @@ class VideoLinkTrackerBlock(BaseBlock):
       • Database integration to avoid re-processing known assets/pages.
       • DB seeding + controlled expansion that converges.
       • Playwright resource + domain blocking.
-      • NEW: content-based deduplication + cooldown (keeps best/largest asset).
+      • content-based deduplication + cooldown (keeps best/largest asset).
     """
 
     VIDEO_EXTENSIONS = {
@@ -8439,48 +8051,42 @@ class VideoLinkTrackerBlock(BaseBlock):
 
     _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
 
-    # NEW: volatile query params to strip for canonicalization
     _VOLATILE_QS = {
         "ui", "psid", "token", "sig", "signature", "expires", "expire",
         "download", "dl", "session", "sess", "key", "auth",
         "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
     }
 
-    # NEW: xvideos CDN content matcher
     _XVIDEOS_CONTENT_RE = re.compile(
         r"(xvideos\.com_[a-f0-9]{16,}\.(?:mp4|m4v|webm|3gp))",
         re.IGNORECASE,
     )
+
     network_sniffer = submanagers.NetworkSniffer()
     js_sniffer = submanagers.JSSniffer()
+
     def __post_init__(self):
-        self.db_conn: Optional[sqlite3.Connection] = None
+        # DB plumbing (NEW)
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[VideoTrackerStore] = None
 
     # ------------------------------------------------------------------ #
-    # URL canonicalization + content-id dedupe (NEW)
+    # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
 
     def _canonicalize_url(self, u: str) -> str:
-        """Strip volatile qs, normalize host."""
         try:
             pu = urlparse(u)
             host = pu.netloc.lower().split(":")[0]
             path = pu.path
-
             qs = parse_qsl(pu.query, keep_blank_values=False)
             qs = [(k, v) for k, v in qs if k.lower() not in self._VOLATILE_QS]
             new_query = urlencode(qs, doseq=True)
-
             return urlunparse((pu.scheme, host, path, pu.params, new_query, ""))
         except Exception:
             return u
 
     def _get_content_id(self, url: str) -> str:
-        """
-        Return a stable content identifier for dedupe/cooldown.
-        - If URL looks like xvideos-cdn, extract its hash filename.
-        - Else fallback to canonicalized url.
-        """
         u = url or ""
         m = self._XVIDEOS_CONTENT_RE.search(u)
         if m:
@@ -8488,10 +8094,6 @@ class VideoLinkTrackerBlock(BaseBlock):
         return self._canonicalize_url(u)
 
     def _parse_size_to_bytes(self, size_str: str) -> int:
-        """
-        Convert '7777 KB', '19 MB', '1 GB' to bytes.
-        Unknown/invalid -> 0.
-        """
         if not size_str:
             return 0
         s = size_str.strip().upper()
@@ -8504,585 +8106,22 @@ class VideoLinkTrackerBlock(BaseBlock):
         return int(val * mult)
 
     # ------------------------------------------------------------------ #
-    # Database helpers
+    # DB bootstrap (NEW)
     # ------------------------------------------------------------------ #
 
-    def _initialize_database(self, db_path: str, log: List[str]) -> None:
-        try:
-            if self.db_conn:
-                return
-
-            db_path = str(db_path or "video_corpus.db")
-            existed = Path(db_path).exists()
-
-            self.db_conn = sqlite3.connect(db_path)
-            cur = self.db_conn.cursor()
-
-            # base tables
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assets
-                (
-                    url TEXT PRIMARY KEY,
-                    canonical_url TEXT,
-                    content_id TEXT,
-                    text TEXT,
-                    source TEXT,
-                    size TEXT,
-                    status TEXT,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    seed_ok INTEGER DEFAULT 1,
-                    synthetic INTEGER DEFAULT 0
-                )
-                """
-            )
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pages
-                (
-                    url TEXT PRIMARY KEY,
-                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-
-            # migrate assets
-            existing_cols = {
-                r[1].lower()
-                for r in cur.execute("PRAGMA table_info(assets)").fetchall()
-            }
-
-            if "seed_ok" not in existing_cols:
-                cur.execute("ALTER TABLE assets ADD COLUMN seed_ok INTEGER DEFAULT 1")
-            if "synthetic" not in existing_cols:
-                cur.execute("ALTER TABLE assets ADD COLUMN synthetic INTEGER DEFAULT 0")
-            if "canonical_url" not in existing_cols:
-                cur.execute("ALTER TABLE assets ADD COLUMN canonical_url TEXT")
-            if "content_id" not in existing_cols:
-                cur.execute("ALTER TABLE assets ADD COLUMN content_id TEXT")
-
-            # indexes
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_seed_ok ON assets (seed_ok)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_last_checked ON assets (last_checked)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_canonical ON assets (canonical_url)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_content_id ON assets (content_id)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
-
-            # NEW cooldown table
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS recent_returns
-                (
-                    identifier TEXT PRIMARY KEY,
-                    returned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_recent_returns_at ON recent_returns(returned_at)")
-
-            self.db_conn.commit()
-
-            log.append(
-                f"[VideoLinkTracker] {'Using existing' if existed else 'Database created and initialized'} at {db_path}"
-            )
-
-        except Exception as e:
-            log.append(f"[VideoLinkTracker] Error initializing/opening database: {e}")
-            try:
-                if self.db_conn:
-                    self.db_conn.close()
-            finally:
-                self.db_conn = None
-
-    def _is_url_in_database(self, url: str, log: List[str]) -> bool:
-        if not self.db_conn:
-            return False
-        try:
-            canon = self._canonicalize_url(url)
-            cid = self._get_content_id(url)
-            cur = self.db_conn.cursor()
-            cur.execute(
-                """
-                SELECT status, last_checked
-                FROM assets
-                WHERE canonical_url=? OR content_id=?
-                ORDER BY last_checked DESC
-                LIMIT 1
-                """,
-                (canon, cid),
-            )
-            row = cur.fetchone()
-            if not row:
-                return False
-
-            status, last_checked = row
-            status = (status or "").lower()
-
-            # only suppress if it was actually good or very recent
-            if "200 ok" in status or "sniffed" in status or "mega" in status:
-                return True
-
-            # otherwise allow re-check
-            return False
-
-        except Exception as e:
-            log.append(f"[VideoLinkTracker] Error checking URL in database: {e}")
-            return False
-
-    def _save_asset_to_database(self, asset: Dict[str, Any], log: List[str]) -> None:
-        if not self.db_conn:
+    def _init_db_if_needed(self, db_path: str, log: List[str]) -> None:
+        if self.db and self.store:
             return
         try:
-            cur = self.db_conn.cursor()
-
-            raw_url = asset.get("url", "")
-            canon = self._canonicalize_url(raw_url)
-            cid = self._get_content_id(raw_url)
-
-            tag = (asset.get("tag") or "").lower()
-            synthetic = 1 if tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic") else 0
-            seed_ok = 0 if synthetic else 1
-
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO assets
-                    (url, canonical_url, content_id, text, source, size, status, last_checked, seed_ok, synthetic)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-                """,
-                (
-                    raw_url,
-                    canon,
-                    cid,
-                    asset.get("text", ""),
-                    asset.get("source_page", "") or asset.get("source", ""),
-                    asset.get("size", ""),
-                    asset.get("status", ""),
-                    seed_ok,
-                    synthetic,
-                ),
-            )
-            self.db_conn.commit()
+            cfg = submanagers.DatabaseConfig(path=str(db_path or "video_corpus.db"))
+            self.db = submanagers.DatabaseSubmanager(cfg, logger=getattr(self, "logger", None))
+            self.store = VideoTrackerStore(db=self.db)
+            self.store.ensure_schema()
+            log.append(f"[VideoLinkTracker][db] Store ready at {cfg.normalized_path()}")
         except Exception as e:
-            log.append(f"[VideoLinkTracker] Error saving asset to database: {e}")
-
-    def _is_page_scanned(self, url: str, log: List[str]) -> bool:
-        if not self.db_conn:
-            return False
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
-            return cur.fetchone() is not None
-        except Exception as e:
-            log.append(f"[VideoLinkTracker] Error checking page in database: {e}")
-            return False
-
-    def _mark_page_scanned(self, url: str, log: List[str]) -> None:
-        if not self.db_conn:
-            return
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO pages (url, last_scanned)
-                VALUES (?, CURRENT_TIMESTAMP)
-                """,
-                (url,),
-            )
-            self.db_conn.commit()
-        except Exception as e:
-            log.append(f"[VideoLinkTracker] Error marking page as scanned: {e}")
-
-    # ---------------- cooldown (NEW) ----------------
-
-    def _get_recently_returned_assets_from_db(self, cooldown_hours: int) -> Set[str]:
-        if not self.db_conn:
-            return set()
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute(
-                """
-                SELECT identifier FROM recent_returns
-                WHERE returned_at >= datetime('now', ?)
-                """,
-                (f"-{int(cooldown_hours)} hours",)
-            )
-            return {r[0] for r in (cur.fetchall() or []) if r and r[0]}
-        except Exception:
-            return set()
-
-    def _mark_returned_identifier(self, ident: str) -> None:
-        if not self.db_conn or not ident:
-            return
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute(
-                """
-                INSERT OR REPLACE INTO recent_returns(identifier, returned_at)
-                VALUES (?, CURRENT_TIMESTAMP)
-                """,
-                (ident,)
-            )
-            self.db_conn.commit()
-        except Exception:
-            return
-
-    # ------------------------------------------------------------------ #
-    # Advanced Database Intelligence (Hubs + Prediction)
-    # ------------------------------------------------------------------ #
-
-    def _fetch_proven_hubs(self, required_sites: List[str], min_hits: int = 1) -> List[str]:
-        if not self.db_conn:
-            return []
-
-        cur = self.db_conn.cursor()
-
-        site_clause = ""
-        args = []
-        if required_sites and required_sites != ["*"]:
-            clauses = []
-            for s in required_sites:
-                clauses.append("source LIKE ?")
-                args.append(f"%{s}%")
-            site_clause = "AND (" + " OR ".join(clauses) + ")"
-
-        q = f"""
-            SELECT source, COUNT(*) as hit_count
-            FROM assets
-            WHERE (status LIKE '%200 OK%' OR status = 'sniffed' OR status LIKE 'MEGA%')
-              AND source LIKE 'http%'
-              {site_clause}
-            GROUP BY source
-            HAVING hit_count >= ?
-            ORDER BY hit_count DESC
-            LIMIT 50
-        """
-        args.append(min_hits)
-
-        hubs = []
-        try:
-            for row in cur.execute(q, args).fetchall():
-                hubs.append(row[0])
-        except Exception:
-            pass
-
-        return hubs
-
-    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
-        generated = set()
-        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
-
-        for u in urls:
-            match = re_seq.search(u)
-            if match:
-                original_num_str = match.group(1)
-                try:
-                    width = len(original_num_str)
-                    val = int(original_num_str)
-                    for i in range(1, 4):
-                        next_val = val + i
-                        next_str = f"{next_val:0{width}d}"
-                        new_url = u[:match.start(1)] + next_str + u[match.end(1):]
-                        generated.add(new_url)
-                except ValueError:
-                    pass
-
-        return list(generated)
-
-    def _load_database_seeds(
-        self,
-        log: List[str],
-        *,
-        sources: str = "pages",
-        limit: int = 400,
-        max_age_days: int = 14,
-        include_synthetic: bool = False,
-        per_domain_cap: int = 8,     # NEW diversification
-    ) -> List[Dict[str, Any]]:
-        if not self.db_conn:
-            return []
-
-        sources = (sources or "pages").lower().strip()
-        limit = max(1, min(int(limit), 10_000))
-        max_age_days = max(1, min(int(max_age_days), 3650))
-
-        out: List[Dict[str, Any]] = []
-        try:
-            cur = self.db_conn.cursor()
-            age_clause_assets = f"last_checked >= datetime('now', '-{max_age_days} days')"
-            age_clause_pages  = f"last_scanned >= datetime('now', '-{max_age_days} days')"
-
-            if sources in ("assets", "both"):
-                if include_synthetic:
-                    cur.execute(
-                        f"""
-                        SELECT url, source
-                        FROM assets
-                        WHERE {age_clause_assets}
-                        ORDER BY last_checked DESC
-                        LIMIT ?
-                        """,
-                        (limit,)
-                    )
-                else:
-                    cur.execute(
-                        f"""
-                        SELECT url, source
-                        FROM assets
-                        WHERE seed_ok=1 AND synthetic=0 AND {age_clause_assets}
-                        ORDER BY last_checked DESC
-                        LIMIT ?
-                        """,
-                        (limit,)
-                    )
-                for u, src in cur.fetchall() or []:
-                    if u:
-                        out.append({"url": u, "kind": "asset", "source": src or "", "tag": "db_seed"})
-
-            if sources in ("pages", "both"):
-                cur.execute(
-                    f"""
-                    SELECT url
-                    FROM pages
-                    WHERE {age_clause_pages}
-                    ORDER BY last_scanned DESC
-                    LIMIT ?
-                    """,
-                    (limit,)
-                )
-                for (u,) in cur.fetchall() or []:
-                    if u:
-                        out.append({"url": u, "kind": "page", "source": "", "tag": "db_seed"})
-
-        except Exception as e:
-            log.append(f"[VideoLinkTracker][db] Error loading seeds: {e}")
-            return []
-
-        # dedupe
-        seen = set()
-        deduped = []
-        for s in out:
-            u = s["url"]
-            if u in seen:
-                continue
-            seen.add(u)
-            deduped.append(s)
-
-        # NEW: diversify by domain
-        by_domain = collections.defaultdict(list)
-        for s in deduped:
-            d = self._clean_domain(s["url"])
-            by_domain[d].append(s)
-
-        domains = list(by_domain.keys())
-        random.shuffle(domains)
-        diverse = []
-        for d in domains:
-            diverse.extend(by_domain[d][:per_domain_cap])
-
-        deduped = diverse[:limit]
-
-        log.append(
-            f"[VideoLinkTracker][db] Loaded {len(deduped)} seed URLs "
-            f"(sources={sources}, max_age_days={max_age_days}, include_synthetic={include_synthetic})."
-        )
-        return deduped
-
-    def _expand_db_seed_urls(
-            self,
-            seeds: List[Dict[str, Any]],
-            log: List[str],
-            *,
-            max_per_seed: int = 4,
-            ladder_depth: int = 2,
-            per_domain_cap: int = 80,
-            max_pages_out: int = 250,
-            max_assets_out: int = 300,
-            skip_known_db_urls: bool = True,
-    ) -> Tuple[List[str], List[str]]:
-
-        candidate_pages: List[str] = []
-        direct_assets: List[str] = []
-
-        domain_counts_pages = collections.Counter()
-        domain_counts_assets = collections.Counter()
-
-        def _known(u: str) -> bool:
-            return (
-                    skip_known_db_urls
-                    and self.db_conn
-                    and self._is_url_in_database(u, log)
-            )
-
-        def add_page(u: str):
-            if not u or u in candidate_pages:
-                return
-            if _known(u):
-                return
-            d = self._clean_domain(u)
-            if d and domain_counts_pages[d] >= per_domain_cap:
-                return
-            domain_counts_pages[d] += 1
-            candidate_pages.append(u)
-
-        def add_asset(u: str):
-            if not u or u in direct_assets:
-                return
-            if _known(u):
-                return
-            d = self._clean_domain(u)
-            if d and domain_counts_assets[d] >= per_domain_cap:
-                return
-            domain_counts_assets[d] += 1
-            direct_assets.append(u)
-
-        if not seeds:
-            log.append("[VideoLinkTracker][db] Expanded 0 seeds -> 0 pages, 0 direct assets.")
-            return [], []
-
-        def ladder_up(u: str, depth: int) -> List[str]:
-            out = []
-            try:
-                pu = urlparse(u)
-                base = f"{pu.scheme}://{pu.netloc}"
-                path = pu.path or "/"
-                if not path.endswith("/"):
-                    path = path.rsplit("/", 1)[0] + "/"
-                parts = [p for p in path.split("/") if p]
-                for k in range(min(depth, len(parts)), 0, -1):
-                    parent = base + "/" + "/".join(parts[:k]) + "/"
-                    out.append(parent)
-                out.append(base + "/")
-            except Exception:
-                return []
-            return list(dict.fromkeys(out))
-
-        def archive_expansions(u: str) -> List[str]:
-            out = []
-            try:
-                pu = urlparse(u)
-                host = pu.netloc.lower()
-                if "archive.org" not in host:
-                    return []
-                path = pu.path.strip("/")
-                ident = ""
-                parts = path.split("/")
-                if parts:
-                    if parts[0] in ("details", "download") and len(parts) >= 2:
-                        ident = parts[1]
-                    elif len(parts) == 1:
-                        ident = parts[0]
-                if ident:
-                    out.extend(self._archive_ident_to_downloads(ident))
-            except Exception:
-                return []
-            return list(dict.fromkeys(out))
-
-        seeds_used = 0
-        for s in seeds:
-            if len(candidate_pages) >= max_pages_out and len(direct_assets) >= max_assets_out:
-                break
-
-            seed_url = (s.get("url") or "").strip()
-            if not seed_url:
-                continue
-
-            seeds_used += 1
-            added_for_seed = 0
-
-            spath = self._clean_path(seed_url)
-            if self._is_probable_video_url(seed_url, spath, seed_url.lower()):
-                add_asset(seed_url)
-                added_for_seed += 1
-                if added_for_seed >= max_per_seed:
-                    continue
-
-            for au in archive_expansions(seed_url):
-                if added_for_seed >= max_per_seed:
-                    break
-                apath = self._clean_path(au)
-                if self._is_probable_video_url(au, apath, au.lower()):
-                    add_asset(au)
-                else:
-                    add_page(au)
-                added_for_seed += 1
-
-            for pu in ladder_up(seed_url, ladder_depth):
-                if added_for_seed >= max_per_seed:
-                    break
-                add_page(pu)
-                added_for_seed += 1
-
-        candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_out]
-        direct_assets = list(dict.fromkeys(direct_assets))[:max_assets_out]
-
-        log.append(
-            f"[VideoLinkTracker][db] Expanded {seeds_used} seeds -> "
-            f"{len(candidate_pages)} pages, {len(direct_assets)} direct assets."
-        )
-
-        return candidate_pages, direct_assets
-
-    def _extract_urls_from_db_text(
-            self,
-            log: List[str],
-            limit_rows: int = 300,
-            max_urls: int = 600,
-            include_synthetic: bool = False,
-    ) -> List[str]:
-        if not self.db_conn:
-            return []
-
-        out: List[str] = []
-        try:
-            cur = self.db_conn.cursor()
-
-            where = "text IS NOT NULL"
-            if not include_synthetic:
-                where += " AND seed_ok=1 AND synthetic=0"
-
-            cur.execute(
-                f"""
-                SELECT text FROM assets
-                WHERE {where}
-                ORDER BY last_checked DESC
-                LIMIT ?
-                """,
-                (int(limit_rows),)
-            )
-
-            rows = cur.fetchall() or []
-            for (txt,) in rows:
-                if not txt:
-                    continue
-
-                tl = txt.lstrip().lower()
-                looks_manifest = "#extm3u" in tl or "m3u8" in tl or "dash" in tl
-                looks_json = tl.startswith("{") or tl.startswith("[")
-                if not (looks_manifest or looks_json):
-                    continue
-
-                for m in self._URL_RE.finditer(txt):
-                    u = m.group(0)
-                    if u:
-                        out.append(u)
-                        if len(out) >= max_urls:
-                            break
-                if len(out) >= max_urls:
-                    break
-
-        except Exception as e:
-            log.append(f"[VideoLinkTracker][db] Error extracting urls from asset text: {e}")
-            return []
-
-        out = list(dict.fromkeys(out))
-        log.append(f"[VideoLinkTracker][db] Extracted {len(out)} hidden URLs from prior manifest/JSON text.")
-        return out
-
-    def _is_db_derived(self, tag: str) -> bool:
-        return tag in ("db_seed", "db_expand", "db_manifest", "synthetic")
+            log.append(f"[VideoLinkTracker][db] Failed initializing store: {e}")
+            self.db = None
+            self.store = None
 
     # ------------------------------------------------------------------ #
     # Fetch helpers
@@ -9143,14 +8182,16 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     if any(x in ctype for x in ("text/", "xml", "json", "html")) or not ctype:
                         return text
-
                     return text
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_err = e
                 if attempt < retries:
                     backoff = 0.5 * (2 ** attempt) + random.uniform(0.0, 0.25)
-                    log.append(f"[VideoLinkTracker] _fetch_text retry {attempt+1}/{retries} after {backoff:.2f}s: {url} ({e})")
+                    log.append(
+                        f"[VideoLinkTracker] _fetch_text retry {attempt+1}/{retries} "
+                        f"after {backoff:.2f}s: {url} ({e})"
+                    )
                     await asyncio.sleep(backoff)
                     continue
                 break
@@ -9203,7 +8244,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                 last_err = e
                 if attempt < retries:
                     backoff = 0.5 * (2 ** attempt) + random.uniform(0, 0.25)
-                    log.append(f"[VideoLinkTracker] _fetch_bytes retry {attempt+1}/{retries} after {backoff:.2f}s: {url} ({e})")
+                    log.append(
+                        f"[VideoLinkTracker] _fetch_bytes retry {attempt+1}/{retries} "
+                        f"after {backoff:.2f}s: {url} ({e})"
+                    )
                     await asyncio.sleep(backoff)
                     continue
                 break
@@ -9636,7 +8680,8 @@ class VideoLinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
     # Network sniff + JS extraction
     # ------------------------------------------------------------------ #
-    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions = None):
+
+    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
         return await self.network_sniffer.sniff(
             context, page_url,
             timeout=timeout,
@@ -9644,7 +8689,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             extensions=extensions,
         )
 
-    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions = None):
+    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
         return await self.js_sniffer.sniff(
             context,
             page_url,
@@ -9880,6 +8925,25 @@ class VideoLinkTrackerBlock(BaseBlock):
 
         return out
 
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+        for u in urls:
+            m = re_seq.search(u)
+            if not m:
+                continue
+            num_s, ext = m.group(1), m.group(2)
+            try:
+                width = len(num_s)
+                val = int(num_s)
+                for i in range(1, 4):
+                    nxt = f"{val + i:0{width}d}"
+                    new_u = u[:m.start(1)] + nxt + u[m.end(1):]
+                    generated.add(new_u)
+            except ValueError:
+                pass
+        return list(generated)
+
     # ------------------------------------------------------------------ #
     # Main execution
     # ------------------------------------------------------------------ #
@@ -9900,7 +8964,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             log.append("[VideoLinkTracker][db] source=database forces use_database=True.")
 
         if use_database:
-            self._initialize_database(db_path, log)
+            self._init_db_if_needed(db_path, log)
 
         # Config
         scan_limit = int(params.get("scan_limit", 3))
@@ -9933,7 +8997,6 @@ class VideoLinkTrackerBlock(BaseBlock):
         ua = str(params.get("user_agent", "promptchat/VideoLinkTracker"))
         smart_sniff = bool(params.get("smart_sniff", False))
 
-        # NEW cooldown hours param (default 48h)
         output_cooldown_hours = int(params.get("output_cooldown_hours", 48))
 
         # DB seeding params
@@ -10029,62 +9092,79 @@ class VideoLinkTrackerBlock(BaseBlock):
                 sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
             return sq
 
-        # ===================== source=database (NEW) =====================
+        # ===================== source=database =====================
         if source == "database":
-            log.append("[VideoLinkTracker] Running Advanced Database Intelligence...")
+            if not self.store:
+                log.append("[VideoLinkTracker][db] Store missing; cannot use database source.")
+            else:
+                log.append("[VideoLinkTracker] Running Advanced Database Intelligence...")
 
-            seeds = self._load_database_seeds(
-                log,
-                sources=db_seed_sources,
-                limit=db_seed_limit,
-                max_age_days=db_seed_max_age_days,
-                include_synthetic=db_include_synthetic_seeds,
-                per_domain_cap=db_seed_per_domain_cap,
-            )
+                seeds = self.store.load_database_seeds(
+                    sources=db_seed_sources,
+                    limit=db_seed_limit,
+                    max_age_days=db_seed_max_age_days,
+                    include_synthetic=db_include_synthetic_seeds,
+                    per_domain_cap=db_seed_per_domain_cap,
+                )
+                log.append(
+                    f"[VideoLinkTracker][db] Loaded {len(seeds)} seed URLs "
+                    f"(sources={db_seed_sources}, max_age_days={db_seed_max_age_days}, include_synthetic={db_include_synthetic_seeds})."
+                )
 
-            known_asset_urls = [s['url'] for s in seeds if s.get('kind') == 'asset']
-            if self.db_conn:
-                try:
-                    cur = self.db_conn.cursor()
-                    cur.execute("SELECT url FROM assets WHERE status LIKE '%OK%' ORDER BY last_checked DESC LIMIT 100")
-                    known_asset_urls.extend([r[0] for r in cur.fetchall()])
-                except Exception:
-                    pass
+                known_asset_urls = [s['url'] for s in seeds if s.get('kind') == 'asset']
+                known_asset_urls.extend(self.store.fetch_recent_good_asset_urls(limit=100))
 
-            predicted_urls = self._predict_next_in_sequence(known_asset_urls)
-            if predicted_urls:
-                log.append(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
-                direct_asset_urls.extend(predicted_urls)
+                predicted_urls = self._predict_next_in_sequence(known_asset_urls)
+                if predicted_urls:
+                    log.append(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
+                    direct_asset_urls.extend(predicted_urls)
 
-            proven_hubs = self._fetch_proven_hubs(required_sites, min_hits=1)
-            if proven_hubs:
-                log.append(f"[db] Identified {len(proven_hubs)} high-yield hubs for re-crawling.")
-                candidate_pages.extend(proven_hubs)
+                proven_hubs = self.store.fetch_proven_hubs(required_sites, min_hits=1)
+                if proven_hubs:
+                    log.append(f"[db] Identified {len(proven_hubs)} high-yield hubs for re-crawling.")
+                    candidate_pages.extend(proven_hubs)
 
-            db_pages, db_assets = self._expand_db_seed_urls(
-                seeds, log,
-                max_per_seed=db_expand_max_per_seed,
-                ladder_depth=db_expand_ladder_depth,
-                per_domain_cap=db_domain_cap,
-            )
+                db_pages, db_assets = self.store.expand_db_seed_urls(
+                    seeds,
+                    max_per_seed=db_expand_max_per_seed,
+                    ladder_depth=db_expand_ladder_depth,
+                    per_domain_cap=db_domain_cap,
+                    max_pages_out=250,
+                    max_assets_out=300,
+                    known_url_fn=lambda u: self.store.asset_exists_by_canon_or_cid(
+                        self._canonicalize_url(u), self._get_content_id(u)
+                    ),
+                    clean_domain_fn=self._clean_domain,
+                    clean_path_fn=self._clean_path,
+                    is_probable_video_url_fn=self._is_probable_video_url,
+                    archive_ident_to_downloads_fn=self._archive_ident_to_downloads,
+                )
+                log.append(f"[VideoLinkTracker][db] Expanded seeds -> {len(db_pages)} pages, {len(db_assets)} direct assets.")
 
-            if extract_urls_from_db_text:
-                hidden_from_text = self._extract_urls_from_db_text(log, limit_rows=db_seed_limit)
-                for hu in hidden_from_text:
-                    hp = self._clean_path(hu)
-                    if self._is_probable_video_url(hu, hp, hu.lower()):
-                        direct_asset_urls.append(hu)
-                    else:
-                        candidate_pages.append(hu)
+                if extract_urls_from_db_text:
+                    hidden_from_text = self.store.extract_urls_from_db_text(
+                        limit_rows=db_seed_limit,
+                        max_urls=600,
+                        include_synthetic=db_include_synthetic_seeds,
+                        url_regex=self._URL_RE,
+                    )
+                    if hidden_from_text:
+                        log.append(f"[VideoLinkTracker][db] Extracted {len(hidden_from_text)} hidden URLs from prior manifest/JSON text.")
+                    for hu in hidden_from_text:
+                        hp = self._clean_path(hu)
+                        if self._is_probable_video_url(hu, hp, hu.lower()):
+                            direct_asset_urls.append(hu)
+                        else:
+                            candidate_pages.append(hu)
 
-            candidate_pages.extend(db_pages)
-            direct_asset_urls.extend(db_assets)
+                candidate_pages.extend(db_pages)
+                direct_asset_urls.extend(db_assets)
 
-            skip_search_engine_for_payload = True
-            queries_to_run = ["<database seeds + prediction + hubs>"]
+                skip_search_engine_for_payload = True
+                queries_to_run = ["<database seeds + prediction + hubs>"]
 
-            candidate_pages = list(dict.fromkeys(candidate_pages))
-            direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
+                candidate_pages = list(dict.fromkeys(candidate_pages))
+                direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
 
         # ------------------ pipeline urls / queries ------------------
         if pipeline_urls and source != "database":
@@ -10283,15 +9363,15 @@ class VideoLinkTrackerBlock(BaseBlock):
                 log.append(f"[search] Unknown engine={engine!r}; no search performed.")
 
         # Crawl state
-        final_found_assets_by_content_id: Dict[str, Dict[str, Any]] = {}  # NEW
-        seen_asset_urls: set[str] = set()  # per-run canonical urls
+        final_found_assets_by_content_id: Dict[str, Dict[str, Any]] = {}
+        seen_asset_urls: set[str] = set()
         visited_pages: set[str] = set()
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
 
         recently_returned_identifiers = set()
-        if source == "database" and use_database and output_cooldown_hours > 0:
-            recently_returned_identifiers = self._get_recently_returned_assets_from_db(output_cooldown_hours)
+        if source == "database" and use_database and output_cooldown_hours > 0 and self.store:
+            recently_returned_identifiers = self.store.get_recently_returned(output_cooldown_hours)
 
         # Direct assets
         if direct_asset_urls:
@@ -10303,8 +9383,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                     if source == "database" and (canon in recently_returned_identifiers or cid in recently_returned_identifiers):
                         continue
 
-                    if use_database and source != "database":
-                        if self._is_url_in_database(canon, log):
+                    if use_database and source != "database" and self.store:
+                        if self.store.asset_exists_by_canon_or_cid(canon, cid):
                             continue
 
                     if canon in seen_asset_urls:
@@ -10337,17 +9417,21 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "size": size,
                             "status": status,
                             "tag": "direct_asset",
-                            "content_id": cid,
                         }
 
-                        # NEW: content-based best-asset selection
                         new_b = self._parse_size_to_bytes(size)
                         old = final_found_assets_by_content_id.get(cid)
                         if not old or new_b > self._parse_size_to_bytes(old.get("size", "")):
+                            asset["content_id"] = cid
                             final_found_assets_by_content_id[cid] = asset
 
-                        if use_database:
-                            self._save_asset_to_database(asset, log)
+                        if use_database and self.store:
+                            self.store.upsert_asset(
+                                asset,
+                                canonical_url=canon,
+                                content_id=cid,
+                                synthetic_tags={"direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic"},
+                            )
 
         def _should_persist_page(u: str) -> bool:
             if engine == "sites":
@@ -10477,8 +9561,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                             html = await self._fetch_page_html_plain(session, page_url, timeout)
                         except Exception as e:
                             local_log.append(f"Error fetching {page_url} (plain HTML): {e}")
-                            if use_database and _should_persist_page(page_url):
-                                self._mark_page_scanned(page_url, log)
+                            if use_database and self.store and _should_persist_page(page_url):
+                                self.store.mark_page_scanned(page_url)
                             return {
                                 "page": page_url,
                                 "assets": local_assets,
@@ -10550,9 +9634,8 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         tag = link.get("tag") or ""
                         is_sniff_or_db = (
-                                tag == "network_sniff"
-                                or self._is_db_derived(tag)
-                                or tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic")
+                            tag == "network_sniff"
+                            or tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic")
                         )
 
                         if not is_sniff_or_db:
@@ -10562,8 +9645,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if source == "database" and (canon in recently_returned_identifiers or cid in recently_returned_identifiers):
                             continue
 
-                        if use_database and self._is_url_in_database(canon, log):
-                            continue
+                        if use_database and self.store:
+                            if self.store.asset_exists_by_canon_or_cid(canon, cid):
+                                continue
 
                         if canon in seen_asset_urls:
                             continue
@@ -10586,12 +9670,11 @@ class VideoLinkTrackerBlock(BaseBlock):
                             continue
 
                         if not (source == "database" and is_sniff_or_db):
-                            if keywords and not page_has_keywords:
-                                if link.get("tag") != "network_sniff":
-                                    haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace(
-                                        "%20", " ")
-                                    if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
-                                        continue
+                            if keywords and not page_has_keywords and link.get("tag") != "network_sniff":
+                                haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace("%20", " ")
+                                if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
+                                    continue
+
                         status = "unverified"
                         size = "?"
                         do_head = verify_links or smart_sniff_param
@@ -10634,8 +9717,14 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "content_id": cid,
                             }
                             local_assets.append(asset)
-                            if use_database:
-                                self._save_asset_to_database(asset, log)
+
+                            if use_database and self.store:
+                                self.store.upsert_asset(
+                                    asset,
+                                    canonical_url=canon,
+                                    content_id=cid,
+                                    synthetic_tags={"direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic"},
+                                )
 
                     # Next-level pages
                     if depth < max_depth:
@@ -10674,13 +9763,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 if len(next_pages) < child_page_limit:
                                     next_pages.append(parent_url)
 
-                    if use_database and _should_persist_page(page_url):
-                        self._mark_page_scanned(page_url, log)
+                    if use_database and self.store and _should_persist_page(page_url):
+                        self.store.mark_page_scanned(page_url)
 
                 except Exception as e:
                     local_log.append(f"Error scanning {page_url}: {e}")
-                    if use_database and _should_persist_page(page_url):
-                        self._mark_page_scanned(page_url, log)
+                    if use_database and self.store and _should_persist_page(page_url):
+                        self.store.mark_page_scanned(page_url)
 
                 return {
                     "page": page_url,
@@ -10725,7 +9814,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     break
                 if u in visited_pages:
                     continue
-                if use_database and self._is_page_scanned(u, log):
+                if use_database and self.store and self.store.page_scanned(u):
                     visited_pages.add(u)
                     continue
                 batch.append(u)
@@ -10770,7 +9859,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         found_assets.sort(key=lambda a: len(a.get("url","")))
 
         # Apply cooldown on output, then mark returned
-        if source == "database" and output_cooldown_hours > 0 and use_database:
+        if source == "database" and output_cooldown_hours > 0 and use_database and self.store:
             filtered = []
             for a in found_assets:
                 canon = a.get("url","")
@@ -10784,8 +9873,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             for a in found_assets:
                 canon = a.get("url","")
                 cid = a.get("content_id") or self._get_content_id(canon)
-                self._mark_returned_identifier(canon)
-                self._mark_returned_identifier(cid)
+                self.store.mark_returned_identifier(canon)
+                self.store.mark_returned_identifier(cid)
 
         if not found_assets:
             base_text = (
@@ -10840,7 +9929,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             lines.append(f"- **[{asset['text']}]({asset['url']})**")
             lines.append(
                 f"  - *Tag: <{asset['tag']}> | "
-                f"Source: {urlparse(asset['source_page']).netloc} | "
+                f"Source: {urlparse(asset.get('source_page','')).netloc if asset.get('source_page') else ''} | "
                 f"Status: {asset['status']} | Size: {asset.get('size', '?')} | "
                 f"content_id={asset.get('content_id','')}*"
             )
@@ -10921,7 +10010,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             "extract_urls_from_db_text": True,
 
-            # Cooldown (NEW)
+            # Cooldown
             "output_cooldown_hours": 48,
 
             # Playwright block
@@ -10938,6 +10027,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
+
 # ======================= TorOnionBlock =============================
 @dataclass
 class TorOnionBlock(BaseBlock):

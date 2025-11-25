@@ -4,9 +4,10 @@ import asyncio
 import collections  # For collections.Counter
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
 import random  # For random delays
 import json  # For JSON parsing in NetworkSniffer and JSSniffer
@@ -1138,5 +1139,193 @@ class JSSniffer:
             if log is not None: log.append(f"[JSSniffer] Failed to close page: {e}")
 
         return html, links
+
+# ======================================================================
+# Database
+# ======================================================================
+
+DEFAULT_TIMEOUT_S = 10.0
+
+
+@dataclass
+class DatabaseConfig:
+    """
+    Configuration for sqlite connections.
+
+    You can extend this later with:
+      - pragmas
+      - in-memory / shared-cache
+      - WAL tuning
+      - migrations folder, etc.
+    """
+    path: str = "link_corpus.db"
+    timeout_s: float = DEFAULT_TIMEOUT_S
+    check_same_thread: bool = False  # allow multi-thread access with our lock
+    pragmas: Optional[dict[str, Any]] = None  # e.g. {"journal_mode":"WAL"}
+
+    def normalized_path(self) -> str:
+        return str(self.path or "link_corpus.db")
+
+
+class DatabaseSubmanager:
+    """
+    A small sqlite manager intended to be shared across blocks.
+
+    Responsibilities:
+      - open/close a connection
+      - install schema + perform light migrations
+      - provide safe execute/fetch helpers
+      - be thread-safe (single connection + RLock)
+
+    Blocks should NOT talk to sqlite directly; use Stores instead.
+    """
+
+    def __init__(self, config: DatabaseConfig | None = None, logger=None):
+        self.config = config or DatabaseConfig()
+        self.logger = logger
+        self._conn: Optional[sqlite3.Connection] = None
+        self._lock = threading.RLock()
+        self._schema_installed = False
+
+    # ------------------------------------------------------------ #
+    # Connection lifecycle
+    # ------------------------------------------------------------ #
+    def open(self) -> sqlite3.Connection:
+        with self._lock:
+            if self._conn:
+                return self._conn
+
+            db_path = self.config.normalized_path()
+            existed = Path(db_path).exists()
+
+            self._conn = sqlite3.connect(
+                db_path,
+                timeout=self.config.timeout_s,
+                check_same_thread=self.config.check_same_thread,
+            )
+            self._conn.row_factory = sqlite3.Row
+
+            self._apply_pragmas()
+            # schema installation is store-driven (each store can call ensure_schema)
+            if self.logger:
+                self.logger.log_message(
+                    f"[DB] {'Using existing' if existed else 'Created'} sqlite DB at {db_path}"
+                )
+            else:
+                print(f"[DB] {'Using existing' if existed else 'Created'} sqlite DB at {db_path}")
+
+            return self._conn
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
+                    self._schema_installed = False
+
+    def connection(self) -> Optional[sqlite3.Connection]:
+        return self._conn
+
+    # ------------------------------------------------------------ #
+    # Pragmas / schema / migrations
+    # ------------------------------------------------------------ #
+    def _apply_pragmas(self):
+        if not self._conn:
+            return
+        pragmas = self.config.pragmas or {
+            "journal_mode": "WAL",
+            "synchronous": "NORMAL",
+            "temp_store": "MEMORY",
+            "foreign_keys": "ON",
+        }
+        cur = self._conn.cursor()
+        for k, v in pragmas.items():
+            try:
+                cur.execute(f"PRAGMA {k}={v}")
+            except Exception:
+                # pragma failures should never crash the app
+                pass
+        self._conn.commit()
+
+    def ensure_schema(self, ddl_statements: Sequence[str]) -> None:
+        """
+        Idempotent schema installer.
+
+        Each Store passes its own DDL list.
+        This allows many blocks to share one DB without collisions.
+        """
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            for ddl in ddl_statements:
+                cur.execute(ddl)
+            conn.commit()
+            self._schema_installed = True
+
+    def ensure_columns(self, table: str, columns: dict[str, str]) -> None:
+        """
+        Micro-migration helper:
+        Adds missing columns with ALTER TABLE.
+
+        columns = {"seed_ok": "INTEGER DEFAULT 0", ...}
+        """
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            try:
+                cur.execute(f"PRAGMA table_info({table})")
+                existing = {r["name"] for r in cur.fetchall()}
+            except Exception:
+                existing = set()
+
+            for col, ddl in columns.items():
+                if col not in existing:
+                    try:
+                        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                        if self.logger:
+                            self.logger.log_message(f"[DB] Added column {table}.{col}")
+                    except Exception as e:
+                        if self.logger:
+                            self.logger.log_message(f"[DB] Failed adding column {table}.{col}: {e}")
+            conn.commit()
+
+    # ------------------------------------------------------------ #
+    # Query helpers
+    # ------------------------------------------------------------ #
+    def execute(self, sql: str, args: Sequence[Any] | None = None) -> None:
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            cur.execute(sql, args or [])
+            conn.commit()
+
+    def executemany(self, sql: str, rows: Iterable[Sequence[Any]]) -> None:
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            cur.executemany(sql, rows)
+            conn.commit()
+
+    def fetchone(self, sql: str, args: Sequence[Any] | None = None) -> Optional[sqlite3.Row]:
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            cur.execute(sql, args or [])
+            return cur.fetchone()
+
+    def fetchall(self, sql: str, args: Sequence[Any] | None = None) -> list[sqlite3.Row]:
+        conn = self.open()
+        with self._lock:
+            cur = conn.cursor()
+            cur.execute(sql, args or [])
+            return cur.fetchall()
+
+    def scalar(self, sql: str, args: Sequence[Any] | None = None) -> Any:
+        row = self.fetchone(sql, args)
+        if not row:
+            return None
+        return row[0]
 
 
