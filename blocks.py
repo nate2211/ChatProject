@@ -8070,7 +8070,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         self.store: Optional[VideoTrackerStore] = None
         self.network_sniffer = submanagers.NetworkSniffer()
         self.js_sniffer = submanagers.JSSniffer()
-
+        self.hls_manager = submanagers.HLSSubManager()
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
@@ -9394,11 +9394,13 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     status = "unverified"
                     size = "?"
+                    content_type = ""  # NEW
                     if verify_links:
                         try:
                             async with session_direct.head(
                                 canon, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=3)
                             ) as h:
+                                content_type = (h.headers.get("Content-Type") or "").lower()
                                 if h.status == 200:
                                     status = "200 OK"
                                     cl = h.headers.get("Content-Length")
@@ -9419,6 +9421,26 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "status": status,
                             "tag": "direct_asset",
                         }
+
+                        # NEW: if this is an HLS manifest, try to capture it
+                        is_hls_manifest = canon.lower().endswith(".m3u8") or (
+                            content_type in self.HLS_CONTENT_TYPES
+                        )
+                        if is_hls_manifest and self.hls_manager:
+                            try:
+                                hls_res = await self.hls_manager.capture_hls_stream(
+                                    session_direct, canon, timeout=timeout, log=log
+                                )
+                                if hls_res:
+                                    asset["hls_stream_id"] = hls_res.stream_id
+                                    asset["hls_manifest_path"] = hls_res.manifest_path
+                                    if hls_res.variant_manifest_path:
+                                        asset["hls_variant_manifest_path"] = hls_res.variant_manifest_path
+                                    if hls_res.segment_paths:
+                                        # Just store the first few to keep metadata small
+                                        asset["hls_segment_paths"] = hls_res.segment_paths[:10]
+                            except Exception as e:
+                                log.append(f"[VideoLinkTracker][HLS] Error capturing direct asset {canon}: {e}")
 
                         new_b = self._parse_size_to_bytes(size)
                         old = final_found_assets_by_content_id.get(cid)
@@ -9678,22 +9700,23 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         status = "unverified"
                         size = "?"
+                        content_type = ""  # NEW
                         do_head = verify_links or smart_sniff_param
 
                         if do_head:
                             try:
                                 async with session.head(
-                                    canon,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=4),
+                                        canon,
+                                        allow_redirects=True,
+                                        timeout=aiohttp.ClientTimeout(total=4),
                                 ) as h:
+                                    content_type = (h.headers.get("Content-Type") or "").lower()
                                     if h.status == 200:
-                                        ct = (h.headers.get("Content-Type") or "").lower()
                                         if (not smart_sniff_param) or (
-                                            any(ct.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
-                                            or ct in self.HLS_CONTENT_TYPES
-                                            or ct in self.DASH_CONTENT_TYPES
-                                            or canon.lower().endswith(tuple(self.VIDEO_EXTENSIONS))
+                                                any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
+                                                or content_type in self.HLS_CONTENT_TYPES
+                                                or content_type in self.DASH_CONTENT_TYPES
+                                                or canon.lower().endswith(tuple(self.VIDEO_EXTENSIONS))
                                         ):
                                             status = "200 OK"
                                             cl = h.headers.get("Content-Length")
@@ -9707,7 +9730,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 status = "Timeout/Error"
 
                         if not verify_links or "OK" in status:
-                            display_text = (link.get("text", "") or asset_path.rsplit("/", 1)[-1] or "[video asset]")[:100]
+                            display_text = (link.get("text", "") or asset_path.rsplit("/", 1)[-1] or "[video asset]")[
+                                           :100]
                             asset = {
                                 "text": display_text,
                                 "url": canon,
@@ -9717,6 +9741,28 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "tag": link["tag"],
                                 "content_id": cid,
                             }
+
+                            # NEW: best-effort HLS capture for manifests
+                            is_hls_manifest = canon.lower().endswith(".m3u8") or (
+                                    content_type in self.HLS_CONTENT_TYPES
+                            )
+                            if is_hls_manifest and self.hls_manager:
+                                try:
+                                    hls_res = await self.hls_manager.capture_hls_stream(
+                                        session, canon, timeout=timeout, log=local_log
+                                    )
+                                    if hls_res:
+                                        asset["hls_stream_id"] = hls_res.stream_id
+                                        asset["hls_manifest_path"] = hls_res.manifest_path
+                                        if hls_res.variant_manifest_path:
+                                            asset["hls_variant_manifest_path"] = hls_res.variant_manifest_path
+                                        if hls_res.segment_paths:
+                                            asset["hls_segment_paths"] = hls_res.segment_paths[:10]
+                                except Exception as e:
+                                    local_log.append(
+                                        f"[VideoLinkTracker][HLS] Error capturing HLS for {canon}: {e}"
+                                    )
+
                             local_assets.append(asset)
 
                             if use_database and self.store:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import collections  # For collections.Counter
+import hashlib
 import re
 import sqlite3
 import threading
@@ -12,6 +13,8 @@ from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
 import random  # For random delays
 import json  # For JSON parsing in NetworkSniffer and JSSniffer
 import xml.etree.ElementTree as ET
+
+import aiohttp
 
 from loggers import DEBUG_LOGGER
 
@@ -1344,5 +1347,272 @@ class DatabaseSubmanager:
         if not row:
             return None
         return row[0]
+
+
+# ======================================================================
+# HLS
+# ======================================================================
+
+@dataclass
+class HLSDownloadResult:
+    """
+    Result of an HLS capture.
+
+    - stream_id: stable ID for this stream (hash of manifest URL)
+    - manifest_url: original manifest URL (may be master or media playlist)
+    - manifest_path: local path for the first manifest saved
+    - variant_manifest_url: chosen variant playlist URL (if found)
+    - variant_manifest_path: local path for variant manifest (if any)
+    - segment_paths: list of local file paths for downloaded .ts segments
+    """
+    stream_id: str
+    manifest_url: str
+    manifest_path: str
+    variant_manifest_url: Optional[str]
+    variant_manifest_path: Optional[str]
+    segment_paths: List[str]
+
+
+class HLSSubManager:
+    """
+    Simple, environment-friendly HLS helper.
+
+    Responsibilities:
+      • Given a manifest URL (.m3u8), download it.
+      • If it's a master playlist (#EXT-X-STREAM-INF), choose one variant.
+      • Download that media playlist + up to N .ts segments.
+      • Save everything under hls_cache/<stream_id>/...
+      • Return paths + URLs; NO ffmpeg, NO transcoding.
+
+    This is intentionally generic so other blocks can reuse it.
+    """
+
+    def __init__(
+        self,
+        root_dir: str | Path = "hls_cache",
+        logger=None,
+        max_segments: int = 200,
+        max_total_bytes: int = 500 * 1024 * 1024,  # 500 MB safety cap
+    ):
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.logger = logger
+        self.max_segments = max_segments
+        self.max_total_bytes = max_total_bytes
+
+    # ---- helpers -----------------------------------------------------
+
+    def _log(self, msg: str):
+        if self.logger and hasattr(self.logger, "log_message"):
+            try:
+                self.logger.log_message(msg)
+                return
+            except Exception:
+                pass
+        # Fallback – safe in background / tests
+        print(msg)
+
+    def _stream_id(self, manifest_url: str) -> str:
+        h = hashlib.sha1(manifest_url.encode("utf-8", errors="ignore")).hexdigest()
+        return h[:16]
+
+    async def _fetch_text(self, session: aiohttp.ClientSession, url: str,
+                          timeout: float, log: list[str]) -> str:
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=True,
+            ) as r:
+                if r.status >= 400:
+                    log.append(f"[HLS] HTTP {r.status} for manifest {url}")
+                    return ""
+                return await r.text(errors="ignore")
+        except Exception as e:
+            log.append(f"[HLS] Error fetching manifest {url}: {e}")
+            return ""
+
+    async def _download_binary(self, session: aiohttp.ClientSession, url: str,
+                               path: Path, timeout: float,
+                               log: list[str], budget: dict) -> bool:
+        """
+        Download binary URL into path, respecting global byte budget.
+        Returns True if some bytes written.
+        """
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=True,
+            ) as r:
+                if r.status >= 400:
+                    log.append(f"[HLS] Segment HTTP {r.status}: {url}")
+                    return False
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                written = 0
+                with path.open("wb") as f:
+                    async for chunk in r.content.iter_chunked(256 * 1024):
+                        if not chunk:
+                            continue
+                        if budget["bytes"] + len(chunk) > self.max_total_bytes:
+                            log.append(
+                                "[HLS] Max_total_bytes reached; "
+                                "stopping further segment downloads."
+                            )
+                            break
+                        f.write(chunk)
+                        budget["bytes"] += len(chunk)
+                        written += len(chunk)
+
+                if written == 0:
+                    log.append(f"[HLS] Zero-length segment from {url}")
+                    return False
+                return True
+
+        except Exception as e:
+            log.append(f"[HLS] Error downloading segment {url}: {e}")
+            return False
+
+    # ---- public API --------------------------------------------------
+
+    async def capture_hls_stream(
+        self,
+        session: aiohttp.ClientSession,
+        manifest_url: str,
+        timeout: float,
+        log: list[str],
+    ) -> Optional[HLSDownloadResult]:
+        """
+        Best-effort HLS capture.
+
+        Downloads:
+          • The original manifest.
+          • If it is a master playlist, the best BANDWIDTH variant.
+          • Up to max_segments media segments from the chosen playlist.
+
+        Returns HLSDownloadResult or None on total failure.
+        """
+        manifest_url = manifest_url.strip()
+        if not manifest_url:
+            return None
+
+        stream_id = self._stream_id(manifest_url)
+        stream_dir = self.root_dir / stream_id
+        stream_dir.mkdir(parents=True, exist_ok=True)
+
+        log.append(f"[HLS] Capturing HLS stream {manifest_url} -> {stream_dir}")
+
+        # 1) Download original manifest
+        master_text = await self._fetch_text(session, manifest_url, timeout, log)
+        if not master_text.strip():
+            log.append("[HLS] Empty master manifest; aborting.")
+            return None
+
+        master_path = stream_dir / "master.m3u8"
+        master_path.write_text(master_text, encoding="utf-8", errors="ignore")
+
+        # 2) Check for variants (#EXT-X-STREAM-INF)
+        lines = [ln.strip() for ln in master_text.splitlines()]
+        best_variant_url = None
+        best_bandwidth = -1
+
+        for idx, ln in enumerate(lines):
+            if not ln.startswith("#EXT-X-STREAM-INF"):
+                continue
+            # Very small parser – looks for BANDWIDTH=12345
+            bw = -1
+            for part in ln.split(","):
+                part = part.strip()
+                if part.upper().startswith("BANDWIDTH="):
+                    try:
+                        bw = int(part.split("=", 1)[1].strip())
+                    except ValueError:
+                        bw = -1
+                    break
+
+            # Next non-comment line should be the URI
+            uri = None
+            if idx + 1 < len(lines):
+                nxt = lines[idx + 1].strip()
+                if nxt and not nxt.startswith("#"):
+                    uri = nxt
+
+            if uri:
+                full = urljoin(manifest_url, uri)
+                if bw > best_bandwidth:
+                    best_bandwidth = bw
+                    best_variant_url = full
+
+        variant_text = None
+        variant_path: Optional[Path] = None
+
+        if best_variant_url:
+            log.append(
+                f"[HLS] Master playlist detected. Choosing variant "
+                f"{best_variant_url} (BANDWIDTH={best_bandwidth})."
+            )
+            variant_text = await self._fetch_text(session, best_variant_url, timeout, log)
+            if variant_text.strip():
+                variant_path = stream_dir / "variant.m3u8"
+                variant_path.write_text(variant_text, encoding="utf-8", errors="ignore")
+            else:
+                log.append("[HLS] Variant manifest empty; falling back to master for segments.")
+        else:
+            log.append("[HLS] No EXT-X-STREAM-INF found; treating master as media playlist.")
+
+        media_text = variant_text or master_text
+        media_url = best_variant_url or manifest_url
+
+        # 3) Parse media playlist for segment URIs
+        seg_urls: list[str] = []
+        for ln in media_text.splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            # Non-comment lines in media playlist are segment URIs
+            seg_urls.append(urljoin(media_url, ln))
+            if len(seg_urls) >= self.max_segments:
+                break
+
+        if not seg_urls:
+            log.append("[HLS] No segments found in media playlist.")
+            return HLSDownloadResult(
+                stream_id=stream_id,
+                manifest_url=manifest_url,
+                manifest_path=str(master_path),
+                variant_manifest_url=best_variant_url,
+                variant_manifest_path=str(variant_path) if variant_path else None,
+                segment_paths=[],
+            )
+
+        # 4) Download segments with a global byte budget
+        seg_paths: list[str] = []
+        budget = {"bytes": 0}
+
+        for idx, su in enumerate(seg_urls):
+            seg_name = f"seg-{idx:05d}.ts"
+            seg_path = stream_dir / seg_name
+            ok = await self._download_binary(
+                session, su, seg_path, timeout, log, budget
+            )
+            if ok:
+                seg_paths.append(str(seg_path))
+            if budget["bytes"] >= self.max_total_bytes:
+                break
+
+        log.append(
+            f"[HLS] Downloaded {len(seg_paths)} segments "
+            f"({budget['bytes'] / 1024 / 1024:.1f} MB) for stream_id={stream_id}."
+        )
+
+        return HLSDownloadResult(
+            stream_id=stream_id,
+            manifest_url=manifest_url,
+            manifest_path=str(master_path),
+            variant_manifest_url=best_variant_url,
+            variant_manifest_path=str(variant_path) if variant_path else None,
+            segment_paths=seg_paths,
+        )
 
 
