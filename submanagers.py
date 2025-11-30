@@ -5,6 +5,7 @@ import collections  # For collections.Counter
 import hashlib
 import re
 import sqlite3
+import ssl
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +16,7 @@ import json  # For JSON parsing in NetworkSniffer and JSSniffer
 import xml.etree.ElementTree as ET
 
 import aiohttp
+from aiohttp import ClientTimeout
 
 from loggers import DEBUG_LOGGER
 
@@ -84,6 +86,10 @@ class NetworkSniffer:
       - HLS/DASH manifest expansion into derived segment links
       - Robust URL canonicalization for all captured URLs.
       - Granular logging for filtering decisions.
+      - SAFE JSON sniffing:
+          * Only reads JSON bodies if:
+                - Content-Length <= json_body_max_kb (in Config), AND
+                - URL matches one of json_url_patterns (e.g. "/api/player").
 
     IMPORTANT: Output schema is normalized to legacy style:
       item = {url, text, tag, kind, content_type, size}
@@ -166,15 +172,32 @@ class NetworkSniffer:
             "/click/", "/impression", "/pixel", "/sponsor/", "/advert/"
         })
 
-        # ------------------ json sniff sets ------------------ #
+        # ------------------ JSON sniff config ------------------ #
 
+        # Master toggle
         enable_json_sniff: bool = True
+
+        # "loose" hints (same as before)
         json_url_hints: Set[str] = field(default_factory=lambda: {
             "player", "manifest", "api", "metadata", "m3u8", "mpd",
             "playlist", "video", "audio"
         })
         json_content_types: Set[str] = field(default_factory=lambda: {
             "application/json", "text/json"
+        })
+
+        # HARD gate: only sniff JSON bodies when BOTH are true:
+        #  - Content-Length <= json_body_max_kb,
+        #  - URL contains one of these patterns.
+        json_body_max_kb: int = 256
+        json_url_patterns: Set[str] = field(default_factory=lambda: {
+            "/api/player",
+            "/player_api",
+            "/player/",
+            "/manifest",
+            "/playlist",
+            "/video/",
+            "/audio/",
         })
 
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
@@ -253,13 +276,50 @@ class NetworkSniffer:
             return "audio"
         return None
 
-    def _should_sniff_json(self, url_lower: str, ctype: str) -> bool:
+    def _matches_json_pattern(self, url_lower: str) -> bool:
+        return any(pat in url_lower for pat in self.cfg.json_url_patterns)
+
+    def _should_sniff_json(
+        self,
+        url_lower: str,
+        ctype: str,
+        content_length: Optional[int],
+    ) -> bool:
+        """
+        Decide whether to read JSON body in Playwright.
+
+        All must be true:
+          - enable_json_sniff is True
+          - Content-Type is JSON-ish OR /metadata/ in URL
+          - URL has one of json_url_hints
+          - Content-Length <= json_body_max_kb (and is known)
+          - URL matches one of json_url_patterns (hard gate)
+        """
         if not self.cfg.enable_json_sniff:
             return False
+
         ct = (ctype or "").lower()
-        if not any(jt in ct for jt in self.cfg.json_content_types) and "/metadata/" not in url_lower:
+        # Only JSON-ish or metadata-ish
+        if not (any(jt in ct for jt in self.cfg.json_content_types) or "/metadata/" in url_lower):
             return False
-        return any(h in url_lower for h in self.cfg.json_url_hints)
+
+        # Loose hints: must still look like a JSON player/manifest/etc.
+        if not any(h in url_lower for h in self.cfg.json_url_hints):
+            return False
+
+        # Hard gate 1: size
+        if content_length is None:
+            # If CL unknown, we *skip* for safety.
+            return False
+        max_bytes = int(self.cfg.json_body_max_kb) * 1024
+        if content_length > max_bytes:
+            return False
+
+        # Hard gate 2: URL pattern
+        if not self._matches_json_pattern(url_lower):
+            return False
+
+        return True
 
     def _is_allowed_by_extensions(self, url: str, extensions: Optional[Set[str]], kind: Optional[str]) -> bool:
         if not extensions:
@@ -463,6 +523,14 @@ class NetworkSniffer:
                 ctype = (response.headers.get("content-type") or "").lower()
                 url_lower = canonical_url.lower()
 
+                cl_header = response.headers.get("content-length") or ""
+                content_length: Optional[int] = None
+                try:
+                    if cl_header and cl_header.isdigit():
+                        content_length = int(cl_header)
+                except Exception:
+                    content_length = None
+
                 if (not is_blob) and ctype and self._deny_by_content_type(ctype):
                     self._log(
                         f"[NetworkSniffer] Skipped denied ctype: {canonical_url} ({ctype})",
@@ -477,10 +545,13 @@ class NetworkSniffer:
                     )
                     return
 
-                if (not is_blob) and self._should_sniff_json(url_lower, ctype):
+                # ---- SAFE JSON sniff (size + URL pattern gated) ----
+                if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
                     asyncio.create_task(handle_json(response, canonical_url))
+                    # We *don't* treat these as media; just JSON introspection.
                     return
 
+                # ---- Blob media handling ----
                 if is_blob:
                     if resource_type == "media":
                         blob_placeholders.append({
@@ -1615,4 +1686,191 @@ class HLSSubManager:
             segment_paths=seg_paths,
         )
 
+# ======================================================================
+# HTTPS
+# ======================================================================
 
+class HTTPSSubmanager:
+    """
+    Shared HTTPS engine for LinkTrackerBlock and other crawlers.
+
+    Features:
+    - One aiohttp session for the entire crawl (fast, low overhead).
+    - Retries with exponential backoff.
+    - Per-host concurrency limiting.
+    - Unified GET/HEAD/text/bytes interfaces.
+    - Optional automatic proxy rotation.
+    - Explicit TLS control (verify, custom CA bundle).
+    """
+
+    def __init__(
+        self,
+        user_agent: str = "Mozilla/5.0 PromptChat/LinkTracker",
+        timeout: float = 6.0,
+        retries: int = 2,
+        backoff_base: float = 0.35,
+        max_conn_per_host: int = 8,
+        proxy: Optional[str] = None,          # "http://127.0.0.1:8888"
+        proxy_pool: Optional[list] = None,    # list of proxies to rotate
+        verify: bool = True,
+        ca_bundle: Optional[str] = None,      # e.g. path to certifi bundle in PyInstaller exe
+    ):
+        self.ua = user_agent
+        self.timeout = timeout
+        self.retries = retries
+        self.backoff_base = backoff_base
+        self.max_conn_per_host = max_conn_per_host
+
+        self.proxy = proxy
+        self.proxy_pool = proxy_pool or []
+
+        self.verify = verify
+        self.ca_bundle = ca_bundle
+
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._connector: Optional[aiohttp.TCPConnector] = None
+
+        # Fair per-host concurrency limit
+        self._host_limiters: Dict[str, asyncio.Semaphore] = {}
+
+        # SSL context initialized in __aenter__
+        self._ssl_context: Optional[ssl.SSLContext] = None
+
+    # ------------------------------------------------------------- #
+    # Context manager
+    # ------------------------------------------------------------- #
+    async def __aenter__(self):
+        # Build SSL context for HTTPS
+        self._ssl_context = self._build_ssl_context()
+
+        self._connector = aiohttp.TCPConnector(
+            limit_per_host=self.max_conn_per_host,
+            ssl=self._ssl_context,  # applies to HTTPS URLs
+        )
+        self._session = aiohttp.ClientSession(
+            connector=self._connector,
+            headers={"User-Agent": self.ua},
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._session:
+            await self._session.close()
+        self._session = None
+        self._connector = None
+        self._ssl_context = None
+
+    # ------------------------------------------------------------- #
+    # SSL / TLS helpers
+    # ------------------------------------------------------------- #
+    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
+        """
+        Build an SSLContext depending on verify + ca_bundle.
+        aiohttp will use system defaults if we return None.
+        """
+        # If we don't want to customize anything, let aiohttp use defaults.
+        if self.verify and not self.ca_bundle:
+            return None
+
+        # Explicit context
+        if self.verify:
+            # Verify ON with custom CA bundle (or default if path is None)
+            ctx = ssl.create_default_context(
+                cafile=self.ca_bundle if self.ca_bundle else None
+            )
+            # default: verify_mode = CERT_REQUIRED, check_hostname = True
+            return ctx
+
+        # verify = False: disable certificate verification (dangerous, but useful behind intercepting proxies)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    # ------------------------------------------------------------- #
+    # Internal helpers
+    # ------------------------------------------------------------- #
+    def _get_host_semaphore(self, url: str) -> asyncio.Semaphore:
+        from urllib.parse import urlparse
+        host = urlparse(url).netloc.lower()
+        if host not in self._host_limiters:
+            self._host_limiters[host] = asyncio.Semaphore(self.max_conn_per_host)
+        return self._host_limiters[host]
+
+    def _choose_proxy(self) -> Optional[str]:
+        if self.proxy:
+            return self.proxy
+        if self.proxy_pool:
+            import random
+            return random.choice(self.proxy_pool)
+        return None
+
+    # ------------------------------------------------------------- #
+    # Core request with retries + host limit
+    # ------------------------------------------------------------- #
+    async def _request(self, method: str, url: str, **kwargs):
+        if not self._session:
+            raise RuntimeError("HTTPSSubmanager must be used in an async context.")
+
+        sem = self._get_host_semaphore(url)
+        proxy = self._choose_proxy()
+
+        for attempt in range(self.retries + 1):
+            try:
+                async with sem:
+                    async with self._session.request(
+                        method,
+                        url,
+                        proxy=proxy,
+                        timeout=ClientTimeout(total=self.timeout),
+                        **kwargs,
+                    ) as resp:
+                        return resp
+
+            except Exception:
+                if attempt >= self.retries:
+                    return None
+                await asyncio.sleep(self.backoff_base * (1 + attempt))
+
+        return None
+
+    # ------------------------------------------------------------- #
+    # Public GET/HEAD helpers
+    # ------------------------------------------------------------- #
+    async def get_text(self, url: str) -> str:
+        """
+        GET url and return decoded text ("" on non-200 or error).
+        Works for both HTTPS and HTTP URLs; HTTPS uses the SSL context.
+        """
+        resp = await self._request("GET", url)
+        if not resp or resp.status != 200:
+            return ""
+        try:
+            return await resp.text()
+        except Exception:
+            return ""
+
+    async def get_bytes(self, url: str) -> bytes:
+        """
+        GET url and return raw bytes (b"" on non-200 or error).
+        """
+        resp = await self._request("GET", url)
+        if not resp or resp.status != 200:
+            return b""
+        try:
+            return await resp.read()
+        except Exception:
+            return b""
+
+    async def head(self, url: str) -> Tuple[Optional[int], Dict[str, str]]:
+        """
+        HEAD url and return (status, headers).
+        If the server doesn't like HEAD, you'll just get (None, {}).
+        """
+        resp = await self._request("HEAD", url, allow_redirects=True)
+        if not resp:
+            return None, {}
+        try:
+            return resp.status, dict(resp.headers)
+        except Exception:
+            return resp.status, {}

@@ -19,6 +19,7 @@ datas = [
     ('registry.py', '.'),
     ('subblocks.py', '.'),
     ('submanagers.py', '.'),
+    ('stores.py', '.'),
     ('loggers.py', '.'),
 
     (cert_path, 'certifi'),

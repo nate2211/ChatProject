@@ -368,6 +368,7 @@ class Worker(QObject):
             else:
                 out = (
                     f"--- FINAL OUTPUT ---\n{current_payload}\n\n"
+                    f"--- RUN LOG ---\n" + "".join(results_md).lstrip()
                 )
             self.finished.emit(True, out, combined_meta)
         except Exception as e:
