@@ -29,6 +29,7 @@ import feedparser
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
+from camoufox import AsyncCamoufox
 from playwright.async_api import async_playwright, Page, Response
 from playwright.sync_api import BrowserContext
 from registry import BLOCKS
@@ -6011,8 +6012,8 @@ class LinkTrackerBlock(BaseBlock):
         # Store/submanager are initialized per-run when use_database=True
         self.db: Optional[submanagers.DatabaseSubmanager] = None
         self.store: Optional[LinkTrackerStore] = None
-        self.js_sniffer = submanagers.JSSniffer()
-        self.network_sniffer = submanagers.NetworkSniffer()
+        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
+        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
 
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
@@ -6474,13 +6475,20 @@ class LinkTrackerBlock(BaseBlock):
         block_domains: bool,
         blocked_domains: set[str],
         log: List[str],
+        *,
+        use_camoufox: bool = False,               # <-- NEW
+        camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
     ):
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError:
-            log.append("Playwright not installed.")
-            return None, None, None
+        """
+        Open a shared Playwright/Camoufox browser context.
 
+        Returns (p_handle, browser, context) where:
+          - For plain Playwright:
+              p_handle = async_playwright() instance
+          - For Camoufox:
+              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
+        """
+        # ---- small helper for blocked domains ----
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
             for bd in blocked_domains:
@@ -6490,6 +6498,62 @@ class LinkTrackerBlock(BaseBlock):
                 if host == bd or host.endswith("." + bd):
                     return True
             return False
+
+        # ---- Camoufox path ----
+        if use_camoufox:
+            if AsyncCamoufox is None:
+                log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
+            else:
+                try:
+                    # Default Camoufox launch opts; you can tweak these
+                    options = {
+                        "headless": True,
+                        "block_images": block_resources,
+                        "block_webrtc": True,
+                        "geoip": False,
+                        "humanize": False,
+                    }
+                    if camoufox_options:
+                        options.update(camoufox_options)
+
+                    # Async context manager: we keep the CM instance as p_handle
+                    cf_cm = AsyncCamoufox(**options)
+                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
+                    context = await browser.new_context(user_agent=ua)
+
+                    # Route blocking is exactly like Playwright Firefox
+                    if block_resources or block_domains:
+                        async def route_blocker(route, request):
+                            rtype = (request.resource_type or "").lower()
+                            try:
+                                host = urlparse(request.url).netloc.lower()
+                            except Exception:
+                                host = ""
+
+                            if block_domains and _host_matches_blocked(host):
+                                await route.abort()
+                                return
+
+                            if block_resources and rtype in blocked_resource_types:
+                                await route.abort()
+                                return
+
+                            await route.continue_()
+
+                        await context.route("**/*", route_blocker)
+
+                    log.append("[PlaywrightCtx] Camoufox context ready.")
+                    return cf_cm, browser, context
+
+                except Exception as e:
+                    log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
+
+        # ---- Standard Playwright (Chromium) path ----
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
+            return None, None, None
 
         p = await async_playwright().start()
         browser = await p.chromium.launch(headless=True)
@@ -6521,14 +6585,41 @@ class LinkTrackerBlock(BaseBlock):
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
         try:
             if context:
-                await context.close()
-            if browser:
-                await browser.close()
-            if p:
-                await p.stop()
-            log.append("Playwright shared context closed.")
+                close = getattr(context, "close", None)
+                if callable(close):
+                    await close()
         except Exception as e:
-            log.append(f"Error closing Playwright context: {e}")
+            log.append(f"Error closing Playwright/Camoufox context: {e}")
+
+        try:
+            if browser:
+                close = getattr(browser, "close", None)
+                if callable(close):
+                    await close()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox browser: {e}")
+
+        # p may be either async_playwright() handle or AsyncCamoufox CM
+        try:
+            if p:
+                # Playwright: p.stop()
+                stop = getattr(p, "stop", None)
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    # Camoufox: use __aexit__ on the context manager
+                    aexit = getattr(p, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+            log.append("Playwright/Camoufox shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox handle: {e}")
 
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
         return await self.network_sniffer.sniff(
@@ -6554,6 +6645,11 @@ class LinkTrackerBlock(BaseBlock):
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
         subpipeline = params.get("subpipeline", None)
 
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
         # ------------------- DB setup ------------------- #
         use_database = bool(params.get("use_database", False))
         db_path = params.get("db_path", "link_corpus.db")
@@ -7111,6 +7207,8 @@ class LinkTrackerBlock(BaseBlock):
                     block_domains=block_domains,
                     blocked_domains=blocked_domains,
                     log=log,
+                    use_camoufox=use_camoufox,           # <-- NEW
+                    camoufox_options=camoufox_options,   # <-- NEW
                 )
 
             async def _process_page(
@@ -7767,6 +7865,8 @@ class LinkTrackerBlock(BaseBlock):
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
             "http_ca_bundle": "",   # path to bundled cacert.pem if needed
+            "use_camoufox": False,
+            "camoufox_options": {},
         }
 
 
@@ -8120,8 +8220,8 @@ class VideoLinkTrackerBlock(BaseBlock):
         self.store: Optional[VideoTrackerStore] = None
 
         # Sniffers / helpers
-        self.network_sniffer = submanagers.NetworkSniffer()
-        self.js_sniffer = submanagers.JSSniffer()
+        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
+        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.hls_manager = submanagers.HLSSubManager()
 
     # ------------------------------------------------------------------ #
@@ -8522,18 +8622,28 @@ class VideoLinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
 
     async def _open_playwright_context(
-        self,
-        ua: str,
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
-        log: List[str],
-    ) -> Tuple[Any, Any, Any]:
-        if async_playwright is None:
-            log.append("Playwright not installed.")
-            return None, None, None
+            self,
+            ua: str,
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
+            log: List[str],
+            *,
+            use_camoufox: bool = False,  # <-- NEW
+            camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
+    ):
+        """
+        Open a shared Playwright/Camoufox browser context.
 
+        Returns (p_handle, browser, context) where:
+          - For plain Playwright:
+              p_handle = async_playwright() instance
+          - For Camoufox:
+              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
+        """
+
+        # ---- small helper for blocked domains ----
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
             for bd in blocked_domains:
@@ -8544,48 +8654,127 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return True
             return False
 
+        # ---- Camoufox path ----
+        if use_camoufox:
+            if AsyncCamoufox is None:
+                log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
+            else:
+                try:
+                    # Default Camoufox launch opts; you can tweak these
+                    options = {
+                        "headless": True,
+                        "block_images": block_resources,
+                        "block_webrtc": True,
+                        "geoip": False,
+                        "humanize": False,
+                    }
+                    if camoufox_options:
+                        options.update(camoufox_options)
+
+                    # Async context manager: we keep the CM instance as p_handle
+                    cf_cm = AsyncCamoufox(**options)
+                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
+                    context = await browser.new_context(user_agent=ua)
+
+                    # Route blocking is exactly like Playwright Firefox
+                    if block_resources or block_domains:
+                        async def route_blocker(route, request):
+                            rtype = (request.resource_type or "").lower()
+                            try:
+                                host = urlparse(request.url).netloc.lower()
+                            except Exception:
+                                host = ""
+
+                            if block_domains and _host_matches_blocked(host):
+                                await route.abort()
+                                return
+
+                            if block_resources and rtype in blocked_resource_types:
+                                await route.abort()
+                                return
+
+                            await route.continue_()
+
+                        await context.route("**/*", route_blocker)
+
+                    log.append("[PlaywrightCtx] Camoufox context ready.")
+                    return cf_cm, browser, context
+
+                except Exception as e:
+                    log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
+
+        # ---- Standard Playwright (Chromium) path ----
         try:
-            p = await async_playwright().start()
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(user_agent=ua)
-
-            if block_resources or block_domains:
-                async def route_blocker(route, request):
-                    rtype = (request.resource_type or "").lower()
-                    try:
-                        host = urlparse(request.url).netloc.lower()
-                    except Exception:
-                        host = ""
-
-                    if block_domains and _host_matches_blocked(host):
-                        await route.abort()
-                        return
-
-                    if block_resources and rtype in blocked_resource_types:
-                        await route.abort()
-                        return
-
-                    await route.continue_()
-
-                await context.route("**/*", route_blocker)
-
-            log.append("Playwright shared context ready.")
-            return p, browser, context
-        except Exception as e:
-            log.append(f"Error initializing Playwright: {e}")
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
             return None, None, None
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=ua)
+
+        if block_resources or block_domains:
+            async def route_blocker(route, request):
+                rtype = (request.resource_type or "").lower()
+                try:
+                    host = urlparse(request.url).netloc.lower()
+                except Exception:
+                    host = ""
+
+                if block_domains and _host_matches_blocked(host):
+                    await route.abort()
+                    return
+
+                if block_resources and rtype in blocked_resource_types:
+                    await route.abort()
+                    return
+
+                await route.continue_()
+
+            await context.route("**/*", route_blocker)
+
+        log.append("Playwright shared context ready.")
+        return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
         try:
             if context:
-                await context.close()
-            if browser:
-                await browser.close()
-            if p:
-                await p.stop()
-            log.append("Playwright shared context closed.")
+                close = getattr(context, "close", None)
+                if callable(close):
+                    await close()
         except Exception as e:
-            log.append(f"Error closing Playwright context: {e}")
+            log.append(f"Error closing Playwright/Camoufox context: {e}")
+
+        try:
+            if browser:
+                close = getattr(browser, "close", None)
+                if callable(close):
+                    await close()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox browser: {e}")
+
+        # p may be either async_playwright() handle or AsyncCamoufox CM
+        try:
+            if p:
+                # Playwright: p.stop()
+                stop = getattr(p, "stop", None)
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    # Camoufox: use __aexit__ on the context manager
+                    aexit = getattr(p, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+            log.append("Playwright/Camoufox shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox handle: {e}")
 
     # ------------------------------------------------------------------ #
     # Network sniff + JS extraction
@@ -8945,6 +9134,11 @@ class VideoLinkTrackerBlock(BaseBlock):
         subpipeline = params.get("subpipeline", None)
         log: List[str] = []
 
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
         # ---- DB control ----
         use_database = bool(params.get("use_database", False))
         db_path = params.get("db_path", "video_corpus.db")
@@ -9491,14 +9685,19 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 synthetic_tags={"direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic"},
                             )
 
+            pw_needed = use_js or use_network_sniff
+            pw_p = pw_browser = pw_context = None
             if pw_needed:
+                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
                 pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                    ua=ua,
+                    ua=ua_pw,
                     block_resources=block_resources,
                     blocked_resource_types=blocked_resource_types,
                     block_domains=block_domains,
                     blocked_domains=blocked_domains,
                     log=log,
+                    use_camoufox=use_camoufox,           # <-- NEW
+                    camoufox_options=camoufox_options,   # <-- NEW
                 )
 
             async def _process_page(page_url: str, depth: int, smart_sniff_param: bool) -> Dict[str, Any]:
@@ -10357,8 +10556,8 @@ class DirectLinkTrackerBlock(BaseBlock):
 
     def __post_init__(self):
         self.db_conn: Optional[sqlite3.Connection] = None
-        self.js_sniffer = submanagers.JSSniffer()
-        self.network_sniffer = submanagers.NetworkSniffer()
+        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
+        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
     # ------------------------------------------------------------------ #
     # DB helpers (same schema as LinkTrackerBlock)
     # ------------------------------------------------------------------ #
@@ -10831,37 +11030,107 @@ class DirectLinkTrackerBlock(BaseBlock):
         block_domains: bool,
         blocked_domains: set[str],
         log: List[str],
+        *,
+        use_camoufox: bool = False,               # <-- NEW
+        camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
     ):
+        """
+        Open a shared Playwright/Camoufox browser context.
+
+        Returns (p_handle, browser, context) where:
+          - For plain Playwright:
+              p_handle = async_playwright() instance
+          - For Camoufox:
+              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
+        """
+        # ---- small helper for blocked domains ----
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return True
+            return False
+
+        # ---- Camoufox path ----
+        if use_camoufox:
+            if AsyncCamoufox is None:
+                log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
+            else:
+                try:
+                    # Default Camoufox launch opts; you can tweak these
+                    options = {
+                        "headless": True,
+                        "block_images": block_resources,
+                        "block_webrtc": True,
+                        "geoip": False,
+                        "humanize": False,
+                    }
+                    if camoufox_options:
+                        options.update(camoufox_options)
+
+                    # Async context manager: we keep the CM instance as p_handle
+                    cf_cm = AsyncCamoufox(**options)
+                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
+                    context = await browser.new_context(user_agent=ua)
+
+                    # Route blocking is exactly like Playwright Firefox
+                    if block_resources or block_domains:
+                        async def route_blocker(route, request):
+                            rtype = (request.resource_type or "").lower()
+                            try:
+                                host = urlparse(request.url).netloc.lower()
+                            except Exception:
+                                host = ""
+
+                            if block_domains and _host_matches_blocked(host):
+                                await route.abort()
+                                return
+
+                            if block_resources and rtype in blocked_resource_types:
+                                await route.abort()
+                                return
+
+                            await route.continue_()
+
+                        await context.route("**/*", route_blocker)
+
+                    log.append("[PlaywrightCtx] Camoufox context ready.")
+                    return cf_cm, browser, context
+
+                except Exception as e:
+                    log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
+
+        # ---- Standard Playwright (Chromium) path ----
         try:
             from playwright.async_api import async_playwright
         except ImportError:
             log.append("Playwright not installed.")
             return None, None, None
 
-        from urllib.parse import urlparse as _urlparse
-
-        def _host_matches_blocked(host: str) -> bool:
-            host = host.split(":", 1)[0].lower()
-            for bd in blocked_domains:
-                bd = bd.lower()
-                if host == bd or host.endswith("." + bd):
-                    return True
-            return False
-
         p = await async_playwright().start()
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(user_agent=ua)
 
         if block_resources or block_domains:
-
             async def route_blocker(route, request):
                 rtype = (request.resource_type or "").lower()
-                host = _urlparse(request.url).netloc.lower()
+                try:
+                    host = urlparse(request.url).netloc.lower()
+                except Exception:
+                    host = ""
+
                 if block_domains and _host_matches_blocked(host):
-                    return await route.abort()
+                    await route.abort()
+                    return
+
                 if block_resources and rtype in blocked_resource_types:
-                    return await route.abort()
-                return await route.continue_()
+                    await route.abort()
+                    return
+
+                await route.continue_()
 
             await context.route("**/*", route_blocker)
 
@@ -10871,14 +11140,41 @@ class DirectLinkTrackerBlock(BaseBlock):
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
         try:
             if context:
-                await context.close()
-            if browser:
-                await browser.close()
-            if p:
-                await p.stop()
-            log.append("Playwright shared context closed.")
+                close = getattr(context, "close", None)
+                if callable(close):
+                    await close()
         except Exception as e:
-            log.append(f"Error closing Playwright context: {e}")
+            log.append(f"Error closing Playwright/Camoufox context: {e}")
+
+        try:
+            if browser:
+                close = getattr(browser, "close", None)
+                if callable(close):
+                    await close()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox browser: {e}")
+
+        # p may be either async_playwright() handle or AsyncCamoufox CM
+        try:
+            if p:
+                # Playwright: p.stop()
+                stop = getattr(p, "stop", None)
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    # Camoufox: use __aexit__ on the context manager
+                    aexit = getattr(p, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+            log.append("Playwright/Camoufox shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox handle: {e}")
 
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
         return await self.network_sniffer.sniff(
@@ -10906,6 +11202,11 @@ class DirectLinkTrackerBlock(BaseBlock):
         query_text = self._resolve_query_text(payload, params)
         query_label = query_text or (seed_urls[0] if seed_urls else "<no seeds>")
 
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
         # DB optional
         use_database = bool(params.get("use_database", False))
         db_path = params.get("db_path", "link_corpus.db")
@@ -11035,14 +11336,20 @@ class DirectLinkTrackerBlock(BaseBlock):
             }
             blocked_domains: set[str] = default_blocked_domains.union(user_blocked_domains) if block_domains else set()
 
-            pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                ua="Mozilla/5.0 PromptChat/DirectLinkTracker",
-                block_resources=block_resources,
-                blocked_resource_types=blocked_resource_types,
-                block_domains=block_domains,
-                blocked_domains=blocked_domains,
-                log=log,
-            )
+            pw_needed = use_js or use_network_sniff
+            pw_p = pw_browser = pw_context = None
+            if pw_needed:
+                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                    ua=ua_pw,
+                    block_resources=block_resources,
+                    blocked_resource_types=blocked_resource_types,
+                    block_domains=block_domains,
+                    blocked_domains=blocked_domains,
+                    log=log,
+                    use_camoufox=use_camoufox,           # <-- NEW
+                    camoufox_options=camoufox_options,   # <-- NEW
+                )
 
         async def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
             local_log: List[str] = []

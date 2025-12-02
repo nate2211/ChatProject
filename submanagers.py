@@ -77,6 +77,7 @@ def _canonicalize_url(u: str) -> str:
 # NetworkSniffer
 # ======================================================================
 
+
 class NetworkSniffer:
     """
     Advanced Playwright network sniffer for VIDEO + AUDIO + IMAGES.
@@ -86,13 +87,9 @@ class NetworkSniffer:
       - HLS/DASH manifest expansion into derived segment links
       - Robust URL canonicalization for all captured URLs.
       - Granular logging for filtering decisions.
-      - SAFE JSON sniffing:
-          * Only reads JSON bodies if:
-                - Content-Length <= json_body_max_kb (in Config), AND
-                - URL matches one of json_url_patterns (e.g. "/api/player").
-
-    IMPORTANT: Output schema is normalized to legacy style:
-      item = {url, text, tag, kind, content_type, size}
+      - SAFE JSON sniffing (size + URL pattern gated).
+      - Auto-scroll support to trigger lazy-loaded media/content.
+      - Configurable goto_wait_until (e.g. 'commit' for Camoufox).
     """
 
     @dataclass
@@ -108,6 +105,15 @@ class NetworkSniffer:
 
         # If True, store sniff items even without size/ctype
         accept_unknown_streams: bool = True
+
+        # ------------------ auto-scroll options ------------------ #
+        enable_auto_scroll: bool = True
+        max_scroll_steps: int = 20
+        scroll_step_delay_ms: int = 400
+        scroll_back_to_top: bool = False
+
+        # How Playwright waits in page.goto; for Camoufox you can set "commit"
+        goto_wait_until: str = "domcontentloaded"
 
         # ------------------ extension sets ------------------ #
 
@@ -174,10 +180,8 @@ class NetworkSniffer:
 
         # ------------------ JSON sniff config ------------------ #
 
-        # Master toggle
         enable_json_sniff: bool = True
 
-        # "loose" hints (same as before)
         json_url_hints: Set[str] = field(default_factory=lambda: {
             "player", "manifest", "api", "metadata", "m3u8", "mpd",
             "playlist", "video", "audio"
@@ -186,9 +190,9 @@ class NetworkSniffer:
             "application/json", "text/json"
         })
 
-        # HARD gate: only sniff JSON bodies when BOTH are true:
-        #  - Content-Length <= json_body_max_kb,
-        #  - URL contains one of these patterns.
+        # HARD gate: only sniff JSON when BOTH:
+        #  - Content-Length <= json_body_max_kb, AND
+        #  - URL matches one of json_url_patterns.
         json_body_max_kb: int = 256
         json_url_patterns: Set[str] = field(default_factory=lambda: {
             "/api/player",
@@ -202,26 +206,18 @@ class NetworkSniffer:
 
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
-        # Default to global DEBUG_LOGGER so logs land in the GUI
         self.logger = logger or DEBUG_LOGGER
-        # Initial log (no per-run `log` list yet, so pass None)
         self._log("[NetworkSniffer] NetworkSniffer initialized", None)
 
     # ------------------------------ logging helper ------------------------------ #
 
     def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
-        """
-        Unified logging:
-          - Append to the per-run `log` list if provided.
-          - Emit to the global logger (which shows up in the GUI Log tab).
-        """
         try:
             if log_list is not None:
                 log_list.append(msg)
             if self.logger is not None:
                 self.logger.log_message(msg)
         except Exception:
-            # Never let logging kill sniffing
             pass
 
     # ------------------------------ helpers ------------------------------ #
@@ -285,37 +281,22 @@ class NetworkSniffer:
         ctype: str,
         content_length: Optional[int],
     ) -> bool:
-        """
-        Decide whether to read JSON body in Playwright.
-
-        All must be true:
-          - enable_json_sniff is True
-          - Content-Type is JSON-ish OR /metadata/ in URL
-          - URL has one of json_url_hints
-          - Content-Length <= json_body_max_kb (and is known)
-          - URL matches one of json_url_patterns (hard gate)
-        """
         if not self.cfg.enable_json_sniff:
             return False
 
         ct = (ctype or "").lower()
-        # Only JSON-ish or metadata-ish
         if not (any(jt in ct for jt in self.cfg.json_content_types) or "/metadata/" in url_lower):
             return False
 
-        # Loose hints: must still look like a JSON player/manifest/etc.
         if not any(h in url_lower for h in self.cfg.json_url_hints):
             return False
 
-        # Hard gate 1: size
         if content_length is None:
-            # If CL unknown, we *skip* for safety.
             return False
         max_bytes = int(self.cfg.json_body_max_kb) * 1024
         if content_length > max_bytes:
             return False
 
-        # Hard gate 2: URL pattern
         if not self._matches_json_pattern(url_lower):
             return False
 
@@ -337,7 +318,6 @@ class NetworkSniffer:
         return False
 
     def _is_manifest(self, url: str, ctype: str) -> Optional[str]:
-        """Return 'hls' or 'dash' if this response is a manifest."""
         ul = url.lower()
         ct = (ctype or "").lower()
         if ul.endswith(".m3u8") or ct in self.cfg.hls_types:
@@ -419,6 +399,59 @@ class NetworkSniffer:
         )
         return derived
 
+    # ------------------ auto-scroll implementation ------------------ #
+
+    async def _auto_scroll(self, page: "Page", tmo: float, log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_auto_scroll:
+            return
+
+        try:
+            max_steps = max(1, int(self.cfg.max_scroll_steps))
+            step_delay = max(50, int(self.cfg.scroll_step_delay_ms))
+
+            max_total_ms = int(tmo * 1000 * 0.8)
+            used_ms = 0
+
+            self._log(
+                f"[NetworkSniffer] Auto-scroll enabled: steps={max_steps}, step_delay={step_delay}ms",
+                log,
+            )
+
+            last_height = await page.evaluate("() => document.body ? document.body.scrollHeight : 0")
+
+            for i in range(max_steps):
+                if used_ms >= max_total_ms:
+                    self._log("[NetworkSniffer] Auto-scroll: reached time budget; stopping.", log)
+                    break
+
+                await page.evaluate("() => window.scrollBy(0, window.innerHeight);")
+                await page.wait_for_timeout(step_delay)
+                used_ms += step_delay
+
+                new_height = await page.evaluate("() => document.body ? document.body.scrollHeight : 0")
+
+                self._log(
+                    f"[NetworkSniffer] Auto-scroll step {i + 1}/{max_steps}: "
+                    f"height {last_height} -> {new_height}",
+                    log,
+                )
+
+                if new_height <= last_height:
+                    self._log("[NetworkSniffer] Auto-scroll: no further height growth; stopping.", log)
+                    break
+
+                last_height = new_height
+
+            if self.cfg.scroll_back_to_top:
+                try:
+                    await page.evaluate("() => window.scrollTo(0, 0);")
+                    self._log("[NetworkSniffer] Auto-scroll: scrolled back to top.", log)
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] Auto-scroll: failed to scroll back to top: {e}", log)
+
+        except Exception as e:
+            self._log(f"[NetworkSniffer] Auto-scroll error: {e}", log)
+
     # ------------------ output normalization ------------------ #
 
     def _normalize_item(self, it: Dict[str, Any]) -> Dict[str, str]:
@@ -463,249 +496,262 @@ class NetworkSniffer:
         blob_placeholders: List[Dict[str, Any]] = []
         req_types: Dict[str, str] = {}
 
+        html: str = ""
+
         page: Page = await context.new_page()
+        wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
 
-        max_items = int(self.cfg.max_items)
-        max_json = int(self.cfg.max_json_hits)
-        max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
-        max_manifests = int(self.cfg.max_manifests_to_expand)
+        try:
+            max_items = int(self.cfg.max_items)
+            max_json = int(self.cfg.max_json_hits)
+            max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
+            max_manifests = int(self.cfg.max_manifests_to_expand)
 
-        manifests_to_expand: List[Tuple[Response, str, str]] = []
+            manifests_to_expand: List[Tuple[Response, str, str]] = []
 
-        self._log(
-            f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)",
-            log
-        )
+            self._log(
+                f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)",
+                log
+            )
 
-        def handle_request(req: Request):
-            try:
-                req_types[req.url] = req.resource_type
-            except Exception:
-                pass
+            def handle_request(req: Request):
+                try:
+                    req_types[req.url] = req.resource_type
+                except Exception:
+                    pass
 
-        page.on("request", handle_request)
+            page.on("request", handle_request)
 
-        async def handle_json(resp: Response, url: str):
-            if len(json_hits) >= max_json:
-                return
-            try:
-                data = await resp.json()
-                json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
-            except Exception as e:
-                self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
-
-        def handle_response(response: Response):
-            try:
-                url = response.url
-                canonical_url = _canonicalize_url(url)
-
-                if not canonical_url or canonical_url in seen_network:
+            async def handle_json(resp: Response, url: str):
+                if len(json_hits) >= max_json:
                     return
+                try:
+                    data = await resp.json()
+                    json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
 
-                is_blob = canonical_url.startswith("blob:")
-                resource_type = req_types.get(url, "")
+            def handle_response(response: Response):
+                try:
+                    url = response.url
+                    canonical_url = _canonicalize_url(url)
 
-                if not is_blob:
-                    parsed = urlparse(canonical_url)
-                    path = (parsed.path or "/").lower()
-                    netloc = parsed.netloc or ""
+                    if not canonical_url or canonical_url in seen_network:
+                        return
+
+                    is_blob = canonical_url.startswith("blob:")
+                    resource_type = req_types.get(url, "")
+
+                    if not is_blob:
+                        parsed = urlparse(canonical_url)
+                        path = (parsed.path or "/").lower()
+                        netloc = parsed.netloc or ""
+                        url_lower = canonical_url.lower()
+
+                        if self._is_junk_by_extension(path):
+                            self._log(f"[NetworkSniffer] Skipped junk ext: {canonical_url}", log)
+                            return
+                        if self._looks_like_ad(netloc, path):
+                            self._log(f"[NetworkSniffer] Skipped ad: {canonical_url}", log)
+                            return
+
+                    seen_network.add(canonical_url)
+
+                    ctype = (response.headers.get("content-type") or "").lower()
                     url_lower = canonical_url.lower()
 
-                    if self._is_junk_by_extension(path):
-                        self._log(f"[NetworkSniffer] Skipped junk ext: {canonical_url}", log)
-                        return
-                    if self._looks_like_ad(netloc, path):
-                        self._log(f"[NetworkSniffer] Skipped ad: {canonical_url}", log)
-                        return
+                    cl_header = response.headers.get("content-length") or ""
+                    content_length: Optional[int] = None
+                    try:
+                        if cl_header and cl_header.isdigit():
+                            content_length = int(cl_header)
+                    except Exception:
+                        content_length = None
 
-                seen_network.add(canonical_url)
-
-                ctype = (response.headers.get("content-type") or "").lower()
-                url_lower = canonical_url.lower()
-
-                cl_header = response.headers.get("content-length") or ""
-                content_length: Optional[int] = None
-                try:
-                    if cl_header and cl_header.isdigit():
-                        content_length = int(cl_header)
-                except Exception:
-                    content_length = None
-
-                if (not is_blob) and ctype and self._deny_by_content_type(ctype):
-                    self._log(
-                        f"[NetworkSniffer] Skipped denied ctype: {canonical_url} ({ctype})",
-                        log
-                    )
-                    return
-
-                if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
-                    self._log(
-                        f"[NetworkSniffer] Skipped denied rtype: {canonical_url} ({resource_type})",
-                        log
-                    )
-                    return
-
-                # ---- SAFE JSON sniff (size + URL pattern gated) ----
-                if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
-                    asyncio.create_task(handle_json(response, canonical_url))
-                    # We *don't* treat these as media; just JSON introspection.
-                    return
-
-                # ---- Blob media handling ----
-                if is_blob:
-                    if resource_type == "media":
-                        blob_placeholders.append({
-                            "url": canonical_url,
-                            "text": "[Network Video Blob]",
-                            "tag": "network_sniff",
-                            "kind": "video",
-                            "content_type": ctype or "?",
-                            "size": response.headers.get("content-length", "?"),
-                        })
-                        if len(json_hits) < max_json:
-                            json_hits.append({
-                                "url": canonical_url,
-                                "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
-                                "source_page": canonical_page_url
-                            })
+                    if (not is_blob) and ctype and self._deny_by_content_type(ctype):
                         self._log(
-                            f"[NetworkSniffer] Detected blob media: {canonical_url}",
+                            f"[NetworkSniffer] Skipped denied ctype: {canonical_url} ({ctype})",
                             log
                         )
+                        return
+
+                    if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
+                        self._log(
+                            f"[NetworkSniffer] Skipped denied rtype: {canonical_url} ({resource_type})",
+                            log
+                        )
+                        return
+
+                    # ---- SAFE JSON sniff ----
+                    if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
+                        asyncio.create_task(handle_json(response, canonical_url))
+                        return
+
+                    # ---- Blob media handling ----
+                    if is_blob:
+                        if resource_type == "media":
+                            blob_placeholders.append({
+                                "url": canonical_url,
+                                "text": "[Network Video Blob]",
+                                "tag": "network_sniff",
+                                "kind": "video",
+                                "content_type": ctype or "?",
+                                "size": response.headers.get("content-length", "?"),
+                            })
+                            if len(json_hits) < max_json:
+                                json_hits.append({
+                                    "url": canonical_url,
+                                    "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
+                                    "source_page": canonical_page_url
+                                })
+                            self._log(
+                                f"[NetworkSniffer] Detected blob media: {canonical_url}",
+                                log
+                            )
+                        return
+
+                    parsed = urlparse(canonical_url)
+                    path = (parsed.path or "/").lower()
+
+                    kind = (
+                        self._classify_by_extension(path)
+                        or (self._classify_by_content_type(ctype) if ctype else None)
+                        or self._classify_by_stream_hint(url_lower)
+                    )
+                    if not kind:
+                        self._log(f"[NetworkSniffer] Skipped unknown kind: {canonical_url}", log)
+                        return
+
+                    if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
+                        self._log(
+                            f"[NetworkSniffer] Skipped by extensions: {canonical_url} (kind={kind})",
+                            log
+                        )
+                        return
+
+                    mkind = self._is_manifest(canonical_url, ctype)
+                    if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
+                        manifests_to_expand.append((response, mkind, canonical_url))
+                        self._log(
+                            f"[NetworkSniffer] Identified manifest: {canonical_url} (kind={mkind})",
+                            log
+                        )
+
+                    if len(found_items) >= max_items:
+                        return
+
+                    found_items.append({
+                        "url": canonical_url,
+                        "text": f"[Network {kind.capitalize()}]",
+                        "tag": "network_sniff",
+                        "kind": kind,
+                        "content_type": ctype or "?",
+                        "size": response.headers.get("content-length", "?"),
+                    })
+                    self._log(f"[NetworkSniffer] Added item: {canonical_url} (kind={kind})", log)
+
+                except Exception as e:
+                    self._log(
+                        f"[NetworkSniffer][handle_response] Error processing {response.url}: {e}",
+                        log
+                    )
                     return
 
-                parsed = urlparse(canonical_url)
-                path = (parsed.path or "/").lower()
+            page.on("response", handle_response)
 
-                kind = (
-                    self._classify_by_extension(path)
-                    or (self._classify_by_content_type(ctype) if ctype else None)
-                    or self._classify_by_stream_hint(url_lower)
+            sniff_goto_timeout = max(15000, int(tmo * 1000))
+            try:
+                await page.goto(
+                    canonical_page_url,
+                    wait_until=wait_mode,
+                    timeout=sniff_goto_timeout
                 )
-                if not kind:
-                    self._log(f"[NetworkSniffer] Skipped unknown kind: {canonical_url}", log)
-                    return
-
-                if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
-                    self._log(
-                        f"[NetworkSniffer] Skipped by extensions: {canonical_url} (kind={kind})",
-                        log
-                    )
-                    return
-
-                mkind = self._is_manifest(canonical_url, ctype)
-                if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
-                    manifests_to_expand.append((response, mkind, canonical_url))
-                    self._log(
-                        f"[NetworkSniffer] Identified manifest: {canonical_url} (kind={mkind})",
-                        log
-                    )
-
-                if len(found_items) >= max_items:
-                    return
-
-                found_items.append({
-                    "url": canonical_url,
-                    "text": f"[Network {kind.capitalize()}]",
-                    "tag": "network_sniff",
-                    "kind": kind,
-                    "content_type": ctype or "?",
-                    "size": response.headers.get("content-length", "?"),
-                })
-                self._log(f"[NetworkSniffer] Added item: {canonical_url} (kind={kind})", log)
-
             except Exception as e:
                 self._log(
-                    f"[NetworkSniffer][handle_response] Error processing {response.url}: {e}",
+                    f"[NetworkSniffer] goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}",
                     log
                 )
-                return
 
-        page.on("response", handle_response)
+            # ---- Auto-scroll to trigger more network activity ----
+            await self._auto_scroll(page, tmo, log)
 
-        sniff_goto_timeout = max(15000, int(tmo * 1000))
-        try:
-            await page.goto(
-                canonical_page_url,
-                wait_until="domcontentloaded",
-                timeout=sniff_goto_timeout
-            )
-        except Exception as e:
-            self._log(
-                f"[NetworkSniffer] goto timeout on {canonical_page_url}: {e}",
-                log
-            )
+            # Final small wait (<= 20% of tmo)
+            await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
-        await page.wait_for_timeout(int(tmo * 1000))
+            if manifests_to_expand:
+                self._log(
+                    f"[NetworkSniffer] Expanding {len(manifests_to_expand)} manifests...",
+                    log
+                )
 
-        if manifests_to_expand:
-            self._log(
-                f"[NetworkSniffer] Expanding {len(manifests_to_expand)} manifests...",
-                log
-            )
+                async def expand_one(resp: Response, mkind: str, murl: str):
+                    derived_urls = await self._expand_manifest(resp, mkind, murl, log)
+                    if not derived_urls:
+                        return
 
-            async def expand_one(resp: Response, mkind: str, murl: str):
-                derived_urls = await self._expand_manifest(resp, mkind, murl, log)
-                if not derived_urls:
-                    return
+                    for u in derived_urls[:max_derived_per_manifest]:
+                        if u in seen_derived or u in seen_network:
+                            continue
+                        seen_derived.add(u)
 
-                for u in derived_urls[:max_derived_per_manifest]:
-                    if u in seen_derived or u in seen_network:
-                        continue
-                    seen_derived.add(u)
+                        dk = self._classify_by_extension(
+                            urlparse(u).path or ""
+                        ) or "video"
+                        if not self._is_allowed_by_extensions(u, extensions, dk):
+                            self._log(
+                                f"[NetworkSniffer] Derived skipped by extensions: {u} (kind={dk})",
+                                log
+                            )
+                            continue
 
-                    dk = self._classify_by_extension(
-                        urlparse(u).path or ""
-                    ) or "video"
-                    if not self._is_allowed_by_extensions(u, extensions, dk):
+                        derived_items.append({
+                            "url": u,
+                            "text": f"[Network {dk.capitalize()} Segment]",
+                            "tag": "network_sniff",
+                            "kind": dk,
+                            "content_type": mkind,
+                            "size": "?",
+                        })
                         self._log(
-                            f"[NetworkSniffer] Derived skipped by extensions: {u} (kind={dk})",
+                            f"[NetworkSniffer] Added derived item: {u} (kind={dk})",
                             log
                         )
-                        continue
 
-                    derived_items.append({
-                        "url": u,
-                        "text": f"[Network {dk.capitalize()} Segment]",
-                        "tag": "network_sniff",
-                        "kind": dk,
-                        "content_type": mkind,
-                        "size": "?",
-                    })
-                    self._log(
-                        f"[NetworkSniffer] Added derived item: {u} (kind={dk})",
-                        log
-                    )
+                        if len(json_hits) < max_json:
+                            json_hits.append({
+                                "url": u,
+                                "json": {"derived_from": murl, "manifest_type": mkind},
+                                "source_page": canonical_page_url
+                            })
 
-                    if len(json_hits) < max_json:
-                        json_hits.append({
-                            "url": u,
-                            "json": {"derived_from": murl, "manifest_type": mkind},
-                            "source_page": canonical_page_url
-                        })
+                await asyncio.gather(*[
+                    expand_one(resp, mkind, murl)
+                    for (resp, mkind, murl) in manifests_to_expand
+                ])
 
-            await asyncio.gather(*[
-                expand_one(resp, mkind, murl)
-                for (resp, mkind, murl) in manifests_to_expand
-            ])
+                self._log(
+                    f"[NetworkSniffer] Finished manifest expansion. Total derived: {len(derived_items)}",
+                    log
+                )
 
-            self._log(
-                f"[NetworkSniffer] Finished manifest expansion. Total derived: {len(derived_items)}",
-                log
-            )
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
+                html = ""
 
-        try:
-            html = await page.content()
         except Exception as e:
-            self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
-            html = ""
+            self._log(f"[NetworkSniffer] Unexpected error during sniff for {canonical_page_url}: {e}", log)
+        finally:
+            try:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    self._log("[NetworkSniffer] page.close() timed out; ignoring.", log)
+            except Exception as e:
+                self._log(f"[NetworkSniffer] Failed to close page: {e}", log)
 
-        try:
-            await page.close()
-        except Exception as e:
-            self._log(f"[NetworkSniffer] Failed to close page: {e}", log)
-
-        merged_items_any = found_items + derived_items + blob_placeholders
+            merged_items_any = found_items + derived_items + blob_placeholders
         merged_items = [self._normalize_item(it) for it in merged_items_any if it.get("url")]
 
         summary = (
@@ -718,6 +764,7 @@ class NetworkSniffer:
 
         return html, merged_items, json_hits
 
+
 # ======================================================================
 # JSSniffer
 # ======================================================================
@@ -726,8 +773,13 @@ class JSSniffer:
     """
     Shared-context Playwright JS DOM link sniffer.
 
-    Output schema is normalized to legacy JS-link style:
+    Output schema:
       link = {url, text, tag}
+
+    Now:
+      - Configurable goto_wait_until (e.g. 'commit' for Camoufox).
+      - goto timeouts are non-fatal (log + continue).
+      - Bounded auto-scroll relative to timeout.
     """
 
     @dataclass
@@ -736,6 +788,15 @@ class JSSniffer:
         max_links: int = 500
         wait_after_goto_ms: int = 500
         include_shadow_dom: bool = True
+
+        # ------------------ auto-scroll options ------------------ #
+        enable_auto_scroll: bool = True
+        max_scroll_steps: int = 20
+        scroll_step_delay_ms: int = 400
+        scroll_back_to_top: bool = False
+
+        # How Playwright waits in page.goto; for Camoufox you can set "commit"
+        goto_wait_until: str = "domcontentloaded"
 
         selectors: List[str] = field(default_factory=lambda: [
             "a[href]",
@@ -802,19 +863,12 @@ class JSSniffer:
 
     def __init__(self, config: Optional["JSSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
-        # Default to global DEBUG_LOGGER so logs show in GUI
         self.logger = logger or DEBUG_LOGGER
         self._log("JSSniffer initialized", None)
 
     # ------------------------- helpers ------------------------- #
 
     def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
-        """
-        Unified logging:
-          - Prefix with [JSSniffer]
-          - Append to the per-run log_list if provided
-          - Emit to global DEBUG_LOGGER
-        """
         full = f"[JSSniffer] {msg}"
         try:
             if log_list is not None:
@@ -822,7 +876,6 @@ class JSSniffer:
             if self.logger is not None:
                 self.logger.log_message(full)
         except Exception:
-            # Logging must never break sniffing
             pass
 
     def _is_junk_url(self, url: str) -> bool:
@@ -876,6 +929,63 @@ class JSSniffer:
             "tag": tag or "a",
         }
 
+    # ------------------ auto-scroll implementation ------------------ #
+
+    async def _auto_scroll(self, page: "Page", tmo: float, log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_auto_scroll:
+            return
+
+        try:
+            max_steps = max(1, int(self.cfg.max_scroll_steps))
+            step_delay = max(50, int(self.cfg.scroll_step_delay_ms))
+
+            max_total_ms = int(tmo * 1000 * 0.7)
+            used_ms = 0
+
+            self._log(
+                f"Auto-scroll enabled: steps={max_steps}, step_delay={step_delay}ms",
+                log,
+            )
+
+            last_height = await page.evaluate(
+                "() => document.body ? document.body.scrollHeight : 0"
+            )
+
+            for i in range(max_steps):
+                if used_ms >= max_total_ms:
+                    self._log("Auto-scroll: reached time budget; stopping.", log)
+                    break
+
+                await page.evaluate("() => window.scrollBy(0, window.innerHeight);")
+                await page.wait_for_timeout(step_delay)
+                used_ms += step_delay
+
+                new_height = await page.evaluate(
+                    "() => document.body ? document.body.scrollHeight : 0"
+                )
+
+                self._log(
+                    f"Auto-scroll step {i + 1}/{max_steps}: "
+                    f"height {last_height} -> {new_height}",
+                    log,
+                )
+
+                if new_height <= last_height:
+                    self._log("Auto-scroll: no further height growth; stopping.", log)
+                    break
+
+                last_height = new_height
+
+            if self.cfg.scroll_back_to_top:
+                try:
+                    await page.evaluate("() => window.scrollTo(0, 0);")
+                    self._log("Auto-scroll: scrolled back to top.", log)
+                except Exception as e:
+                    self._log(f"Auto-scroll: failed to scroll back to top: {e}", log)
+
+        except Exception as e:
+            self._log(f"Auto-scroll error: {e}", log)
+
     # ------------------------- main sniff ------------------------- #
 
     async def sniff(
@@ -898,13 +1008,14 @@ class JSSniffer:
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
         canonical_page_url = _canonicalize_url(page_url)
 
-        html = ""
+        html: str = ""
         links: List[Dict[str, str]] = []
         seen_urls_in_js: Set[str] = set()
 
         page: Page = await context.new_page()
         js_timeout_ms = int(max(tmo, 10.0) * 1000)
         wait_after_ms = int(self.cfg.wait_after_goto_ms)
+        wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
 
         selector_js = ", ".join(self.cfg.selectors)
         data_keys_js = list(self.cfg.data_url_keys)
@@ -915,9 +1026,28 @@ class JSSniffer:
         self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
 
         try:
-            await page.goto(canonical_page_url, wait_until="domcontentloaded", timeout=js_timeout_ms)
+            # --- 1) Navigation: timeout is NON-FATAL --- #
+            try:
+                await page.goto(
+                    canonical_page_url,
+                    wait_until=wait_mode,
+                    timeout=js_timeout_ms,
+                )
+            except Exception as e:
+                self._log(
+                    f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}",
+                    log,
+                )
+
             if wait_after_ms > 0:
                 await page.wait_for_timeout(wait_after_ms)
+
+            # ---- Auto-scroll to trigger lazy-loaded elements ----
+            await self._auto_scroll(page, tmo, log)
+
+            # Small extra delay after scroll (<= 10% of tmo, but at least 200ms)
+            extra_wait = max(200, int(tmo * 1000 * 0.1))
+            await page.wait_for_timeout(extra_wait)
 
             html = await page.content()
 
@@ -963,7 +1093,7 @@ class JSSniffer:
                       const v = el.getAttribute?.(k);
                       if (v) push(el, v, el.tagName.toLowerCase(), "data-attr");
                     }
-                    for (const attr of el.attributes || []) {
+                    for (const attr of (el.attributes || [])) {
                       const n = attr.name.toLowerCase();
                       const v = attr.value;
                       if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://"))) {
@@ -1104,7 +1234,7 @@ class JSSniffer:
             raw_links = raw_payload.get("items") or []
             self._log(f"Raw links from DOM/scripts: {len(raw_links)}", log)
 
-            # Optional click simulation
+            # Optional click simulation (unchanged)
             if self.cfg.enable_click_simulation:
                 self._log("Starting click simulation…", log)
                 try:
@@ -1220,15 +1350,18 @@ class JSSniffer:
                 self._log(f"Added JS item: {canonical_url_py}", log)
 
             self._log(f"Done: {len(links)} links for {canonical_page_url}", log)
-
         except Exception as e:
             self._log(f"Overall error on {canonical_page_url}: {e}", log)
 
+        # --- Robust page close: NEVER let close() hang the whole sniffer --- #
         try:
-            await page.close()
+            try:
+                # Hard cap: if Camoufox / page is weird, give close() a small budget
+                await asyncio.wait_for(page.close(), timeout=3.0)
+            except asyncio.TimeoutError:
+                self._log("page.close() timed out; ignoring and continuing.", log)
         except Exception as e:
             self._log(f"Failed to close page: {e}", log)
-
         return html, links
 
 # ======================================================================
