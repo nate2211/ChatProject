@@ -10814,6 +10814,9 @@ class VideoLinkTrackerBlock(BaseBlock):
             "http_max_conn_per_host": 8,
             "http_verify": True,
             "http_ca_bundle": "",  # e.g. certifi bundle path inside PyInstaller exe
+
+            "use_camoufox": False,
+            "camoufox_options": {},
         }
 
 
@@ -12455,6 +12458,8 @@ class DirectLinkTrackerBlock(BaseBlock):
             "blocked_domains": "",
             "expand_direct": True,
             "best_n": 50,
+            "use_camoufox": False,
+            "camoufox_options": {},
         }
 
 
