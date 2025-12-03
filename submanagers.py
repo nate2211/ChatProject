@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections  # For collections.Counter
 import hashlib
+import os
 import re
 import sqlite3
 import ssl
@@ -17,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 import aiohttp
 from aiohttp import ClientTimeout
+from bs4 import BeautifulSoup
 
 from loggers import DEBUG_LOGGER
 
@@ -2007,3 +2009,4 @@ class HTTPSSubmanager:
             return resp.status, dict(resp.headers)
         except Exception:
             return resp.status, {}
+

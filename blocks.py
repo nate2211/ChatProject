@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +40,8 @@ import re as _re
 from dotenv import load_dotenv
 
 import submanagers
-from stores import LinkTrackerStore, VideoTrackerStore
+from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
+    CodeCorpusStore
 
 load_dotenv()
 # ---------------- Paths & helpers ----------------
@@ -717,7 +719,7 @@ def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]
     return [t for t, _ in terms[:top_k]]
 
 
-# ---------------- Prompt Builder (Smart & Dissecting) ----------------
+# ================- Prompt Builder (Smart & Dissecting) ================
 @dataclass
 class PromptBlock(BaseBlock):
     """
@@ -995,27 +997,49 @@ class PromptBlock(BaseBlock):
 BLOCKS.register("prompt", PromptBlock)
 
 
-# ---------------- Corpus (HF with timeout + wiki_api fallback) ----------------
+# ================ Corpus (HF with timeout + wiki_api fallback) ================
 @dataclass
 class CorpusBlock(BaseBlock):
     """
     Resilient corpus puller:
-      • provider = "wikimedia/wikipedia" (default) with short startup timeout
-      • automatic fallback to provider = "wiki_api" (direct Wikipedia REST) on timeout/failure
-      • [NEW] Caches results in a local SQLite FTS (Full-Text Search) database.
-      • [NEW] Queries FTS database first, falling back to HF/API.
-      • BM25-ish re-ranking, sentence extraction, auto-lexicon
+      • provider = "wiki_api" (default) with short startup timeout
+      • optional HF provider = "wikimedia/wikipedia" if explicitly requested
+      • Caches results in a local SQLite FTS (Full-Text Search) database via CorpusStore.
+      • Queries FTS database first, falling back to HF/API.
+      • BM25-ish re-ranking, sentence extraction, auto-lexicon.
     """
 
+    def __post_init__(self):
+        # Per-instance DB objects (created lazily in execute)
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[CorpusStore] = None
+
+    # ---------------- DB init helper ---------------- #
+    def _init_db(self, db_path: str, logger=None) -> None:
+        """
+        Initialize shared DatabaseSubmanager + CorpusStore.
+        Idempotent.
+        """
+        if self.db and self.store:
+            return
+
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "corpus_cache.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
+
+        self.store = CorpusStore(db=self.db)
+        self.store.ensure_schema()
+
+    # ---------------- Main execute ---------------- #
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         import os, re, json, time, threading
-        import sqlite3  # [NEW]
         from math import log
-        from typing import Iterable, Dict, List
+        from typing import Dict, List
         from itertools import islice
 
         # ---- Params ----
-        provider = str(params.get("provider", "wikimedia/wikipedia"))
+        # NOTE: default provider is now "wiki_api" so we only hit Wikipedia unless you override.
+        provider = str(params.get("provider", "wiki_api"))
         config = str(params.get("config", "20231101.en"))
         split = str(params.get("split", "train"))
         query = str(params.get("query", "")).strip()
@@ -1027,7 +1051,7 @@ class CorpusBlock(BaseBlock):
         max_chars = int(params.get("max_chars", 2800))
         cache_dir = params.get("cache_dir")
 
-        # [NEW] DB Params
+        # DB Params
         db_path = str(params.get("db_path", os.path.join(APP_DIR, "corpus_cache.db")))
         use_db_cache = bool(params.get("use_db_cache", True))
 
@@ -1057,122 +1081,36 @@ class CorpusBlock(BaseBlock):
 
         meta: Dict[str, Any] = {"db_source": "none"}
 
-        # ---- [NEW] DB Helpers (with FTS5) ----
-        def _get_db_conn():
-            conn = sqlite3.connect(db_path)
-            # Main table for doc storage
-            conn.execute("""
-                         CREATE TABLE IF NOT EXISTS corpus_docs
-                         (
-                             id
-                             INTEGER
-                             PRIMARY
-                             KEY,
-                             title
-                             TEXT
-                             NOT
-                             NULL,
-                             content
-                             TEXT
-                             NOT
-                             NULL,
-                             config
-                             TEXT
-                             NOT
-                             NULL, -- '20231101.en', 'wiki_api', etc.
-                             fetched_at
-                             DATETIME
-                             DEFAULT
-                             CURRENT_TIMESTAMP,
-                             UNIQUE
-                         (
-                             title,
-                             config
-                         )
-                             );
-                         """)
-            # FTS table to search
-            conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS corpus_fts USING fts5(
-                content='corpus_docs', -- Link to the table
-                content_rowid='id',    -- Link to its rowid
-                tokenize='porter unicode61',
-                -- Columns to index
-                title,
-                content
-            );
-            """)
-            # Triggers to keep them in sync
-            conn.executescript("""
-                               CREATE TRIGGER IF NOT EXISTS corpus_docs_ai AFTER INSERT ON corpus_docs
-                               BEGIN
-              INSERT INTO corpus_fts(rowid, title, content) VALUES (new.id, new.title, new.content);
-                               END;
-                               CREATE TRIGGER IF NOT EXISTS corpus_docs_ad AFTER
-                               DELETE
-                               ON corpus_docs BEGIN
-              INSERT INTO corpus_fts(corpus_fts, rowid, title, content) VALUES ('delete', old.id, old.title, old.content);
-                               END;
-                               CREATE TRIGGER IF NOT EXISTS corpus_docs_au AFTER
-                               UPDATE ON corpus_docs BEGIN
-                               INSERT
-                               INTO corpus_fts(corpus_fts, rowid, title, content)
-                               VALUES ('delete', old.id, old.title, old.content);
-                               INSERT INTO corpus_fts(rowid, title, content)
-                               VALUES (new.id, new.title, new.content);
-                               END;
-                               """)
-            return conn
+        # ---- DB: init if needed ----
+        if use_db_cache:
+            self._init_db(db_path, logger=getattr(self, "logger", None))
 
+        # ---- DB wrapper helpers using CorpusStore ----
         def _save_many_to_db(docs: List[Dict[str, str]], config_key: str):
-            if not use_db_cache or not docs: return
+            if not (use_db_cache and self.store and docs):
+                return
             try:
-                with _get_db_conn() as conn:
-                    conn.executemany(
-                        "INSERT OR IGNORE INTO corpus_docs (title, content, config) VALUES (?, ?, ?)",
-                        [(d['title'], d['text'], config_key) for d in docs]
-                    )
+                self.store.save_many(docs, config_key)
             except Exception as e:
                 print(f"[CorpusBlock] DB bulk save failed: {e}")
 
-        def _load_from_db(query: str, config_key: str) -> List[Dict[str, str]]:
-            if not use_db_cache or not query: return []
-
-            # Sanitize query for FTS
-            fts_query = " ".join(re.findall(r'[a-zA-Z0-9]+', query))
-            if not fts_query: return []
-
-            docs = []
-            try:
-                with _get_db_conn() as conn:
-                    # FTS query to get relevant rowids, matching *either* the specified config
-                    # or the 'wiki_api' fallback config.
-                    sql = """
-                          SELECT T.title, T.content
-                          FROM corpus_docs AS T
-                                   JOIN corpus_fts AS F ON T.id = F.rowid
-                          WHERE F.corpus_fts MATCH ?
-                            AND (T.config = ? OR T.config = 'wiki_api')
-                          ORDER BY F.rank -- FTS rank
-                              LIMIT ?; \
-                          """
-                    # Fetch a larger candidate pool from DB to feed into BM25
-                    fetch_limit = max(sample * 5, 50)
-
-                    cursor = conn.execute(sql, (fts_query, config_key, fetch_limit))
-                    for row in cursor.fetchall():
-                        docs.append({"title": row[0], "text": row[1]})
-                return docs
-            except Exception as e:
-                print(f"[CorpusBlock] DB load failed: {e}")
+        def _load_from_db(q: str, config_key: str) -> List[Dict[str, str]]:
+            if not (use_db_cache and self.store and q):
                 return []
+            # Fetch a larger candidate pool from DB to feed into BM25
+            fetch_limit = max(sample * 5, 50)
+            return self.store.search_fts(q, config_key, fetch_limit)
 
         # ---- Standard Helpers ----
         def _normalize(v) -> str:
-            if v is None: return ""
-            if isinstance(v, str): return v
-            if isinstance(v, list): return " ".join(_normalize(x) for x in v)
-            if isinstance(v, dict): return " ".join(_normalize(x) for x in v.values())
+            if v is None:
+                return ""
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                return " ".join(_normalize(x) for x in v)
+            if isinstance(v, dict):
+                return " ".join(_normalize(x) for x in v.values())
             return str(v)
 
         def _tokenize(t: str) -> List[str]:
@@ -1181,23 +1119,30 @@ class CorpusBlock(BaseBlock):
         def _contains_whole_word(t: str, q: str) -> bool:
             return re.search(rf"\b{re.escape(q)}\b", t, flags=re.IGNORECASE) is not None
 
-        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
-                                                                         str) and regex_query.strip() else None
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
 
         def _matches(title: str, text: str) -> bool:
+            """
+            Used by the HF provider only (NOT for wiki_api HTTP fetch).
+            """
             hay = title if title_only else (title + "\n" + text)
-            if len(hay) < min_doc_chars: return False
+            if len(hay) < min_doc_chars:
+                return False
             # positive
             if q_pattern:
-                if not q_pattern.search(hay): return False
+                if not q_pattern.search(hay):
+                    return False
             elif query:
                 if whole_word:
-                    if not _contains_whole_word(hay, query): return False
+                    if not _contains_whole_word(hay, query):
+                        return False
                 else:
-                    if query.lower() not in hay.lower(): return False
+                    if query.lower() not in hay.lower():
+                        return False
             # must terms
             for m in must_terms:
-                if m and (m not in hay.lower()): return False
+                if m and (m not in hay.lower()):
+                    return False
             # negatives
             for n in neg:
                 if re.search(rf"\b{re.escape(n)}\b", hay, flags=re.IGNORECASE):
@@ -1208,53 +1153,75 @@ class CorpusBlock(BaseBlock):
             bits = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
             return [b.strip() for b in bits if b.strip()]
 
-        # ---- wiki_api provider (no HF, zero “Resolving data files”) ----
+        # ---- wiki_api provider (simple: send query as-is, no special-casing) ----
         def _fetch_wiki_api_pages(topic: str) -> List[Dict[str, str]]:
-            # ... (function unchanged) ...
+            """
+            Take the query string as-is, use it to search Wikipedia, and return pages.
+            No special-case heuristics, no prompt-like logic.
+            Uses the REST /page/summary/{title} endpoint (JSON) and pulls 'extract'.
+            """
             import requests
+
+            topic = (topic or "").strip()
+            if not topic:
+                return []
+
             session = requests.Session()
             session.headers.update({"User-Agent": "promptchat/mini-crawler"})
+
             titles: List[str] = []
 
-            # Seed titles from the topic if it looks like a name; otherwise use search
-            if re.search(r"raf\s+simons", topic, re.I):
-                titles = ["Raf_Simons", "Raf_Simons_(brand)", "Prada", "Jil_Sander", "Calvin_Klein", "Dior"]
-            elif re.search(r"transport\s+layer\s+security|tls", topic, re.I):
-                titles = ["Transport_Layer_Security", "TLS_1.3", "HTTPS", "X.509", "Public_key_certificate",
-                          "Forward_secrecy"]
-            else:
-                # fallback: try a top-5 search
-                try:
-                    r = session.get("https://en.wikipedia.org/w/api.php", params={
-                        "action": "opensearch", "search": topic, "limit": 5, "namespace": 0, "format": "json"
-                    }, timeout=8)
-                    r.raise_for_status()
-                    data = r.json()
-                    titles = [re.sub(r"^.*/wiki/", "", u) for u in data[3]]
-                    if not titles:
-                        titles = [topic.replace(" ", "_")]
-                except Exception:
-                    titles = [topic.replace(" ", "_")]
+            # 1) Use the raw topic as the search string (no modifications)
+            try:
+                r = session.get(
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "opensearch",
+                        "search": topic,      # <-- raw query
+                        "limit": 5,
+                        "namespace": 0,
+                        "format": "json",
+                    },
+                    timeout=8,
+                )
+                r.raise_for_status()
+                data = r.json()
+                # data[3] is an array of full wiki URLs; strip /wiki/ prefix
+                titles = [re.sub(r"^.*/wiki/", "", u) for u in data[3]]
+            except Exception:
+                titles = []
+
+            # 2) Fallback: direct page guess from the topic
+            if not titles:
+                titles = [topic.replace(" ", "_")]
 
             docs: List[Dict[str, str]] = []
             for t in titles:
                 try:
-                    r = session.get(f"https://en.wikipedia.org/api/rest_v1/page/plain/{t}", timeout=8)
+                    # Use REST summary endpoint (stable + documented)
+                    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{t}"
+                    r = session.get(url, timeout=8)
                     if r.status_code != 200:
                         continue
-                    text = r.text
-                    title = t.replace("_", " ")
-                    if _matches(title, text):
-                        docs.append({"title": title, "text": text})
+
+                    data = r.json()
+                    title = data.get("title") or t.replace("_", " ")
+                    text = data.get("extract") or ""
+
+                    # Skip completely empty extracts
+                    if not text.strip():
+                        continue
+
+                    docs.append({"title": title, "text": text})
+
+                    if sample > 0 and len(docs) >= sample:
+                        break
                 except Exception:
                     continue
-                if len(docs) >= max(1, sample):
-                    break
-            return docs
 
+            return docs
         # ---- HF provider with startup timeout, then fallback to wiki_api ----
         def _load_hf_docs() -> List[Dict[str, str]]:
-            # ... (function unchanged) ...
             from datasets import load_dataset
             docs: List[Dict[str, str]] = []
 
@@ -1284,9 +1251,7 @@ class CorpusBlock(BaseBlock):
                             docs[:] = docs[:sample]
                     else:
                         ds = load_dataset(provider, config, split=split, cache_dir=cache_dir)
-                        # Python-side filter (avoid heavy .filter planning)
                         keep: List[Dict[str, str]] = []
-                        # take up to scan_limit rows to keep snappy
                         stop = min(len(ds), scan_limit) if scan_limit > 0 else len(ds)
                         for i in range(stop):
                             rec = ds[i]
@@ -1317,37 +1282,40 @@ class CorpusBlock(BaseBlock):
         # ---- acquire docs (provider or fallback) ----
         docs_raw: List[Dict[str, str]] = []
         used_provider = provider
-        db_config_key = config  # This is the config we'll use for DB query/save
 
-        # [NEW] Try DB first
+        # Use a stable config key for DB
+        if provider == "wiki_api":
+            db_config_key = "wiki_api"
+        else:
+            db_config_key = config  # config key for DB
+
+        # Try DB first
         if use_db_cache:
             docs_raw = _load_from_db(query, db_config_key)
             if docs_raw:
                 meta["db_source"] = "fts_cache"
 
-        # [NEW] If DB cache failed or was empty, go to source
+        # If DB cache is empty, go to upstream
         if not docs_raw:
             meta["db_source"] = "fetch"
             if provider == "wiki_api":
-                docs_raw = _fetch_wiki_api_pages(query or "Raf Simons")
-                db_config_key = "wiki_api"  # Set config key for saving
+                docs_raw = _fetch_wiki_api_pages(query)
+                # db_config_key is already "wiki_api" here
             else:
                 try:
                     docs_raw = _load_hf_docs()
                     if not docs_raw:
-                        # timeout / empty → fallback
                         used_provider = "wiki_api"
                         db_config_key = "wiki_api"
-                        docs_raw = _fetch_wiki_api_pages(query or "Raf Simons")
+                        docs_raw = _fetch_wiki_api_pages(query)
                 except Exception:
                     used_provider = "wiki_api"
                     db_config_key = "wiki_api"
-                    docs_raw = _fetch_wiki_api_pages(query or "Raf Simons")
+                    docs_raw = _fetch_wiki_api_pages(query)
 
-            # [NEW] Save freshly fetched docs to DB
             _save_many_to_db(docs_raw, db_config_key)
 
-        # ---- no docs? return early (but with metadata explaining why) ----
+        # ---- no docs? return early ----
         if not docs_raw:
             base = "" if payload is None else str(payload)
             meta.update({
@@ -1359,12 +1327,12 @@ class CorpusBlock(BaseBlock):
                 "neg": neg,
                 "must": must_terms,
                 "streaming": streaming,
-                "scan_limit": scan_limit
+                "scan_limit": scan_limit,
+                "db_path": db_path if use_db_cache else None,
             })
             return base, meta
 
         # ---- ranking (BM25-ish + regex boost) ----
-        # This now ranks the candidates from *either* the DB or the fresh fetch
         corpus_tokens = [set(_tokenize((d["title"] + " " + d["text"]).lower())) for d in docs_raw]
         N = len(corpus_tokens)
         q_terms = set(_tokenize(query)) if query else set()
@@ -1374,13 +1342,14 @@ class CorpusBlock(BaseBlock):
                 df[t] = df.get(t, 0) + 1
 
         def _bm25ish_score(doc_text: str) -> float:
-            words = _tokenize(doc_text);
+            words = _tokenize(doc_text)
             L = len(words) or 1
             score = 0.0
             if q_terms:
                 for t in q_terms:
                     tf = words.count(t)
-                    if tf == 0: continue
+                    if tf == 0:
+                        continue
                     idf = log((N - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5) + 1.0)
                     k1, b, avgdl = 1.2, 0.75, 2000.0
                     score += idf * ((tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (L / avgdl))))
@@ -1388,32 +1357,37 @@ class CorpusBlock(BaseBlock):
                 score += 2.0
             return score
 
-        ranked = sorted(docs_raw, key=lambda d: _bm25ish_score(d["title"] + " " + d["text"]), reverse=True)[
-                 :max(1, top_k_docs)]
+        ranked = sorted(
+            docs_raw,
+            key=lambda d: _bm25ish_score(d["title"] + " " + d["text"]),
+            reverse=True,
+        )[: max(1, top_k_docs)]
 
         # ---- sentence extraction ----
-        # ... (function unchanged) ...
         hit_sents: List[str] = []
         per_doc_quota = max(1, top_k_sents // max(1, len(ranked)))
         for d in ranked:
             title = (d["title"] or "").strip()
             sents = _split_sents(d["text"] or "")
-            scored: List[Tuple[float, int, str]] = []
+            scored: List[tuple[float, int, str]] = []
             for idx, s in enumerate(sents):
                 tok = set(_tokenize(s))
                 overlap = len(tok & q_terms) if q_terms else 0
-                if q_pattern and q_pattern.search(s): overlap += 2
-                if query and whole_word and _contains_whole_word(s, query): overlap += 1
-                if overlap > 0: scored.append((float(overlap), idx, s))
+                if q_pattern and q_pattern.search(s):
+                    overlap += 2
+                if query and whole_word and _contains_whole_word(s, query):
+                    overlap += 1
+                if overlap > 0:
+                    scored.append((float(overlap), idx, s))
             took = 0
             for _, idx, _ in sorted(scored, key=lambda x: (-x[0], x[1]))[:per_doc_quota]:
-                lo = max(0, idx - sent_window);
+                lo = max(0, idx - sent_window)
                 hi = min(len(sents), idx + sent_window + 1)
                 chunk = " ".join(sents[lo:hi]).strip()
                 if chunk and chunk not in hit_sents:
                     if title and (not hit_sents or not hit_sents[-1].startswith("# ")):
                         hit_sents.append(f"# {title}")
-                    hit_sents.append(chunk);
+                    hit_sents.append(chunk)
                     took += 1
             if took == 0 and sents:
                 chunk = " ".join(sents[: max(1, sent_window + 1)]).strip()
@@ -1427,23 +1401,29 @@ class CorpusBlock(BaseBlock):
             context = context[:max_chars] + "…"
 
         # ---- lexicon ----
-        # ... (function unchanged) ...
         def _extract_terms_local(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
             counts: Dict[str, int] = {}
             for raw in text.split():
                 w = "".join(ch.lower() for ch in raw if ch.isalnum() or ch in "-_")
-                if len(w) < min_len or w in _STOPWORDS: continue
+                if len(w) < min_len or w in _STOPWORDS:
+                    continue
                 counts[w] = counts.get(w, 0) + 1
             return [t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]]
 
-        lexicon = _extract_terms_local(context, top_k=lexicon_top_k, min_len=lexicon_min_len) if context else []
+        lexicon: List[str] = _extract_terms_local(
+            context, top_k=lexicon_top_k, min_len=lexicon_min_len
+        ) if context else []
+
         if use_phrases and context:
-            phrase_candidates = re.findall(r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b",
-                                           context)
+            phrase_candidates = re.findall(
+                r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b",
+                context,
+            )
             phrase_counts: Dict[str, int] = {}
             for ph in phrase_candidates:
                 ph = ph.lower().strip()
-                if any(tok in _STOPWORDS for tok in ph.split()): continue
+                if any(tok in _STOPWORDS for tok in ph.split()):
+                    continue
                 phrase_counts[ph] = phrase_counts.get(ph, 0) + 1
             phrases = [p for p, _ in sorted(phrase_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
             lexicon = list(dict.fromkeys(phrases + lexicon))[:lexicon_top_k]
@@ -1478,19 +1458,22 @@ class CorpusBlock(BaseBlock):
             "regex": bool(q_pattern),
             "context_len": len(context),
             "hit_sents": len(hit_sents),
-            "db_path": db_path if use_db_cache else None,  # [NEW]
+            "db_path": db_path if use_db_cache else None,
+            "db_source": meta.get("db_source", "none"),
         })
         return out, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "provider": "wikimedia/wikipedia",
+            "provider": "wiki_api",          # default: direct Wikipedia REST only
             "config": "20231101.en",
             "split": "train",
             "query": "",
             "neg": "",
             "must_terms": "",
             "sample": 50,
+            "columns": ["title", "text"],
+            "sep": "\n\n",
             "max_chars": 2800,
             "cache_dir": None,
             "title_only": False,
@@ -1503,20 +1486,25 @@ class CorpusBlock(BaseBlock):
             "streaming": False,
             "scan_limit": 200000,
             "hf_timeout_sec": 10.0,
+            "set_hf_env": True,
             "export_lexicon": True,
             "lexicon_key": "corpus_lexicon",
             "inject_lexicon": True,
             "inject_context": True,
-            "db_path": "corpus_cache.db",  # [NEW]
-            "use_db_cache": True,  # [NEW]
+            "lexicon_top_k": 40,
+            "lexicon_min_len": 4,
+            "lexicon_phrases": True,
+            "db_path": "corpus_cache.db",
+            "use_db_cache": True,
         }
+
 
 
 # keep registration
 BLOCKS.register("corpus", CorpusBlock)
 
 
-# ---------------- Chat (no personas/prompts; uses lexicon only) ----------------
+# ================ Chat (no personas/prompts; uses lexicon only) ================
 @dataclass
 class ChatBlock(BaseBlock):
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -1670,7 +1658,8 @@ class ChatBlock(BaseBlock):
 BLOCKS.register("chat", ChatBlock)
 
 
-# ---------------- WebCorpus (web search + fetch + summarize) ----------------
+# ================ WebCorpus (web search + fetch + summarize) ================
+
 @dataclass
 class WebCorpusBlock(BaseBlock):
     """
@@ -1681,17 +1670,54 @@ class WebCorpusBlock(BaseBlock):
       • BM25-ish re-ranking + sentence extraction
       • Exports lexicon into Memory and injects [lexicon]/[context] into pipeline
       • Pluggable query processing via `subpipeline` param.
-      • [NEW] Caches and retrieves results from a persistent SQLite DB.
-      • [UPDATED] Uses asyncio + aiohttp for concurrent fetches.
+      • Uses DatabaseSubmanager + WebCorpusStore for persistent caching.
+      • Optional JSSniffer + NetworkSniffer enrichment for top URLs.
     """
+
+    def __post_init__(self):
+        # Per-instance DB objects (created lazily in execute)
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[WebCorpusStore] = None
+
+        # Lazy-init sniffers when needed
+        self._js_sniffer: Optional[submanagers.JSSniffer] = None
+        self._net_sniffer: Optional[submanagers.NetworkSniffer] = None
+
+    # ---------------- DB init helper ---------------- #
+
+    def _init_db(self, db_path: str, logger=None) -> None:
+        """
+        Initialize shared DatabaseSubmanager + WebCorpusStore.
+        Idempotent.
+        """
+        if self.db and self.store:
+            return
+
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "webcorpus.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
+
+        self.store = WebCorpusStore(db=self.db)
+        self.store.ensure_schema()
+
+    # ---------------- Sniffer init helpers ---------------- #
+
+    def _ensure_sniffers(self, logger=None) -> None:
+        if self._js_sniffer is None:
+            self._js_sniffer = submanagers.JSSniffer(logger=logger or getattr(self, "logger", None))
+        if self._net_sniffer is None:
+            self._net_sniffer = submanagers.NetworkSniffer(logger=logger or getattr(self, "logger", None))
+
+    # ---------------- Main execute ---------------- #
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         import os, re, time, hashlib, json, sys, traceback
-        import sqlite3
         from math import log
         from typing import List, Dict, Tuple
         from urllib.parse import urlparse
         from threading import Thread
+
+        logger = getattr(self, "logger", None)
 
         # ---- Params ----
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
@@ -1706,9 +1732,15 @@ class WebCorpusBlock(BaseBlock):
         cache_dir = str(params.get("cache_dir", os.path.join(APP_DIR, "webcache")))
         os.makedirs(cache_dir, exist_ok=True)
 
-        # [NEW] DB Params
+        # DB Params
         db_path = str(params.get("db_path", os.path.join(APP_DIR, "webcorpus.db")))
         use_db_cache = bool(params.get("use_db_cache", True))
+
+        # Sniffer params
+        use_js_sniffer = bool(params.get("use_js_sniffer", False))
+        use_network_sniffer = bool(params.get("use_network_sniffer", False))
+        sniffer_timeout = float(params.get("sniffer_timeout", 8.0))
+        max_sniffer_pages = int(params.get("max_sniffer_pages", 4))
 
         # text handling
         regex_query = params.get("regex")
@@ -1733,15 +1765,23 @@ class WebCorpusBlock(BaseBlock):
         lexicon_min_len = int(params.get("lexicon_min_len", 4))
         use_phrases = bool(params.get("lexicon_phrases", True))
 
+        # context export
+        export_context = bool(params.get("export_context", True))
+        context_key = str(params.get("context_key", "web_context"))
+        append_ctx = bool(params.get("append_context", False))
+
         # compile regex
-        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
-                                                                         str) and regex_query.strip() else None
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
 
         meta: Dict[str, Any] = {
             "engine": engine,
             "query": query_raw,
-            "errors": []
+            "errors": [],
         }
+
+        # ---- DB: init if needed ----
+        if use_db_cache:
+            self._init_db(db_path, logger=logger)
 
         # ---- Build list of queries to run (subpipeline OR raw) ----
         queries_to_run: Any
@@ -1797,54 +1837,32 @@ class WebCorpusBlock(BaseBlock):
                 return False
             return True
 
-        # ---- DB Helpers ----
-        def _get_db_conn():
-            conn = sqlite3.connect(db_path)
-            conn.execute("""
-                         CREATE TABLE IF NOT EXISTS corpus
-                         (
-                             url
-                             TEXT
-                             PRIMARY
-                             KEY,
-                             title
-                             TEXT,
-                             content
-                             TEXT,
-                             fetched_at
-                             DATETIME
-                             DEFAULT
-                             CURRENT_TIMESTAMP
-                         );
-                         """)
-            return conn
-
-        def _save_to_db(url: str, title: str, content: str):
-            if not use_db_cache:
-                return
-            try:
-                with _get_db_conn() as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO corpus (url, title, content, fetched_at) "
-                        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                        (url, title, content)
-                    )
-            except Exception as e:
-                # Non-critical, just log to stderr
-                print(f"[WebCorpusBlock] DB save failed for {url}: {e}", file=sys.stderr)
+        # ---- DB helpers via WebCorpusStore ----
 
         def _load_from_db(url: str) -> Tuple[str, str] | None:
-            if not use_db_cache:
+            if not (use_db_cache and self.store):
                 return None
             try:
-                with _get_db_conn() as conn:
-                    cursor = conn.execute("SELECT title, content FROM corpus WHERE url = ?", (url,))
-                    row = cursor.fetchone()
-                    if row:
-                        return row[0], row[1]  # title, content
+                rec = self.store.get_page(url)
+                if rec:
+                    return rec.title, rec.content
             except Exception as e:
                 print(f"[WebCorpusBlock] DB load failed for {url}: {e}", file=sys.stderr)
             return None
+
+        def _save_to_db(url: str, title: str, content: str):
+            if not (use_db_cache and self.store):
+                return
+            try:
+                self.store.save_page(
+                    url=url,
+                    title=title,
+                    content=content,
+                    engine=engine,
+                    query=query_raw,
+                )
+            except Exception as e:
+                print(f"[WebCorpusBlock] DB save failed for {url}: {e}", file=sys.stderr)
 
         # ---- File Cache (used by async fetch) ----
         def _cache_path(url: str) -> str:
@@ -1873,11 +1891,10 @@ class WebCorpusBlock(BaseBlock):
                     html,
                     include_comments=False,
                     include_tables=False,
-                    deduplicate=True
+                    deduplicate=True,
                 )
                 return clean_text or ""
             except ImportError:
-                # Not an error per se, just a warning
                 pass
             except Exception:
                 pass
@@ -1932,7 +1949,7 @@ class WebCorpusBlock(BaseBlock):
                 from ddgs import DDGS  # pip install duckduckgo_search
                 with DDGS() as ddgs:
                     out = []
-                    for r in ddgs.text(q, max_results=n, safesearch='off'):
+                    for r in ddgs.text(q, max_results=n, safesearch="off"):
                         u = r.get("href") or r.get("url")
                         if u:
                             out.append(u)
@@ -1945,19 +1962,25 @@ class WebCorpusBlock(BaseBlock):
             import requests
             urls = []
             try:
-                # Ensure we have a valid User-Agent to avoid immediate 403
-                ua_fallback = user_agent if "Mozilla" in user_agent else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ua_fallback = (
+                    user_agent
+                    if "Mozilla" in user_agent
+                    else "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
 
                 r = requests.get(
                     "https://html.duckduckgo.com/html/",
                     params={"q": q},
                     headers={"User-Agent": ua_fallback},
-                    timeout=(timeout_sec, read_timeout)
+                    timeout=(timeout_sec, read_timeout),
                 )
                 if r.status_code == 200:
                     from bs4 import BeautifulSoup
                     soup = BeautifulSoup(r.text, "html.parser")
-                    for a in soup.select("a.result__a, a.result__url, a.result__a.js-result-title-link"):
+                    for a in soup.select(
+                        "a.result__a, a.result__url, a.result__a.js-result-title-link"
+                    ):
                         href = a.get("href")
                         if href and href.startswith("http"):
                             urls.append(href)
@@ -1978,11 +2001,12 @@ class WebCorpusBlock(BaseBlock):
                 meta["errors"].append("SERPAPI_KEY missing")
                 return []
             import requests
+
             try:
                 r = requests.get(
                     "https://serpapi.com/search",
                     params={"engine": "google", "q": q, "num": n, "api_key": key},
-                    timeout=(timeout_sec, read_timeout)
+                    timeout=(timeout_sec, read_timeout),
                 )
                 r.raise_for_status()
                 data = r.json()
@@ -2003,15 +2027,15 @@ class WebCorpusBlock(BaseBlock):
                 meta["errors"].append("GOOGLE_CSE_ID or GOOGLE_API_KEY missing")
                 return []
             import requests
+
             out = []
             try:
                 for start in range(1, min(n, 10) + 1, 10):
                     r = requests.get(
                         "https://www.googleapis.com/customsearch/v1",
                         params={"q": q, "cx": cx, "key": key, "num": min(10, n), "start": start},
-                        timeout=(timeout_sec, read_timeout)
+                        timeout=(timeout_sec, read_timeout),
                     )
-
                     r.raise_for_status()
                     data = r.json()
                     for item in (data.get("items") or []):
@@ -2061,7 +2085,7 @@ class WebCorpusBlock(BaseBlock):
         urls = filtered[:max_fetch] if max_fetch > 0 else filtered
 
         # ---- Fetch pages (async) ----
-        docs_raw: List[Dict[str, str]] = []
+        docs_raw: List[Dict[str, Any]] = []
 
         async def _fetch_all():
             nonlocal docs_raw
@@ -2073,15 +2097,15 @@ class WebCorpusBlock(BaseBlock):
                 # Fallback: sync fetch if aiohttp is not available
                 meta["errors"].append("aiohttp not found, falling back to requests")
                 import requests
+
                 for u in urls:
                     # DB first
-                    if use_db_cache:
-                        db_entry = _load_from_db(u)
-                        if db_entry:
-                            db_title, db_text = db_entry
-                            if _matches_any(db_text):
-                                docs_raw.append({"title": db_title, "text": db_text, "url": u})
-                            continue
+                    db_entry = _load_from_db(u)
+                    if db_entry:
+                        db_title, db_text = db_entry
+                        if _matches_any(db_text):
+                            docs_raw.append({"title": db_title, "text": db_text, "url": u})
+                        continue
 
                     html = _load_cache(u)
                     if not html:
@@ -2095,7 +2119,7 @@ class WebCorpusBlock(BaseBlock):
                                 html = r.text
                                 _save_cache(u, html)
                         except Exception:
-                            continue
+                            html = ""
                     if not html:
                         continue
 
@@ -2129,13 +2153,12 @@ class WebCorpusBlock(BaseBlock):
                 nonlocal docs_raw
 
                 # DB first
-                if use_db_cache:
-                    db_entry = _load_from_db(u)
-                    if db_entry:
-                        db_title, db_text = db_entry
-                        if _matches_any(db_text):
-                            docs_raw.append({"title": db_title, "text": db_text, "url": u})
-                        return
+                db_entry = _load_from_db(u)
+                if db_entry:
+                    db_title, db_text = db_entry
+                    if _matches_any(db_text):
+                        docs_raw.append({"title": db_title, "text": db_text, "url": u})
+                    return
 
                 html = _load_cache(u)
                 if not html:
@@ -2143,9 +2166,9 @@ class WebCorpusBlock(BaseBlock):
                         await asyncio.sleep(pause)
                         async with sem:
                             async with session.get(
-                                    u,
-                                    headers={"User-Agent": user_agent},
-                                    timeout=timeout,
+                                u,
+                                headers={"User-Agent": user_agent},
+                                timeout=timeout,
                             ) as resp:
                                 if resp.status == 200:
                                     html_text = await resp.text()
@@ -2218,7 +2241,6 @@ class WebCorpusBlock(BaseBlock):
                 "engine": engine,
                 "query": query_raw,
             })
-            # Append to errors list in meta if it exists
             meta.setdefault("errors", []).append(f"Fetch error: {e}")
             return base, meta
 
@@ -2234,7 +2256,7 @@ class WebCorpusBlock(BaseBlock):
                 "must_terms": must_terms,
                 "sites": {"include": site_include, "exclude": site_exclude},
                 "urls_found": len(all_urls),
-                "urls_filtered": len(urls)
+                "urls_filtered": len(urls),
             })
             return base, meta
 
@@ -2267,8 +2289,94 @@ class WebCorpusBlock(BaseBlock):
         ranked = sorted(
             docs_raw,
             key=lambda d: _bm25ish_score(d["title"] + " " + d["text"]),
-            reverse=True
-        )[:max(1, top_k_docs)]
+            reverse=True,
+        )[: max(1, top_k_docs)]
+
+        # ---- optional JS + Network sniff on top URLs ----
+        sniff_links: List[Dict[str, str]] = []
+        sniff_media: List[Dict[str, str]] = []
+
+        async def _run_sniffers_on_top_urls(urls_to_sniff: List[str]):
+            nonlocal sniff_links, sniff_media
+            if not urls_to_sniff:
+                return
+            from playwright.async_api import async_playwright
+
+            self._ensure_sniffers(logger=logger)
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context()
+
+                try:
+                    for u in urls_to_sniff:
+                        log_buf: List[str] = []
+
+                        # JS sniff
+                        if use_js_sniffer and self._js_sniffer is not None:
+                            try:
+                                _, links = await self._js_sniffer.sniff(
+                                    context,
+                                    u,
+                                    timeout=sniffer_timeout,
+                                    log=log_buf,
+                                    extensions=None,
+                                )
+                                sniff_links.extend(links)
+                            except Exception as e:
+                                if logger:
+                                    logger.log_message(f"[WebCorpusBlock] JSSniffer error for {u}: {e}")
+
+                        # Network sniff
+                        if use_network_sniffer and self._net_sniffer is not None:
+                            try:
+                                _, media_items, _json_hits = await self._net_sniffer.sniff(
+                                    context,
+                                    u,
+                                    timeout=sniffer_timeout,
+                                    log=log_buf,
+                                    extensions=None,
+                                )
+                                sniff_media.extend(media_items)
+                            except Exception as e:
+                                if logger:
+                                    logger.log_message(f"[WebCorpusBlock] NetworkSniffer error for {u}: {e}")
+                finally:
+                    await context.close()
+                    await browser.close()
+
+        if (use_js_sniffer or use_network_sniffer) and ranked:
+            top_urls_for_sniff = [d.get("url") for d in ranked if d.get("url")][:max_sniffer_pages]
+
+            try:
+                loop = None
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = None
+
+                if not loop or not loop.is_running():
+                    asyncio.run(_run_sniffers_on_top_urls(top_urls_for_sniff))
+                else:
+                    exc_holder: Dict[str, BaseException] = {}
+
+                    def _sniff_runner():
+                        try:
+                            new_loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(new_loop)
+                            new_loop.run_until_complete(_run_sniffers_on_top_urls(top_urls_for_sniff))
+                        except BaseException as e:
+                            exc_holder["exc"] = e
+                        finally:
+                            new_loop.close()
+
+                    t = Thread(target=_sniff_runner, daemon=True)
+                    t.start()
+                    t.join()
+                    if "exc" in exc_holder:
+                        raise exc_holder["exc"]
+            except Exception as e:
+                meta.setdefault("errors", []).append(f"Sniffer error: {e}")
 
         # ---- sentence extraction ----
         hit_sents: List[str] = []
@@ -2323,7 +2431,7 @@ class WebCorpusBlock(BaseBlock):
         if use_phrases and context:
             phrases = re.findall(
                 r"\b([A-Za-z0-9][A-Za-z0-9_\-]+(?:\s+[A-Za-z0-9][A-Za-z0-9_\-]+){1,3})\b",
-                context
+                context,
             )
             pc: Dict[str, int] = {}
             for ph in phrases:
@@ -2335,22 +2443,18 @@ class WebCorpusBlock(BaseBlock):
             lexicon = list(dict.fromkeys(phrase_top + lexicon))[:lexicon_top_k]
 
         # ---- store lexicon + context in Memory ----
-        export_context = bool(params.get("export_context", True))
-        context_key = str(params.get("context_key", "web_context"))
-        append_ctx = bool(params.get("append_context", False))
-
         if export_lexicon and lexicon:
-            store = Memory.load()
-            store[lexicon_key] = lexicon
-            Memory.save(store)
+            store_mem = Memory.load()
+            store_mem[lexicon_key] = lexicon
+            Memory.save(store_mem)
 
         if export_context and context:
-            store = Memory.load()
-            if append_ctx and isinstance(store.get(context_key), str) and store[context_key]:
-                store[context_key] = store[context_key].rstrip() + "\n\n" + context
+            store_mem = Memory.load()
+            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
+                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
             else:
-                store[context_key] = context
-            Memory.save(store)
+                store_mem[context_key] = context
+            Memory.save(store_mem)
 
         # ---- compose output ----
         base = "" if payload is None else str(payload)
@@ -2378,6 +2482,11 @@ class WebCorpusBlock(BaseBlock):
             "site_exclude": site_exclude,
             "min_term_overlap": min_term_overlap,
             "db_path": db_path if use_db_cache else None,
+            "use_js_sniffer": use_js_sniffer,
+            "use_network_sniffer": use_network_sniffer,
+            "sniffer_timeout": sniffer_timeout,
+            "sniff_links": sniff_links,      # normalized {url,text,tag}
+            "sniff_media": sniff_media,      # normalized {url,text,tag,kind,content_type,size}
         })
         return out, meta
 
@@ -2390,6 +2499,7 @@ class WebCorpusBlock(BaseBlock):
             "num_results": 10,
             "max_fetch": 8,
             "timeout": 8.0,
+            "read_timeout": 12.0,
             "pause": 0.7,
             "max_concurrent_fetch": 4,
             "regex": None,
@@ -2408,28 +2518,41 @@ class WebCorpusBlock(BaseBlock):
             "min_term_overlap": 1,
             "db_path": "webcorpus.db",
             "use_db_cache": True,
+            "export_lexicon": True,
+            "inject_lexicon": True,
+            "inject_context": True,
+            "lexicon_top_k": 40,
+            "lexicon_min_len": 4,
+            "lexicon_phrases": True,
+            "export_context": True,
+            # Sniffer options
+            "use_js_sniffer": False,
+            "use_network_sniffer": False,
+            "sniffer_timeout": 8.0,
+            "max_sniffer_pages": 4,
         }
 
 BLOCKS.register("webcorpus", WebCorpusBlock)
 
-
-# ---------------- WebCorpus (Playwright Hybrid) ----------------
+# ================WebCorpus (Playwright Hybrid) ================
 @dataclass
 class PlaywrightBlock(BaseBlock):
     """
-    Playwright-powered corpus builder (Hybrid v7.2) with optional subpipeline:
-      • If `subpipeline` is provided, expand the raw query into multiple
-        natural queries (e.g. via PromptQuerySubBlock) and search each.
-      • If `subpipeline` is NOT provided, behave like before and use the
-        raw query as-is.
-      • [NEW] Caches and retrieves results from a persistent SQLite DB.
-      • [UPDATED] Uses async Playwright (async_playwright) under asyncio.
+    Playwright-powered corpus builder (Hybrid v8.1):
+
+      • Optional `subpipeline` to expand the raw query into multiple queries.
+      • Hybrid search via DuckDuckGo (DDGS lib + HTML fallback).
+      • Async Playwright scraping with optional:
+           - NetworkSniffer (media detection + manifests + SAFE JSON sniff)
+           - JSSniffer      (DOM/script link discovery)
+      • Text extraction via trafilatura from final HTML.
+      • Caches pages + sniff results in sqlite via DatabaseSubmanager + PlaywrightCorpusStore.
+      • BM25-ish re-ranking + sentence extraction.
+      • Lexicon/context export into Memory.
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        import os, re, json, time, sys
-        import sqlite3
-        import asyncio
+        import os, re, json, time, sys, asyncio
         from math import log
         from typing import List, Dict, Tuple, Set
         from urllib.parse import urlparse
@@ -2437,11 +2560,11 @@ class PlaywrightBlock(BaseBlock):
         from threading import Thread
 
         try:
-            # CHANGED: use async Playwright API
             import trafilatura
             from ddgs import DDGS
             from bs4 import BeautifulSoup
             import requests
+            from playwright.async_api import async_playwright
         except ImportError:
             print("[PlaywrightBlock] ERROR: Missing dependencies. Please run:", file=sys.stderr)
             print("pip install playwright trafilatura duckduckgo_search beautifulsoup4 requests", file=sys.stderr)
@@ -2453,7 +2576,6 @@ class PlaywrightBlock(BaseBlock):
 
         # ---- Optional subpipeline expansion ----
         subpipe_name = str(params.get("subpipeline", "")).strip()
-
         if subpipe_name:
             queries_to_run: Any = self.run_sub_pipeline(
                 initial_value=query_raw,
@@ -2479,7 +2601,8 @@ class PlaywrightBlock(BaseBlock):
                 "queries_run": [],
             }
 
-        query = query_raw
+        # Canonical query for BM25 / overlap
+        query = query_raw or queries_to_run[0]
 
         # ---- Params ----
         num_results = int(params.get("num_results", 15))
@@ -2488,13 +2611,22 @@ class PlaywrightBlock(BaseBlock):
         read_timeout = float(params.get("read_timeout", 12.0))
         user_agent = str(params.get(
             "user_agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
         ))
         verbose = bool(params.get("verbose", False))
 
-        # [NEW] DB Params
+        # NEW: toggle sniffers
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        use_js_sniff = bool(params.get("use_js_sniff", False))
+
+        # DB / store
         db_path = str(params.get("db_path", os.path.join(APP_DIR, "webcorpus.db")))
         use_db_cache = bool(params.get("use_db_cache", True))
+        db_config = submanagers.DatabaseConfig(path=db_path)
+        dbm = submanagers.DatabaseSubmanager(db_config)
+        store = PlaywrightCorpusStore(dbm)
+        store.ensure_schema()
 
         # Target & Learning
         default_targets = "grailed.com,hypebeast.com,vogue.com,depop.com,poshmark.com"
@@ -2521,7 +2653,6 @@ class PlaywrightBlock(BaseBlock):
         max_chars = int(params.get("max_chars", 4000))
         min_doc_chars = int(params.get("min_doc_chars", 250))
         site_exclude = [s.strip().lower() for s in str(params.get("site_exclude", "")).split(",") if s.strip()]
-
         min_term_overlap = int(params.get("min_term_overlap", 1))
 
         # lexicon export
@@ -2549,11 +2680,13 @@ class PlaywrightBlock(BaseBlock):
             "learned_sites": [],
             "newly_learned": [],
             "db_path": db_path if use_db_cache else None,
+            "sniffer_stats": {},
+            "use_network_sniff": use_network_sniff,
+            "use_js_sniff": use_js_sniff,
         }
 
         # compile regex
-        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query,
-                                                                         str) and regex_query.strip() else None
+        q_pattern = re.compile(regex_query, re.IGNORECASE) if isinstance(regex_query, str) and regex_query.strip() else None
 
         # ---- Helpers ----
         def _tokenize(t: str) -> List[str]:
@@ -2583,58 +2716,28 @@ class PlaywrightBlock(BaseBlock):
             overlap = sum(1 for t in qt if t in low)
             return overlap >= min_term_overlap
 
-        # ---- DB Helpers ----
-        def _get_db_conn():
-            conn = sqlite3.connect(db_path)
-            conn.execute("""
-                         CREATE TABLE IF NOT EXISTS corpus
-                         (
-                             url
-                             TEXT
-                             PRIMARY
-                             KEY,
-                             title
-                             TEXT,
-                             content
-                             TEXT,
-                             fetched_at
-                             DATETIME
-                             DEFAULT
-                             CURRENT_TIMESTAMP
-                         );
-                         """)
-            return conn
+        def _matches_filters(text: str) -> bool:
+            if not text or len(text) < min_doc_chars:
+                return False
+            low = text.lower()
 
-        def _save_to_db(url: str, title: str, content: str):
-            if not use_db_cache:
-                return
-            try:
-                with _get_db_conn() as conn:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO corpus (url, title, content, fetched_at) "
-                        "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                        (url, title, content)
-                    )
-            except Exception as e:
-                print(f"[PlaywrightBlock] DB save failed for {url}: {e}", file=sys.stderr)
+            for m in must_terms:
+                if m and m not in low:
+                    return False
+            for n in neg:
+                if n and re.search(rf"\b{re.escape(n)}\b", text, flags=re.IGNORECASE):
+                    return False
+            if q_pattern and not q_pattern.search(text):
+                return False
+            if not _term_overlap_ok(text):
+                return False
+            return True
 
-        def _load_from_db(url: str) -> Tuple[str, str] | None:
-            if not use_db_cache:
-                return None
-            try:
-                with _get_db_conn() as conn:
-                    cursor = conn.execute("SELECT title, content FROM corpus WHERE url = ?", (url,))
-                    row = cursor.fetchone()
-                    if row:
-                        return row[0], row[1]  # title, content
-            except Exception as e:
-                print(f"[PlaywrightBlock] DB load failed for {url}: {e}", file=sys.stderr)
-            return None
-
+        # ---- Hybrid search helper ----
         def _hybrid_search(q: str, n: int) -> List[Dict[str, str]]:
             try:
                 if verbose:
-                    print(f"[PlaywrightBlock] Searching (via DDGS library) for: {q}", file=sys.stderr)
+                    print(f"[PlaywrightBlock] Searching (DDGS) for: {q}", file=sys.stderr)
                 with DDGS() as ddgs:
                     out = []
                     for r in ddgs.text(q, max_results=n, safesearch="off"):
@@ -2647,11 +2750,10 @@ class PlaywrightBlock(BaseBlock):
                     return out
             except Exception as e:
                 if verbose:
-                    print(f"[PlaywrightBlock] DDGS library failed: {e}", file=sys.stderr)
+                    print(f"[PlaywrightBlock] DDGS failed: {e}", file=sys.stderr)
 
-            # Fallback via requests
             if verbose:
-                print(f"[PlaywrightBlock] Searching (via requests fallback) for: {q}", file=sys.stderr)
+                print(f"[PlaywrightBlock] Searching (HTML fallback) for: {q}", file=sys.stderr)
             urls = []
             try:
                 r = requests.get(
@@ -2674,31 +2776,32 @@ class PlaywrightBlock(BaseBlock):
                     return urls
             except Exception as e:
                 if verbose:
-                    print(f"[PlaywrightBlock] Requests fallback failed: {e}", file=sys.stderr)
+                    print(f"[PlaywrightBlock] HTML fallback failed: {e}", file=sys.stderr)
 
             meta["search_method"] = "failed"
             return []
 
+        # ---- 1. SEARCH (per query + targeted sites) ----
         docs_raw: List[Dict[str, str]] = []
-
         if not query:
             base = "" if payload is None else str(payload)
             return base, {"rows": 0, "note": "empty query", "engine": "playwright_hybrid"}
 
-        # --- 1. SEARCH (GENETIC LEARNING) ---
         search_links: List[Dict[str, str]] = []
         seen_urls: Set[str] = set()
-        store = Memory.load()
+        store_mem = Memory.load()
+
         sites_to_search: Set[str] = set()
         for s in target_sites.split(","):
             if s.strip():
                 sites_to_search.add(s.strip())
         if learn_new_sites:
-            learned_sites = store.get(learned_sites_key, [])
+            learned_sites = store_mem.get(learned_sites_key, [])
             if isinstance(learned_sites, list):
                 for s in learned_sites:
                     sites_to_search.add(str(s))
         meta["learned_sites"] = list(sites_to_search)
+
         junk_list: Set[str] = set()
         for s in junk_domains.split(","):
             if s.strip():
@@ -2709,8 +2812,7 @@ class PlaywrightBlock(BaseBlock):
 
         try:
             if verbose:
-                print(f"[PlaywrightBlock] Running targeted search on {len(sites_to_search)} known sites...",
-                      file=sys.stderr)
+                print(f"[PlaywrightBlock] Running targeted search on {len(sites_to_search)} known sites...", file=sys.stderr)
             for site in sites_to_search:
                 targeted_query = f"{query} site:{site}"
                 links = _hybrid_search(targeted_query, n=num_per_site)
@@ -2721,29 +2823,34 @@ class PlaywrightBlock(BaseBlock):
                         search_links.append(link)
 
             if verbose:
-                print(f"[PlaywrightBlock] Running general search for discovery...", file=sys.stderr)
-            general_links = _hybrid_search(query, n=num_general)
+                print(f"[PlaywrightBlock] Running general search for expanded queries...", file=sys.stderr)
+
             new_domain_counts: Dict[str, int] = defaultdict(int)
             discovered_links: List[Dict[str, str]] = []
-            for link in general_links:
-                url = link["url"]
-                if url in seen_urls:
-                    continue
-                domain = _clean_domain(url)
-                if not domain:
-                    continue
-                if any(domain == s or domain.endswith("." + s) for s in junk_list):
-                    continue
-                if any(domain == s or domain.endswith("." + s) for s in sites_to_search):
-                    continue
-                search_text = (link.get("title", "") + " " + url)
-                if not _term_overlap_ok(search_text):
+
+            for q in queries_to_run:
+                general_links = _hybrid_search(q, n=num_general)
+                for link in general_links:
+                    url = link["url"]
+                    if url in seen_urls:
+                        continue
+                    domain = _clean_domain(url)
+                    if not domain:
+                        continue
+                    if any(domain == s or domain.endswith("." + s) for s in junk_list):
+                        continue
+                    if any(domain == s or domain.endswith("." + s) for s in sites_to_search):
+                        continue
+
+                    search_text = (link.get("title", "") + " " + url)
+                    if not _term_overlap_ok(search_text):
+                        discovered_links.append(link)
+                        seen_urls.add(url)
+                        continue
+
+                    new_domain_counts[domain] += 1
                     discovered_links.append(link)
                     seen_urls.add(url)
-                    continue
-                new_domain_counts[domain] += 1
-                discovered_links.append(link)
-                seen_urls.add(url)
 
             newly_learned_sites: List[str] = []
             if learn_new_sites:
@@ -2753,10 +2860,10 @@ class PlaywrightBlock(BaseBlock):
                 if newly_learned_sites:
                     if verbose:
                         print(f"[PlaywrightBlock] Learning new domains: {newly_learned_sites}", file=sys.stderr)
-                    current_learned = set(store.get(learned_sites_key, []))
+                    current_learned = set(store_mem.get(learned_sites_key, []))
                     current_learned.update(newly_learned_sites)
-                    store[learned_sites_key] = list(current_learned)
-                    Memory.save(store)
+                    store_mem[learned_sites_key] = list(current_learned)
+                    Memory.save(store_mem)
                     meta["newly_learned"] = newly_learned_sites
 
             search_links.extend(discovered_links)
@@ -2766,13 +2873,13 @@ class PlaywrightBlock(BaseBlock):
             if verbose:
                 print(f"[PlaywrightBlock] Total {len(search_links)} links to scrape.", file=sys.stderr)
             if not search_links:
-                print(f"[PlaywrightBlock] ERROR: No search results for query: {query}", file=sys.stderr)
+                print(f"[PlaywrightBlock] ERROR: No search results for queries: {queries_to_run}", file=sys.stderr)
 
         except Exception as e:
             print(f"[PlaywrightBlock] FATAL ERROR during search step: {e}", file=sys.stderr)
             return str(payload), {"error": f"Search failed: {e}", **meta}
 
-        # --- 2. SCRAPE via async Playwright ---
+        # ---- 2. SCRAPE via async Playwright (+ optional sniffers) ----
         async def _run_playwright_scrape():
             nonlocal docs_raw, meta
             if not search_links:
@@ -2790,60 +2897,132 @@ class PlaywrightBlock(BaseBlock):
                     user_agent=user_agent,
                     java_script_enabled=True,
                 )
-                # set_default_timeout is sync in async_api
                 context.set_default_timeout(timeout_ms)
-                page = await context.new_page()
+
+                net_sniffer = submanagers.NetworkSniffer() if use_network_sniff else None
+                js_sniffer = submanagers.JSSniffer() if use_js_sniff else None
+
+                sniffer_stats: Dict[str, Any] = {}
 
                 for link in search_links:
                     url = link["url"]
+                    title_guess = (link.get("title") or _clean_domain(url) or "").strip()
 
-                    # Check DB first
-                    if use_db_cache:
-                        db_entry = _load_from_db(url)
-                        if db_entry:
-                            db_title, db_text = db_entry
-                            if len(db_text) >= min_doc_chars and _term_overlap_ok(db_text):
-                                if verbose:
-                                    print(f"[PlaywrightBlock] Using DB cache: {url}", file=sys.stderr)
-                                docs_raw.append({"title": db_title, "text": db_text, "url": url})
-                                meta["scraped_urls"].append(url)
+                    # ---- DB cache ----
+                    cached = store.load_page(url) if use_db_cache else None
+                    if cached:
+                        text_cached = cached.get("content") or ""
+                        if _matches_filters(text_cached):
+                            if verbose:
+                                print(f"[PlaywrightBlock] Using DB cache: {url}", file=sys.stderr)
+                            docs_raw.append({
+                                "title": cached.get("title") or title_guess,
+                                "text": text_cached,
+                                "url": url,
+                            })
+                            meta["scraped_urls"].append(url)
                             continue
 
                     try:
                         if verbose:
                             print(f"[PlaywrightBlock] Scraping: {url}", file=sys.stderr)
 
-                        await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                        await page.wait_for_timeout(1000)
-                        html = await page.content()
+                        log_list: List[str] = []
+                        html = ""
+                        js_links: List[dict] = []
+                        net_items: List[dict] = []
+                        json_hits: List[dict] = []
+
+                        # ---- Optional sniffers ----
+                        if net_sniffer:
+                            if verbose:
+                                print(f"[PlaywrightBlock]  - NetworkSniffer enabled", file=sys.stderr)
+                            html_net, net_items, json_hits = await net_sniffer.sniff(
+                                context,
+                                url,
+                                timeout=timeout_sec,
+                                log=log_list,
+                                extensions=None,
+                            )
+                        else:
+                            html_net = ""
+
+                        if js_sniffer:
+                            if verbose:
+                                print(f"[PlaywrightBlock]  - JSSniffer enabled", file=sys.stderr)
+                            html_js, js_links = await js_sniffer.sniff(
+                                context,
+                                url,
+                                timeout=timeout_sec,
+                                log=log_list,
+                                extensions=None,
+                            )
+                        else:
+                            html_js = ""
+
+                        html = html_net or html_js or ""
+
+                        # If sniffers are disabled OR did not produce HTML, do a direct Playwright fetch
+                        if not html:
+                            if verbose:
+                                print(f"[PlaywrightBlock]  - Using direct Playwright fetch for {url}", file=sys.stderr)
+                            page = await context.new_page()
+                            try:
+                                await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                                await page.wait_for_timeout(1000)
+                                html = await page.content()
+                            finally:
+                                try:
+                                    await page.close()
+                                except Exception:
+                                    pass
+
+                        if not html:
+                            if verbose:
+                                print(f"[PlaywrightBlock] No HTML captured for {url}", file=sys.stderr)
+                            continue
 
                         text = trafilatura.extract(
                             html,
                             include_comments=False,
                             include_tables=False,
                             deduplicate=True,
+                        ) or ""
+
+                        if not _matches_filters(text):
+                            if verbose:
+                                print(f"[PlaywrightBlock] Filters rejected {url}", file=sys.stderr)
+                            continue
+
+                        # Save to store
+                        store.save_page(
+                            url=url,
+                            title=title_guess,
+                            content=text,
+                            html=html,
+                            js_links=js_links,
+                            net_items=net_items,
+                            json_hits=json_hits,
                         )
 
-                        if not text or len(text) < min_doc_chars:
-                            if verbose:
-                                print(f"[PlaywrightBlock] Text too short for {url}", file=sys.stderr)
-                            continue
-
-                        if not _term_overlap_ok(text):
-                            if verbose:
-                                print(f"[PlaywrightBlock] Overlap too low for {url}", file=sys.stderr)
-                            continue
-
-                        _save_to_db(url, link["title"], text)
-
-                        docs_raw.append({"title": link["title"], "text": text, "url": url})
+                        docs_raw.append({"title": title_guess, "text": text, "url": url})
                         meta["scraped_urls"].append(url)
 
+                        if net_sniffer or js_sniffer:
+                            sniffer_stats[url] = {
+                                "media_items": len(net_items),
+                                "json_hits": len(json_hits),
+                                "js_links": len(js_links),
+                                "log_lines": len(log_list),
+                            }
+
                     except Exception as e:
-                        err_msg = f"{url}: {str(e)[:100]}"
+                        err_msg = f"{url}: {str(e)[:140]}"
                         if verbose:
                             print(f"[PlaywrightBlock] SCRAPE_ERROR: {err_msg}", file=sys.stderr)
                         meta["scrape_errors"].append(err_msg)
+
+                meta["sniffer_stats"] = sniffer_stats
 
                 if verbose:
                     print(f"[PlaywrightBlock] Closing async browser.", file=sys.stderr)
@@ -2857,11 +3036,8 @@ class PlaywrightBlock(BaseBlock):
                     loop = None
 
                 if not loop or not loop.is_running():
-                    # Simple case: no running loop in this thread
                     asyncio.run(_run_playwright_scrape())
                 else:
-                    # If we're already inside an event loop (GUI / notebook),
-                    # run the async scraping in a separate thread with its own loop.
                     exc_holder: Dict[str, BaseException] = {}
 
                     def _runner():
@@ -2884,7 +3060,7 @@ class PlaywrightBlock(BaseBlock):
             print(f"[PlaywrightBlock] FATAL ERROR during Playwright scrape: {e}", file=sys.stderr)
             return str(payload), {"error": f"Playwright execution failed: {e}", **meta}
 
-        # --- 3. Post-processing (unchanged) ---
+        # ---- 3. Post-processing (BM25 + sentence extraction + lexicon) ----
         if verbose:
             print(f"[PlaywrightBlock] Post-processing {len(docs_raw)} documents...", file=sys.stderr)
 
@@ -2999,19 +3175,19 @@ class PlaywrightBlock(BaseBlock):
             lexicon = list(dict.fromkeys(phrase_top + lexicon))[:lexicon_top_k]
 
         if export_lexicon and lexicon:
-            store = Memory.load()
-            store[lexicon_key] = lexicon
-            Memory.save(store)
+            store_mem = Memory.load()
+            store_mem[lexicon_key] = lexicon
+            Memory.save(store_mem)
             if verbose:
                 print(f"[PlaywrightBlock] Exported {len(lexicon)} terms to memory[{lexicon_key}]", file=sys.stderr)
 
         if export_context and context:
-            store = Memory.load()
-            if append_ctx and isinstance(store.get(context_key), str) and store[context_key]:
-                store[context_key] = store[context_key].rstrip() + "\n\n" + context
+            store_mem = Memory.load()
+            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
+                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
             else:
-                store[context_key] = context
-            Memory.save(store)
+                store_mem[context_key] = context
+            Memory.save(store_mem)
             if verbose:
                 print(f"[PlaywrightBlock] Exported {len(context)} chars to memory[{context_key}]", file=sys.stderr)
 
@@ -3045,11 +3221,13 @@ class PlaywrightBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "",
+            "subpipeline": "",
             "num_results": 15,
             "headless": True,
             "timeout": 15.0,
+            "read_timeout": 12.0,
             "verbose": False,
-            "target_sites": "grailed.com,hypebeast.com,vogue.com",
+            "target_sites": "grailed.com,hypebeast.com,vogue.com,depop.com,poshmark.com",
             "num_per_site": 2,
             "num_general": 10,
             "learn_new_sites": True,
@@ -3065,7 +3243,11 @@ class PlaywrightBlock(BaseBlock):
             "min_term_overlap": 1,
             "db_path": "webcorpus.db",
             "use_db_cache": True,
+            # NEW:
+            "use_network_sniff": False,
+            "use_js_sniff": False,
         }
+
 
 
 BLOCKS.register("playwright", PlaywrightBlock)
@@ -3316,7 +3498,7 @@ class TensorBlock(BaseBlock):
 BLOCKS.register("tensor", TensorBlock)
 
 
-# ---------------- Code Generation (Specialized, no-guides/no-fallbacks) ----------------
+# ================ Code Generation (Specialized, no-guides/no-fallbacks) ================
 
 @dataclass
 class CodeBlock(BaseBlock):
@@ -3522,10 +3704,14 @@ class CodeBlock(BaseBlock):
                 "error": "CodeBlock requires 'prompt' param (e.g., --extra code.prompt=...)"
             }
 
-        # -------- FULL CONTEXT SUPPORT (multi-key) --------
+        # -------- FULL CONTEXT SUPPORT (multi-key + direct context) --------
         store = Memory.load()
 
-        ctx_key = str(params.get("context_key", "web_context"))
+        # DEFAULT to "code_context" now (CodeCorpus)
+        ctx_key = str(params.get("context_key", "code_context"))
+
+        # Optional direct context override / supplement
+        direct_ctx = str(params.get("context", "")).strip()
 
         # NEW: allow merging multiple context keys, e.g.
         #   --extra code.extra_context_keys="code_search_context,other_context"
@@ -3537,6 +3723,12 @@ class CodeBlock(BaseBlock):
             )
 
         ctx_pieces: List[str] = []
+
+        # 1) Direct context (if provided) goes first
+        if direct_ctx:
+            ctx_pieces.append(direct_ctx)
+
+        # 2) Memory-based contexts
         for k in context_keys:
             v = store.get(k, "")
             if isinstance(v, str):
@@ -3609,7 +3801,13 @@ class CodeBlock(BaseBlock):
         except Exception:
             max_chars = 0
 
+        # --- Lexicon: default from Memory["code_lexicon"] unless explicitly given ---
         lexicon = params.get("lexicon", None)
+        lexicon_key = str(params.get("lexicon_key", "code_lexicon"))
+        if lexicon is None:
+            mem_lex = store.get(lexicon_key)
+            if isinstance(mem_lex, list):
+                lexicon = mem_lex
 
         try:
             gen_kwargs = params.copy()
@@ -3668,15 +3866,26 @@ class CodeBlock(BaseBlock):
             "max_input_chars": max_input_chars,
             "used_context": bool(ctx),
             "subpipeline": subpipeline_name,
+            "lexicon_key": lexicon_key,
+            "lexicon_size": len(lexicon) if isinstance(lexicon, list) else 0,
+            "used_direct_context": bool(direct_ctx),
         }
         return result, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "prompt": "REQUIRED: Write a python function...",
-            "context_key": "web_context",
-            "extra_context_keys": "",  # NEW: e.g. "code_search_context,other_key"
-            "context_chars": 0,  # 0 = full combined context
+
+            # Context handling
+            "context": "",                  # NEW: direct context blob
+            "context_key": "code_context",  # DEFAULT: code context from CodeCorpus
+            "extra_context_keys": "",       # e.g. "code_search_context,other_key"
+            "context_chars": 0,             # 0 = full combined context
+
+            # Lexicon handling
+            "lexicon": None,                # optional explicit lexicon override
+            "lexicon_key": "code_lexicon",  # DEFAULT: Memory["code_lexicon"]
+
             "model": "lexicon-adv",
             "max_input_chars": 8000,
             "wrap": True,
@@ -3699,137 +3908,41 @@ class CodeBlock(BaseBlock):
 
 BLOCKS.register("code", CodeBlock)
 
+# ================ CodeCorpus (code docs & API learner) ================
 
-# ---------------- CodeCorpus (code docs & API learner) ----------------
 @dataclass
 class CodeCorpusBlock(BaseBlock):
     """
-    Code-focused corpus builder.
+    Code-focused corpus builder (DBSubmanager + Sniffers + Lexicon edition).
+
       • Inputs: list of urls, sitemap(s), or (query + site_include) search.
       • Extracts: fenced / <pre>/<code> blocks from Markdown/HTML.
-      • Saves ONLY code snippets to a local SQLite FTS5 database (kind='code').
-      • NEW: Can use Playwright to fall back for JS-heavy sites.
-      • NEW: Remembers scraped URLs and skips them unless force_refresh=true.
-
-    Deps:
-      - requests, beautifulsoup4
-      - trafilatura (optional, preferred for HTML)
-      - duckduckgo_search (optional, for query)
-      - playwright (optional, for use_playwright_fallback=true)
-
-    Example:
-      --block codecorpus --extra codecorpus.urls="https://react.dev/learn"
-      --extra codecorpus.use_playwright_fallback=true
+      • Saves ONLY code snippets to SQLite via DatabaseSubmanager + CodeCorpusStore.
+      • Remembers scraped URLs (code_indexed_urls) and skips unless force_refresh=true.
+      • Optional Playwright fallback for JS-heavy sites:
+          - Optionally uses NetworkSniffer / JSSniffer (async) to get better HTML.
+      • NEW: Builds a code lexicon + context (like WebCorpus) and exports them to Memory.
     """
 
-    # --- DB Helpers ---
-
-    def _init_db(self, db_path: str):
-        """Initialize the FTS5 virtual table."""
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
-                url UNINDEXED,    -- Don't index the URL itself
-                title,            -- Index the title
-                content,          -- Index the main content
-                kind,             -- 'prose' or 'code'
-                tokenize = 'porter unicode61'
-            );
-            """)
-
-    # --- NEW: URL Tracking DB ---
-    def _init_url_tracking_db(self, db_path: str):
-        """
-        Initializes a separate table to track scraped URLs and times.
-        """
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("""
-                         CREATE TABLE IF NOT EXISTS indexed_urls
-                         (
-                             url
-                             TEXT
-                             PRIMARY
-                             KEY,
-                             last_scraped_time
-                             REAL
-                             NOT
-                             NULL
-                         );
-                         """)
-
-    def _get_last_scraped_time(self, conn: sqlite3.Connection, url: str) -> float:
-        """Check the DB for the last scraped time of a URL."""
-        try:
-            cur = conn.execute(
-                "SELECT last_scraped_time FROM indexed_urls WHERE url = ?", (url,)
-            )
-            row = cur.fetchone()
-            return float(row[0]) if row else 0.0
-        except sqlite3.Error as e:
-            print(f"Error checking scrape time for {url}: {e}")
-            return 0.0
-
-    # --- END NEW ---
-
-    def _clean_domain(self, u: str) -> str:
-        """Utility to get the bare domain from a URL."""
-        try:
-            netloc = urlparse(u).netloc.lower()
-            return netloc.split(":")[0]
-        except Exception:
-            return ""
-
-    def _clear_db_for_urls(self, conn: sqlite3.Connection, urls: List[str]):
-        """Clear old entries for domains we are about to re-scrape."""
-        domains = set(self._clean_domain(u) for u in urls)
-        domains.discard("")
-        if not domains:
-            return
-
-        patterns = [f"https://{d}%" for d in domains] + [f"http://{d}%" for d in domains]
-        placeholders = " OR ".join(["url LIKE ?"] * len(patterns))
-
-        try:
-            # Clear from FTS table
-            cur = conn.execute(f"DELETE FROM docs WHERE {placeholders};", patterns)
-            print(f"Cleared {cur.rowcount} old FTS entries for domains: {', '.join(domains)}")
-
-            # --- NEW: Clear from tracking table ---
-            cur_track = conn.execute(f"DELETE FROM indexed_urls WHERE {placeholders};", patterns)
-            print(f"Cleared {cur_track.rowcount} old tracking entries.")
-
-        except sqlite3.Error as e:
-            print(f"Error clearing old entries: {e}")
-
-    def _looks_like_traceback(self, code: str) -> bool:
-        c = code.lower()
-        if "traceback (most recent call last)" in c:
-            return True
-        if "error:" in c or "exception" in c:
-            # Very simple heuristic: mostly "File ..." lines, no 'def'/'class'
-            lines = [ln.strip() for ln in code.splitlines() if ln.strip()]
-            file_like = sum(ln.startswith("file \"") or ln.startswith("file \"") for ln in lines)
-            has_def = any("def " in ln or "class " in ln for ln in lines)
-            if file_like >= 2 and not has_def:
-                return True
-        return False
-
     # --- Identifier & text processing ---
+
     _STOP = set([
-        "the", "a", "an", "and", "or", "if", "on", "in", "to", "for", "from", "of", "at", "by", "with", "as", "is",
-        "are", "was", "were", "be", "been", "being", "that", "this", "these", "those", "it", "its", "into", "about",
-        "over", "under", "can", "should", "would", "will", "may", "might", "must", "do", "does", "did", "done", "have",
-        "has", "had", "having", "not", "no", "yes", "you", "your", "we", "our", "they", "their", "there", "here",
-        "also", "such", "via", "etc", "see",
-        "code", "example", "examples", "note", "notes", "true", "false", "none", "null", "class", "function", "method",
-        "module", "package", "return", "returns", "type", "types", "param", "parameter", "parameters"
+        "the", "a", "an", "and", "or", "if", "on", "in", "to", "for", "from", "of", "at", "by",
+        "with", "as", "is", "are", "was", "were", "be", "been", "being", "that", "this", "these",
+        "those", "it", "its", "into", "about", "over", "under", "can", "should", "would", "will",
+        "may", "might", "must", "do", "does", "did", "done", "have", "has", "had", "having", "not",
+        "no", "yes", "you", "your", "we", "our", "they", "their", "there", "here", "also", "such",
+        "via", "etc", "see",
+        "code", "example", "examples", "note", "notes", "true", "false", "none", "null",
+        "class", "function", "method", "module", "package", "return", "returns", "type", "types",
+        "param", "parameter", "parameters",
     ])
 
     _IDENT_RE = re.compile(
         r"""
         (?:
-          [A-Za-z_][A-Za-z0-9_]* # snake/UPPER/mixed
-          (?:\.[A-Za-z_][A-Za-z0-9_]*)* # dotted api.name
+          [A-Za-z_][A-Za-z0-9_]*           # snake/UPPER/mixed
+          (?:\.[A-Za-z_][A-Za-z0-9_]*)*    # dotted api.name
         )
         |
         (?:
@@ -3840,7 +3953,7 @@ class CodeCorpusBlock(BaseBlock):
           [a-z0-9]+(?:-[a-z0-9]+)+              # kebab-case
         )
         """,
-        re.VERBOSE
+        re.VERBOSE,
     )
 
     _FENCE_RE = re.compile(
@@ -3849,12 +3962,36 @@ class CodeCorpusBlock(BaseBlock):
         (.*?)                                     # code body (non-greedy)
         \n```[ \t]*$                              # closing fence
         """,
-        re.MULTILINE | re.DOTALL | re.VERBOSE
+        re.MULTILINE | re.DOTALL | re.VERBOSE,
     )
+
+    # ---- Heuristics ----
+
+    def _looks_like_traceback(self, code: str) -> bool:
+        c = code.lower()
+        if "traceback (most recent call last)" in c:
+            return True
+        if "error:" in c or "exception" in c:
+            lines = [ln.strip() for ln in code.splitlines() if ln.strip()]
+            file_like = sum(
+                ln.lower().startswith("file \"") or ln.lower().startswith("file '")
+                for ln in lines
+            )
+            has_def = any("def " in ln or "class " in ln for ln in lines)
+            if file_like >= 2 and not has_def:
+                return True
+        return False
+
+    def _clean_domain(self, u: str) -> str:
+        try:
+            netloc = urlparse(u).netloc.lower()
+            return netloc.split(":")[0]
+        except Exception:
+            return ""
 
     def _extract_identifiers(self, text: str, min_len: int) -> List[str]:
         ids = self._IDENT_RE.findall(text or "")
-        out = []
+        out: List[str] = []
         for s in ids:
             tok = s.strip().strip(".")
             if len(tok) < min_len:
@@ -3865,41 +4002,7 @@ class CodeCorpusBlock(BaseBlock):
             out.append(tok)
         return out
 
-    # --- fetch helpers ---
-
-    def _get_page_static(self, url: str) -> str:
-        """Fast static HTML fetch using requests."""
-        try:
-            import requests
-            r = requests.get(
-                url,
-                headers={"User-Agent": self.user_agent},
-                timeout=(self.timeout, self.read_timeout)
-            )
-            if r.status_code == 200:
-                return r.text
-        except Exception as e:
-            print(f"Static fetch failed for {url}: {e}")
-            return ""
-        return ""
-
-    def _get_page_dynamic(self, browser: "Browser", url: str) -> str:
-        """Rendered HTML fetch using an existing Playwright browser instance."""
-        page = None
-        try:
-            page = browser.new_page(
-                user_agent=self.user_agent,
-                java_script_enabled=True
-            )
-            page.goto(url, timeout=int(self.timeout * 1000), wait_until="domcontentloaded")
-            page.wait_for_timeout(500)
-            return page.content()
-        except Exception as e:
-            print(f"Playwright fetch error for {url}: {e}")
-            return ""
-        finally:
-            if page:
-                page.close()
+    # --- HTML / Markdown processing ---
 
     def _extract_text_html(self, html_text: str, has_trafilatura: bool) -> Tuple[str, List[str]]:
         """
@@ -3914,7 +4017,10 @@ class CodeCorpusBlock(BaseBlock):
             try:
                 import trafilatura
                 clean_text = trafilatura.extract(
-                    html_text, include_comments=False, include_tables=False, deduplicate=True
+                    html_text,
+                    include_comments=False,
+                    include_tables=False,
+                    deduplicate=True,
                 ) or ""
             except Exception:
                 clean_text = ""
@@ -3956,6 +4062,11 @@ class CodeCorpusBlock(BaseBlock):
     # --- main execution ---
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        import html
+        import time
+        import asyncio
+        from collections import defaultdict
+
         # ---------- Params ----------
         query = str(params.get("query", "")).strip()
         urls_raw = str(params.get("urls", "")).strip()
@@ -3990,15 +4101,35 @@ class CodeCorpusBlock(BaseBlock):
 
         db_path = str(params.get("db_path", "code_corpus.db"))
 
-        self.timeout = float(params.get("timeout", 10.0))
-        self.read_timeout = float(params.get("read_timeout", 12.0))
-        self.user_agent = str(params.get("user_agent", "promptchat/codecorpus"))
+        timeout = float(params.get("timeout", 10.0))
+        read_timeout = float(params.get("read_timeout", 12.0))
+        user_agent = str(params.get("user_agent", "promptchat/codecorpus"))
         verbose = bool(params.get("verbose", False))
 
         use_playwright_fallback = bool(params.get("use_playwright_fallback", True))
-
-        # --- NEW: Refresh Param ---
         force_refresh = bool(params.get("force_refresh", False))
+
+        # NEW: sniffers toggles (default False)
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        use_js_sniff = bool(params.get("use_js_sniff", False))
+
+        # NEW: lexicon/context options (like WebCorpus)
+        export_lexicon = bool(params.get("export_lexicon", True))
+        lexicon_key = str(params.get("lexicon_key", "code_lexicon"))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        lexicon_top_k = int(params.get("lexicon_top_k", 60))
+        lexicon_min_len = int(params.get("lexicon_min_len", 3))
+
+        export_context = bool(params.get("export_context", True))
+        context_key = str(params.get("context_key", "code_context"))
+        append_ctx = bool(params.get("append_context", False))
+        max_context_chars = int(params.get("max_context_chars", 8000))
+
+        # Save onto self for helper usage
+        self.timeout = timeout
+        self.read_timeout = read_timeout
+        self.user_agent = user_agent
 
         # --- Check dependencies ---
         try:
@@ -4007,31 +4138,50 @@ class CodeCorpusBlock(BaseBlock):
             return str(payload), {"error": "Install `requests` to use CodeCorpusBlock."}
 
         try:
-            from bs4 import BeautifulSoup
+            from bs4 import BeautifulSoup  # noqa: F401
         except Exception:
             return str(payload), {"error": "Install `beautifulsoup4` to use CodeCorpusBlock."}
 
         try:
-            import trafilatura
-            _has_traf = True
+            import trafilatura  # noqa: F401
+            has_traf = True
         except Exception:
-            _has_traf = False
+            has_traf = False
 
         try:
-            from ddgs import DDGS
-            _has_ddgs = True
+            from ddgs import DDGS  # noqa: F401
+            has_ddgs = True
         except Exception:
-            _has_ddgs = False
+            has_ddgs = False
 
+        # Playwright imports (async)
+        has_async_playwright = True
         try:
-            from playwright.sync_api import sync_playwright, Page, Browser
-            _has_playwright = True
+            from playwright.async_api import async_playwright  # noqa: F401
         except Exception:
-            _has_playwright = False
-            if use_playwright_fallback:
+            has_async_playwright = False
+            if use_playwright_fallback or use_network_sniff or use_js_sniff:
                 print(
-                    "Warning: use_playwright_fallback=true, but 'playwright' is not installed. Skipping JS rendering.")
+                    "[CodeCorpusBlock] Warning: Playwright not installed; "
+                    "disabling dynamic fallback & sniffers."
+                )
                 use_playwright_fallback = False
+                use_network_sniff = False
+                use_js_sniff = False
+
+        # Sniffers
+        if use_network_sniff:
+            try:
+                _ = submanagers.NetworkSniffer
+            except AttributeError:
+                print("[CodeCorpusBlock] NetworkSniffer not available; disabling.", flush=True)
+                use_network_sniff = False
+        if use_js_sniff:
+            try:
+                _ = submanagers.JSSniffer
+            except AttributeError:
+                print("[CodeCorpusBlock] JSSniffer not available; disabling.", flush=True)
+                use_js_sniff = False
 
         def _allowed(url: str) -> bool:
             d = self._clean_domain(url)
@@ -4043,10 +4193,27 @@ class CodeCorpusBlock(BaseBlock):
                 return False
             return True
 
-        # --- Initialize DB ---
+        def _get_page_static(url: str) -> str:
+            """Fast static HTML fetch using requests."""
+            try:
+                r = requests.get(
+                    url,
+                    headers={"User-Agent": user_agent},
+                    timeout=(timeout, read_timeout),
+                )
+                if r.status_code == 200:
+                    return r.text
+            except Exception as e:
+                if verbose:
+                    print(f"[CodeCorpusBlock] Static fetch failed for {url}: {e}")
+            return ""
+
+        # --- Initialize DB via DatabaseSubmanager + CodeCorpusStore ---
+        db_config = submanagers.DatabaseConfig(path=db_path)
+        dbm = submanagers.DatabaseSubmanager(db_config)
+        store = CodeCorpusStore(dbm)
         try:
-            self._init_db(db_path)
-            self._init_url_tracking_db(db_path)  # --- NEW ---
+            store.ensure_schema()
         except Exception as e:
             return str(payload), {"error": f"Failed to initialize database at {db_path}: {e}"}
 
@@ -4058,7 +4225,7 @@ class CodeCorpusBlock(BaseBlock):
         if sitemaps_raw:
             for sm in [s.strip() for s in sitemaps_raw.split(",") if s.strip()]:
                 try:
-                    xml = self._get_page_static(sm)
+                    xml = _get_page_static(sm)
                     if not xml:
                         continue
                     locs = re.findall(r"<loc>(.*?)</loc>", xml, re.IGNORECASE | re.DOTALL)
@@ -4069,16 +4236,17 @@ class CodeCorpusBlock(BaseBlock):
                 except Exception:
                     continue
 
-        if query and not (urls_raw or sitemaps_raw) and _has_ddgs:
+        if query and not (urls_raw or sitemaps_raw) and has_ddgs:
             from ddgs import DDGS
             with DDGS() as ddgs:
                 try:
-                    for r in ddgs.text(query, max_results=max_pages * 2, safesearch='off'):
+                    for r in ddgs.text(query, max_results=max_pages * 2, safesearch="off"):
                         u = r.get("href") or r.get("url")
                         if u and _allowed(u):
                             candidates.append(u)
                 except Exception as e:
-                    print(f"DDGS search failed: {e}")
+                    if verbose:
+                        print(f"[CodeCorpusBlock] DDGS search failed: {e}")
 
         seen = set()
         final_urls: List[str] = []
@@ -4094,85 +4262,70 @@ class CodeCorpusBlock(BaseBlock):
         if not final_urls:
             return str(payload), {"rows": 0, "note": "no matching URLs found to scrape"}
 
-        # --- NEW: Playwright Lifecycle Management ---
-        playwright_context = None
-        browser = None
-        if use_playwright_fallback and _has_playwright:
-            try:
-                from playwright.sync_api import sync_playwright
-                playwright_context = sync_playwright().start()
-                browser = playwright_context.chromium.launch(headless=True)
-            except Exception as e:
-                print(f"Failed to launch Playwright, disabling fallback: {e}")
-                use_playwright_fallback = False
-                if playwright_context:
-                    playwright_context.stop()
-                playwright_context = None
+        # --- If force_refresh: clear DB for these domains ---
+        if force_refresh:
+            domains = [self._clean_domain(u) for u in final_urls]
+            store.clear_for_domains(domains)
 
-        # --- Connect to DB and clear old entries ---
-        try:
-            conn = sqlite3.connect(db_path)
-            # --- NEW: Only clear if refreshing ---
-            if force_refresh:
-                self._clear_db_for_urls(conn, final_urls)
-            # --- END NEW ---
-        except Exception as e:
-            if browser:
-                browser.close()
-            if playwright_context:
-                playwright_context.stop()
-            return str(payload), {"error": f"DB connect/clear failed: {e}"}
-
-        # --- fetch and parse pages ---
+        # --- Stats ---
         domain_hits: Dict[str, int] = defaultdict(int)
-        total_prose = 0
         total_code = 0
-        # --- NEW: Counters ---
         total_indexed = 0
         total_updated = 0
         total_skipped = 0
         total_errors = 0
-        # --- END NEW ---
 
+        # URLs that need dynamic fallback (JS-heavy)
+        need_dynamic: List[str] = []
+
+        # Snippets collected for context/lexicon
+        snippets_for_context: List[Dict[str, str]] = []
+
+        # --- 1) STATIC PASS ---
         for u in final_urls:
             try:
-                # --- NEW: Check if URL should be skipped ---
                 current_time = time.time()
-                last_scraped_time = self._get_last_scraped_time(conn, u)
+                last_scraped_time = store.get_last_scraped_time(u)
 
                 if last_scraped_time > 0.0 and not force_refresh:
                     if verbose:
-                        print(f"Skipping (already indexed): {u}")
+                        print(f"[CodeCorpusBlock] Skipping (already indexed): {u}")
                     total_skipped += 1
                     continue
-                # --- END NEW ---
 
-                html_text = self._get_page_static(u)
+                html_text = _get_page_static(u)
                 if not html_text:
-                    total_errors += 1
+                    # If we have dynamic tools, we can retry later
+                    if use_playwright_fallback or use_network_sniff or use_js_sniff:
+                        need_dynamic.append(u)
+                    else:
+                        total_errors += 1
                     continue
 
                 if u.lower().endswith(".md") or "/raw/" in u or "raw.githubusercontent.com" in u:
                     prose_body, code_blocks = self._extract_text_md(html_text)
                 else:
-                    prose_body, code_blocks = self._extract_text_html(html_text, _has_traf)
+                    prose_body, code_blocks = self._extract_text_html(html_text, has_traf)
 
                 code_text = "\n\n".join(code_blocks).strip()
 
-                if len(code_text) < min_doc_chars and use_playwright_fallback and browser and not u.lower().endswith(
-                        ".md"):
+                # If static fetch got too little code and we have dynamic fallback, defer
+                if len(code_text) < min_doc_chars and (
+                    use_playwright_fallback or use_network_sniff or use_js_sniff
+                ) and not u.lower().endswith(".md"):
                     if verbose:
-                        print(f"Static scrape for {u} got {len(code_text)} code chars, retrying with Playwright...")
-                    html_text_js = self._get_page_dynamic(browser, u)
-                    if html_text_js:
-                        html_text = html_text_js  # Use JS html for title
-                        prose_body, code_blocks = self._extract_text_html(html_text, _has_traf)
-                        code_text = "\n\n".join(code_blocks).strip()
-
-                if len(code_text) < min_doc_chars:
-                    total_skipped += 1  # Skip if still not enough content
+                        print(
+                            f"[CodeCorpusBlock] Static scrape for {u} "
+                            f"got only {len(code_text)} code chars; deferring to dynamic."
+                        )
+                    need_dynamic.append(u)
                     continue
 
+                if len(code_text) < min_doc_chars:
+                    total_skipped += 1
+                    continue
+
+                # Extract title
                 title = self._clean_domain(u)
                 try:
                     if "<title" in html_text.lower():
@@ -4183,7 +4336,6 @@ class CodeCorpusBlock(BaseBlock):
                 except Exception:
                     pass
 
-                # --- Insert ONLY code snippets into DB ---
                 url_had_code = False
                 for code in code_blocks:
                     code = (code or "").strip()
@@ -4192,60 +4344,275 @@ class CodeCorpusBlock(BaseBlock):
                     if self._looks_like_traceback(code):
                         continue
 
-                    conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
-                        (u, title, code, "code")
-                    )
+                    store.upsert_snippet(u, title, code, kind="code")
                     total_code += 1
                     url_had_code = True
+                    snippets_for_context.append({"url": u, "title": title, "code": code})
 
-                # --- NEW: Update tracking DB only if we found content ---
                 if url_had_code:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_urls (url, last_scraped_time) VALUES (?, ?)",
-                        (u, current_time)
-                    )
+                    store.mark_scraped(u, current_time)
+                    domain_hits[self._clean_domain(u)] += 1
                     if last_scraped_time == 0.0:
                         total_indexed += 1
                     else:
                         total_updated += 1
-                # --- END NEW ---
-
-                domain_hits[self._clean_domain(u)] += 1
+                else:
+                    total_skipped += 1
 
             except Exception as e:
                 total_errors += 1
                 if verbose:
-                    print(f"Error processing {u}: {e}")
+                    print(f"[CodeCorpusBlock] Error processing (static) {u}: {e}")
 
-        # --- Close Playwright ---
-        if browser: browser.close()
-        if playwright_context: playwright_context.stop()
+        # --- 2) DYNAMIC PASS (Playwright + optional sniffers) ---
+        async def _run_dynamic():
+            if not need_dynamic:
+                return
 
-        # --- Commit DB ---
-        try:
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
+            from playwright.async_api import async_playwright
+
+            # Lazy sniffers
+            net_sniffer = None
+            js_sniffer = None
+
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                context = await browser.new_context(
+                    user_agent=user_agent,
+                    java_script_enabled=True,
+                )
+
+                if use_network_sniff:
+                    try:
+                        net_sniffer = submanagers.NetworkSniffer()
+                    except Exception:
+                        net_sniffer = None
+                if use_js_sniff:
+                    try:
+                        js_sniffer = submanagers.JSSniffer()
+                    except Exception:
+                        js_sniffer = None
+
+                for u in need_dynamic:
+                    nonlocal total_code, total_indexed, total_updated, total_skipped, total_errors
+
+                    try:
+                        current_time = time.time()
+                        last_scraped_time = store.get_last_scraped_time(u)
+                        if last_scraped_time > 0.0 and not force_refresh:
+                            if verbose:
+                                print(f"[CodeCorpusBlock] (dynamic) skipping already indexed: {u}")
+                            total_skipped += 1
+                            continue
+
+                        html_text = ""
+                        log_list: List[str] = []
+                        js_links: List[dict] = []
+                        net_items: List[dict] = []
+                        json_hits: List[dict] = []
+
+                        # Prefer sniffers if enabled
+                        if net_sniffer:
+                            if verbose:
+                                print(f"[CodeCorpusBlock] NetworkSniffer for {u}", flush=True)
+                            html_net, net_items, json_hits = await net_sniffer.sniff(
+                                context,
+                                u,
+                                timeout=timeout,
+                                log=log_list,
+                                extensions=None,
+                            )
+                        else:
+                            html_net = ""
+
+                        if js_sniffer:
+                            if verbose:
+                                print(f"[CodeCorpusBlock] JSSniffer for {u}", flush=True)
+                            html_js, js_links = await js_sniffer.sniff(
+                                context,
+                                u,
+                                timeout=timeout,
+                                log=log_list,
+                                extensions=None,
+                            )
+                        else:
+                            html_js = ""
+
+                        html_text = html_net or html_js or ""
+
+                        # Fallback: direct Playwright page content.
+                        if not html_text and (use_playwright_fallback or not (net_sniffer or js_sniffer)):
+                            page = await context.new_page()
+                            try:
+                                await page.goto(u, timeout=int(timeout * 1000), wait_until="domcontentloaded")
+                                await page.wait_for_timeout(500)
+                                html_text = await page.content()
+                            finally:
+                                try:
+                                    await page.close()
+                                except Exception:
+                                    pass
+
+                        if not html_text:
+                            total_skipped += 1
+                            continue
+
+                        if u.lower().endswith(".md") or "/raw/" in u or "raw.githubusercontent.com" in u:
+                            prose_body, code_blocks = self._extract_text_md(html_text)
+                        else:
+                            prose_body, code_blocks = self._extract_text_html(html_text, has_traf)
+
+                        code_text = "\n\n".join(code_blocks).strip()
+                        if len(code_text) < min_doc_chars:
+                            total_skipped += 1
+                            continue
+
+                        title = self._clean_domain(u)
+                        try:
+                            if "<title" in html_text.lower():
+                                from bs4 import BeautifulSoup
+                                soup = BeautifulSoup(html_text, "html.parser")
+                                if soup.title and soup.title.string:
+                                    title = " ".join(soup.title.string.strip().split())
+                        except Exception:
+                            pass
+
+                        url_had_code = False
+                        for code in code_blocks:
+                            code = (code or "").strip()
+                            if len(code) < 20:
+                                continue
+                            if self._looks_like_traceback(code):
+                                continue
+                            store.upsert_snippet(u, title, code, kind="code")
+                            total_code += 1
+                            url_had_code = True
+                            snippets_for_context.append({"url": u, "title": title, "code": code})
+
+                        if url_had_code:
+                            store.mark_scraped(u, current_time)
+                            domain_hits[self._clean_domain(u)] += 1
+                            if last_scraped_time == 0.0:
+                                total_indexed += 1
+                            else:
+                                total_updated += 1
+                        else:
+                            total_skipped += 1
+
+                    except Exception as e:
+                        total_errors += 1
+                        if verbose:
+                            print(f"[CodeCorpusBlock] Error processing (dynamic) {u}: {e}", flush=True)
+
+                await browser.close()
+
+        # Run dynamic phase if needed
+        if need_dynamic and (use_playwright_fallback or use_network_sniff or use_js_sniff) and has_async_playwright:
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            if not loop or not loop.is_running():
+                asyncio.run(_run_dynamic())
+            else:
+                exc_holder: Dict[str, BaseException] = {}
+
+                def _runner():
+                    try:
+                        new_loop = asyncio.new_event_loop()
+                        asyncio.set_event_loop(new_loop)
+                        new_loop.run_until_complete(_run_dynamic())
+                    except BaseException as e:
+                        exc_holder["exc"] = e
+                    finally:
+                        new_loop.close()
+
+                t = threading.Thread(target=_runner, daemon=True)
+                t.start()
+                t.join()
+                if "exc" in exc_holder:
+                    if verbose:
+                        print(f"[CodeCorpusBlock] Dynamic phase error: {exc_holder['exc']}")
+                    total_errors += 1
 
         # --- Learn new domains ---
         newly_learned: List[str] = []
         if learn_new_sites:
-            store = Memory.load()
-            learned = set(store.get(learned_sites_key, []))
+            store_mem = Memory.load()
+            learned = set(store_mem.get(learned_sites_key, []))
             for dom, c in domain_hits.items():
-                if not dom: continue
+                if not dom:
+                    continue
                 if c >= learn_min_hits and dom not in learned and _allowed(f"https://{dom}/"):
                     learned.add(dom)
                     newly_learned.append(dom)
             if newly_learned:
-                store[learned_sites_key] = sorted(list(learned))
-                Memory.save(store)
+                store_mem[learned_sites_key] = sorted(list(learned))
+                Memory.save(store_mem)
+
+        # --- Build code context & lexicon (like WebCorpus) ---
+        # Context: concatenate snippets with headers
+        context_chunks: List[str] = []
+        total_ctx_chars = 0
+        for sn in snippets_for_context:
+            title = sn.get("title") or self._clean_domain(sn.get("url", ""))
+            url = sn.get("url", "")
+            code = sn.get("code", "").strip()
+            if not code:
+                continue
+            header = f"# {title} — {url}".strip()
+            block = f"{header}\n{code}"
+            block_len = len(block)
+            if max_context_chars > 0 and total_ctx_chars + block_len > max_context_chars:
+                break
+            context_chunks.append(block)
+            total_ctx_chars += block_len + 2
+
+        context = "\n\n".join(context_chunks).strip()
+
+        # Lexicon: from identifiers in all snippets
+        all_code_concat = "\n\n".join(sn["code"] for sn in snippets_for_context if sn.get("code"))
+        lexicon: List[str] = []
+        if all_code_concat:
+            ids = self._extract_identifiers(all_code_concat, min_len=lexicon_min_len)
+            counts: Dict[str, int] = {}
+            for tok in ids:
+                key = tok.strip()
+                if not key:
+                    continue
+                counts[key] = counts.get(key, 0) + 1
+            # sort by freq desc, then name
+            lexicon = [
+                t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            ][:lexicon_top_k]
+
+        # --- store lexicon + context in Memory ---
+        if export_lexicon and lexicon:
+            store_mem = Memory.load()
+            store_mem[lexicon_key] = lexicon
+            Memory.save(store_mem)
+
+        if export_context and context:
+            store_mem = Memory.load()
+            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
+                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
+            else:
+                store_mem[context_key] = context
+            Memory.save(store_mem)
 
         # --- Compose output ---
         base = "" if payload is None else str(payload)
-        # --- NEW: Updated report ---
+        parts: List[str] = [base] if base else []
+
+        if inject_lexicon and lexicon:
+            parts.append("[lexicon]\n" + ", ".join(lexicon))
+        if inject_context and context:
+            parts.append("[context]\n" + context)
+
         out_msg = (
             f"Web corpus scan complete. Processed {len(final_urls)} URLs.\n"
             f"  - New Snippets Indexed: {total_indexed}\n"
@@ -4254,11 +4621,13 @@ class CodeCorpusBlock(BaseBlock):
             f"  - Total Snippets Added: {total_code}\n"
             f"  - Errors:               {total_errors}"
         )
+        parts.append("[corpus_update]\n" + out_msg)
+
+        out = "\n\n".join(parts).strip()
 
         meta = {
             "db_path": db_path,
             "urls_scraped": len(final_urls),
-            "total_prose_snippets": 0,  # This block only indexes code
             "total_code_snippets": total_code,
             "files_indexed": total_indexed,
             "files_updated": total_updated,
@@ -4268,8 +4637,15 @@ class CodeCorpusBlock(BaseBlock):
             "site_exclude": site_exclude,
             "learned_sites_key": learned_sites_key if learn_new_sites else None,
             "newly_learned": newly_learned,
+            "need_dynamic": need_dynamic,
+            "use_network_sniff": use_network_sniff,
+            "use_js_sniff": use_js_sniff,
+            "lexicon_key": lexicon_key if (export_lexicon and lexicon) else None,
+            "lexicon_size": len(lexicon),
+            "context_key": context_key if (export_context and context) else None,
+            "context_len": len(context),
         }
-        return f"{base}\n\n[corpus_update]\n{out_msg}", meta
+        return out, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -4286,13 +4662,26 @@ class CodeCorpusBlock(BaseBlock):
             "timeout": 10.0,
             "read_timeout": 12.0,
             "use_playwright_fallback": True,
-            "force_refresh": False  # <-- NEW PARAM
+            "force_refresh": False,
+            # sniffers:
+            "use_network_sniff": False,
+            "use_js_sniff": False,
+            # lexicon/context (like WebCorpus, but code-specific):
+            "export_lexicon": True,
+            "inject_lexicon": True,
+            "inject_context": True,
+            "lexicon_key": "code_lexicon",
+            "context_key": "code_context",
+            "append_context": False,
+            "lexicon_top_k": 60,
+            "lexicon_min_len": 3,
+            "export_context": True,
+            "max_context_chars": 8000,
         }
 
 
 # Register the block
 BLOCKS.register("codecorpus", CodeCorpusBlock)
-
 
 @dataclass
 class CodeSearchBlock(BaseBlock):
@@ -4587,7 +4976,7 @@ class CodeSearchBlock(BaseBlock):
 BLOCKS.register("codesearch", CodeSearchBlock)
 
 
-# ---------------- LocalCodeCorpus (scans local files) ----------------
+# ================ LocalCodeCorpus (scans local files) ================
 @dataclass
 class LocalCodeCorpusBlock(BaseBlock):
     """
@@ -5427,7 +5816,7 @@ class NasaBlock(BaseBlock):
 BLOCKS.register("nasa", NasaBlock)
 
 
-# ---------------- Intelligence (Code vs. Prose) ----------------
+# ================ Intelligence (Code vs. Prose) =====================================
 @dataclass
 class IntelligenceBlock(BaseBlock):
     """
@@ -6642,8 +7031,55 @@ class LinkTrackerBlock(BaseBlock):
     # Main execution (Async)
     # ------------------------------------------------------------------ #
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # --------- Natural ChatBlock-style parsing of context / lexicon ---------
+        text = str(payload or "")
+
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        # Last [context] block
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        # Last [lexicon] block (up to the next [tag)
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        # Core text = everything before the blocks
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
         subpipeline = params.get("subpipeline", None)
+
+        # --------- Extract URL seeds from context + lexicon (if present) ---------
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]   # sanity cap
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            # If it looks like a URL, treat it as URL seed; otherwise as a keyword term
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
 
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options") or {}
@@ -6677,7 +7113,17 @@ class LinkTrackerBlock(BaseBlock):
                 pipeline_urls = list(subpipe_out.get("urls") or [])
             else:
                 pipeline_result = subpipe_out
+        # Naturally merge URL seeds from [context] and [lexicon] into pipeline URLs
+        extra_seed_urls: List[str] = []
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
 
+        if extra_seed_urls:
+            if not pipeline_urls:
+                pipeline_urls = []
+            pipeline_urls.extend(extra_seed_urls)
         # ------------------- Config --------------------- #
         mode = str(params.get("mode", "docs")).lower()
         scan_limit = int(params.get("scan_limit", 5))
@@ -6773,7 +7219,11 @@ class LinkTrackerBlock(BaseBlock):
                 for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
                     if qt not in keywords:
                         keywords.append(qt)
-
+        # Add non-URL lexicon terms as natural keyword seasoning
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
         # -------------------- Helpers ------------------- #
         def _clean_domain(u: str) -> str:
             try:
@@ -7121,8 +7571,16 @@ class LinkTrackerBlock(BaseBlock):
                         seen_search_urls.add(u)
 
             elif engine not in ("database", "sites"):
-                print(f"[search] unknown engine={engine!r}; no search performed")
-
+                urls_from_search, queries_run, search_log = await self.search_mgr.run_searches(
+                    queries=queries_to_run,
+                    engine=("google_api" if engine == "google_cse" else engine),
+                    mode=mode,
+                    required_sites=required_sites,
+                    max_results=search_results_cap,
+                    search_results_cap=search_results_cap,
+                    search_page_limit=search_page_limit,
+                    search_per_page=search_per_page,
+                )
         # ---------------- Crawl state ------------------ #
         found_assets: List[Dict[str, Any]] = []
         seen_asset_urls: set[str] = set()
@@ -9130,6 +9588,50 @@ class VideoLinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
 
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+
+        text = str(payload or "")
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        # Last [context] block
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        # Last [lexicon] block (up to the next [tag)
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        # Core text = everything before the blocks
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+        # --------- Extract URL seeds from context + lexicon (if present) ---------
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]   # sanity cap
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            # If it looks like a URL, treat it as URL seed; otherwise as a keyword term
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
         subpipeline = params.get("subpipeline", None)
         log: List[str] = []
@@ -9232,6 +9734,11 @@ class VideoLinkTrackerBlock(BaseBlock):
         keywords: List[str] = self._get_keywords_from_query(query_raw)
         if not keywords and query_raw:
             keywords = [query_raw.lower()]
+        # Add non-URL lexicon terms as natural keyword seasoning
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
 
         # Subpipeline
         pipeline_result: Any = query_raw
@@ -9251,6 +9758,18 @@ class VideoLinkTrackerBlock(BaseBlock):
                 pipeline_urls = list(subpipe_out.get("urls") or [])
             else:
                 pipeline_result = subpipe_out
+
+        # Naturally merge URL seeds from [context] and [lexicon] into pipeline URLs
+        extra_seed_urls: List[str] = []
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
+
+        if extra_seed_urls:
+            if not pipeline_urls:
+                pipeline_urls = []
+            pipeline_urls.extend(extra_seed_urls)
 
         # Triage initial URLs
         candidate_pages: List[str] = []

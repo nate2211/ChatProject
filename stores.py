@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import collections
 import random
+import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Callable
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Callable, ClassVar
 from urllib.parse import urlparse
 
 from submanagers import DatabaseSubmanager
@@ -16,6 +17,153 @@ class BaseStore:
     Thin base class for typed stores.
     """
     db: DatabaseSubmanager
+
+# ======================================================================
+# CorpusStore  (place with your other Stores, e.g. in submanagers.py)
+# ======================================================================
+
+class CorpusStore(BaseStore):
+    """
+    Store for CorpusBlock.
+
+    Owns schema + all Corpus/FTS-specific queries.
+    """
+
+    CORPUS_DDL = """
+    CREATE TABLE IF NOT EXISTS corpus_docs
+    (
+        id INTEGER PRIMARY KEY,
+        title   TEXT NOT NULL,
+        content TEXT NOT NULL,
+        config  TEXT NOT NULL,       -- '20231101.en', 'wiki_api', etc.
+        fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(title, config)
+    );
+    """
+
+    FTS_DDL = """
+    CREATE VIRTUAL TABLE IF NOT EXISTS corpus_fts USING fts5(
+        content='corpus_docs',        -- Link to main table
+        content_rowid='id',           -- Link to rowid
+        tokenize='porter unicode61',
+        title,
+        content
+    );
+    """
+
+    TRIGGERS_DDL = [
+        # AFTER INSERT → add row to FTS
+        """
+        CREATE TRIGGER IF NOT EXISTS corpus_docs_ai
+        AFTER INSERT ON corpus_docs
+        BEGIN
+            INSERT INTO corpus_fts(rowid, title, content)
+            VALUES (new.id, new.title, new.content);
+        END;
+        """,
+        # AFTER DELETE → delete from FTS
+        """
+        CREATE TRIGGER IF NOT EXISTS corpus_docs_ad
+        AFTER DELETE ON corpus_docs
+        BEGIN
+            INSERT INTO corpus_fts(corpus_fts, rowid, title, content)
+            VALUES ('delete', old.id, old.title, old.content);
+        END;
+        """,
+        # AFTER UPDATE → delete old + insert new into FTS
+        """
+        CREATE TRIGGER IF NOT EXISTS corpus_docs_au
+        AFTER UPDATE ON corpus_docs
+        BEGIN
+            INSERT INTO corpus_fts(corpus_fts, rowid, title, content)
+            VALUES ('delete', old.id, old.title, old.content);
+            INSERT INTO corpus_fts(rowid, title, content)
+            VALUES (new.id, new.title, new.content);
+        END;
+        """,
+    ]
+
+    def ensure_schema(self) -> None:
+        """
+        Install corpus_docs + FTS + triggers (idempotent).
+        """
+        self.db.ensure_schema([self.CORPUS_DDL, self.FTS_DDL, *self.TRIGGERS_DDL])
+
+    # -------------------- Writes -------------------- #
+    def save_many(self, docs: list[dict[str, str]], config_key: str) -> None:
+        """
+        Bulk insert docs; ignores duplicates by (title, config).
+        """
+        if not docs:
+            return
+        rows = []
+        for d in docs:
+            title = (d.get("title") or "").strip()
+            text = (d.get("text") or "").strip()
+            if not title or not text:
+                continue
+            rows.append((title, text, config_key))
+
+        if not rows:
+            return
+
+        try:
+            self.db.executemany(
+                """
+                INSERT OR IGNORE INTO corpus_docs (title, content, config)
+                VALUES (?, ?, ?)
+                """,
+                rows,
+            )
+        except Exception as e:
+            # Keep failures non-fatal
+            print(f"[CorpusStore] save_many failed: {e}")
+
+    # -------------------- Reads -------------------- #
+    def search_fts(
+        self,
+        query: str,
+        config_key: str,
+        fetch_limit: int,
+    ) -> list[dict[str, str]]:
+        """
+        FTS lookup by query for a given config (or 'wiki_api'),
+        returning up to fetch_limit docs as {title, text}.
+        """
+        import re
+
+        if not query:
+            return []
+
+        # Very simple sanitization → remove weird operators that might break MATCH
+        fts_query = " ".join(re.findall(r"[A-Za-z0-9]+", query))
+        if not fts_query:
+            return []
+
+        try:
+            rows = self.db.fetchall(
+                """
+                SELECT T.title, T.content
+                FROM corpus_docs AS T
+                JOIN corpus_fts AS F ON T.id = F.rowid
+                WHERE F.corpus_fts MATCH ?
+                  AND (T.config = ? OR T.config = 'wiki_api')
+                LIMIT ?
+                """,
+                (fts_query, config_key, int(fetch_limit)),
+            )
+        except Exception as e:
+            print(f"[CorpusStore] search_fts failed: {e}")
+            return []
+
+        out: list[dict[str, str]] = []
+        for r in rows:
+            out.append({"title": r["title"], "text": r["content"]})
+        return out
+
+# ======================================================================
+# LinkTrackerStore  (place with your other Stores, e.g. in submanagers.py)
+# ======================================================================
 
 
 class LinkTrackerStore(BaseStore):
@@ -275,6 +423,9 @@ class LinkTrackerStore(BaseStore):
             (url,),
         )
 
+# ======================================================================
+# VideoTrackerStore  (place with your other Stores, e.g. in submanagers.py)
+# ======================================================================
 
 
 class VideoTrackerStore(BaseStore):
@@ -764,3 +915,365 @@ class VideoTrackerStore(BaseStore):
                 break
 
         return list(dict.fromkeys(out))
+
+
+# ======================================================================
+# WebCorpusStore  (place with your other Stores, e.g. in submanagers.py)
+# ======================================================================
+
+@dataclass
+class WebPageRecord:
+    url: str
+    domain: str
+    title: str
+    content: str
+    engine: str
+    query: str
+    fetched_at: str | None = None
+
+
+class WebCorpusStore:
+    """
+    Persistent cache of fetched web pages.
+
+    Responsibilities:
+      • Own the schema for web corpus pages.
+      • Provide URL-based load/save helpers.
+      • Optionally expose recent pages (by engine/query) later if needed.
+    """
+
+    def __init__(self, db: "DatabaseSubmanager"):
+        self.db = db
+        self._schema_ready = False
+
+    # ---------------- schema ---------------- #
+
+    def ensure_schema(self) -> None:
+        if self._schema_ready:
+            return
+
+        ddl = [
+            """
+            CREATE TABLE IF NOT EXISTS web_pages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                url        TEXT UNIQUE,
+                domain     TEXT,
+                title      TEXT,
+                content    TEXT,
+                engine     TEXT,
+                query      TEXT,
+                fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_web_pages_domain
+                ON web_pages (domain);
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_web_pages_engine_query
+                ON web_pages (engine, query);
+            """,
+        ]
+        self.db.ensure_schema(ddl)
+        self._schema_ready = True
+
+    # ---------------- helpers ---------------- #
+
+    def _row_to_record(self, row: sqlite3.Row | None) -> WebPageRecord | None:
+        if row is None:
+            return None
+        return WebPageRecord(
+            url=row["url"],
+            domain=row["domain"],
+            title=row["title"],
+            content=row["content"],
+            engine=row["engine"],
+            query=row["query"],
+            fetched_at=row["fetched_at"],
+        )
+
+    def get_page(self, url: str) -> WebPageRecord | None:
+        sql = """
+        SELECT url, domain, title, content, engine, query, fetched_at
+        FROM web_pages
+        WHERE url = ?
+        """
+        row = self.db.fetchone(sql, (url,))
+        return self._row_to_record(row)
+
+    def save_page(
+        self,
+        *,
+        url: str,
+        title: str,
+        content: str,
+        engine: str,
+        query: str,
+    ) -> None:
+        from urllib.parse import urlparse
+
+        domain = ""
+        try:
+            domain = (urlparse(url).netloc or "").split(":")[0].lower()
+        except Exception:
+            pass
+
+        sql = """
+        INSERT OR REPLACE INTO web_pages
+            (url, domain, title, content, engine, query, fetched_at)
+        VALUES
+            (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        """
+        self.db.execute(sql, (url, domain, title, content, engine, query))
+
+# ======================================================================
+# PlaywrightCorpusStore
+# ======================================================================
+
+@dataclass
+class PlaywrightCorpusStore:
+    """
+    Store for PlaywrightBlock:
+      - Caches per-URL text/html + sniffed assets/links.
+      - All DB access goes through DatabaseSubmanager.
+    """
+
+    db: DatabaseSubmanager
+    logger: Any = None
+
+    # Main table: one row per URL
+    DDL: ClassVar[list[str]] = [
+        """
+        CREATE TABLE IF NOT EXISTS playwright_pages (
+            url             TEXT PRIMARY KEY,
+            title           TEXT,
+            content         TEXT,
+            html            TEXT,
+            js_links_json   TEXT,
+            net_items_json  TEXT,
+            json_hits_json  TEXT,
+            fetched_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    ]
+
+    def _log(self, msg: str) -> None:
+        try:
+            if self.logger is not None:
+                self.logger.log_message(f"[PlaywrightCorpusStore] {msg}")
+            else:
+                print(f"[PlaywrightCorpusStore] {msg}")
+        except Exception:
+            pass
+
+    def ensure_schema(self) -> None:
+        self.db.ensure_schema(self.DDL)
+
+    def load_page(self, url: str) -> Optional[dict]:
+        row = self.db.fetchone(
+            "SELECT url, title, content, html, js_links_json, net_items_json, json_hits_json, fetched_at "
+            "FROM playwright_pages WHERE url = ?",
+            [url],
+        )
+        if not row:
+            return None
+
+        import json
+
+        def _maybe_json(x: str | None):
+            if not x:
+                return []
+            try:
+                return json.loads(x)
+            except Exception:
+                return []
+
+        return {
+            "url": row["url"],
+            "title": row["title"] or "",
+            "content": row["content"] or "",
+            "html": row["html"] or "",
+            "js_links": _maybe_json(row["js_links_json"]),
+            "net_items": _maybe_json(row["net_items_json"]),
+            "json_hits": _maybe_json(row["json_hits_json"]),
+            "fetched_at": row["fetched_at"],
+        }
+
+    def save_page(
+        self,
+        url: str,
+        title: str,
+        content: str,
+        html: str,
+        *,
+        js_links: Optional[list[dict]] = None,
+        net_items: Optional[list[dict]] = None,
+        json_hits: Optional[list[dict]] = None,
+    ) -> None:
+        import json
+
+        js_links_json = json.dumps(js_links or [], ensure_ascii=False)
+        net_items_json = json.dumps(net_items or [], ensure_ascii=False)
+        json_hits_json = json.dumps(json_hits or [], ensure_ascii=False)
+
+        self.db.execute(
+            """
+            INSERT OR REPLACE INTO playwright_pages
+            (url, title, content, html, js_links_json, net_items_json, json_hits_json, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            [url, title, content, html, js_links_json, net_items_json, json_hits_json],
+        )
+
+# ======================================================================
+# CodeCorpusStore
+# ======================================================================
+
+@dataclass
+class CodeCorpusStore:
+    """
+    Store for code snippets + URL tracking, backed by DatabaseSubmanager.
+
+    Tables:
+      • code_docs
+          id, url, title, content, kind, created_at, updated_at
+      • code_indexed_urls
+          url, last_scraped_time
+    """
+
+    dbm: DatabaseSubmanager
+    logger: Any = None
+
+    # ---------- logging helper ----------
+
+    def log(self, msg: str) -> None:
+        if self.logger:
+            try:
+                self.logger.log_message(f"[CodeCorpusStore] {msg}")
+                return
+            except Exception:
+                pass
+        print(f"[CodeCorpusStore] {msg}")
+
+    # ---------- schema management ----------
+
+    def ensure_schema(self) -> None:
+        """
+        Ensure all tables/indexes exist, using DatabaseSubmanager.ensure_schema().
+        """
+        ddl_statements: Sequence[str] = [
+            # Core table for snippets
+            """
+            CREATE TABLE IF NOT EXISTS code_docs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'code',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            """,
+            # Unique constraint to avoid duplicate snippets per URL/content
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_code_docs_url_content
+            ON code_docs (url, content);
+            """,
+            # Tracking table for scraping times
+            """
+            CREATE TABLE IF NOT EXISTS code_indexed_urls (
+                url TEXT PRIMARY KEY,
+                last_scraped_time REAL NOT NULL
+            );
+            """,
+        ]
+        self.dbm.ensure_schema(ddl_statements)
+
+    # ---------- URL tracking helpers ----------
+
+    def get_last_scraped_time(self, url: str) -> float:
+        """
+        Return last_scraped_time for URL, or 0.0 if not present.
+        """
+        ts = self.dbm.scalar(
+            "SELECT last_scraped_time FROM code_indexed_urls WHERE url = ?",
+            (url,),
+        )
+        if ts is None:
+            return 0.0
+        try:
+            return float(ts)
+        except Exception:
+            return 0.0
+
+    def mark_scraped(self, url: str, ts: float) -> None:
+        """
+        Upsert last_scraped_time for a URL.
+        """
+        self.dbm.execute(
+            """
+            INSERT OR REPLACE INTO code_indexed_urls (url, last_scraped_time)
+            VALUES (?, ?);
+            """,
+            (url, ts),
+        )
+
+    def clear_for_domains(self, domains: List[str]) -> None:
+        """
+        Clears all docs + tracking rows for given domains.
+        """
+        clean = [d for d in {d.strip().lower() for d in domains} if d]
+        if not clean:
+            return
+
+        patterns: List[str] = []
+        for d in clean:
+            patterns.append(f"https://{d}%")
+            patterns.append(f"http://{d}%")
+
+        if not patterns:
+            return
+
+        placeholders = " OR ".join(["url LIKE ?"] * len(patterns))
+
+        # Delete from docs
+        self.dbm.execute(
+            f"DELETE FROM code_docs WHERE {placeholders};",
+            tuple(patterns),
+        )
+
+        # Delete from tracking table
+        self.dbm.execute(
+            f"DELETE FROM code_indexed_urls WHERE {placeholders};",
+            tuple(patterns),
+        )
+
+        self.log(f"Cleared docs + tracking for domains: {', '.join(clean)}")
+
+    # ---------- snippet CRUD ----------
+
+    def upsert_snippet(self, url: str, title: str, content: str, kind: str = "code") -> None:
+        """
+        Insert or update a code snippet for (url, content).
+
+        Preserves original created_at if the row already exists,
+        and bumps updated_at on each upsert.
+        """
+        self.dbm.execute(
+            """
+            INSERT OR REPLACE INTO code_docs (id, url, title, content, kind, created_at, updated_at)
+            VALUES (
+                COALESCE(
+                    (SELECT id FROM code_docs WHERE url = ? AND content = ?),
+                    NULL
+                ),
+                ?, ?, ?, ?,
+                COALESCE(
+                    (SELECT created_at FROM code_docs WHERE url = ? AND content = ?),
+                    CURRENT_TIMESTAMP
+                ),
+                CURRENT_TIMESTAMP
+            );
+            """,
+            (url, content, url, title, content, kind, url, content),
+        )
