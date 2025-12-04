@@ -21,7 +21,6 @@ datas = [
     ('submanagers.py', '.'),
     ('stores.py', '.'),
     ('loggers.py', '.'),
-
     (cert_path, 'certifi'),
 ]
 
@@ -67,6 +66,15 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('trafilatura')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+# --- Bundle browserforge, language_tags, camoufox data ---
+
+bf_datas, bf_binaries, bf_hidden = collect_all("browserforge")
+lt_datas, lt_binaries, lt_hidden = collect_all("language_tags")
+cf_datas, cf_binaries, cf_hidden = collect_all("camoufox")
+
+datas += bf_datas + lt_datas + cf_datas
+binaries += bf_binaries + lt_binaries + cf_binaries
+hiddenimports += bf_hidden + lt_hidden + cf_hidden
 
 a = Analysis(
     ['gui.py'],

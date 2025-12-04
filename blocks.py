@@ -7159,6 +7159,8 @@ class LinkTrackerBlock(BaseBlock):
         http_verify_tls = bool(params.get("http_verify_tls", True))
         http_ca_bundle = params.get("http_ca_bundle", None)
 
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+
         # PW blocking params
         block_resources = bool(params.get("block_resources", False))
         blocked_resource_types = {
@@ -8003,22 +8005,41 @@ class LinkTrackerBlock(BaseBlock):
                 for s, bucket in site_buckets.items():
                     frontier.extend(bucket[:per_site_cap])
 
-            frontier = frontier[:max_pages_total]
+            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
             current_depth = 0
 
-            while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
-                remaining_slots = max_pages_total - len(visited_pages)
+            # New: only log the rescan notice once
+            logged_rescan_notice = False
+
+            while (
+                    frontier
+                    and current_depth <= max_depth
+                    and len(visited_pages) < max_pages_total
+            ):
+                remaining_page_slots = max_pages_total - len(visited_pages)
 
                 batch: List[str] = []
                 for u in frontier:
-                    if len(batch) >= remaining_slots:
+                    if len(batch) >= remaining_page_slots:
                         break
                     if u in visited_pages:
                         continue
-                    if use_database and store and store.page_scanned(u):
-                        visited_pages.add(u)
-                        log.append(f"Skipping page {u} (already scanned in database)")
-                        continue
+
+                    # Respect DB "page_scanned" flag unless we explicitly allow rescan
+                    if use_database and self.store and self.store.page_scanned(u):
+                        # Normal behavior: skip already-scanned pages
+                        if not (db_allow_rescan and params.get("source", "database") == "database"):
+                            visited_pages.add(u)
+                            continue
+
+                        # Rescan mode: process them again, but log once
+                        if not logged_rescan_notice:
+                            log.append(
+                                "[LinkTracker][db] Rescan enabled: "
+                                "processing previously scanned pages from database."
+                            )
+                            logged_rescan_notice = True
+
                     batch.append(u)
 
                 if not batch:
@@ -8318,6 +8339,7 @@ class LinkTrackerBlock(BaseBlock):
             "blocked_domains": "",
             "db_seed_limit": 250,
             "db_seed_max_age_days": None,
+            "db_allow_rescan": False,
             # HTTPSSubmanager-specific params:
             "http_retries": 2,
             "http_max_conn_per_host": 8,
@@ -9698,7 +9720,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         db_expand_ladder_depth = int(params.get("db_expand_ladder_depth", 2))
         db_domain_cap = int(params.get("db_domain_cap", 80))
         extract_urls_from_db_text = bool(params.get("extract_urls_from_db_text", True))
-
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
         # HTTPSSubmanager tuning
         http_retries = int(params.get("http_retries", 2))
         http_max_conn = int(params.get("http_max_conn_per_host", 8))
@@ -10589,7 +10611,11 @@ class VideoLinkTrackerBlock(BaseBlock):
             frontier = list(dict.fromkeys(frontier))[:max_pages_total]
             current_depth = 0
 
-            while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total and len(final_found_assets_by_content_id) < max_assets:
+            # (you can define this just above the while loop)
+            logged_rescan_notice = False
+
+            while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total and len(
+                    final_found_assets_by_content_id) < max_assets:
                 remaining_page_slots = max_pages_total - len(visited_pages)
 
                 batch: List[str] = []
@@ -10598,9 +10624,21 @@ class VideoLinkTrackerBlock(BaseBlock):
                         break
                     if u in visited_pages:
                         continue
+
+                    # Respect DB "page_scanned" flag unless we explicitly allow rescan
                     if use_database and self.store and self.store.page_scanned(u):
-                        visited_pages.add(u)
-                        continue
+                        # Normal behavior: skip already-scanned pages
+                        if not (db_allow_rescan and source == "database"):
+                            visited_pages.add(u)
+                            continue
+                        # Rescan mode: process them again, but log once
+                        if not logged_rescan_notice:
+                            log.append(
+                                "[VideoLinkTracker][db] Rescan enabled: "
+                                "processing previously scanned pages from database."
+                            )
+                            logged_rescan_notice = True
+
                     batch.append(u)
 
                 if not batch:
@@ -10792,6 +10830,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "db_expand_max_per_seed": 4,
             "db_expand_ladder_depth": 2,
             "db_domain_cap": 80,
+            "db_allow_rescan": False,
 
             "extract_urls_from_db_text": True,
 
