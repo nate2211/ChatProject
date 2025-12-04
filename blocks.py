@@ -8480,6 +8480,7 @@ class LinkTrackerBlock(BaseBlock):
             "http_ca_bundle": "",   # path to bundled cacert.pem if needed
             "use_camoufox": False,
             "camoufox_options": {},
+                        "searxng_url": "http://127.0.0.1:8080"
         }
 
 
