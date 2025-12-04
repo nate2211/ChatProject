@@ -6398,6 +6398,7 @@ class LinkTrackerBlock(BaseBlock):
     MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
     MEGA_QUERY_MARKERS = ("mega.nz",)  # fallback
 
+
     def __post_init__(self):
         # Store/submanager are initialized per-run when use_database=True
         self.db: Optional[submanagers.DatabaseSubmanager] = None
@@ -6450,6 +6451,123 @@ class LinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
     # Search engines (unchanged)
     # ------------------------------------------------------------------ #
+
+    async def _search_searxng(
+            self,
+            q: str,
+            max_results: int,
+            timeout: float,
+            base_url: Optional[str] = None,
+            page_limit: int = 1,
+    ) -> List[str]:
+        """
+        Query a SearXNG instance and return a list of result URLs.
+
+        - Uses ?format=json
+        - Respects max_results and page_limit
+        - base_url can be passed via params['searxng_url'] or SEARXNG_URL env var.
+        """
+        import os, json
+
+        # Where is SearXNG?
+        base_url = (
+                base_url
+                or os.environ.get("SEARXNG_URL")
+                or "http://127.0.0.1:8080"
+        ).rstrip("/")
+
+        search_url = base_url + "/search"
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(page_limit):
+                    if len(out) >= max_results:
+                        break
+
+                    # SearXNG pagination: 'pageno' is 1-based
+                    params = {
+                        "q": q,
+                        "format": "json",
+                        "pageno": str(page_idx + 1),
+                    }
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                                search_url,
+                                params=params,
+                                timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            # Classic misconfig case: JSON disabled -> 403 HTML
+                            if status == 403:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][SearXNG][debug] HTTP 403 "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            if status != 200:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][SearXNG][debug] HTTP {status} "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                print(f"[LinkTracker][SearXNG] JSON decode error: {e}")
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][SearXNG][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            results = data.get("results") or []
+                            if not results:
+                                # No more pages.
+                                break
+
+                            for item in results:
+                                u = item.get("url")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_results:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        print(f"[LinkTracker][SearXNG] AIOHTTP error: {e}")
+                        if not did_dump_debug and text:
+                            preview = text[:1500].replace("\n", " ")
+                            print(
+                                f"[LinkTracker][SearXNG][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            print(f"[LinkTracker][SearXNG] General error: {e}")
+
+        return out[:max_results]
     async def _search_duckduckgo(
         self,
         q: str,
@@ -7572,18 +7690,32 @@ class LinkTrackerBlock(BaseBlock):
                             continue
                         candidate_pages.append(u)
                         seen_search_urls.add(u)
+            # -------- Engine: searxng -------- #
+            elif engine == "searxng":
+                searxng_url = params.get("searxng_url") or None
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_searxng(
+                            sq,
+                            max_results=search_results_cap,
+                            timeout=timeout,
+                            base_url=searxng_url,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        print(f"[search][searxng] error for {sq!r}: {e}")
+                        urls = []
 
-            elif engine not in ("database", "sites"):
-                urls_from_search, queries_run, search_log = await self.search_mgr.run_searches(
-                    queries=queries_to_run,
-                    engine=("google_api" if engine == "google_cse" else engine),
-                    mode=mode,
-                    required_sites=required_sites,
-                    max_results=search_results_cap,
-                    search_results_cap=search_results_cap,
-                    search_page_limit=search_page_limit,
-                    search_per_page=search_per_page,
-                )
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
         # ---------------- Crawl state ------------------ #
         found_assets: List[Dict[str, Any]] = []
         seen_asset_urls: set[str] = set()
@@ -9586,7 +9718,139 @@ class VideoLinkTrackerBlock(BaseBlock):
             log.append(f"[VideoLinkTracker][GoogleCSE] General error: {e}")
 
         return out
+    async def _search_searxng(
+            self,
+            q: str,
+            max_results: int,
+            timeout: float,
+            log: List[str],
+            base_url: str,
+            page_limit: int = 1,
+    ) -> List[str]:
+        """
+        SearXNG JSON search.
 
+        This assumes you run your own SearXNG instance so you don't care
+        about bot walls from upstream engines.
+
+        base_url example:
+          http://127.0.0.1:8080
+          https://searxng.yourdomain.tld
+
+        You can configure it via:
+          - params["searxng_url"]
+          - or env var SEARXNG_URL
+        """
+        import json
+        import aiohttp
+        from aiohttp import ClientTimeout
+        from urllib.parse import urljoin
+
+        q = (q or "").strip()
+        if not q:
+            log.append("[VideoLinkTracker][SearXNG] Empty query, skipping search.")
+            return []
+
+        base_url = (base_url or "").strip().rstrip("/")
+        if not base_url:
+            log.append("[VideoLinkTracker][SearXNG] Missing base_url (set searxng_url or SEARXNG_URL).")
+            return []
+
+        search_url = base_url + "/search"
+
+        max_results = max(1, min(int(max_results), 300))
+        page_limit = max(1, min(int(page_limit), 10))
+
+        out: List[str] = []
+        seen: set[str] = set()
+        did_dump_debug = False
+
+        try:
+            timeout_obj = ClientTimeout(total=timeout)
+            async with aiohttp.ClientSession(timeout=timeout_obj) as session:
+                for page_idx in range(page_limit):
+                    if len(out) >= max_results:
+                        break
+
+                    pageno = page_idx + 1
+                    params = {
+                        "q": q,
+                        "format": "json",
+                        "language": "en",
+                        "safesearch": 0,
+                        "pageno": pageno,
+                        # you can tune categories in your SearXNG instance;
+                        # leaving it generic here:
+                        "categories": "general",
+                    }
+
+                    text = ""
+                    status = None
+                    try:
+                        async with session.get(search_url, params=params) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            if status != 200:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(
+                                        f"[VideoLinkTracker][SearXNG][debug] HTTP {status} "
+                                        f"query={q!r} pageno={pageno}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                log.append(f"[VideoLinkTracker][SearXNG] JSON decode error: {e}")
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    log.append(
+                                        f"[VideoLinkTracker][SearXNG][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            results = data.get("results") or []
+                            if not results:
+                                log.append(
+                                    f"[VideoLinkTracker][SearXNG] No items for query={q!r}, "
+                                    f"pageno={pageno}. Stopping pagination."
+                                )
+                                break
+
+                            found_new = False
+                            for item in results:
+                                u = item.get("url")
+                                if not u:
+                                    continue
+                                if u in seen:
+                                    continue
+                                seen.add(u)
+                                out.append(u)
+                                found_new = True
+                                if len(out) >= max_results:
+                                    break
+
+                            if not found_new:
+                                break
+
+                    except aiohttp.ClientError as e:
+                        log.append(f"[VideoLinkTracker][SearXNG] AIOHTTP error: {e}")
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            log.append(
+                                f"[VideoLinkTracker][SearXNG][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][SearXNG] General error: {e}")
+
+        return out[:max_results]
     def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
         generated = set()
         re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
@@ -9760,6 +10024,10 @@ class VideoLinkTrackerBlock(BaseBlock):
         source = str(params.get("source", "search")).lower()
         engine = str(params.get("engine", "duckduckgo")).lower()
 
+        searxng_url = str(
+            params.get("searxng_url")
+            or "http://127.0.0.1:8080"
+        ).strip()
         if source == "database" and not use_database:
             use_database = True
             log.append("[VideoLinkTracker][db] source=database forces use_database=True.")
@@ -10133,6 +10401,32 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if _allowed_by_required_sites_check(u):
                             candidate_pages.append(u)
                             seen_search_urls.add(u)
+            elif engine == "searxng":
+                if not searxng_url:
+                    log.append(
+                        "[VideoLinkTracker][SearXNG] engine='searxng' but no searxng_url or SEARXNG_URL configured."
+                    )
+                else:
+                    for qv in queries_to_run:
+                        sq = _augment_search_query(qv, required_sites)
+                        log.append(f"Searching SearXNG at {searxng_url} for: {sq}")
+                        urls = await self._search_searxng(
+                            sq,
+                            max_results=search_results_cap,
+                            timeout=timeout,
+                            log=log,
+                            base_url=searxng_url,
+                            page_limit=search_page_limit,
+                        )
+                        for u in urls:
+                            if len(candidate_pages) >= max_pages_total:
+                                break
+                            if not u:
+                                continue
+                            if _allowed_by_required_sites_check(u):
+                                if u not in seen_search_urls:
+                                    candidate_pages.append(u)
+                                    seen_search_urls.add(u)
             else:
                 if engine not in ("sites",):
                     log.append(f"[search] Unknown engine={engine!r}; no search performed.")
@@ -11005,6 +11299,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "download_dir": "video_cache",       # NEW: base dir to stash files
             "max_download_bytes": 300 * 1024**2, # NEW: 300 MB per asset safety cap
             "skip_if_no_content_length": True,   # NEW: avoid unknown-size downloads
+            "searxng_url": "http://127.0.0.1:8080",
         }
 
 
