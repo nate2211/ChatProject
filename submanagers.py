@@ -79,7 +79,6 @@ def _canonicalize_url(u: str) -> str:
 # NetworkSniffer
 # ======================================================================
 
-
 class NetworkSniffer:
     """
     Advanced Playwright network sniffer for VIDEO + AUDIO + IMAGES.
@@ -766,7 +765,6 @@ class NetworkSniffer:
 
         return html, merged_items, json_hits
 
-
 # ======================================================================
 # JSSniffer
 # ======================================================================
@@ -1365,6 +1363,553 @@ class JSSniffer:
         except Exception as e:
             self._log(f"Failed to close page: {e}", log)
         return html, links
+
+# ======================================================================
+# RuntimeSniffer
+# ======================================================================
+
+class RuntimeSniffer:
+    """
+    Extra-channel sniffing that complements NetworkSniffer + JSSniffer.
+
+    Covers:
+      - WebSockets (URLs + small frames with URL/manifest hints).
+      - Request body JSON (GraphQL / player POSTs) via page.route.
+      - Performance entries (resource timing with URL / proto).
+      - localStorage / sessionStorage keys with URL-ish values.
+      - Media events (play/pause/timeupdate) and src changes.
+      - MediaSource / blob: instrumentation (createObjectURL, addSourceBuffer).
+      - Console logs that mention manifests / streams.
+
+    Output schema (similar to json_hits):
+      hit = {
+        "url": <string>,          # WS URL, page URL, etc.
+        "json": <dict>,           # structured payload
+        "source_page": <string>,  # canonical_page_url
+      }
+    """
+
+    @dataclass
+    class Config:
+        timeout: float = 8.0
+
+        # --- feature toggles ---
+        enable_websocket_sniff: bool = True
+        enable_request_body_sniff: bool = True
+        enable_perf_sniff: bool = True
+        enable_storage_sniff: bool = True
+        enable_media_events_sniff: bool = True
+        enable_mediasource_sniff: bool = True
+        enable_console_sniff: bool = True
+
+        # --- WebSocket limits ---
+        max_ws_frames: int = 50
+        max_ws_frame_bytes: int = 4096
+
+        # --- Request body limits ---
+        json_body_max_kb: int = 256
+        json_body_url_hints: Set[str] = field(default_factory=lambda: {
+            "player", "api", "manifest", "playlist", "video", "audio"
+        })
+
+        # --- Storage limits ---
+        storage_value_max_bytes: int = 8192
+
+        # --- Perf sniff ---
+        perf_url_regex: str = r"\.(m3u8|mpd|ts|mp4|webm)(\?|$)"
+
+        # --- Media events ---
+        auto_play_media: bool = True
+        media_event_timeout_ms: int = 4000
+
+        # --- Console sniff ---
+        console_keywords: Set[str] = field(default_factory=lambda: {
+            "manifest", "m3u8", "mpd", "hls", "dash", "stream"
+        })
+
+        # How Playwright waits in page.goto
+        goto_wait_until: str = "domcontentloaded"
+
+    def __init__(self, config: Optional["RuntimeSniffer.Config"] = None, logger=None):
+        self.cfg = config or self.Config()
+        self.logger = logger or DEBUG_LOGGER
+        self._log("RuntimeSniffer Initialized", None)
+
+    # ------------------------------ logging ------------------------------ #
+
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        full = f"[RuntimeSniffer] {msg}"
+        try:
+            if log_list is not None:
+                log_list.append(full)
+            if self.logger is not None:
+                self.logger.log_message(full)
+        except Exception:
+            pass
+
+    # ------------------------- helpers ------------------------- #
+
+    def _should_sniff_request_json(
+        self,
+        url_lower: str,
+        ctype: str,
+        content_length: Optional[int],
+    ) -> bool:
+        ct = (ctype or "").lower()
+        if "json" not in ct:
+            return False
+
+        if not any(h in url_lower for h in self.cfg.json_body_url_hints):
+            return False
+
+        if content_length is None:
+            return False
+
+        max_bytes = int(self.cfg.json_body_max_kb) * 1024
+        if content_length > max_bytes:
+            return False
+
+        return True
+
+    # ------------------------- attach hooks ------------------------- #
+
+    def _attach_console_sniffer(
+        self,
+        page: "Page",
+        runtime_hits: List[Dict[str, Any]],
+        canonical_page_url: str,
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_console_sniff:
+            return
+
+        def on_console(msg):
+            try:
+                text = msg.text()
+                low = text.lower()
+                if any(kw in low for kw in self.cfg.console_keywords):
+                    runtime_hits.append({
+                        "url": canonical_page_url,
+                        "json": {"console": text},
+                        "source_page": canonical_page_url,
+                    })
+                    self._log(f"Console hit: {text[:200]!r}", log)
+            except Exception:
+                pass
+
+        page.on("console", on_console)
+
+    def _attach_websocket_sniffer(
+        self,
+        page: "Page",
+        runtime_hits: List[Dict[str, Any]],
+        canonical_page_url: str,
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_websocket_sniff:
+            return
+
+        max_frames = int(self.cfg.max_ws_frames)
+        max_bytes = int(self.cfg.max_ws_frame_bytes)
+
+        def on_ws(ws):
+            url = getattr(ws, "url", "?")
+            self._log(f"WebSocket opened: {url}", log)
+            frames_seen = 0
+
+            async def handle_frame(data):
+                nonlocal frames_seen
+                if frames_seen >= max_frames:
+                    return
+                frames_seen += 1
+                try:
+                    if isinstance(data, bytes):
+                        if len(data) > max_bytes:
+                            return
+                        try:
+                            data = data.decode("utf-8", "ignore")
+                        except Exception:
+                            return
+                    text = str(data)
+                    low = text.lower()
+
+                    # crude but safe: look for URLs / manifests
+                    if ("http://" in low or "https://" in low or
+                        ".m3u8" in low or ".mpd" in low):
+                        runtime_hits.append({
+                            "url": url,
+                            "json": {
+                                "ws_frame": text[:max_bytes],
+                                "reason": "websocket-sniff",
+                            },
+                            "source_page": canonical_page_url,
+                        })
+                        self._log(
+                            f"WS frame hit from {url}: {text[:120]!r}",
+                            log,
+                        )
+                except Exception as e:
+                    self._log(f"WebSocket frame error: {e}", log)
+
+            ws.on("framereceived", lambda msg: asyncio.create_task(handle_frame(msg)))
+
+        page.on("websocket", on_ws)
+
+    async def _attach_request_body_sniffer(
+        self,
+        page: "Page",
+        runtime_hits: List[Dict[str, Any]],
+        canonical_page_url: str,
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_request_body_sniff:
+            return
+
+        async def route_handler(route, request):
+            try:
+                url = request.url
+                url_lower = url.lower()
+                headers = request.headers
+                ctype = headers.get("content-type", "")
+                cl = headers.get("content-length", "")
+                content_length: Optional[int] = None
+                if cl and cl.isdigit():
+                    try:
+                        content_length = int(cl)
+                    except Exception:
+                        content_length = None
+
+                if self._should_sniff_request_json(url_lower, ctype, content_length):
+                    body = request.post_data()
+                    if body:
+                        try:
+                            if isinstance(body, bytes):
+                                body = body.decode("utf-8", "ignore")
+                            data = json.loads(body)
+                            runtime_hits.append({
+                                "url": url,
+                                "json": {"request_body": data},
+                                "source_page": canonical_page_url,
+                            })
+                            self._log(f"Request JSON hit at {url}", log)
+                        except Exception as e:
+                            self._log(f"Failed to parse request JSON at {url}: {e}", log)
+            except Exception as e:
+                self._log(f"route_handler error: {e}", log)
+            await route.continue_()
+
+        await page.route("**/*", route_handler)
+
+    async def _inject_mediasource_script(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_mediasource_sniff:
+            return
+
+        try:
+            await context.add_init_script("""
+            (() => {
+              const origCreateObjectURL = URL.createObjectURL;
+              const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+              const mediaLog = [];
+
+              function logMedia(event, payload) {
+                try {
+                  window.__networkMediaEvents = window.__networkMediaEvents || [];
+                  window.__networkMediaEvents.push(Object.assign({event, ts: Date.now()}, payload));
+                } catch {}
+              }
+
+              URL.createObjectURL = function(obj) {
+                const url = origCreateObjectURL.call(this, obj);
+                if (obj instanceof MediaSource) {
+                  logMedia('createObjectURL', { url, mediaSourceType: 'MediaSource' });
+                }
+                return url;
+              };
+
+              MediaSource.prototype.addSourceBuffer = function(mime) {
+                logMedia('addSourceBuffer', { mime });
+                return origAddSourceBuffer.call(this, mime);
+              };
+
+              const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+              if (desc && desc.set) {
+                const origSet = desc.set;
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                  set(value) {
+                    logMedia('setMediaSrc', {
+                      tagName: this.tagName.toLowerCase(),
+                      src: String(value || "")
+                    });
+                    return origSet.call(this, value);
+                  }
+                });
+              }
+            })();
+            """)
+            self._log("Injected MediaSource instrumentation script.", log)
+        except Exception as e:
+            self._log(f"Failed to inject MediaSource script: {e}", log)
+
+    async def _inject_media_events_script(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_media_events_sniff:
+            return
+
+        try:
+            auto_play = bool(self.cfg.auto_play_media)
+            timeout_ms = int(self.cfg.media_event_timeout_ms)
+
+            await page.evaluate(
+                """
+                (args) => {
+                  const { autoPlay } = args;
+                  window.__mediaEvents = [];
+
+                  function log(ev, el) {
+                    try {
+                      window.__mediaEvents.push({
+                        event: ev.type,
+                        currentTime: el.currentTime,
+                        duration: el.duration,
+                        src: el.currentSrc || el.src || null,
+                        muted: el.muted,
+                        tag: el.tagName.toLowerCase(),
+                        ts: Date.now()
+                      });
+                    } catch {}
+                  }
+
+                  const media = Array.from(document.querySelectorAll("video, audio"));
+                  for (const el of media) {
+                    ["play","pause","ended","timeupdate","error"].forEach(evt => {
+                      el.addEventListener(evt, e => log(e, el));
+                    });
+                    if (autoPlay) {
+                      try {
+                        el.muted = true;
+                        el.play().catch(() => {});
+                      } catch {}
+                    }
+                  }
+                }
+                """,
+                {"autoPlay": auto_play}
+            )
+
+            # Wait a bit to let events fire
+            if timeout_ms > 0:
+                await page.wait_for_timeout(timeout_ms)
+
+            media_events = await page.evaluate("() => window.__mediaEvents || []") or []
+            if media_events:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"media_events": media_events},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Captured {len(media_events)} media events.", log)
+        except Exception as e:
+            self._log(f"Media events sniff error: {e}", log)
+
+    async def _collect_perf_entries(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_perf_sniff:
+            return
+
+        try:
+            regex_str = self.cfg.perf_url_regex
+            perf_resources = await page.evaluate(
+                """
+                (rxStr) => {
+                  let rx;
+                  try { rx = new RegExp(rxStr, "i"); }
+                  catch { return []; }
+                  const out = [];
+                  const entries = performance.getEntriesByType("resource") || [];
+                  for (const e of entries) {
+                    if (e && e.name && rx.test(e.name)) {
+                      out.push({
+                        name: e.name,
+                        type: e.initiatorType || null,
+                        proto: e.nextHopProtocol || null,
+                        startTime: e.startTime || null,
+                        duration: e.duration || null
+                      });
+                    }
+                  }
+                  return out;
+                }
+                """,
+                regex_str
+            ) or []
+
+            if perf_resources:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"perf_entries": perf_resources},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Perf entries hit: {len(perf_resources)}", log)
+        except Exception as e:
+            self._log(f"Perf sniff error: {e}", log)
+
+    async def _collect_storage(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_storage_sniff:
+            return
+
+        try:
+            max_bytes = int(self.cfg.storage_value_max_bytes)
+            storage_hits = await page.evaluate(
+                """
+                (maxBytes) => {
+                  const out = [];
+                  function scan(kind, store) {
+                    try {
+                      const len = store.length || 0;
+                      for (let i = 0; i < len; i++) {
+                        const key = store.key(i);
+                        const val = store.getItem(key) || "";
+                        if (!val) continue;
+                        if (val.length > maxBytes) continue;
+                        if (/(https?:\\/\\/|\\.m3u8|\\.mpd)/i.test(val)) {
+                          out.push({ kind, key, value: val });
+                        }
+                      }
+                    } catch {}
+                  }
+                  try { scan("localStorage", window.localStorage); } catch {}
+                  try { scan("sessionStorage", window.sessionStorage); } catch {}
+                  return out;
+                }
+                """,
+                max_bytes
+            ) or []
+
+            if storage_hits:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"storage": storage_hits},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Storage hits: {len(storage_hits)}", log)
+        except Exception as e:
+            self._log(f"Storage sniff error: {e}", log)
+
+    # ------------------------- main sniff ------------------------- #
+
+    async def sniff(
+        self,
+        context: "BrowserContext",
+        page_url: str,
+        *,
+        timeout: Optional[float] = None,
+        log: Optional[List[str]] = None,
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+
+        if context is None:
+            self._log("No Playwright context; skipping runtime sniff.", log)
+            return "", []
+        if Page is None:
+            self._log("Playwright classes not found; skipping runtime sniff.", log)
+            return "", []
+
+        tmo = float(timeout if timeout is not None else self.cfg.timeout)
+        canonical_page_url = _canonicalize_url(page_url)
+        runtime_hits: List[Dict[str, Any]] = []
+
+        # Some hooks must be injected at context level
+        await self._inject_mediasource_script(context, log)
+
+        page: Page = await context.new_page()
+        html: str = ""
+        wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
+        goto_timeout_ms = max(15000, int(tmo * 1000))
+
+        # Attach page-level hooks BEFORE navigation
+        self._attach_console_sniffer(page, runtime_hits, canonical_page_url, log)
+        self._attach_websocket_sniffer(page, runtime_hits, canonical_page_url, log)
+        await self._attach_request_body_sniffer(page, runtime_hits, canonical_page_url, log)
+
+        self._log(f"Start runtime sniff: {canonical_page_url} timeout={tmo}s", log)
+
+        try:
+            try:
+                await page.goto(
+                    canonical_page_url,
+                    wait_until=wait_mode,
+                    timeout=goto_timeout_ms,
+                )
+            except Exception as e:
+                self._log(
+                    f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}",
+                    log,
+                )
+
+            # Let page settle a bit
+            await page.wait_for_timeout(int(tmo * 1000 * 0.2))
+
+            # Media events (may auto-play)
+            await self._inject_media_events_script(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
+            # Perf entries
+            await self._collect_perf_entries(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
+            # Storage
+            await self._collect_storage(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"Failed to get page content: {e}", log)
+                html = ""
+
+        except Exception as e:
+            self._log(f"Unexpected error during runtime sniff: {e}", log)
+        finally:
+            try:
+                try:
+                    await asyncio.wait_for(page.close(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    self._log("page.close() timed out; ignoring.", log)
+            except Exception as e:
+                self._log(f"Failed to close page: {e}", log)
+
+        self._log(
+            f"Finished runtime sniff for {canonical_page_url}: hits={len(runtime_hits)}",
+            log,
+        )
+        return html, runtime_hits
 
 # ======================================================================
 # Database

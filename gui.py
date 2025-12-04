@@ -227,6 +227,12 @@ def save_presets_to_disk() -> None:
 
 # ======================= WORKER THREAD ===================================
 
+# Safety caps to keep GUI from blowing RAM
+MAX_FINAL_PAYLOAD_CHARS   = 200_000   # ~200 KB of final text
+MAX_BLOCK_SNIPPET_CHARS   = 80_000    # per-block snippet in RUN LOG
+MAX_RUN_LOG_TOTAL_CHARS   = 800_000   # total joined RUN LOG size
+
+
 class Worker(QObject):
     finished = pyqtSignal(bool, str, dict)
     status_update = pyqtSignal(str)
@@ -276,9 +282,6 @@ class Worker(QObject):
                 pipe_extras.setdefault("code.model", self.model_name)
 
             # NEW: model-specific params via "modelname.param" extras section
-            # Example:
-            #   hf-llm.max_new_tokens=512
-            #   hf-llm.temperature=0.4
             model_key = (self.model_name or "").strip().lower()
             model_params: Dict[str, Any] = {}
 
@@ -304,7 +307,7 @@ class Worker(QObject):
             combined_meta: Dict[str, Any] = {"runs": []}
 
             root_payload = self.prompt
-            current_payload = self.prompt
+            current_payload = self.prompt or ""
 
             for idx, block_name in enumerate(self.blocks_sel, 1):
                 if self.stop_event.is_set():
@@ -330,6 +333,7 @@ class Worker(QObject):
                 try:
                     result, meta = blk.execute(payload_to_use, params=params)
 
+                    # --------- Update current_payload (with clamp) ---------
                     if payload_source == "root":
                         if result.startswith(root_payload):
                             additive_result = result[len(root_payload):].strip()
@@ -340,11 +344,27 @@ class Worker(QObject):
                     else:
                         current_payload = result
 
+                    if len(current_payload) > MAX_FINAL_PAYLOAD_CHARS:
+                        # keep the tail; prepend a note
+                        current_payload = (
+                            "[… output truncated for GUI; see logs/file for full text …]\n\n"
+                            + current_payload[-MAX_FINAL_PAYLOAD_CHARS:]
+                        )
+
+                    # --------- Per-block log snippet (with clamp) ----------
+                    snippet = result or ""
+                    if len(snippet) > MAX_BLOCK_SNIPPET_CHARS:
+                        snippet = (
+                            snippet[:MAX_BLOCK_SNIPPET_CHARS]
+                            + "\n\n[… block output truncated …]"
+                        )
+
                     results_md.append(
-                        f"\n\n# ── {block_name} ─────────────────────────────────────\n{result}"
+                        f"\n\n# ── {block_name} ─────────────────────────────────────\n{snippet}"
                     )
+                    # Store preview instead of full result to save memory
                     results_json.append(
-                        {"block": block_name, "metadata": meta, "result": result}
+                        {"block": block_name, "metadata": meta, "result_preview": snippet}
                     )
                     combined_meta["runs"].append({"block": block_name, "metadata": meta})
 
@@ -352,25 +372,53 @@ class Worker(QObject):
                     import traceback
                     tb = traceback.format_exc()
                     err_blob = f"[{block_name}] ERROR: {e}\n{tb}"
+
+                    # Clamp error blob too, just in case
+                    if len(err_blob) > MAX_BLOCK_SNIPPET_CHARS:
+                        err_blob = (
+                            err_blob[:MAX_BLOCK_SNIPPET_CHARS]
+                            + "\n\n[… error log truncated …]"
+                        )
+
                     results_md.append(
                         f"\n\n# ── {block_name} (ERROR) ───────────────────────────\n{err_blob}"
                     )
                     results_json.append(
-                        {"block": block_name, "error": str(e), "traceback": tb}
+                        {"block": block_name, "error": str(e), "traceback_preview": err_blob}
                     )
                     combined_meta["runs"].append({"block": block_name, "error": str(e)})
                     self.status_update.emit(f"Failed on block '{block_name}'. Stopping pipeline.")
                     break
 
-
+            # ------------- Final output building (with clamps) -------------
             if self.print_json:
                 out = json.dumps(results_json, indent=2, ensure_ascii=False)
             else:
-                out = (
-                    f"--- FINAL OUTPUT ---\n{current_payload}\n\n"
-                    f"--- RUN LOG ---\n" + "".join(results_md).lstrip()
-                )
+                total_log = "".join(results_md)
+                if len(total_log) > MAX_RUN_LOG_TOTAL_CHARS:
+                    total_log = (
+                        total_log[:MAX_RUN_LOG_TOTAL_CHARS]
+                        + "\n\n[… RUN LOG truncated due to size …]"
+                    )
+
+                try:
+                    out = (
+                        f"--- FINAL OUTPUT ---\n{current_payload}\n\n"
+                        f"--- RUN LOG ---\n" + total_log.lstrip()
+                    )
+                except MemoryError:
+                    # Brutal fallback if even that fails
+                    safe_payload = current_payload[-MAX_FINAL_PAYLOAD_CHARS:]
+                    safe_log = total_log[:MAX_RUN_LOG_TOTAL_CHARS]
+                    out = (
+                        "--- FINAL OUTPUT (TRUNCATED DUE TO MEMORY) ---\n"
+                        + safe_payload
+                        + "\n\n--- RUN LOG (TRUNCATED DUE TO MEMORY) ---\n"
+                        + safe_log
+                    )
+
             self.finished.emit(True, out, combined_meta)
+
         except Exception as e:
             import traceback
             tb = traceback.format_exc()

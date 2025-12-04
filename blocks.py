@@ -6405,6 +6405,7 @@ class LinkTrackerBlock(BaseBlock):
         self.store: Optional[LinkTrackerStore] = None
         self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
+        self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
 
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
@@ -7145,7 +7146,13 @@ class LinkTrackerBlock(BaseBlock):
             log=log,
             extensions=extensions,
         )
-
+    async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
+        return await self.runtime_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -7262,6 +7269,10 @@ class LinkTrackerBlock(BaseBlock):
 
         use_network_sniff = bool(params.get("use_network_sniff", False))
         return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+
+        # NEW: runtime sniffer toggles
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
 
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
@@ -7724,6 +7735,7 @@ class LinkTrackerBlock(BaseBlock):
         log: List[str] = []
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
+        all_runtime_hits: List[Dict[str, Any]] = []
 
         # choose UA for HTTP engine
         ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
@@ -7789,7 +7801,7 @@ class LinkTrackerBlock(BaseBlock):
                 return True
 
             # --- Shared Playwright context, if needed --- #
-            pw_needed = use_js or use_network_sniff
+            pw_needed = use_js or use_network_sniff or use_runtime_sniff
             pw_p = pw_browser = pw_context = None
             if pw_needed:
                 ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
@@ -7812,6 +7824,7 @@ class LinkTrackerBlock(BaseBlock):
                 local_log: List[str] = []
                 local_js_links: List[Dict[str, str]] = []
                 local_network_links: List[Dict[str, str]] = []
+                local_runtime_hits: List[Dict[str, Any]] = []  # NEW
                 local_assets: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
@@ -7898,6 +7911,16 @@ class LinkTrackerBlock(BaseBlock):
                                         sniff_parent_pages.append(parent_url)
                             except Exception:
                                 pass
+                    # 1b) Runtime sniff (WebSockets, perf, storage, media events, etc.)
+                    if use_runtime_sniff and pw_context:
+                        rt_html, _rt_items, rt_hits = await self._pw_fetch_runtime_hits(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        # Prefer HTML from PW if we don't already have some
+                        if rt_html and not html:
+                            html = rt_html
+                        if rt_hits:
+                            local_runtime_hits.extend(rt_hits)
 
                     # 2) JS render/gather (shared PW)
                     if use_js and pw_context:
@@ -7936,6 +7959,7 @@ class LinkTrackerBlock(BaseBlock):
                                 "next_pages": next_pages,
                                 "js_links": local_js_links,
                                 "network_links": local_network_links,
+                                "runtime_hits": local_runtime_hits,
                                 "log": local_log,
                             }
 
@@ -8114,6 +8138,7 @@ class LinkTrackerBlock(BaseBlock):
                     "next_pages": next_pages,
                     "js_links": local_js_links,
                     "network_links": local_network_links,
+                    "runtime_hits": local_runtime_hits,  # NEW
                     "log": local_log,
                 }
 
@@ -8190,6 +8215,7 @@ class LinkTrackerBlock(BaseBlock):
                     log.extend(res["log"])
                     all_js_links.extend(res["js_links"])
                     all_network_links.extend(res["network_links"])
+                    all_runtime_hits.extend(res.get("runtime_hits", []))  # NEW
 
                     for asset in res["assets"]:
                         a_url = asset["url"]
@@ -8251,6 +8277,7 @@ class LinkTrackerBlock(BaseBlock):
                 "required_sites": required_sites,
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
+                "runtime_hits": all_runtime_hits,
                 "log": log,
                 "queries_run": queries_to_run,
             }
@@ -8301,6 +8328,7 @@ class LinkTrackerBlock(BaseBlock):
             "required_sites": required_sites,
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
+            "runtime_hits": all_runtime_hits,
             "log": log,
             "queries_run": queries_to_run,
         }
@@ -8460,6 +8488,8 @@ class LinkTrackerBlock(BaseBlock):
             "strict_keywords": False,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
+            "use_runtime_sniff": False,
+            "return_runtime_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
@@ -8837,7 +8867,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.hls_manager = submanagers.HLSSubManager()
-
+        self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
@@ -9411,6 +9441,13 @@ class VideoLinkTrackerBlock(BaseBlock):
             extensions=extensions,
         )
 
+    async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
+        return await self.runtime_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
         # ------------------------------------------------------------------ #
         # Search engines (DuckDuckGo + Google CSE)
         # ------------------------------------------------------------------ #
@@ -10052,6 +10089,10 @@ class VideoLinkTrackerBlock(BaseBlock):
         use_network_sniff = bool(params.get("use_network_sniff", False))
         return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
 
+        # NEW: runtime sniffer toggles
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min(min_term_overlap_raw, 12))
 
@@ -10438,6 +10479,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         visited_pages: set[str] = set()
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
+        all_runtime_hits: List[Dict[str, Any]] = []
 
         recently_returned_identifiers = set()
         if source == "database" and use_database and output_cooldown_hours > 0 and self.store:
@@ -10451,7 +10493,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return False
             return True
 
-        pw_needed = use_js or use_network_sniff
+        pw_needed = use_js or use_network_sniff or use_runtime_sniff
         pw_p = pw_browser = pw_context = None
 
         ua_http = ua if ua else "promptchat/VideoLinkTracker"
@@ -10657,6 +10699,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_log: List[str] = []
                 local_js_links: List[Dict[str, str]] = []
                 local_network_links: List[Dict[str, str]] = []
+                local_runtime_hits: List[Dict[str, Any]] = []
                 local_assets: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
@@ -10735,6 +10778,15 @@ class VideoLinkTrackerBlock(BaseBlock):
                                         sniff_parent_pages.append(parent_url)
                             except Exception:
                                 pass
+                    if use_runtime_sniff and pw_context:
+                        rt_html, rt_hits = await self._pw_fetch_runtime_hits(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        # Prefer HTML from PW if we don't already have some
+                        if rt_html and not html:
+                            html = rt_html
+                        if rt_hits:
+                            local_runtime_hits.extend(rt_hits)
 
                     # 2) JS render/gather
                     if use_js and pw_context:
@@ -10767,6 +10819,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "next_pages": next_pages,
                                 "js_links": local_js_links,
                                 "network_links": local_network_links,
+                                "runtime_hits": local_runtime_hits,
                                 "log": local_log,
                             }
 
@@ -10778,6 +10831,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "next_pages": next_pages,
                             "js_links": local_js_links,
                             "network_links": local_network_links,
+                            "runtime_hits": local_runtime_hits,
                             "log": local_log + ["BeautifulSoup missing - cannot parse HTML."],
                         }
 
@@ -11022,6 +11076,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     "next_pages": list(dict.fromkeys(next_pages)),
                     "js_links": local_js_links,
                     "network_links": local_network_links,
+                    "runtime_hits": local_runtime_hits,
                     "log": local_log,
                 }
 
@@ -11093,7 +11148,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     log.extend(res["log"])
                     all_js_links.extend(res["js_links"])
                     all_network_links.extend(res["network_links"])
-
+                    all_runtime_hits.extend(res.get("runtime_hits", []))
                     for asset in res["assets"]:
                         cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
                         new_b = self._parse_size_to_bytes(asset.get("size", ""))
@@ -11174,6 +11229,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "log": log,
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
+                "runtime_hits": all_runtime_hits,
                 "source": source,
                 "subpipeline": subpipeline,
                 "engine": engine,
@@ -11224,6 +11280,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "pages_processed": len(visited_pages),
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
+            "runtime_hits": all_runtime_hits,
             "source": source,
             "subpipeline": subpipeline,
             "engine": engine,
@@ -11252,6 +11309,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "max_assets": 100,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
+            "use_runtime_sniff": False,
+            "return_runtime_sniff_hits": False,
             "min_term_overlap": 1,
             "subpipeline": "",
 
@@ -11305,6 +11364,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
+
 
 # ======================= TorOnionBlock =============================
 @dataclass
