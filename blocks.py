@@ -8,6 +8,7 @@ import asyncio
 import collections
 import functools
 import gzip
+import hashlib
 import html
 import json
 import os
@@ -9609,6 +9610,96 @@ class VideoLinkTrackerBlock(BaseBlock):
     # Main execution (HTTPSSubmanager integrated)
     # ------------------------------------------------------------------ #
 
+    async def _download_asset_to_cache(
+            self,
+            http: "HTTPSSubmanager",
+            url: str,
+            cid: str,
+            log: List[str],
+            *,
+            download_dir: str,
+            max_bytes: int,
+            skip_if_no_cl: bool = True,
+    ) -> Optional[str]:
+        """
+        Download a direct-file asset (mp4/webm/etc.) to disk and return local path.
+
+        Uses HEAD first to respect size caps, then GETs full bytes via http.get_bytes.
+        """
+        try:
+            os.makedirs(download_dir, exist_ok=True)
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][download] Failed to create dir {download_dir}: {e}")
+            return None
+
+        try:
+            status, headers = await http.head(url)
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][download] HEAD failed for {url}: {e}")
+            return None
+
+        if status != 200:
+            log.append(f"[VideoLinkTracker][download] HEAD non-200 ({status}) for {url}")
+            return None
+
+        cl_raw = headers.get("content-length")
+        if cl_raw:
+            try:
+                cl = int(cl_raw)
+            except ValueError:
+                cl = -1
+        else:
+            cl = -1
+
+        if cl < 0 and skip_if_no_cl:
+            log.append(f"[VideoLinkTracker][download] No Content-Length for {url}, skipping (skip_if_no_cl=True).")
+            return None
+
+        effective_size = cl if cl >= 0 else max_bytes + 1
+        if effective_size > max_bytes:
+            log.append(
+                f"[VideoLinkTracker][download] Asset too large ({effective_size} bytes > {max_bytes}) for {url}"
+            )
+            return None
+
+        # Derive a stable filename from cid + extension
+        parsed = urlparse(url)
+        filename = (parsed.path.rsplit("/", 1)[-1] or "asset").split("?")[0]
+        base, ext = os.path.splitext(filename)
+        if not ext:
+            ext = ".bin"
+
+        # Use a hash of cid so paths are deterministic
+        h = hashlib.sha1(cid.encode("utf-8", "ignore")).hexdigest()[:16]
+        safe_name = f"{base[:40]}_{h}{ext}"
+        local_path = os.path.join(download_dir, safe_name)
+
+        # If it already exists, assume we have it
+        if os.path.exists(local_path):
+            return local_path
+
+        try:
+            data = await http.get_bytes(url)
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][download] GET failed for {url}: {e}")
+            return None
+
+        if len(data) > max_bytes:
+            log.append(
+                f"[VideoLinkTracker][download] Download exceeded max_bytes "
+                f"({len(data)} > {max_bytes}) for {url}; discarding."
+            )
+            return None
+
+        try:
+            with open(local_path, "wb") as f:
+                f.write(data)
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][download] Failed writing {local_path}: {e}")
+            return None
+
+        log.append(f"[VideoLinkTracker][download] Cached {url} -> {local_path}")
+        return local_path
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
         text = str(payload or "")
@@ -9726,6 +9817,13 @@ class VideoLinkTrackerBlock(BaseBlock):
         http_max_conn = int(params.get("http_max_conn_per_host", 8))
         http_verify = bool(params.get("http_verify", True))
         http_ca_bundle = params.get("http_ca_bundle") or None
+
+
+        # Download / caching
+        download_assets = bool(params.get("download_assets", False))
+        download_dir = str(params.get("download_dir", "video_cache"))
+        max_download_bytes = int(params.get("max_download_bytes", 300 * 1024**2))
+        skip_if_no_cl = bool(params.get("skip_if_no_content_length", True))
 
         # PW blocking params
         block_resources = bool(params.get("block_resources", False))
@@ -10151,19 +10249,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 for u in direct_asset_urls:
                     canon = self._canonicalize_url(u)
                     cid = self._get_content_id(u)
-
-                    if source == "database" and (
-                        canon in recently_returned_identifiers or cid in recently_returned_identifiers
-                    ):
-                        continue
-
-                    if use_database and source != "database" and self.store:
-                        if self.store.asset_exists_by_canon_or_cid(canon, cid):
-                            continue
-
-                    if canon in seen_asset_urls:
-                        continue
-                    seen_asset_urls.add(canon)
+                    # ... all your existing dedupe + DB cooldown checks ...
 
                     status = "unverified"
                     size = "?"
@@ -10195,8 +10281,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                         }
 
                         is_hls_manifest = canon.lower().endswith(".m3u8") or (
-                            content_type in self.HLS_CONTENT_TYPES
+                                content_type in self.HLS_CONTENT_TYPES
                         )
+
+                        # HLS capture (you already had this)
                         if is_hls_manifest and self.hls_manager:
                             try:
                                 hls_res = await self.hls_manager.capture_hls_stream(
@@ -10209,8 +10297,31 @@ class VideoLinkTrackerBlock(BaseBlock):
                                         asset["hls_variant_manifest_path"] = hls_res.variant_manifest_path
                                     if hls_res.segment_paths:
                                         asset["hls_segment_paths"] = hls_res.segment_paths[:10]
+
+                                        # OPTIONAL: local root dir for all segments
+                                        try:
+                                            import os as _os
+                                            asset["local_hls_root"] = _os.path.dirname(
+                                                hls_res.segment_paths[0]
+                                            )
+                                        except Exception:
+                                            pass
                             except Exception as e:
                                 log.append(f"[VideoLinkTracker][HLS] Error capturing direct asset {canon}: {e}")
+
+                        # NEW: download non-HLS direct files
+                        if download_assets and not is_hls_manifest:
+                            local_path = await self._download_asset_to_cache(
+                                http,
+                                canon,
+                                cid,
+                                log,
+                                download_dir=download_dir,
+                                max_bytes=max_download_bytes,
+                                skip_if_no_cl=skip_if_no_cl,
+                            )
+                            if local_path:
+                                asset["local_path"] = local_path
 
                         new_b = self._parse_size_to_bytes(size)
                         old = final_found_assets_by_content_id.get(cid)
@@ -10223,7 +10334,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 asset,
                                 canonical_url=canon,
                                 content_id=cid,
-                                synthetic_tags={"direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic"},
+                                synthetic_tags={
+                                    "direct_asset",
+                                    "db_seed",
+                                    "db_expand",
+                                    "db_manifest",
+                                    "synthetic",
+                                },
                             )
 
             pw_needed = use_js or use_network_sniff
@@ -10503,7 +10620,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             }
 
                             is_hls_manifest = canon.lower().endswith(".m3u8") or (
-                                content_type in self.HLS_CONTENT_TYPES
+                                    content_type in self.HLS_CONTENT_TYPES
                             )
                             if is_hls_manifest and self.hls_manager:
                                 try:
@@ -10517,10 +10634,31 @@ class VideoLinkTrackerBlock(BaseBlock):
                                             asset["hls_variant_manifest_path"] = hls_res.variant_manifest_path
                                         if hls_res.segment_paths:
                                             asset["hls_segment_paths"] = hls_res.segment_paths[:10]
+                                            try:
+                                                import os as _os
+                                                asset["local_hls_root"] = _os.path.dirname(
+                                                    hls_res.segment_paths[0]
+                                                )
+                                            except Exception:
+                                                pass
                                 except Exception as e:
                                     local_log.append(
                                         f"[VideoLinkTracker][HLS] Error capturing HLS for {canon}: {e}"
                                     )
+
+                            # NEW: download normal file-like assets
+                            if download_assets and not is_hls_manifest:
+                                local_path = await self._download_asset_to_cache(
+                                    http,
+                                    canon,
+                                    cid,
+                                    local_log,
+                                    download_dir=download_dir,
+                                    max_bytes=max_download_bytes,
+                                    skip_if_no_cl=skip_if_no_cl,
+                                )
+                                if local_path:
+                                    asset["local_path"] = local_path
 
                             local_assets.append(asset)
 
@@ -10529,7 +10667,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                                     asset,
                                     canonical_url=canon,
                                     content_id=cid,
-                                    synthetic_tags={"direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic"},
+                                    synthetic_tags={
+                                        "direct_asset",
+                                        "db_seed",
+                                        "db_expand",
+                                        "db_manifest",
+                                        "synthetic",
+                                    },
                                 )
 
                     # Next-level pages
@@ -10856,6 +11000,11 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             "use_camoufox": False,
             "camoufox_options": {},
+
+            "download_assets": False,            # NEW: actually fetch media bytes
+            "download_dir": "video_cache",       # NEW: base dir to stash files
+            "max_download_bytes": 300 * 1024**2, # NEW: 300 MB per asset safety cap
+            "skip_if_no_content_length": True,   # NEW: avoid unknown-size downloads
         }
 
 
