@@ -7092,44 +7092,56 @@ class LinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        # Close page context
         try:
             if context:
-                close = getattr(context, "close", None)
-                if callable(close):
-                    await close()
+                close_ctx = getattr(context, "close", None)
+                if callable(close_ctx):
+                    if asyncio.iscoroutinefunction(close_ctx):
+                        await close_ctx()
+                    else:
+                        close_ctx()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
+        # Close browser
         try:
             if browser:
-                close = getattr(browser, "close", None)
-                if callable(close):
-                    await close()
+                close_browser = getattr(browser, "close", None)
+                if callable(close_browser):
+                    if asyncio.iscoroutinefunction(close_browser):
+                        await close_browser()
+                    else:
+                        close_browser()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
-        # p may be either async_playwright() handle or AsyncCamoufox CM
+        # Close handle:
+        #   - Playwright: p.stop()
+        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
-                # Playwright: p.stop()
                 stop = getattr(p, "stop", None)
+
+                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
+
                 else:
-                    # Camoufox: use __aexit__ on the context manager
+                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
+
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
-
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
         return await self.network_sniffer.sniff(
             context, page_url,
@@ -7803,19 +7815,23 @@ class LinkTrackerBlock(BaseBlock):
             # --- Shared Playwright context, if needed --- #
             pw_needed = use_js or use_network_sniff or use_runtime_sniff
             pw_p = pw_browser = pw_context = None
-            if pw_needed:
-                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                    ua=ua_pw,
-                    block_resources=block_resources,
-                    blocked_resource_types=blocked_resource_types,
-                    block_domains=block_domains,
-                    blocked_domains=blocked_domains,
-                    log=log,
-                    use_camoufox=use_camoufox,           # <-- NEW
-                    camoufox_options=camoufox_options,   # <-- NEW
-                )
-
+            try:
+                if pw_needed:
+                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,           # <-- NEW
+                        camoufox_options=camoufox_options,   # <-- NEW
+                    )
+            except:
+                # ALWAYS close Camoufox/Playwright if we opened it
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
             async def _process_page(
                 page_url: str,
                 depth: int,
@@ -8203,9 +8219,20 @@ class LinkTrackerBlock(BaseBlock):
                 if not batch:
                     break
 
-                results = await asyncio.gather(
-                    *[_process_page(url, current_depth, http) for url in batch]
-                )
+                if use_camoufox:
+                    results: List[Dict[str, Any]] = []
+                    for url in batch:
+                        try:
+                            res = await _process_page(url, current_depth, http)
+                        except Exception as e:
+                            log.append(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                            continue
+                        results.append(res)
+                else:
+                    # Original concurrent behaviour (Chromium / normal Playwright)
+                    results = await asyncio.gather(
+                        *[_process_page(url, current_depth, http) for url in batch]
+                    )
                 next_frontier: List[str] = []
 
                 for res in results:
@@ -9382,40 +9409,53 @@ class VideoLinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        # Close page context
         try:
             if context:
-                close = getattr(context, "close", None)
-                if callable(close):
-                    await close()
+                close_ctx = getattr(context, "close", None)
+                if callable(close_ctx):
+                    if asyncio.iscoroutinefunction(close_ctx):
+                        await close_ctx()
+                    else:
+                        close_ctx()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
+        # Close browser
         try:
             if browser:
-                close = getattr(browser, "close", None)
-                if callable(close):
-                    await close()
+                close_browser = getattr(browser, "close", None)
+                if callable(close_browser):
+                    if asyncio.iscoroutinefunction(close_browser):
+                        await close_browser()
+                    else:
+                        close_browser()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
-        # p may be either async_playwright() handle or AsyncCamoufox CM
+        # Close handle:
+        #   - Playwright: p.stop()
+        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
-                # Playwright: p.stop()
                 stop = getattr(p, "stop", None)
+
+                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
+
                 else:
-                    # Camoufox: use __aexit__ on the context manager
+                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
+
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
@@ -10682,19 +10722,23 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             pw_needed = use_js or use_network_sniff
             pw_p = pw_browser = pw_context = None
-            if pw_needed:
-                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                    ua=ua_pw,
-                    block_resources=block_resources,
-                    blocked_resource_types=blocked_resource_types,
-                    block_domains=block_domains,
-                    blocked_domains=blocked_domains,
-                    log=log,
-                    use_camoufox=use_camoufox,           # <-- NEW
-                    camoufox_options=camoufox_options,   # <-- NEW
-                )
-
+            try:
+                if pw_needed:
+                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/VideoTracker"
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,           # <-- NEW
+                        camoufox_options=camoufox_options,   # <-- NEW
+                    )
+            except:
+                # ALWAYS close Camoufox/Playwright if we opened it
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
             async def _process_page(page_url: str, depth: int, smart_sniff_param: bool) -> Dict[str, Any]:
                 local_log: List[str] = []
                 local_js_links: List[Dict[str, str]] = []
@@ -11138,7 +11182,20 @@ class VideoLinkTrackerBlock(BaseBlock):
                 if not batch:
                     break
 
-                results = await asyncio.gather(*[_process_page(url, current_depth, smart_sniff) for url in batch])
+                if use_camoufox:
+                    results: List[Dict[str, Any]] = []
+                    for url in batch:
+                        try:
+                            res = await _process_page(url, current_depth, http)
+                        except Exception as e:
+                            log.append(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                            continue
+                        results.append(res)
+                else:
+                    # Original concurrent behaviour (Chromium / normal Playwright)
+                    results = await asyncio.gather(
+                        *[_process_page(url, current_depth, http) for url in batch]
+                    )
                 next_frontier: List[str] = []
 
                 for res in results:
@@ -12204,40 +12261,53 @@ class DirectLinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        # Close page context
         try:
             if context:
-                close = getattr(context, "close", None)
-                if callable(close):
-                    await close()
+                close_ctx = getattr(context, "close", None)
+                if callable(close_ctx):
+                    if asyncio.iscoroutinefunction(close_ctx):
+                        await close_ctx()
+                    else:
+                        close_ctx()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
+        # Close browser
         try:
             if browser:
-                close = getattr(browser, "close", None)
-                if callable(close):
-                    await close()
+                close_browser = getattr(browser, "close", None)
+                if callable(close_browser):
+                    if asyncio.iscoroutinefunction(close_browser):
+                        await close_browser()
+                    else:
+                        close_browser()
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
-        # p may be either async_playwright() handle or AsyncCamoufox CM
+        # Close handle:
+        #   - Playwright: p.stop()
+        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
-                # Playwright: p.stop()
                 stop = getattr(p, "stop", None)
+
+                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
+
                 else:
-                    # Camoufox: use __aexit__ on the context manager
+                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
+
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
@@ -12404,18 +12474,22 @@ class DirectLinkTrackerBlock(BaseBlock):
 
             pw_needed = use_js or use_network_sniff
             pw_p = pw_browser = pw_context = None
-            if pw_needed:
-                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                    ua=ua_pw,
-                    block_resources=block_resources,
-                    blocked_resource_types=blocked_resource_types,
-                    block_domains=block_domains,
-                    blocked_domains=blocked_domains,
-                    log=log,
-                    use_camoufox=use_camoufox,           # <-- NEW
-                    camoufox_options=camoufox_options,   # <-- NEW
-                )
+            try:
+                if pw_needed:
+                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/DirectLinkTracker"
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,           # <-- NEW
+                        camoufox_options=camoufox_options,   # <-- NEW
+                    )
+            except:
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
 
         async def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
             local_log: List[str] = []
