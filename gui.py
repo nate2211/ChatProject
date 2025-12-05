@@ -169,38 +169,54 @@ DARK_STYLESHEET = """
 # ======================= PRESETS =========================================
 
 def load_presets() -> List[Dict[str, Any]]:
-    placeholder = {
-        "name": "--- Select a Preset ---",
-        "blocks": [],
-        "extras": "",
-        "model": "lexicon",
-    }
+    # Start with the placeholder
+    presets = [
+        {
+            "name": "--- Select a Preset ---",
+            "blocks": [],
+            "extras": "",
+            "model": "lexicon",
+        }
+    ]
 
-    presets = [placeholder]
+    # Helper: find index of existing preset by name
+    def get_index_by_name(name: str) -> int:
+        for i, p in enumerate(presets):
+            if p.get("name") == name:
+                return i
+        return -1
 
-    # 1. Load Bundled Presets (Read-Only defaults included in EXE)
+    # 1. Load Bundled Presets (Base layer) - Preserves File Order
     if BUNDLED_PRESET_FILE.exists():
         try:
             with open(BUNDLED_PRESET_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    # Filter logic...
                     for entry in data:
                         if isinstance(entry, dict) and entry.get("name"):
-                            presets.append(entry)
+                            idx = get_index_by_name(entry["name"])
+                            if idx != -1:
+                                presets[idx] = entry  # Overwrite existing
+                            else:
+                                presets.append(entry) # Add new
         except Exception as e:
             print(f"Error loading bundled presets: {e}", file=sys.stderr)
 
-    # 2. Load User Presets (Read-Write file next to EXE)
+    # 2. Load User Presets (Overlay layer) - Preserves File Order
     if USER_PRESET_FILE.exists():
         try:
             with open(USER_PRESET_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
             if isinstance(raw, list):
-                # Append user presets, potentially deduping based on name if desired
                 for entry in raw:
                     if isinstance(entry, dict) and entry.get("name"):
-                        presets.append(entry)
+                        idx = get_index_by_name(entry["name"])
+                        if idx != -1:
+                            # Update existing slot (maintaining original order)
+                            presets[idx] = entry
+                        else:
+                            # Append new user preset (maintaining user file order)
+                            presets.append(entry)
         except Exception as e:
             print(f"Error loading user presets: {e}", file=sys.stderr)
 
@@ -212,13 +228,12 @@ GUI_PRESETS: List[Dict[str, Any]] = load_presets()
 
 def save_presets_to_disk() -> None:
     """
-    Writes GUI_PRESETS[1:] (user presets) to the user's local 'gui_presets.json'.
+    Writes all current presets (excluding the placeholder) to the user's local file.
+    This effectively snapshots the current configuration.
     """
     try:
-        # logic to filter out built-in presets if you want,
-        # for now we just save everything except placeholder
+        # Skip index 0 (Placeholder)
         data_to_save = GUI_PRESETS[1:]
-
         with open(USER_PRESET_FILE, "w", encoding="utf-8") as f:
             json.dump(data_to_save, f, indent=2, ensure_ascii=False)
     except Exception as e:
@@ -231,7 +246,20 @@ def save_presets_to_disk() -> None:
 MAX_FINAL_PAYLOAD_CHARS   = 200_000   # ~200 KB of final text
 MAX_BLOCK_SNIPPET_CHARS   = 80_000    # per-block snippet in RUN LOG
 MAX_RUN_LOG_TOTAL_CHARS   = 800_000   # total joined RUN LOG size
+def clamp_head_tail(text: str, max_chars: int, head_ratio: float = 0.6) -> str:
+    """
+    Keep the beginning and end of a long string, drop the middle.
 
+    head_ratio = fraction of max_chars reserved for the beginning.
+    """
+    if len(text) <= max_chars:
+        return text
+
+    head_len = int(max_chars * head_ratio)
+    tail_len = max_chars - head_len
+    head = text[:head_len]
+    tail = text[-tail_len:]
+    return head + "\n\n[… middle truncated …]\n\n" + tail
 
 class Worker(QObject):
     finished = pyqtSignal(bool, str, dict)
@@ -345,12 +373,11 @@ class Worker(QObject):
                         current_payload = result
 
                     if len(current_payload) > MAX_FINAL_PAYLOAD_CHARS:
-                        # keep the tail; prepend a note
+                        # Keep the *start* of the final output so you see the actual answer.
                         current_payload = (
-                            "[… output truncated for GUI; see logs/file for full text …]\n\n"
-                            + current_payload[-MAX_FINAL_PAYLOAD_CHARS:]
+                                current_payload[:MAX_FINAL_PAYLOAD_CHARS]
+                                + "\n\n[… output truncated for GUI; see logs/file for full text …]"
                         )
-
                     # --------- Per-block log snippet (with clamp) ----------
                     snippet = result or ""
                     if len(snippet) > MAX_BLOCK_SNIPPET_CHARS:
@@ -396,10 +423,10 @@ class Worker(QObject):
             else:
                 total_log = "".join(results_md)
                 if len(total_log) > MAX_RUN_LOG_TOTAL_CHARS:
-                    total_log = (
-                        total_log[:MAX_RUN_LOG_TOTAL_CHARS]
-                        + "\n\n[… RUN LOG truncated due to size …]"
-                    )
+                    # Keep both the start of the log (early blocks / context)
+                    # and the end (final blocks) so you can see what actually happened.
+                    total_log = clamp_head_tail(total_log, MAX_RUN_LOG_TOTAL_CHARS)
+                    total_log += "\n\n[… RUN LOG truncated due to size …]"
 
                 try:
                     out = (

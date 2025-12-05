@@ -7262,6 +7262,63 @@ class LinkTrackerBlock(BaseBlock):
             if not pipeline_urls:
                 pipeline_urls = []
             pipeline_urls.extend(extra_seed_urls)
+
+        # =========================================================================
+        # <--- NEW: Memory Sources Ingestion (SocketPipe Bridge)
+        # =========================================================================
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                # Split "socketpipe_links, socketpipe_domains" into keys
+                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+
+                    # Handle lists (standard SocketPipe output) or single items
+                    items = data if isinstance(data, list) else [data]
+
+                    for item in items:
+                        candidate = None
+
+                        # 1. Extract string from Dict or raw String
+                        if isinstance(item, dict):
+                            # Try standard SocketPipe keys
+                            candidate = item.get("url") or item.get("domain") or item.get("text")
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        # 2. CLASSIFY: URL vs Keyword
+
+                        # A) It's definitely a URL (http/https)
+                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
+                            pipeline_urls.append(cand_str)
+
+                        # B) It looks like a domain (has dot, no spaces) -> Treat as Seed URL
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
+                            # Prepend protocol to make it actionable
+                            pipeline_urls.append(f"https://{cand_str}")
+
+                        # C) It's just text -> Treat as Lexicon Keyword
+                        else:
+                            # Adds to list used for relevancy scoring
+                            non_url_lex_terms.append(cand_str)
+
+            except Exception as e:
+                # Log but don't crash
+                msg = f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}"
+                print(msg)
         # ------------------- Config --------------------- #
         mode = str(params.get("mode", "docs")).lower()
         scan_limit = int(params.get("scan_limit", 5))
@@ -7853,9 +7910,26 @@ class LinkTrackerBlock(BaseBlock):
 
                     # 1) Network sniff (shared PW)
                     if use_network_sniff and pw_context:
-                        sniff_html, sniff_items, sniff_json = await self._pw_fetch_with_sniff(
+                        sniff_html = ""
+                        sniff_items = []
+                        sniff_json = None
+
+                        sniff_result = await self._pw_fetch_with_sniff(
                             pw_context, page_url, timeout, local_log, targets
                         )
+
+                        # Backwards-compatible: accept (html, items) or (html, items, json_hits)
+                        if isinstance(sniff_result, tuple):
+                            if len(sniff_result) == 3:
+                                sniff_html, sniff_items, sniff_json = sniff_result
+                            elif len(sniff_result) == 2:
+                                sniff_html, sniff_items = sniff_result
+                            elif len(sniff_result) == 1:
+                                sniff_html = sniff_result[0]
+                        else:
+                            # e.g. if you ever change sniff() to return a dict
+                            sniff_html = sniff_result
+
                         html = sniff_html or html
 
                         # Archive metadata special-casing
@@ -7929,10 +8003,24 @@ class LinkTrackerBlock(BaseBlock):
                                 pass
                     # 1b) Runtime sniff (WebSockets, perf, storage, media events, etc.)
                     if use_runtime_sniff and pw_context:
-                        rt_html, _rt_items, rt_hits = await self._pw_fetch_runtime_hits(
+                        rt_html = ""
+                        rt_hits: list[dict[str, Any]] = []
+
+                        rt_result = await self._pw_fetch_runtime_hits(
                             pw_context, page_url, timeout, local_log
                         )
-                        # Prefer HTML from PW if we don't already have some
+
+                        # Accept (html, items, hits) or (html, hits)
+                        if isinstance(rt_result, tuple):
+                            if len(rt_result) == 3:
+                                rt_html, _rt_items, rt_hits = rt_result
+                            elif len(rt_result) == 2:
+                                rt_html, rt_hits = rt_result
+                            elif len(rt_result) == 1:
+                                rt_html = rt_result[0]
+                        else:
+                            rt_html = rt_result
+
                         if rt_html and not html:
                             html = rt_html
                         if rt_hits:
@@ -8530,7 +8618,7 @@ class LinkTrackerBlock(BaseBlock):
             "db_seed_limit": 250,
             "db_seed_max_age_days": None,
             "db_allow_rescan": False,
-            # HTTPSSubmanager-specific params:
+            "memory_sources": "",
             "http_retries": 2,
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
@@ -10240,7 +10328,62 @@ class VideoLinkTrackerBlock(BaseBlock):
             if not pipeline_urls:
                 pipeline_urls = []
             pipeline_urls.extend(extra_seed_urls)
+        # =========================================================================
+        # <--- NEW: Memory Sources Ingestion (SocketPipe Bridge)
+        # =========================================================================
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
 
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                # Split "socketpipe_links, socketpipe_domains" into keys
+                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+
+                    # Handle lists (standard SocketPipe output) or single items
+                    items = data if isinstance(data, list) else [data]
+
+                    for item in items:
+                        candidate = None
+
+                        # 1. Extract string from Dict or raw String
+                        if isinstance(item, dict):
+                            # Try standard SocketPipe keys
+                            candidate = item.get("url") or item.get("domain") or item.get("text")
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        # 2. CLASSIFY: URL vs Keyword
+
+                        # A) It's definitely a URL (http/https)
+                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
+                            pipeline_urls.append(cand_str)
+
+                        # B) It looks like a domain (has dot, no spaces) -> Treat as Seed URL
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
+                            # Prepend protocol to make it actionable
+                            pipeline_urls.append(f"https://{cand_str}")
+
+                        # C) It's just text -> Treat as Lexicon Keyword
+                        else:
+                            # Adds to list used for relevancy scoring
+                            non_url_lex_terms.append(cand_str)
+
+            except Exception as e:
+                # Log but don't crash
+                msg = f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}"
+                print(msg)
         # Triage initial URLs
         candidate_pages: List[str] = []
         direct_asset_urls: List[str] = []
@@ -10757,9 +10900,22 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     # 1) Network sniff
                     if use_network_sniff and pw_context:
-                        sniff_html, sniff_items, sniff_json_hits = await self._pw_fetch_with_sniff(
+                        sniff_result = await self._pw_fetch_with_sniff(
                             pw_context, page_url, timeout, local_log
                         )
+                        # Backwards-compatible: accept (html, items) or (html, items, json_hits)
+                        if isinstance(sniff_result, tuple):
+                            if len(sniff_result) == 3:
+                                sniff_html, sniff_items, sniff_json = sniff_result
+                            elif len(sniff_result) == 2:
+                                sniff_html, sniff_items = sniff_result
+                            elif len(sniff_result) == 1:
+                                sniff_html = sniff_result[0]
+                        else:
+                            # e.g. if you ever change sniff() to return a dict
+                            sniff_html = sniff_result
+
+                        html = sniff_html or html
                         html = sniff_html or html
 
                         if sniff_json_hits:
@@ -10823,15 +10979,24 @@ class VideoLinkTrackerBlock(BaseBlock):
                             except Exception:
                                 pass
                     if use_runtime_sniff and pw_context:
-                        rt_html, rt_hits = await self._pw_fetch_runtime_hits(
+                        rt_result = await self._pw_fetch_runtime_hits(
                             pw_context, page_url, timeout, local_log
                         )
-                        # Prefer HTML from PW if we don't already have some
+                        # Accept (html, items, hits) or (html, hits)
+                        if isinstance(rt_result, tuple):
+                            if len(rt_result) == 3:
+                                rt_html, _rt_items, rt_hits = rt_result
+                            elif len(rt_result) == 2:
+                                rt_html, rt_hits = rt_result
+                            elif len(rt_result) == 1:
+                                rt_html = rt_result[0]
+                        else:
+                            rt_html = rt_result
+
                         if rt_html and not html:
                             html = rt_html
                         if rt_hits:
                             local_runtime_hits.extend(rt_hits)
-
                     # 2) JS render/gather
                     if use_js and pw_context:
                         js_html, js_links = await self._pw_fetch_js_links(
@@ -11381,7 +11546,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "db_seed_max_age_days": 14,
             "db_include_synthetic_seeds": False,
             "db_seed_per_domain_cap": 8,
-
+            "memory_souces":"",
             "db_expand_max_per_seed": 4,
             "db_expand_ladder_depth": 2,
             "db_domain_cap": 80,
