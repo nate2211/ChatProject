@@ -2167,13 +2167,35 @@ class HLSSubManager:
         h = hashlib.sha1(manifest_url.encode("utf-8", errors="ignore")).hexdigest()
         return h[:16]
 
-    async def _fetch_text(self, session: aiohttp.ClientSession, url: str,
-                          timeout: float, log: list[str]) -> str:
+    async def _fetch_text(
+            self,
+            session: Any,
+            url: str,
+            timeout: float,
+            log: list[str],
+    ) -> str:
+        """
+        Fetch text either via:
+          • raw aiohttp.ClientSession (has .get)
+          • HTTPSSubmanager (has .get_text)
+        """
+        # Path 1: HTTPSSubmanager-style wrapper (has get_text / get_bytes, but no .get)
+        if hasattr(session, "get_text") and not hasattr(session, "get"):
+            try:
+                text = await session.get_text(url)
+                if not text:
+                    log.append(f"[HLS] Empty response for manifest {url}")
+                return text or ""
+            except Exception as e:
+                log.append(f"[HLS] Error fetching manifest {url}: {e}")
+                return ""
+
+        # Path 2: plain aiohttp.ClientSession (has .get)
         try:
             async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=timeout),
-                allow_redirects=True,
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=True,
             ) as r:
                 if r.status >= 400:
                     log.append(f"[HLS] HTTP {r.status} for manifest {url}")
@@ -2182,14 +2204,61 @@ class HLSSubManager:
         except Exception as e:
             log.append(f"[HLS] Error fetching manifest {url}: {e}")
             return ""
-
-    async def _download_binary(self, session: aiohttp.ClientSession, url: str,
-                               path: Path, timeout: float,
-                               log: list[str], budget: dict) -> bool:
+    async def _download_binary(
+        self,
+        session: Any,
+        url: str,
+        path: Path,
+        timeout: float,
+        log: list[str],
+        budget: dict,
+    ) -> bool:
         """
         Download binary URL into path, respecting global byte budget.
+        Works with either:
+          • aiohttp.ClientSession
+          • HTTPSSubmanager (get_bytes)
         Returns True if some bytes written.
         """
+        # Path 1: HTTPSSubmanager-style client
+        if hasattr(session, "get_bytes") and not hasattr(session, "get"):
+            try:
+                data = await session.get_bytes(url)
+                if not data:
+                    log.append(f"[HLS] Zero-length segment from {url}")
+                    return False
+
+                remaining = self.max_total_bytes - budget["bytes"]
+                if remaining <= 0:
+                    log.append(
+                        "[HLS] Max_total_bytes reached; "
+                        "stopping further segment downloads."
+                    )
+                    return False
+
+                # Respect the global byte budget
+                if len(data) > remaining:
+                    log.append(
+                        "[HLS] Truncating segment due to max_total_bytes limit."
+                    )
+                    data = data[:remaining]
+
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("wb") as f:
+                    f.write(data)
+
+                written = len(data)
+                budget["bytes"] += written
+                if written == 0:
+                    log.append(f"[HLS] Zero-length segment from {url}")
+                    return False
+                return True
+
+            except Exception as e:
+                log.append(f"[HLS] Error downloading segment {url}: {e}")
+                return False
+
+        # Path 2: aiohttp.ClientSession
         try:
             async with session.get(
                 url,
