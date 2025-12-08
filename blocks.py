@@ -8332,7 +8332,7 @@ class LinkTrackerBlock(BaseBlock):
 
             # --- BFS LOOP START ---
             # We check pages_scanned against max_pages_total to ensure global termination
-            while frontier and current_depth <= max_depth and pages_scanned < max_pages_total:
+            while frontier and current_depth <= max_depth:
 
                 DEBUG_LOGGER.log_message(
                     f"[BFS] --- Starting Depth {current_depth} | "
@@ -8343,12 +8343,9 @@ class LinkTrackerBlock(BaseBlock):
                 batch: List[str] = []
 
                 # Calculate how many slots are left before hitting the global cap
-                slots_left = max_pages_total - pages_scanned
+
 
                 for u in frontier:
-                    if len(batch) >= slots_left:
-                        break
-
                     if u in visited_pages:
                         continue
 
@@ -8424,7 +8421,7 @@ class LinkTrackerBlock(BaseBlock):
                         seen_in_next.add(url)
 
                 # Update frontier for next depth
-                frontier = next_frontier
+                frontier = next_frontier[:max_pages_total]
 
                 DEBUG_LOGGER.log_message(
                     f"[BFS] Depth {current_depth} complete. "
