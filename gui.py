@@ -1011,10 +1011,9 @@ class PromptChatGUI(QMainWindow):
         if model_name and self.model_combo.findText(model_name) != -1:
             self.model_combo.setCurrentText(model_name)
 
-        # Return combo to placeholder (optional UX choice)
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.setCurrentIndex(0)
-        self.preset_combo.blockSignals(False)
+        # [PATCH] Removed the block that resets currentIndex to 0.
+        # Now the combo box stays on the selected preset, allowing deletion.
+
         self.statusBar().showMessage(f"Loaded preset: {preset.get('name', '')}")
 
     def _save_preset(self) -> None:
