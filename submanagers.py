@@ -91,6 +91,8 @@ class NetworkSniffer:
       - SAFE JSON sniffing (size + URL pattern gated).
       - Auto-scroll support to trigger lazy-loaded media/content.
       - Configurable goto_wait_until (e.g. 'commit' for Camoufox).
+      - GraphQL POST sniffing: extracts operationName, variable keys, and
+        detects introspection queries on /graphql.
     """
 
     @dataclass
@@ -205,6 +207,14 @@ class NetworkSniffer:
             "/audio/",
         })
 
+        # ------------------ GraphQL sniff config ------------------ #
+
+        enable_graphql_sniff: bool = True
+        graphql_endpoint_keywords: Set[str] = field(default_factory=lambda: {
+            "/graphql"
+        })
+        graphql_max_body_kb: int = 256  # size gate for request body
+
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
@@ -302,6 +312,9 @@ class NetworkSniffer:
             return False
 
         return True
+
+    def _looks_like_graphql_endpoint(self, url_lower: str) -> bool:
+        return any(k in url_lower for k in self.cfg.graphql_endpoint_keywords)
 
     def _is_allowed_by_extensions(self, url: str, extensions: Optional[Set[str]], kind: Optional[str]) -> bool:
         if not extensions:
@@ -515,13 +528,81 @@ class NetworkSniffer:
                 log
             )
 
+            # -------- request handler (now with GraphQL sniff) -------- #
+
             def handle_request(req: Request):
                 try:
                     req_types[req.url] = req.resource_type
                 except Exception:
                     pass
 
+                # GraphQL sniff: POST to /graphql with small JSON body
+                try:
+                    if (self.cfg.enable_graphql_sniff and
+                        req.method and req.method.upper() == "POST"):
+                        url_lower = req.url.lower()
+                        if self._looks_like_graphql_endpoint(url_lower):
+                            body = req.post_data or ""
+                            if isinstance(body, bytes):
+                                body = body.decode("utf-8", "ignore")
+                            if not body:
+                                return
+                            max_bytes = int(self.cfg.graphql_max_body_kb) * 1024
+                            if len(body) > max_bytes:
+                                return
+
+                            try:
+                                gql_payload = json.loads(body)
+                            except Exception:
+                                return
+
+                            payloads = (
+                                gql_payload if isinstance(gql_payload, list)
+                                else [gql_payload]
+                            )
+
+                            for pay in payloads:
+                                if not isinstance(pay, dict):
+                                    continue
+                                op_name = pay.get("operationName")
+                                vars_obj = pay.get("variables")
+                                query = pay.get("query") or ""
+                                is_introspection = (
+                                    isinstance(query, str)
+                                    and ("__schema" in query or "__type" in query)
+                                )
+
+                                var_keys = (
+                                    list(vars_obj.keys())
+                                    if isinstance(vars_obj, dict)
+                                    else None
+                                )
+
+                                if len(json_hits) >= max_json:
+                                    break
+
+                                json_hits.append({
+                                    "url": req.url,
+                                    "json": {
+                                        "graphql": True,
+                                        "operationName": op_name,
+                                        "variable_keys": var_keys,
+                                        "is_introspection": is_introspection,
+                                        "query_preview": query[:2048] if isinstance(query, str) else None,
+                                    },
+                                    "source_page": canonical_page_url,
+                                })
+                                self._log(
+                                    f"[NetworkSniffer] GraphQL request captured: "
+                                    f"{req.url} op={op_name} introspection={is_introspection}",
+                                    log,
+                                )
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] handle_request GraphQL sniff error: {e}", log)
+
             page.on("request", handle_request)
+
+            # -------- JSON response helper (existing) -------- #
 
             async def handle_json(resp: Response, url: str):
                 if len(json_hits) >= max_json:
@@ -531,6 +612,8 @@ class NetworkSniffer:
                     json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
                 except Exception as e:
                     self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
+
+            # -------- response handler (unchanged except comments) -------- #
 
             def handle_response(response: Response):
                 try:
@@ -583,7 +666,7 @@ class NetworkSniffer:
                         )
                         return
 
-                    # ---- SAFE JSON sniff ----
+                    # ---- SAFE JSON sniff (response-side) ----
                     if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
                         asyncio.create_task(handle_json(response, canonical_url))
                         return
@@ -765,6 +848,7 @@ class NetworkSniffer:
 
         return html, merged_items, json_hits
 
+
 # ======================================================================
 # JSSniffer
 # ======================================================================
@@ -776,10 +860,13 @@ class JSSniffer:
     Output schema:
       link = {url, text, tag}
 
-    Now:
+    Features:
       - Configurable goto_wait_until (e.g. 'commit' for Camoufox).
       - goto timeouts are non-fatal (log + continue).
       - Bounded auto-scroll relative to timeout.
+      - Deep Shadow DOM piercing (open shadowRoots).
+      - Webpack cache/module scan to extract URLs / API-ish endpoints
+        from bundled chunks (useful for route/API discovery).
     """
 
     @dataclass
@@ -860,6 +947,16 @@ class JSSniffer:
             "a[href]", "button", "[role=button]", "[onclick]",
             "div[role=link]", "span[role=link]"
         ])
+
+        # ------------------ Webpack module scan ------------------ #
+        enable_webpack_scan: bool = True
+        webpack_module_soft_limit: int = 400
+        # Regex for URLs & /api/ paths inside module bodies
+        webpack_url_regex: str = r"(https?:\/\/[^\s'\"`]+|\/api\/[a-zA-Z0-9_\/\-\?\=&]+)"
+        webpack_api_hints: Set[str] = field(default_factory=lambda: {
+            "/api/", "/graphql", "/auth", "/login", "/logout", "/stream",
+            ".m3u8", ".mpd", "/cdn/", "/v1/", "/v2/"
+        })
 
     def __init__(self, config: Optional["JSSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
@@ -987,7 +1084,20 @@ class JSSniffer:
             self._log(f"Auto-scroll error: {e}", log)
 
     # ------------------------- main sniff ------------------------- #
-
+    def _fix_escaped_ampersands(self, url: str) -> str:
+        if not url:
+            return url
+        try:
+            # literal backslash-u from JS
+            url = url.replace("\\u0026", "&")
+        except Exception:
+            pass
+        try:
+            # double encoded
+            url = url.replace("%5Cu0026", "%26").replace("%5cu0026", "%26")
+        except Exception:
+            pass
+        return url
     async def sniff(
         self,
         context: BrowserContext,
@@ -1022,6 +1132,11 @@ class JSSniffer:
         onclick_regexes_js = [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes]
         redirect_hints_js = list(self.cfg.redirect_hints)
         script_json_hints_js = list(self.cfg.script_json_hints)
+
+        webpack_enabled_js = bool(self.cfg.enable_webpack_scan)
+        webpack_limit_js = int(self.cfg.webpack_module_soft_limit)
+        webpack_url_regex_js = self.cfg.webpack_url_regex
+        webpack_api_hints_js = list(self.cfg.webpack_api_hints)
 
         self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
 
@@ -1061,15 +1176,34 @@ class JSSniffer:
                     onclickRegexes,
                     redirectHints,
                     scriptJsonHints,
-                    baseUrl
+                    baseUrl,
+                    enableWebpack,
+                    webpackLimit,
+                    webpackUrlRegex,
+                    webpackApiHints
                   } = args;
 
                   const out = [];
                   const seen = new Set();
 
+                  // PATCH: normalize JSON-style & double-encoded ampersands
+                  function normalizeUrlRaw(u) {
+                    if (!u) return "";
+                    try {
+                      // handle literal \\u0026 that came from JSON
+                      u = u.replace(/\\u0026/gi, "&");
+                    } catch (e) {}
+                    try {
+                      // handle %5Cu0026 (double-encoded)
+                      u = u.replace(/%5Cu0026/gi, "%26");
+                    } catch (e) {}
+                    return u;
+                  }
+
                   function absUrl(u) {
                     if (!u) return "";
                     try {
+                      u = normalizeUrlRaw(String(u).trim());
                       return new URL(u, baseUrl).href;
                     } catch {
                       return u;
@@ -1078,11 +1212,18 @@ class JSSniffer:
 
                   function push(el, url, tag, reason=null) {
                     url = absUrl(String(url).trim());
-                    if (!url || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('data:') || seen.has(url)) {
+                    if (!url ||
+                        url.startsWith('blob:') ||
+                        url.startsWith('javascript:') ||
+                        url.startsWith('data:') ||
+                        seen.has(url)) {
                       return;
                     }
                     seen.add(url);
-                    const text = (el.innerText || el.textContent || el.title || "").trim();
+                    let text = "";
+                    try {
+                      text = (el && (el.innerText || el.textContent || el.title) || "").trim();
+                    } catch {}
                     const item = { url, text, tag };
                     if (reason) item.reason = reason;
                     out.push(item);
@@ -1129,7 +1270,8 @@ class JSSniffer:
                   }
 
                   function sniffInlineListeners(el) {
-                    const inlineEvents = ["onclick","onmousedown","onmouseup","ontouchstart","ontouchend", "onplay", "oncanplay"];
+                    const inlineEvents = ["onclick","onmousedown","onmouseup","ontouchstart","ontouchend",
+                                          "onplay","oncanplay"];
                     for (const k of inlineEvents) {
                       const v = el.getAttribute?.(k);
                       if (v) {
@@ -1146,7 +1288,8 @@ class JSSniffer:
                     }
                   }
 
-                  function walk(node) {
+                  // -------- Shadow DOM piercing: deep recursion over shadowRoots --------
+                  function walkNode(node) {
                     if (!node) return;
 
                     node.querySelectorAll?.(selectors).forEach(el => {
@@ -1163,9 +1306,28 @@ class JSSniffer:
                     });
 
                     if (includeShadow) {
-                      node.querySelectorAll?.("*").forEach(el => {
-                        if (el.shadowRoot) walk(el.shadowRoot);
-                      });
+                      const allEls = node.querySelectorAll?.("*") || [];
+                      for (const el of allEls) {
+                        try {
+                          if (el.shadowRoot) {
+                            walkNode(el.shadowRoot);
+                          }
+                        } catch {}
+                      }
+                    }
+                  }
+
+                  function walkDocumentAndShadows() {
+                    walkNode(document);
+
+                    if (!includeShadow) return;
+                    const all = document.querySelectorAll("*");
+                    for (const el of all) {
+                      try {
+                        if (el.shadowRoot) {
+                          walkNode(el.shadowRoot);
+                        }
+                      } catch {}
                     }
                   }
 
@@ -1182,11 +1344,11 @@ class JSSniffer:
                         try {
                           const data = JSON.parse(txt);
                           const stack = [data];
-                          const visitedObjects = new WeakSet();
+                          const visited = new WeakSet();
                           while (stack.length) {
                             const cur = stack.pop();
-                            if (!cur || typeof cur !== "object" || visitedObjects.has(cur)) continue;
-                            visitedObjects.add(cur);
+                            if (!cur || typeof cur !== "object" || visited.has(cur)) continue;
+                            visited.add(cur);
 
                             if (typeof cur === "string") {
                               const low = cur.toLowerCase();
@@ -1214,8 +1376,65 @@ class JSSniffer:
                     }
                   }
 
-                  walk(document);
+                  function scanWebpackModules(globalObj) {
+                    if (!enableWebpack) return;
+                    let req = null;
+                    try {
+                      if (globalObj.__webpack_require__ && globalObj.__webpack_require__.c) {
+                        req = globalObj.__webpack_require__;
+                      }
+                    } catch (e) {}
+
+                    if (!req || !req.c) return;
+                    let modules = Object.values(req.c || {});
+                    const limit = Math.max(1, webpackLimit);
+                    if (modules.length > limit) {
+                      modules = modules.slice(0, limit);
+                    }
+
+                    let rx;
+                    try {
+                      rx = new RegExp(webpackUrlRegex, "ig");
+                    } catch (e) {
+                      return;
+                    }
+
+                    const host = document.documentElement || document.body || document;
+
+                    for (const mod of modules) {
+                      let src = "";
+                      try {
+                        const fn = mod && (mod.toString ? mod : mod.exports && mod.exports.toString ? mod.exports : null);
+                        if (!fn || typeof fn.toString !== "function") continue;
+                        src = String(fn.toString());
+                      } catch (e) {
+                        continue;
+                      }
+                      if (!src) continue;
+
+                      let m;
+                      rx.lastIndex = 0;
+                      while ((m = rx.exec(src)) !== null) {
+                        const candidate = m[0];
+                        if (!candidate) continue;
+                        const low = candidate.toLowerCase();
+                        let ok = false;
+                        for (const hint of webpackApiHints) {
+                          if (low.includes(hint.toLowerCase())) {
+                            ok = true;
+                            break;
+                          }
+                        }
+                        if (!ok) continue;
+
+                        push(host, candidate, "webpack", "webpack-module");
+                      }
+                    }
+                  }
+
+                  walkDocumentAndShadows();
                   scanScripts(document);
+                  scanWebpackModules(window);
 
                   return { items: out };
                 }
@@ -1228,11 +1447,15 @@ class JSSniffer:
                     "redirectHints": redirect_hints_js,
                     "scriptJsonHints": script_json_hints_js,
                     "baseUrl": canonical_page_url,
+                    "enableWebpack": webpack_enabled_js,
+                    "webpackLimit": webpack_limit_js,
+                    "webpackUrlRegex": webpack_url_regex_js,
+                    "webpackApiHints": webpack_api_hints_js,
                 }
             ) or {}
 
             raw_links = raw_payload.get("items") or []
-            self._log(f"Raw links from DOM/scripts: {len(raw_links)}", log)
+            self._log(f"Raw links from DOM/scripts/webpack: {len(raw_links)}", log)
 
             # Optional click simulation (unchanged)
             if self.cfg.enable_click_simulation:
@@ -1275,10 +1498,26 @@ class JSSniffer:
                                 (baseUrl) => {
                                   const out = [];
                                   const seen = new Set();
+
+                                  function normalizeUrlRaw(u) {
+                                    if (!u) return "";
+                                    try {
+                                      u = u.replace(/\\u0026/gi, "&");
+                                    } catch (e) {}
+                                    try {
+                                      u = u.replace(/%5Cu0026/gi, "%26");
+                                    } catch (e) {}
+                                    return u;
+                                  }
+
                                   function absUrl(u) {
                                     if (!u) return "";
-                                    try { return new URL(u, baseUrl).href; } catch { return u; }
+                                    try {
+                                      u = normalizeUrlRaw(String(u).trim());
+                                      return new URL(u, baseUrl).href;
+                                    } catch { return u; }
                                   }
+
                                   document.querySelectorAll("a[href], video[src], audio[src], img[src], source[src]")
                                     .forEach(el => {
                                       let url = el.href || el.currentSrc || el.src ||
@@ -1325,6 +1564,9 @@ class JSSniffer:
                 if not url:
                     continue
 
+                # PATCH: safety net
+                url = self._fix_escaped_ampersands(url)
+
                 canonical_url_py = _canonicalize_url(url)
                 if canonical_url_py in seen_urls_in_js:
                     continue
@@ -1356,13 +1598,14 @@ class JSSniffer:
         # --- Robust page close: NEVER let close() hang the whole sniffer --- #
         try:
             try:
-                # Hard cap: if Camoufox / page is weird, give close() a small budget
                 await asyncio.wait_for(page.close(), timeout=3.0)
             except asyncio.TimeoutError:
                 self._log("page.close() timed out; ignoring and continuing.", log)
         except Exception as e:
             self._log(f"Failed to close page: {e}", log)
+
         return html, links
+
 
 # ======================================================================
 # RuntimeSniffer
@@ -1380,13 +1623,8 @@ class RuntimeSniffer:
       - Media events (play/pause/timeupdate) and src changes.
       - MediaSource / blob: instrumentation (createObjectURL, addSourceBuffer).
       - Console logs that mention manifests / streams.
-
-    Output schema (similar to json_hits):
-      hit = {
-        "url": <string>,          # WS URL, page URL, etc.
-        "json": <dict>,           # structured payload
-        "source_page": <string>,  # canonical_page_url
-      }
+      - JSON.parse hook (captures structured JSON before app logic).
+      - Hydration globals (__NEXT_DATA__, __NUXT__, etc.).
     """
 
     @dataclass
@@ -1401,6 +1639,25 @@ class RuntimeSniffer:
         enable_media_events_sniff: bool = True
         enable_mediasource_sniff: bool = True
         enable_console_sniff: bool = True
+
+        # NEW: JSON.parse hook
+        enable_json_parse_sniff: bool = True
+        json_parse_max_bytes: int = 64 * 1024  # max source string length
+        json_parse_keywords: Set[str] = field(default_factory=lambda: {
+            "manifest", "playlist", "m3u8", "mpd", "stream",
+            "video", "audio", "hls", "dash", "api", "graphql", "next"
+        })
+
+        # NEW: hydration globals
+        enable_hydration_sniff: bool = True
+        hydration_keys: Set[str] = field(default_factory=lambda: {
+            "__NEXT_DATA__",
+            "__NUXT__",
+            "__REMIX_CONTEXT__",
+            "__INITIAL_STATE__",
+            "__ApolloState__",
+        })
+        hydration_max_bytes: int = 256 * 1024  # after JSON.stringify in JS
 
         # --- WebSocket limits ---
         max_ws_frames: int = 50
@@ -1470,6 +1727,199 @@ class RuntimeSniffer:
             return False
 
         return True
+
+    # ------------------------- JSON.parse hook ------------------------- #
+
+    async def _inject_json_parse_hook(
+        self,
+        context: "BrowserContext",
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_json_parse_sniff:
+            return
+
+        max_bytes = int(self.cfg.json_parse_max_bytes)
+        # build keyword regex in JS
+        kw_pattern = "|".join(sorted(self.cfg.json_parse_keywords)) or "manifest"
+        kw_pattern_js = json.dumps(kw_pattern)
+
+        try:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                  try {{
+                    const MAX_LEN = {max_bytes};
+                    const KW_RX = new RegExp({kw_pattern_js}, "i");
+                    const origParse = JSON.parse;
+
+                    if (!window.__jsonParseSnifferEvents) {{
+                      window.__jsonParseSnifferEvents = [];
+                    }}
+
+                    JSON.parse = function(str, reviver) {{
+                      let val = origParse.call(this, str, reviver);
+                      try {{
+                        if (typeof str === "string") {{
+                          if (str.length <= MAX_LEN) {{
+                            const low = str.toLowerCase();
+                            if (KW_RX.test(low)) {{
+                              window.__jsonParseSnifferEvents.push({{
+                                ts: Date.now(),
+                                preview: str.slice(0, MAX_LEN),
+                                length: str.length
+                              }});
+                            }}
+                          }}
+                        }}
+                      }} catch (_) {{}}
+                      return val;
+                    }};
+                  }} catch (e) {{
+                    try {{
+                      console.log("[RuntimeSniffer] JSON.parse hook error:", e);
+                    }} catch (_e) {{}}
+                  }}
+                }})();
+                """
+            )
+            self._log("Injected JSON.parse hook script.", log)
+        except Exception as e:
+            self._log(f"Failed to inject JSON.parse hook script: {e}", log)
+
+    async def _collect_json_parse_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_json_parse_sniff:
+            return
+
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__jsonParseSnifferEvents) ? window.__jsonParseSnifferEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __jsonParseSnifferEvents: {e}", log)
+            return
+
+        if not events:
+            return
+
+        for ev in events:
+            if not isinstance(ev, dict):
+                continue
+            preview = ev.get("preview") or ""
+            ts = ev.get("ts")
+            length = ev.get("length")
+
+            parsed_json = None
+            if preview and isinstance(preview, str):
+                try:
+                    parsed_json = json.loads(preview)
+                except Exception:
+                    parsed_json = None
+
+            payload = {
+                "json_parse_preview": preview[: self.cfg.json_parse_max_bytes],
+                "length": length,
+                "timestamp": ts,
+            }
+            if parsed_json is not None:
+                payload["parsed"] = parsed_json
+
+            runtime_hits.append(
+                {
+                    "url": canonical_page_url,
+                    "json": {"json_parse": payload},
+                    "source_page": canonical_page_url,
+                }
+            )
+
+        self._log(f"JSON.parse events captured: {len(events)}", log)
+
+    # ------------------------- hydration globals ------------------------- #
+
+    async def _collect_hydration_state(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_hydration_sniff:
+            return
+
+        keys = list(self.cfg.hydration_keys) if self.cfg.hydration_keys else []
+        if not keys:
+            return
+
+        max_bytes = int(self.cfg.hydration_max_bytes)
+
+        try:
+            # FIX: Wrap arguments in a single dictionary
+            hydration_dump = await page.evaluate(
+                """
+                (args) => {
+                  const { keys, maxBytes } = args;
+                  const out = [];
+                  for (const k of keys || []) {
+                    try {
+                      if (!(k in window)) continue;
+                      const v = window[k];
+                      let jsonStr;
+                      try {
+                        jsonStr = JSON.stringify(v);
+                      } catch {
+                        continue;
+                      }
+                      if (!jsonStr) continue;
+                      if (jsonStr.length > maxBytes) {
+                        jsonStr = jsonStr.slice(0, maxBytes);
+                      }
+                      out.push({ key: k, json: jsonStr });
+                    } catch {}
+                  }
+                  return out;
+                }
+                """,
+                {"keys": keys, "maxBytes": max_bytes},
+            ) or []
+        except Exception as e:
+            self._log(f"Hydration sniff error: {e}", log)
+            return
+
+        if not hydration_dump:
+            return
+
+        for item in hydration_dump:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("key")
+            js_json = item.get("json") or ""
+            parsed = None
+            try:
+                parsed = json.loads(js_json)
+            except Exception:
+                parsed = None
+
+            payload = {
+                "hydration_key": key,
+                "preview": js_json[: max_bytes],
+            }
+            if parsed is not None:
+                payload["parsed"] = parsed
+
+            runtime_hits.append(
+                {
+                    "url": canonical_page_url,
+                    "json": {"hydration": payload},
+                    "source_page": canonical_page_url,
+                }
+            )
+
+        self._log(f"Hydration globals captured: {len(hydration_dump)}", log)
 
     # ------------------------- attach hooks ------------------------- #
 
@@ -1556,11 +2006,11 @@ class RuntimeSniffer:
         page.on("websocket", on_ws)
 
     async def _attach_request_body_sniffer(
-        self,
-        page: "Page",
-        runtime_hits: List[Dict[str, Any]],
-        canonical_page_url: str,
-        log: Optional[List[str]],
+            self,
+            page: "Page",
+            runtime_hits: List[Dict[str, Any]],
+            canonical_page_url: str,
+            log: Optional[List[str]],
     ) -> None:
         if not self.cfg.enable_request_body_sniff:
             return
@@ -1580,7 +2030,21 @@ class RuntimeSniffer:
                         content_length = None
 
                 if self._should_sniff_request_json(url_lower, ctype, content_length):
-                    body = request.post_data()
+                    body: Optional[str] = None
+
+                    # ---- Playwright compatibility: post_data can be a prop or a method ----
+                    try:
+                        pd = getattr(request, "post_data", None)
+                        # async API: post_data() is awaitable method
+                        if callable(pd):
+                            body = await pd()
+                        else:
+                            # property-style string
+                            body = pd
+                    except Exception as e:
+                        self._log(f"post_data retrieval error at {url}: {e}", log)
+                        body = None
+
                     if body:
                         try:
                             if isinstance(body, bytes):
@@ -1594,11 +2058,17 @@ class RuntimeSniffer:
                             self._log(f"Request JSON hit at {url}", log)
                         except Exception as e:
                             self._log(f"Failed to parse request JSON at {url}: {e}", log)
+
             except Exception as e:
+                # This is where your "'str' object is not callable" was coming from
                 self._log(f"route_handler error: {e}", log)
+
+            # Always continue the request
             await route.continue_()
 
         await page.route("**/*", route_handler)
+
+    # ---------------------- MediaSource / MSE hook ---------------------- #
 
     async def _inject_mediasource_script(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
         if not self.cfg.enable_mediasource_sniff:
@@ -1607,48 +2077,97 @@ class RuntimeSniffer:
         try:
             await context.add_init_script("""
             (() => {
-              const origCreateObjectURL = URL.createObjectURL;
-              const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
-              const mediaLog = [];
+              try {
+                const origCreateObjectURL = URL.createObjectURL;
+                const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+                window.__networkMediaEvents = window.__networkMediaEvents || [];
 
-              function logMedia(event, payload) {
-                try {
-                  window.__networkMediaEvents = window.__networkMediaEvents || [];
-                  window.__networkMediaEvents.push(Object.assign({event, ts: Date.now()}, payload));
-                } catch {}
-              }
-
-              URL.createObjectURL = function(obj) {
-                const url = origCreateObjectURL.call(this, obj);
-                if (obj instanceof MediaSource) {
-                  logMedia('createObjectURL', { url, mediaSourceType: 'MediaSource' });
+                function logMedia(event, payload) {
+                  try {
+                    window.__networkMediaEvents.push(Object.assign(
+                      {event, ts: Date.now()},
+                      payload || {}
+                    ));
+                  } catch {}
                 }
-                return url;
-              };
 
-              MediaSource.prototype.addSourceBuffer = function(mime) {
-                logMedia('addSourceBuffer', { mime });
-                return origAddSourceBuffer.call(this, mime);
-              };
-
-              const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-              if (desc && desc.set) {
-                const origSet = desc.set;
-                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                  set(value) {
-                    logMedia('setMediaSrc', {
-                      tagName: this.tagName.toLowerCase(),
-                      src: String(value || "")
-                    });
-                    return origSet.call(this, value);
+                URL.createObjectURL = function(obj) {
+                  const url = origCreateObjectURL.call(this, obj);
+                  if (obj instanceof MediaSource) {
+                    logMedia('createObjectURL', { url, mediaSourceType: 'MediaSource' });
                   }
-                });
+                  return url;
+                };
+
+                MediaSource.prototype.addSourceBuffer = function(mime) {
+                  let container = null;
+                  let codecs = null;
+                  try {
+                    const m = /^([^;]+)(?:;\\s*codecs=\\"?([^\\"]+)\\"?)?$/i.exec(String(mime || ""));
+                    if (m) {
+                      container = m[1] || null;
+                      codecs = m[2] || null;
+                    }
+                  } catch {}
+                  logMedia('addSourceBuffer', {
+                    mime: String(mime || ""),
+                    container,
+                    codecs
+                  });
+                  return origAddSourceBuffer.call(this, mime);
+                };
+
+                const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+                if (desc && desc.set) {
+                  const origSet = desc.set;
+                  Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                    set(value) {
+                      logMedia('setMediaSrc', {
+                        tagName: this.tagName.toLowerCase(),
+                        src: String(value || "")
+                      });
+                      return origSet.call(this, value);
+                    }
+                  });
+                }
+              } catch (e) {
+                try { console.log("[RuntimeSniffer] MediaSource instrumentation error:", e); } catch {}
               }
             })();
             """)
             self._log("Injected MediaSource instrumentation script.", log)
         except Exception as e:
             self._log(f"Failed to inject MediaSource script: {e}", log)
+
+    async def _collect_mediasource_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_mediasource_sniff:
+            return
+
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__networkMediaEvents) ? window.__networkMediaEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __networkMediaEvents: {e}", log)
+            return
+
+        if not events:
+            return
+
+        runtime_hits.append({
+            "url": canonical_page_url,
+            "json": {"mse_events": events},
+            "source_page": canonical_page_url,
+        })
+        self._log(f"MSE events captured: {len(events)}", log)
+
+    # ---------------------- media events script ---------------------- #
 
     async def _inject_media_events_script(
         self,
@@ -1833,8 +2352,9 @@ class RuntimeSniffer:
         canonical_page_url = _canonicalize_url(page_url)
         runtime_hits: List[Dict[str, Any]] = []
 
-        # Some hooks must be injected at context level
+        # Context-level hooks (must run before new_page / navigation)
         await self._inject_mediasource_script(context, log)
+        await self._inject_json_parse_hook(context, log)
 
         page: Page = await context.new_page()
         html: str = ""
@@ -1888,6 +2408,30 @@ class RuntimeSniffer:
                 log,
             )
 
+            # MSE events
+            await self._collect_mediasource_events(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
+            # JSON.parse hook results
+            await self._collect_json_parse_events(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
+            # Hydration globals
+            await self._collect_hydration_state(
+                page,
+                canonical_page_url,
+                runtime_hits,
+                log,
+            )
+
             try:
                 html = await page.content()
             except Exception as e:
@@ -1910,6 +2454,1014 @@ class RuntimeSniffer:
             log,
         )
         return html, runtime_hits
+
+# ======================================================================
+# ReactSniffer (Advanced: Fiber + Router + State URLs)
+# ======================================================================
+
+class ReactSniffer:
+    """
+    Playwright-based sniffer focused on React / SPA behavior.
+
+    Goals (structural):
+      • Match the API of other sniffers (NetworkSniffer, JSSniffer, RuntimeSniffer).
+      • Single public entrypoint: `await sniff(context, page_url, timeout, log, extensions=None)`.
+      • Return `(html, hits)` so it can be dropped into existing pipelines.
+
+    `hits` is a list of dicts like:
+        {
+            "page": <page_url>,
+            "url": <derived or navigated URL>,
+            "route": <react route / pathname>,
+            "tag": "react_route" | "react_link" | "react_nav" | "react_meta",
+            "kind": "initial" | "pushState" | "replaceState" | "popstate"
+                    | "hashchange" | "click"
+                    | "react_devtools" | "summary"
+                    | "router_config" | "fiber_link" | "fiber_state_url",
+            "meta": {...anything extra...},
+        }
+
+    New “active” capabilities:
+      • React Router Extraction:
+            - Reads router-like configs discovered in memory (paths, children).
+      • Fiber Tree Crawling:
+            - Walks React Fiber roots to find props like:
+                to="/dashboard", href="...", path="..."
+              even when not present in the DOM yet.
+      • State Inspection:
+            - Examines memoizedState / state for URL-like strings
+              (API endpoints, internal routes, etc).
+    """
+
+    # ------------------------------------------------------------------ #
+    # Config
+    # ------------------------------------------------------------------ #
+    @dataclass
+    class Config:
+        # generic controls
+        timeout: float = 8.0
+        max_hits: int = 200
+
+        # how long to wait after first load for SPA nav / route changes
+        wait_after_load_ms: int = 1000
+
+        # whether to instrument history / pushState / replaceState
+        hook_history_api: bool = True
+
+        # whether to instrument common React-link clicks
+        hook_link_clicks: bool = True
+
+        # whether to attempt to read React DevTools global hook as a hint
+        inspect_react_devtools_hook: bool = False
+
+        # advanced controls
+        capture_hashchange: bool = True
+        dedupe_events: bool = True
+        max_events_per_kind: int = 500  # safety cap per kind inside the browser
+
+        # whether to emit an aggregate summary hit
+        emit_summary_hit: bool = True
+
+        # ----- NEW: Fiber / Router / State inspection toggles -----
+        enable_fiber_traversal: bool = True
+        enable_router_inspection: bool = True
+        enable_state_url_scan: bool = True
+
+        # Limits for traversal / extraction
+        max_fiber_nodes: int = 5000
+        max_router_entries: int = 500
+
+        # Heuristic: what looks like a URL / route?
+        url_like_regex: str = r"(https?://[^\s\"']+|/[A-Za-z0-9_./-]+)"
+
+    # ------------------------------------------------------------------ #
+    # Internal memory data structures ("sniffer memory")
+    # ------------------------------------------------------------------ #
+    @dataclass
+    class RouteEvent:
+        kind: str
+        url: str
+        pathname: str
+        timestamp: Optional[float] = None
+
+    @dataclass
+    class ClickEvent:
+        url: str
+        pathname: str
+        text: str
+        timestamp: Optional[float] = None
+
+    @dataclass
+    class DevtoolsSummary:
+        has_react: bool = False
+        renderer_ids: List[str] = field(default_factory=list)
+        timestamp: Optional[float] = None
+
+    def __init__(self, config: "ReactSniffer.Config", logger=None):
+        self.cfg = config
+        self.logger = logger or DEBUG_LOGGER
+        self._reset_memory()
+        self._log("ReactSniffer Initialized", None)
+
+    # ------------------------------------------------------------------ #
+    # Logging helper
+    # ------------------------------------------------------------------ #
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        full = f"[ReactSniffer] {msg}"
+        try:
+            if log_list is not None:
+                log_list.append(full)
+            if self.logger is not None:
+                self.logger.log_message(full)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Memory lifecycle
+    # ------------------------------------------------------------------ #
+    def _reset_memory(self) -> None:
+        self._nav_events: List[ReactSniffer.RouteEvent] = []
+        self._click_events: List[ReactSniffer.ClickEvent] = []
+        self._routes_seen: Set[str] = set()
+        self._urls_seen: Set[str] = set()
+        # Router config extracted from fiber / globals
+        self._router_routes: List[Dict[str, Any]] = []
+        # event fingerprints so we don't double-count same browser event
+        # fingerprint = (kind, url, pathname, timestamp)
+        self._event_fingerprint_seen: Set[Tuple[Any, Any, Any, Any]] = set()
+        self._summary: Optional[ReactSniffer.DevtoolsSummary] = None
+
+    # ------------------------------------------------------------------ #
+    # Public API (matches other sniffers)
+    # ------------------------------------------------------------------ #
+    async def sniff(
+        self,
+        context,              # Playwright BrowserContext
+        page_url: str,
+        timeout: float,
+        log: List[str],
+        extensions=None,      # kept for signature compatibility; usually unused
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Main entrypoint.
+
+        Returns:
+            (html, hits)
+        Where:
+            html: final outerHTML / document HTML snapshot (str)
+            hits: list of dicts describing React routes / SPA navigations.
+        """
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        # fresh memory for each sniff run
+        self._reset_memory()
+        self._log(f"Start React sniff: {page_url} timeout={timeout}s", log)
+
+        page = None
+        hits: List[Dict[str, Any]] = []
+        html: str = ""
+
+        try:
+            page = await context.new_page()
+            await page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=int(timeout * 1000),
+            )
+
+            # Install instrumentation before SPA settles
+            await self._install_instrumentation(page, page_url, log)
+
+            # Give React / SPA some time to bootstrap & navigate
+            await page.wait_for_timeout(self.cfg.wait_after_load_ms)
+
+            # Grab HTML
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"Error getting HTML for {page_url}: {e}", log)
+
+            # Extract SPA / React hints into memory
+            try:
+                raw_hits = await self._collect_raw_hits(page, page_url, log)
+                self._ingest_raw_hits(raw_hits, page_url, log)
+                hits = self._materialize_hits(page_url)
+            except Exception as e:
+                self._log(f"Error collecting hits for {page_url}: {e}", log)
+
+        except PWTimeoutError:
+            self._log(f"Timeout while loading {page_url}", log)
+        except Exception as e:
+            self._log(f"Fatal error on {page_url}: {e}", log)
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as e:
+                    self._log(f"Error closing page for {page_url}: {e}", log)
+
+        # Enforce max_hits
+        if len(hits) > self.cfg.max_hits:
+            hits = hits[: self.cfg.max_hits]
+
+        self._log(f"Finished React sniff for {page_url}: hits={len(hits)}", log)
+        return html or "", hits
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers: JS injection
+    # ------------------------------------------------------------------ #
+    async def _install_instrumentation(self, page, page_url: str, log: List[str]) -> None:
+        """
+        Inject JavaScript into the page to observe:
+          • history.pushState / replaceState
+          • popstate
+          • hashchange (optional)
+          • link clicks
+          • optional React DevTools hook
+          • OPTIONAL (advanced):
+                - Fiber traversal
+                - Router config extraction
+                - State URL sniffing
+
+        Stashes events on window.__PROMPTCHAT_REACT_SNIFFER_HITS__.
+        """
+        script_parts: List[str] = []
+
+        max_events_per_kind = int(self.cfg.max_events_per_kind)
+
+        # ------------------------------------------------------------------
+        # Shared event buffer + pushEvent helper
+        # ------------------------------------------------------------------
+        script_parts.append(
+            f"""
+            (function() {{
+                try {{
+                    if (!window.__PROMPTCHAT_REACT_SNIFFER_HITS__) {{
+                        window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = [];
+                    }}
+
+                    var MAX_EVENTS_PER_KIND = {max_events_per_kind};
+
+                    function __RS_pushEvent(evt) {{
+                        try {{
+                            var arr = window.__PROMPTCHAT_REACT_SNIFFER_HITS__;
+                            if (!Array.isArray(arr)) {{
+                                arr = [];
+                                window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = arr;
+                            }}
+                            var kind = evt && evt.kind || "unknown";
+                            var count = 0;
+                            for (var i = 0; i < arr.length; i++) {{
+                                if (arr[i] && arr[i].kind === kind) {{
+                                    count++;
+                                    if (count >= MAX_EVENTS_PER_KIND) {{
+                                        return;
+                                    }}
+                                }}
+                            }}
+                            arr.push(evt);
+                        }} catch (_) {{}}
+                    }}
+
+                    window.__RS_pushEvent = __RS_pushEvent;
+                }} catch (e) {{
+                    try {{
+                        console.log("[ReactSniffer] Shared buffer init error:", e);
+                    }} catch (_e) {{}}
+                }}
+            }})();"""
+        )
+
+        # ------------------------------------------------------------------
+        # History / SPA navigation hooks
+        # ------------------------------------------------------------------
+        if self.cfg.hook_history_api or self.cfg.capture_hashchange:
+            script_parts.append(
+                """
+                (function() {
+                    try {
+                        if (typeof window.__RS_pushEvent !== "function") return;
+
+                        function recordReactNav(kind, url) {
+                            try {
+                                window.__RS_pushEvent({
+                                    kind: kind,
+                                    url: String(url || location.href),
+                                    href: String(location.href),
+                                    pathname: location.pathname,
+                                    search: location.search,
+                                    hash: location.hash,
+                                    timestamp: Date.now()
+                                });
+                            } catch (_) {}
+                        }
+                """
+            )
+
+            if self.cfg.hook_history_api:
+                script_parts.append(
+                    """
+                        var origPush = history.pushState;
+                        var origReplace = history.replaceState;
+
+                        history.pushState = function(state, title, url) {
+                            try { origPush.apply(this, arguments); } catch (_) {}
+                            recordReactNav("pushState", url);
+                        };
+
+                        history.replaceState = function(state, title, url) {
+                            try { origReplace.apply(this, arguments); } catch (_) {}
+                            recordReactNav("replaceState", url);
+                        };
+
+                        window.addEventListener("popstate", function() {
+                            recordReactNav("popstate", location.href);
+                        });
+
+                        // initial page load
+                        recordReactNav("initial", location.href);
+                    """
+                )
+
+            if self.cfg.capture_hashchange:
+                script_parts.append(
+                    """
+                        window.addEventListener("hashchange", function() {
+                            recordReactNav("hashchange", location.href);
+                        });
+                    """
+                )
+
+            script_parts.append(
+                """
+                    } catch (e) {
+                        try {
+                            console.log("[ReactSniffer] History instrumentation error:", e);
+                        } catch (_e) {}
+                    }
+                })();
+                """
+            )
+
+        # ------------------------------------------------------------------
+        # Link click hooks
+        # ------------------------------------------------------------------
+        if self.cfg.hook_link_clicks:
+            script_parts.append(
+                """
+                (function() {
+                    try {
+                        if (typeof window.__RS_pushEvent !== "function") return;
+
+                        document.addEventListener("click", function(ev) {
+                            try {
+                                var t = ev.target;
+                                // climb up to nearest <a> if needed
+                                while (t && t !== document && !t.href) {
+                                    t = t.parentElement;
+                                }
+                                if (!t || !t.href) { return; }
+
+                                window.__RS_pushEvent({
+                                    kind: "click",
+                                    url: String(t.href),
+                                    href: String(t.href),
+                                    pathname: location.pathname,
+                                    search: location.search,
+                                    hash: location.hash,
+                                    text: (t.innerText || "").trim(),
+                                    timestamp: Date.now()
+                                });
+                            } catch (_) {}
+                        }, true);
+                    } catch (e) {
+                        try {
+                            console.log("[ReactSniffer] Link instrumentation error:", e);
+                        } catch (_e) {}
+                    }
+                })();
+                """
+            )
+
+        # ------------------------------------------------------------------
+        # Optional React DevTools hook inspection
+        # ------------------------------------------------------------------
+        if self.cfg.inspect_react_devtools_hook:
+            script_parts.append(
+                """
+                (function() {
+                    try {
+                        if (typeof window.__RS_pushEvent !== "function") return;
+
+                        var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+                        if (hook && hook.renderers) {
+                            var rendererIds = Object.keys(hook.renderers || {});
+                            window.__RS_pushEvent({
+                                kind: "react_devtools",
+                                rendererIds: rendererIds,
+                                hasReact: rendererIds.length > 0,
+                                pathname: location.pathname,
+                                href: String(location.href),
+                                timestamp: Date.now()
+                            });
+                        }
+                    } catch (e) {
+                        try {
+                            console.log("[ReactSniffer] DevTools hook inspection error:", e);
+                        } catch (_e) {}
+                    }
+                })();
+                """
+            )
+
+        # ------------------------------------------------------------------
+        # NEW: Fiber traversal + Router/state extraction
+        # ------------------------------------------------------------------
+        if (
+            self.cfg.enable_fiber_traversal
+            or self.cfg.enable_router_inspection
+            or self.cfg.enable_state_url_scan
+        ):
+            url_rx = self.cfg.url_like_regex or r"(https?://[^\\s\"']+|/[A-Za-z0-9_./-]+)"
+            # safe JSON string for JS
+            url_rx_js = json.dumps(url_rx)
+
+            script_parts.append(
+                f"""
+                (function() {{
+                    try {{
+                        if (typeof window.__RS_pushEvent !== "function") return;
+
+                        var MAX_FIBER_NODES = {int(self.cfg.max_fiber_nodes)};
+                        var MAX_ROUTES = {int(self.cfg.max_router_entries)};
+                        var URL_RX = new RegExp({url_rx_js}, "i");
+
+                        function isUrlish(str) {{
+                            if (typeof str !== "string") return false;
+                            if (!str) return false;
+                            if (URL_RX.test(str)) return true;
+                            if (str[0] === "/" && str.length <= 256) return true;
+                            return false;
+                        }}
+
+                        function emitFiberLink(url, meta) {{
+                            try {{
+                                if (!url || !isUrlish(url)) return;
+                                window.__RS_pushEvent({{
+                                    kind: "fiber_link",
+                                    url: String(url),
+                                    href: String(location.href),
+                                    pathname: location.pathname,
+                                    meta: meta || {{}},
+                                    timestamp: Date.now()
+                                }});
+                            }} catch (_) {{}}
+                        }}
+
+                        function emitStateUrl(url, meta) {{
+                            try {{
+                                if (!url || !isUrlish(url)) return;
+                                window.__RS_pushEvent({{
+                                    kind: "fiber_state_url",
+                                    url: String(url),
+                                    href: String(location.href),
+                                    pathname: location.pathname,
+                                    meta: meta || {{}},
+                                    timestamp: Date.now()
+                                }});
+                            }} catch (_) {{}}
+                        }}
+
+                        function scanObjectForUrls(obj, meta, depth, maxDepth, cb) {{
+                            if (!obj || typeof obj !== "object") return;
+                            if (depth > maxDepth) return;
+                            var seen = new WeakSet();
+                            function walk(o, d) {{
+                                if (!o || typeof o !== "object") return;
+                                if (seen.has(o)) return;
+                                seen.add(o);
+                                if (d > maxDepth) return;
+                                var keys = Object.keys(o);
+                                for (var i = 0; i < keys.length; i++) {{
+                                    var k = keys[i];
+                                    var v = o[k];
+                                    if (typeof v === "string") {{
+                                        if (isUrlish(v)) {{
+                                            cb(v, Object.assign({{ key: k }}, meta || {{}}));
+                                        }}
+                                    }} else if (v && typeof v === "object") {{
+                                        walk(v, d + 1);
+                                    }}
+                                }}
+                            }}
+                            walk(obj, depth);
+                        }}
+
+                        function gatherRouterRoutesFromConfig(config, meta, out) {{
+                            if (!config || typeof config !== "object") return;
+                            var seen = new WeakSet();
+                            function walkRouteNode(node, baseMeta) {{
+                                if (!node || typeof node !== "object") return;
+                                if (seen.has(node)) return;
+                                seen.add(node);
+                                var path = null;
+                                var hasIndex = false;
+
+                                try {{
+                                    if (typeof node.path === "string") {{
+                                        path = node.path;
+                                    }} else if (typeof node.route === "string") {{
+                                        path = node.route;
+                                    }}
+                                    if (node.index === true) {{
+                                        hasIndex = true;
+                                    }}
+                                }} catch (_) {{}}
+
+                                if (path || hasIndex) {{
+                                    out.push({{
+                                        path: path || null,
+                                        index: !!hasIndex,
+                                        meta: baseMeta || meta || {{}}
+                                    }});
+                                }}
+
+                                var children = null;
+                                try {{
+                                    children = node.children || node.routes || node.childRoutes || null;
+                                }} catch (_) {{}}
+
+                                if (Array.isArray(children)) {{
+                                    for (var i = 0; i < children.length; i++) {{
+                                        walkRouteNode(children[i], baseMeta || meta);
+                                        if (out.length >= MAX_ROUTES) return;
+                                    }}
+                                }}
+                            }}
+
+                            walkRouteNode(config, meta || {{}});
+                        }}
+
+                        function getFiberRootsFromDevtools() {{
+                            var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+                            if (!hook || !hook.getFiberRoots) return [];
+                            var roots = [];
+                            try {{
+                                var rendererIds = Object.keys(hook.renderers || {{}});
+                                for (var i = 0; i < rendererIds.length; i++) {{
+                                    var id = Number(rendererIds[i]);
+                                    var rootSet = hook.getFiberRoots(id);
+                                    if (!rootSet) continue;
+                                    if (typeof rootSet.forEach === "function") {{
+                                        rootSet.forEach(function(root) {{
+                                            if (root && root.current) {{
+                                                roots.push(root.current);
+                                            }} else if (root) {{
+                                                roots.push(root);
+                                            }}
+                                        }});
+                                    }}
+                                }}
+                            }} catch (e) {{
+                                try {{
+                                    console.log("[ReactSniffer] getFiberRoots error", e);
+                                }} catch (_e) {{}}
+                            }}
+                            return roots;
+                        }}
+
+                        function traverseFiberRoot(root, routerRoutes) {{
+                            var seen = new WeakSet();
+                            var count = 0;
+
+                            function visit(node) {{
+                                if (!node || typeof node !== "object") return;
+                                if (seen.has(node)) return;
+                                seen.add(node);
+
+                                if (count >= MAX_FIBER_NODES) return;
+                                count++;
+
+                                var elementTypeName = null;
+                                try {{
+                                    var et = node.elementType || node.type || null;
+                                    if (et && typeof et === "function" && et.name) {{
+                                        elementTypeName = et.name;
+                                    }} else if (typeof et === "string") {{
+                                        elementTypeName = et;
+                                    }}
+                                }} catch (_) {{}}
+
+                                // ----- props scan -----
+                                try {{
+                                    var props = node.memoizedProps || node.pendingProps || node.props || null;
+                                    if (props && typeof props === "object") {{
+                                        // Common React Router / link props
+                                        ["to", "href", "as", "path"].forEach(function(key) {{
+                                            if (props && typeof props[key] === "string") {{
+                                                var val = props[key];
+                                                if (isUrlish(val)) {{
+                                                    emitFiberLink(val, {{
+                                                        where: "props",
+                                                        key: key,
+                                                        elementType: elementTypeName
+                                                    }});
+                                                    if (key === "path" && routerRoutes.length < MAX_ROUTES) {{
+                                                        routerRoutes.push({{
+                                                            path: val,
+                                                            index: false,
+                                                            meta: {{ source: "fiber_props", elementType: elementTypeName }}
+                                                        }});
+                                                    }}
+                                                }}
+                                            }}
+                                        }});
+
+                                        // Also scan nested objects for URL-ish strings
+                                        scanObjectForUrls(
+                                            props,
+                                            {{ where: "props_deep", elementType: elementTypeName }},
+                                            0,
+                                            2,
+                                            emitFiberLink
+                                        );
+                                    }}
+                                }} catch (_) {{}}
+
+                                // ----- state scan -----
+                                try {{
+                                    var st = node.memoizedState || (node.stateNode && node.stateNode.state) || null;
+                                    if (st && typeof st === "object") {{
+                                        scanObjectForUrls(
+                                            st,
+                                            {{ where: "state", elementType: elementTypeName }},
+                                            0,
+                                            2,
+                                            emitStateUrl
+                                        );
+                                    }}
+                                }} catch (_) {{}}
+
+                                // descend
+                                try {{ visit(node.child); }} catch (_) {{}}
+                                try {{ visit(node.sibling); }} catch (_) {{}}
+                            }}
+
+                            visit(root);
+                        }}
+
+                        function scanReactRouterFromGlobals(routerRoutes) {{
+                            try {{
+                                // Heuristic search in window for route configs
+                                var rootKeys = Object.keys(window || {{}});
+                                for (var i = 0; i < rootKeys.length; i++) {{
+                                    var k = rootKeys[i];
+                                    if (!k) continue;
+                                    // skip obvious noise
+                                    if (k === "webpackJsonp" || k === "__PROMPTCHAT_REACT_SNIFFER_HITS__" || k === "__RS_pushEvent") continue;
+                                    if (k.indexOf("route") === -1 && k.indexOf("Router") === -1) continue;
+
+                                    var v;
+                                    try {{ v = window[k]; }} catch (_e) {{ v = null; }}
+                                    if (!v || typeof v !== "object") continue;
+                                    gatherRouterRoutesFromConfig(
+                                        v,
+                                        {{ source: "window:"+k }},
+                                        routerRoutes
+                                    );
+                                    if (routerRoutes.length >= MAX_ROUTES) break;
+                                }}
+                            }} catch (e) {{
+                                try {{
+                                    console.log("[ReactSniffer] scanReactRouterFromGlobals error", e);
+                                }} catch (_e) {{}}
+                            }}
+                        }}
+
+                        function runFiberScan() {{
+                            try {{
+                                var routerRoutes = [];
+                                var roots = getFiberRootsFromDevtools();
+                                for (var i = 0; i < roots.length; i++) {{
+                                    traverseFiberRoot(roots[i], routerRoutes);
+                                    if (routerRoutes.length >= MAX_ROUTES) break;
+                                }}
+
+                                scanReactRouterFromGlobals(routerRoutes);
+
+                                if (routerRoutes.length) {{
+                                    window.__RS_pushEvent({{
+                                        kind: "react_router_routes",
+                                        url: String(location.href),
+                                        href: String(location.href),
+                                        pathname: location.pathname,
+                                        meta: {{
+                                            routes: routerRoutes.slice(0, MAX_ROUTES)
+                                        }},
+                                        timestamp: Date.now()
+                                    }});
+                                }}
+                            }} catch (e) {{
+                                try {{
+                                    console.log("[ReactSniffer] runFiberScan error", e);
+                                }} catch (_e) {{}}
+                            }}
+                        }}
+
+                        // Schedule after initial React bootstraps
+                        setTimeout(runFiberScan, 0);
+                    }} catch (e) {{
+                        try {{
+                            console.log("[ReactSniffer] Fiber instrumentation error:", e);
+                        }} catch (_e) {{}}
+                    }}
+                }})();
+                """
+            )
+
+        final_script = "\n".join(script_parts)
+
+        try:
+            await page.add_init_script(final_script)
+            # also run immediately for the already-loaded document
+            await page.evaluate(final_script)
+            self._log(f"Instrumentation installed on {page_url}", log)
+        except Exception as e:
+            self._log(f"Failed to install instrumentation on {page_url}: {e}", log)
+
+    # ------------------------------------------------------------------ #
+    # Collect & ingest raw hits
+    # ------------------------------------------------------------------ #
+    async def _collect_raw_hits(self, page, page_url: str, log: List[str]) -> List[Dict[str, Any]]:
+        """
+        Read back the window.__PROMPTCHAT_REACT_SNIFFER_HITS__ array.
+        """
+        try:
+            raw_hits = await page.evaluate(
+                """() => {
+                    try {
+                        return Array.isArray(window.__PROMPTCHAT_REACT_SNIFFER_HITS__)
+                            ? window.__PROMPTCHAT_REACT_SNIFFER_HITS__
+                            : [];
+                    } catch (e) {
+                        return [];
+                    }
+                }"""
+            )
+        except Exception as e:
+            self._log(f"Error reading hits from {page_url}: {e}", log)
+            return []
+
+        if not isinstance(raw_hits, list):
+            raw_hits = []
+
+        self._log(f"Raw hits length={len(raw_hits)} for {page_url}", log)
+        return raw_hits
+
+    def _ingest_raw_hits(self, raw_hits: List[Dict[str, Any]], page_url: str, log: List[str]) -> None:
+        """
+        Convert JS-side events into internal dataclasses (sniffer memory).
+        """
+        for h in raw_hits or []:
+            if not isinstance(h, dict):
+                continue
+
+            kind = str(h.get("kind") or "react_nav")
+            url = str(h.get("url") or h.get("href") or page_url)
+            pathname = str(h.get("pathname") or "")
+            timestamp = h.get("timestamp")
+
+            # dedupe based on event fingerprint if enabled
+            fp = (kind, url, pathname, timestamp)
+            if self.cfg.dedupe_events and fp in self._event_fingerprint_seen:
+                continue
+            self._event_fingerprint_seen.add(fp)
+
+            if kind in ("initial", "pushState", "replaceState", "popstate", "hashchange", "react_nav"):
+                self._register_nav(kind, url, pathname, timestamp)
+
+            elif kind == "click":
+                text = str(h.get("text") or "")
+                self._register_click(url, pathname, text, timestamp)
+
+            elif kind == "react_devtools":
+                renderer_ids = list(h.get("rendererIds") or [])
+                has_react = bool(h.get("hasReact"))
+                self._register_summary(has_react, renderer_ids, timestamp)
+
+            elif kind == "react_router_routes":
+                # Router config dump; meta.routes is a list of {path, index, meta}
+                meta = h.get("meta") or {}
+                routes = meta.get("routes") or []
+                if isinstance(routes, list):
+                    for r in routes:
+                        if not isinstance(r, dict):
+                            continue
+                        path = str(r.get("path") or "")
+                        idx_flag = bool(r.get("index", False))
+                        rmeta = r.get("meta") or {}
+                        if path:
+                            self._router_routes.append(
+                                {
+                                    "path": path,
+                                    "index": idx_flag,
+                                    "meta": rmeta,
+                                }
+                            )
+                            # treat as navigation-type route as well
+                            self._register_nav("router_config", url, path, timestamp)
+
+            else:
+                # unknown kinds (fiber_link, fiber_state_url, etc.) treated as generic nav
+                self._register_nav(kind, url, pathname, timestamp)
+
+        self._log(
+            f"Memory populated: "
+            f"{len(self._nav_events)} nav_events, "
+            f"{len(self._click_events)} click_events, "
+            f"router_routes={len(self._router_routes)}, "
+            f"summary={'present' if self._summary else 'none'}",
+            log,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Memory helpers
+    # ------------------------------------------------------------------ #
+    def _register_nav(self, kind: str, url: str, pathname: str, timestamp: Optional[float]) -> None:
+        self._nav_events.append(
+            ReactSniffer.RouteEvent(
+                kind=kind,
+                url=url,
+                pathname=pathname,
+                timestamp=timestamp,
+            )
+        )
+        self._urls_seen.add(url)
+        if pathname:
+            self._routes_seen.add(pathname)
+
+    def _register_click(self, url: str, pathname: str, text: str, timestamp: Optional[float]) -> None:
+        self._click_events.append(
+            ReactSniffer.ClickEvent(
+                url=url,
+                pathname=pathname,
+                text=text,
+                timestamp=timestamp,
+            )
+        )
+        self._urls_seen.add(url)
+        if pathname:
+            self._routes_seen.add(pathname)
+
+    def _register_summary(self, has_react: bool, renderer_ids: List[str], timestamp: Optional[float]) -> None:
+        self._summary = ReactSniffer.DevtoolsSummary(
+            has_react=has_react,
+            renderer_ids=renderer_ids,
+            timestamp=timestamp,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Memory -> final hits
+    # ------------------------------------------------------------------ #
+    def _materialize_hits(self, page_url: str) -> List[Dict[str, Any]]:
+        """
+        Turn sniffer memory into the final list of dict hits.
+
+        This mirrors the pattern of NetworkSniffer / JSSniffer:
+          • 'page' always present
+          • 'url', 'route', 'tag', 'kind'
+          • 'meta' for extra info
+        """
+        hits: List[Dict[str, Any]] = []
+
+        # 1) Nav events (history, hashchange, router_config, fiber_link, etc.)
+        for nav in self._nav_events:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": nav.url,
+                    "route": nav.pathname,
+                    "tag": "react_route",
+                    "kind": nav.kind,
+                    "meta": {
+                        "timestamp": nav.timestamp,
+                    },
+                }
+            )
+
+        # 2) Click events
+        for click in self._click_events:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": click.url,
+                    "route": click.pathname,
+                    "tag": "react_link",
+                    "kind": "click",
+                    "meta": {
+                        "text": click.text,
+                        "timestamp": click.timestamp,
+                    },
+                }
+            )
+
+        # 3) Router routes (from config / fiber props)
+        for r in self._router_routes:
+            path = r.get("path") or ""
+            meta = dict(r.get("meta") or {})
+            meta["index"] = bool(r.get("index", False))
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": path or page_url,
+                    "route": path,
+                    "tag": "react_route",
+                    "kind": "router_config",
+                    "meta": meta,
+                }
+            )
+
+        # 4) Devtools info as its own hit
+        if self._summary is not None:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": page_url,
+                    "route": "",
+                    "tag": "react_meta",
+                    "kind": "react_devtools",
+                    "meta": {
+                        "hasReact": self._summary.has_react,
+                        "rendererIds": self._summary.renderer_ids,
+                        "timestamp": self._summary.timestamp,
+                    },
+                }
+            )
+
+        # 5) Optional aggregate summary hit
+        if self.cfg.emit_summary_hit:
+            summary_hit = self._build_summary_hit(page_url)
+            if summary_hit is not None:
+                hits.append(summary_hit)
+
+        return hits
+
+    def _build_summary_hit(self, page_url: str) -> Optional[Dict[str, Any]]:
+        """
+        Build a synthetic high-level summary hit aggregating counts and
+        the most "interesting" routes.
+        """
+        if (
+            not self._nav_events
+            and not self._click_events
+            and not self._summary
+            and not self._router_routes
+        ):
+            return None
+
+        # route frequency (from nav + router_routes)
+        route_counts: Dict[str, int] = {}
+        for nav in self._nav_events:
+            if nav.pathname:
+                route_counts[nav.pathname] = route_counts.get(nav.pathname, 0) + 1
+        for r in self._router_routes:
+            path = r.get("path") or ""
+            if path:
+                route_counts[path] = route_counts.get(path, 0) + 1
+
+        top_routes = sorted(
+            route_counts.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:10]
+
+        meta: Dict[str, Any] = {
+            "nav_event_count": len(self._nav_events),
+            "click_event_count": len(self._click_events),
+            "router_route_count": len(self._router_routes),
+            "unique_routes": len(self._routes_seen),
+            "unique_urls": len(self._urls_seen),
+            "top_routes": top_routes,
+        }
+
+        if self._summary is not None:
+            meta.update(
+                {
+                    "hasReact": self._summary.has_react,
+                    "rendererIds": self._summary.renderer_ids,
+                    "react_devtools_timestamp": self._summary.timestamp,
+                }
+            )
+
+        return {
+            "page": page_url,
+            "url": page_url,
+            "route": "",
+            "tag": "react_meta",
+            "kind": "summary",
+            "meta": meta,
+        }
+
 
 # ======================================================================
 # Database

@@ -421,7 +421,7 @@ _MODELS: Dict[str, type[BaseChatModel]] = {
     "lexicon":      LexiconFirstToyModel,
     "lexicon-adv":  LexiconAdvanceModel,
     "lexicon-finalize": LexiconFinalizeModel,
-    "hf-llm":       HFLocalLLMModel,   # <-- NEW key
+    "hf-llm":       HFLocalLLMModel,
 }
 
 def get_chat_model(name: str = "toy", **kwargs) -> BaseChatModel:

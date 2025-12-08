@@ -42,8 +42,8 @@ from dotenv import load_dotenv
 
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore
-
+    CodeCorpusStore, PageTrackerStore
+from loggers import DEBUG_LOGGER
 load_dotenv()
 # ---------------- Paths & helpers ----------------
 APP_DIR = _os.path.join(_os.path.expanduser("~"), ".promptchat")
@@ -6407,6 +6407,13 @@ class LinkTrackerBlock(BaseBlock):
         self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
 
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(
+                hook_history_api=True,
+                hook_link_clicks=True,
+                inspect_react_devtools_hook=True,
+            )
+        )
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -7165,6 +7172,15 @@ class LinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
+
+    async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
+        return await self.react_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
+
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -7342,6 +7358,8 @@ class LinkTrackerBlock(BaseBlock):
         # NEW: runtime sniffer toggles
         use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
         return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
 
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
@@ -7511,8 +7529,7 @@ class LinkTrackerBlock(BaseBlock):
         skip_search_engine = False
 
         if pipeline_urls:
-            skip_search_engine = True
-            queries_to_run = ["<URL list>"]
+            skip_search_engine = False
             unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
 
             for u in unique_urls:
@@ -7532,8 +7549,7 @@ class LinkTrackerBlock(BaseBlock):
                 if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                     continue
 
-                if not keywords or _term_overlap_ok(u):
-                    candidate_pages.append(u)
+                candidate_pages.append(u)
 
             candidate_pages = candidate_pages[:max_pages_total]
 
@@ -7805,7 +7821,7 @@ class LinkTrackerBlock(BaseBlock):
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
         all_runtime_hits: List[Dict[str, Any]] = []
-
+        all_react_hits: List[Dict[str, Any]] = []  # [PATCH] New list
         # choose UA for HTTP engine
         ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
 
@@ -7870,7 +7886,7 @@ class LinkTrackerBlock(BaseBlock):
                 return True
 
             # --- Shared Playwright context, if needed --- #
-            pw_needed = use_js or use_network_sniff or use_runtime_sniff
+            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -7899,6 +7915,7 @@ class LinkTrackerBlock(BaseBlock):
                 local_network_links: List[Dict[str, str]] = []
                 local_runtime_hits: List[Dict[str, Any]] = []  # NEW
                 local_assets: List[Dict[str, Any]] = []
+                local_react_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
                 try:
@@ -8046,7 +8063,30 @@ class LinkTrackerBlock(BaseBlock):
                                 "text": jl.get("text", ""),
                                 "tag": jl.get("tag", ""),
                             })
+                    if use_react_sniff and pw_context:
+                        try:
+                            r_html, r_hits = await self._pw_fetch_react_hits(
+                                pw_context, page_url, timeout, local_log
+                            )
+                            # Use React-rendered HTML if we don't have one yet
+                            if r_html and not html:
+                                html = r_html
 
+                            if r_hits:
+                                local_react_hits.extend(r_hits)
+
+                                # Treat found React routes as potential next pages for BFS
+                                for rh in r_hits:
+                                    r_url = rh.get("url")
+                                    if not r_url:
+                                        continue
+
+                                    # Verify site scope before adding to frontier
+                                    if _allowed_by_required_sites(r_url):
+                                        if depth < max_depth:
+                                            next_pages.append(r_url)
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
                     # 3) Plain HTML if PW didn't fill html
                     if not html:
                         try:
@@ -8055,8 +8095,8 @@ class LinkTrackerBlock(BaseBlock):
                                 raise RuntimeError("Empty HTML")
                         except Exception as e:
                             local_log.append(f"Error fetching {page_url}: {e}")
-                            if use_database and store and _should_persist_page(page_url):
-                                store.mark_page_scanned(page_url)
+                            if use_database and self.store and _should_persist_page(page_url):
+                                self.store.mark_scan_complete(page_url)
                             return {
                                 "page": page_url,
                                 "assets": local_assets,
@@ -8064,6 +8104,7 @@ class LinkTrackerBlock(BaseBlock):
                                 "js_links": local_js_links,
                                 "network_links": local_network_links,
                                 "runtime_hits": local_runtime_hits,
+                                "react_hits": local_react_hits,
                                 "log": local_log,
                             }
 
@@ -8263,87 +8304,134 @@ class LinkTrackerBlock(BaseBlock):
                     frontier.append(u)
 
             if required_sites:
-                per_site_cap = max(3, max_pages_total // len(required_sites))
+                per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
                 for s, bucket in site_buckets.items():
                     frontier.extend(bucket[:per_site_cap])
 
-            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
-            current_depth = 0
+            # Initial frontier: only unique URLs
+            frontier = list(dict.fromkeys(frontier))
 
-            # New: only log the rescan notice once
+            current_depth = 0
+            pages_scanned = 0  # metric only
+
+            DEBUG_LOGGER.log_message(
+                f"[LinkTracker][BFS] Starting BFS with max_depth={max_depth}, "
+                f"max_pages_total={max_pages_total}, initial_frontier={len(frontier)}"
+            )
+
+            # New: only log the rescan notice once (for information only)
             logged_rescan_notice = False
 
-            while (
-                    frontier
-                    and current_depth <= max_depth
-                    and len(visited_pages) < max_pages_total
-            ):
-                remaining_page_slots = max_pages_total - len(visited_pages)
+            # BFS over depths
+            # NOTE: we no longer gate on pages_scanned < max_pages_total,
+            # and we no longer **skip** pages based on page_scanned().
+            # Ensure frontier is unique and respects the limit initially
+            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+            current_depth = 0
+            logged_rescan_notice = False
+
+            # --- BFS LOOP START ---
+            # We check pages_scanned against max_pages_total to ensure global termination
+            while frontier and current_depth <= max_depth and pages_scanned < max_pages_total:
+
+                DEBUG_LOGGER.log_message(
+                    f"[BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} | "
+                    f"Scanned: {pages_scanned}/{max_pages_total} ---"
+                )
 
                 batch: List[str] = []
+
+                # Calculate how many slots are left before hitting the global cap
+                slots_left = max_pages_total - pages_scanned
+
                 for u in frontier:
-                    if len(batch) >= remaining_page_slots:
+                    if len(batch) >= slots_left:
                         break
+
                     if u in visited_pages:
                         continue
 
-                    # Respect DB "page_scanned" flag unless we explicitly allow rescan
+                    # DB Page Scanned Check (Logic preserved from your snippet)
                     if use_database and self.store and self.store.page_scanned(u):
-                        # Normal behavior: skip already-scanned pages
-                        if not (db_allow_rescan and params.get("source", "database") == "database"):
-                            visited_pages.add(u)
-                            continue
-
-                        # Rescan mode: process them again, but log once
                         if not logged_rescan_notice:
-                            log.append(
-                                "[LinkTracker][db] Rescan enabled: "
-                                "processing previously scanned pages from database."
+                            DEBUG_LOGGER.log_message(
+                                "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
                             )
                             logged_rescan_notice = True
+                        # We still fall through and add 'u' to batch, as requested
 
                     batch.append(u)
 
+                    # CRITICAL: Mark as visited immediately to prevent re-queueing in next_frontier
+                    visited_pages.add(u)
+
                 if not batch:
+                    DEBUG_LOGGER.log_message(
+                        f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
+                    )
                     break
 
+                DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
+
+                # Process this depth's batch
                 if use_camoufox:
                     results: List[Dict[str, Any]] = []
                     for url in batch:
                         try:
                             res = await _process_page(url, current_depth, http)
+                            results.append(res)
                         except Exception as e:
-                            log.append(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                            DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
                             continue
-                        results.append(res)
                 else:
-                    # Original concurrent behaviour (Chromium / normal Playwright)
+                    # Original concurrent behaviour
                     results = await asyncio.gather(
                         *[_process_page(url, current_depth, http) for url in batch]
                     )
-                next_frontier: List[str] = []
+
+                next_frontier_candidates: List[str] = []
 
                 for res in results:
-                    page_url = res["page"]
-                    visited_pages.add(page_url)
+                    pages_scanned += 1
 
-                    log.extend(res["log"])
-                    all_js_links.extend(res["js_links"])
-                    all_network_links.extend(res["network_links"])
-                    all_runtime_hits.extend(res.get("runtime_hits", []))  # NEW
-
-                    for asset in res["assets"]:
-                        a_url = asset["url"]
+                    # Aggregate Logs & Links
+                    all_js_links.extend(res.get("js_links", []))
+                    all_network_links.extend(res.get("network_links", []))
+                    all_runtime_hits.extend(res.get("runtime_hits", []))
+                    all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
+                    # Collect Assets
+                    for asset in res.get("assets", []):
+                        a_url = asset.get("url")
                         if a_url and a_url not in seen_asset_urls:
                             seen_asset_urls.add(a_url)
                             found_assets.append(asset)
 
-                    for nxt in res["next_pages"]:
-                        if nxt not in visited_pages:
-                            next_frontier.append(nxt)
+                    # Collect Next Pages (only if we haven't hit max depth)
+                    if current_depth < max_depth:
+                        next_pages = res.get("next_pages", [])
+                        if next_pages:
+                            next_frontier_candidates.extend(next_pages)
+
+                # Filter next frontier against visited pages and current batch
+                next_frontier = []
+                seen_in_next = set()
+
+                for url in next_frontier_candidates:
+                    # Ensure we don't circle back to pages we just visited or are about to visit
+                    if url not in visited_pages and url not in seen_in_next:
+                        next_frontier.append(url)
+                        seen_in_next.add(url)
+
+                # Update frontier for next depth
+                frontier = next_frontier
+
+                DEBUG_LOGGER.log_message(
+                    f"[BFS] Depth {current_depth} complete. "
+                    f"Discovered {len(frontier)} new unique pages for next depth."
+                )
 
                 current_depth += 1
-                frontier = list(dict.fromkeys(next_frontier))
 
             # Close shared PW
             if pw_needed:
@@ -8432,7 +8520,46 @@ class LinkTrackerBlock(BaseBlock):
                 size = nl.get("size", "?")
                 lines.append(f"- **[{text}]({url})**")
                 lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+        if return_react_sniff_hits and all_react_hits:
+            lines.append("\n### React / SPA Hits (debug)\n")
+            for rh in all_react_hits[:100]:
+                url = rh.get("url") or "(no url)"
+                route = rh.get("route") or ""
+                kind = rh.get("kind") or "react_nav"
+                lines.append(f"- `{kind}` **{route}** → {url}")
+        if return_runtime_sniff_hits and all_runtime_hits:
+            lines.append("\n### Runtime Sniff Hits (debug)\n")
+            # Cap output to prevent massive message overflow (e.g. 100 items)
+            for hit in all_runtime_hits[:100]:
+                url = hit.get("url") or "(no url)"
+                payload = hit.get("json") or {}
 
+                # Format a readable description based on the hit type
+                desc_parts = []
+                if "console" in payload:
+                    desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
+                elif "ws_frame" in payload:
+                    desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
+                elif "request_body" in payload:
+                    desc_parts.append("Request Body (JSON)")
+                elif "media_events" in payload:
+                    evts = payload["media_events"]
+                    desc_parts.append(f"Media Events: {len(evts)}")
+                elif "storage" in payload:
+                    desc_parts.append(f"Storage Items: {len(payload['storage'])}")
+                elif "perf_entries" in payload:
+                    desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
+                else:
+                    # Generic fallback for unknown payloads
+                    import json as _json
+                    try:
+                        dump = _json.dumps(payload)
+                        desc_parts.append(f"Data: {dump[:100]}...")
+                    except:
+                        desc_parts.append("Data: (complex object)")
+
+                desc = " | ".join(desc_parts)
+                lines.append(f"- `{desc}` found on **{url}**")
         return "\n".join(lines), {
             "found": len(found_assets),
             "scanned_pages": len(visited_pages),
@@ -8444,6 +8571,7 @@ class LinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "runtime_hits": all_runtime_hits,
+            "react_hits": all_react_hits,  # [PATCH]
             "log": log,
             "queries_run": queries_to_run,
         }
@@ -8605,6 +8733,8 @@ class LinkTrackerBlock(BaseBlock):
             "return_network_sniff_links": False,
             "use_runtime_sniff": False,
             "return_runtime_sniff_hits": False,
+            "use_react_sniff": False,
+            "return_react_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
@@ -8983,6 +9113,13 @@ class VideoLinkTrackerBlock(BaseBlock):
         self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.hls_manager = submanagers.HLSSubManager()
         self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(
+                hook_history_api=True,
+                hook_link_clicks=True,
+                inspect_react_devtools_hook=True,
+            )
+        )
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
@@ -9123,6 +9260,299 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return True
         return False
 
+    # ------------------------------------------------------------------ #
+    # Reverse Image/Video Lookup Helpers
+    # ------------------------------------------------------------------ #
+
+    async def _extract_frame_from_video(
+            self,
+            video_input: str,
+            ffmpeg_bin: str,
+            log: List[str]
+    ) -> Optional[bytes]:
+        """
+        Uses FFmpeg to extract a single frame from a video (local path or URL)
+        at timestamp 00:00:01.
+        """
+        import shutil
+
+        # Resolve binary
+        exe = ffmpeg_bin if ffmpeg_bin else "ffmpeg"
+        if not shutil.which(exe) and not os.path.exists(exe):
+            log.append(f"[VideoLinkTracker][ffmpeg] FFmpeg binary not found at '{exe}'.")
+            return None
+
+        log.append(f"[VideoLinkTracker][ffmpeg] Extracting frame from {video_input} using {exe}...")
+
+        # FFmpeg command: Seek to 1s, input file/url, grab 1 frame, output to pipe as JPEG
+        cmd = [
+            exe,
+            "-hide_banner", "-loglevel", "error",
+            "-ss", "00:00:01",
+            "-i", video_input,
+            "-vframes", "1",
+            "-f", "image2",
+            "-c:v", "mjpeg",
+            "pipe:1"
+        ]
+
+        try:
+            # Run FFmpeg asynchronously
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                log.append(f"[VideoLinkTracker][ffmpeg] Error (code {proc.returncode}): {stderr.decode().strip()}")
+                return None
+
+            if not stdout:
+                log.append("[VideoLinkTracker][ffmpeg] No data produced by FFmpeg.")
+                return None
+
+            return stdout
+
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][ffmpeg] Exception: {e}")
+            return None
+
+    async def _upload_frame_to_host(self, image_bytes: bytes, log: List[str]) -> Optional[str]:
+        """
+        Uploads bytes to a temporary host (Catbox.moe) to get a public URL
+        compatible with search engine 'imgurl' parameters.
+        """
+        import aiohttp
+
+        # Using Catbox.moe for simplicity (no key needed)
+        upload_url = "https://catbox.moe/user/api.php"
+
+        data = aiohttp.FormData()
+        data.add_field("reqtype", "fileupload")
+        data.add_field("userhash", "")
+        data.add_field("fileToUpload", image_bytes, filename="frame.jpg", content_type="image/jpeg")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(upload_url, data=data, timeout=15) as resp:
+                    if resp.status != 200:
+                        log.append(f"[VideoLinkTracker][Upload] Upload failed: {resp.status}")
+                        return None
+
+                    text = await resp.text()
+                    if text.startswith("http"):
+                        return text.strip()
+                    else:
+                        log.append(f"[VideoLinkTracker][Upload] Unexpected response: {text[:100]}")
+                        return None
+        except Exception as e:
+            log.append(f"[VideoLinkTracker][Upload] Error: {e}")
+            return None
+
+    async def _fetch_reverse_image_seeds(
+            self,
+            image_url: str,
+            timeout: float,
+            log: List[str],
+            max_results: int = 15
+    ) -> List[str]:
+        """
+        Robust Multi-Engine Reverse Image Search (Yandex + Bing Visual Search + Google Lens).
+        Uses Playwright/Camoufox to bypass bot detection and render JS results.
+        """
+        from urllib.parse import quote
+
+        if not image_url:
+            return []
+
+        seeds = []
+        unique_seeds = set()
+
+        # 1. Setup Engines
+        # Yandex is often better for exact video source matches
+        yandex_url = f"https://yandex.com/images/search?rpt=imageview&url={quote(image_url)}"
+        # Bing Visual Search for additional context / host pages
+        bing_url = (
+            "https://www.bing.com/images/search"
+            f"?view=detailv2&iss=sbi&FORM=SBIIDP&sbisrc=UrlPaste&q=imgurl:{quote(image_url)}"
+        )
+        # Google Lens for broad context
+        google_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url)}"
+
+        # 2. Initialize Playwright (Reusing your robust context opener)
+        # We need a full browser because Google/Yandex/Bing heavily rely on JS
+        pw_p = pw_browser = pw_context = None
+
+        try:
+            DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Initializing browser for reverse lookup...")
+            pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                ua=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                block_resources=True,
+                # still allow images; fonts/media/stylesheet can be blocked safely
+                blocked_resource_types={"font", "media"},
+                block_domains=False,
+                blocked_domains=set(),
+                log=log,
+                use_camoufox=True  # Critical for avoiding Google's/Bing's bot detection
+            )
+
+            if not pw_context:
+                log.append("[VideoLinkTracker][RevImg] Playwright failed to start. Skipping.")
+                return []
+
+            page = await pw_context.new_page()
+
+            # --- ENGINE 1: YANDEX (The "Source Finder") ---
+            try:
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Scanning Yandex Images...")
+                await page.goto(yandex_url, timeout=int(timeout * 1000))
+
+                # Wait for some links to appear
+                try:
+                    await page.wait_for_selector("a[href]", timeout=6000)
+                except:
+                    pass
+
+                # Extract links specifically from the results area
+                yandex_links = await page.evaluate("""
+                    () => {
+                        const links = [];
+                        // Yandex 'similar images' and 'sites' usually appear in specific containers
+                        // We grab all external links to be safe
+                        document.querySelectorAll('a[href]').forEach(a => {
+                            if (a.href.startsWith('http') &&
+                                !a.href.includes('yandex.') &&
+                                !a.href.includes('google.')) {
+                                links.push(a.href);
+                            }
+                        });
+                        return links;
+                    }
+                """)
+
+                count_before = len(unique_seeds)
+                for link in yandex_links:
+                    if link not in unique_seeds and link != image_url:
+                        unique_seeds.add(link)
+                        seeds.append(link)
+
+                DEBUG_LOGGER.log_message(
+                    f"[VideoLinkTracker][RevImg] Yandex found {len(unique_seeds) - count_before} new seeds."
+                )
+
+            except Exception as e:
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Yandex scan failed: {e}")
+
+            # --- ENGINE 2: BING VISUAL SEARCH (The "Extra Context Finder") ---
+            if len(seeds) < max_results:
+                try:
+                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Scanning Bing Visual Search...")
+                    await page.goto(bing_url, timeout=int(timeout * 1000))
+
+                    # Try to get past any light consent prompts
+                    try:
+                        await page.wait_for_selector("a[href]", timeout=6000)
+                    except:
+                        pass
+
+                    bing_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            document.querySelectorAll('a[href]').forEach(a => {
+                                const h = a.href;
+                                if (h.startsWith('http') &&
+                                    !h.includes('bing.com') &&
+                                    !h.includes('microsoft.com') &&
+                                    !h.includes('google.') &&
+                                    !h.includes('yandex.')) {
+                                    links.push(h);
+                                }
+                            });
+                            return links;
+                        }
+                    """)
+
+                    count_before = len(unique_seeds)
+                    for link in bing_links:
+                        if link not in unique_seeds and link != image_url:
+                            unique_seeds.add(link)
+                            seeds.append(link)
+                            if len(seeds) >= max_results:
+                                break
+
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][RevImg] Bing Visual Search found "
+                        f"{len(unique_seeds) - count_before} new seeds."
+                    )
+
+                except Exception as e:
+                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Bing Visual Search scan failed: {e}")
+
+            # --- ENGINE 3: GOOGLE LENS (The "Context Finder") ---
+            if len(seeds) < max_results:
+                try:
+                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Scanning Google Lens...")
+                    await page.goto(google_url, timeout=int(timeout * 1000))
+
+                    # Handle "Accept Cookies" modal if it appears
+                    try:
+                        # Common selector for Google consent 'Reject all' or 'Accept all'
+                        await page.click('button[aria-label="Reject all"]', timeout=2000)
+                    except:
+                        pass
+
+                    # Wait for results
+                    try:
+                        await page.wait_for_selector("a[href]", timeout=6000)
+                    except:
+                        pass
+
+                    google_links = await page.evaluate("""
+                        () => {
+                            const links = [];
+                            // Target the 'Visual matches' grid links
+                            document.querySelectorAll('a[href]').forEach(a => {
+                                const h = a.href;
+                                if (h.startsWith('http') && 
+                                    !h.includes('google.') && 
+                                    !h.includes('googleusercontent') &&
+                                    !h.includes('gstatic')) {
+                                    links.push(h);
+                                }
+                            });
+                            return links;
+                        }
+                    """)
+
+                    count_before = len(unique_seeds)
+                    for link in google_links:
+                        if link not in unique_seeds and link != image_url:
+                            unique_seeds.add(link)
+                            seeds.append(link)
+                            if len(seeds) >= max_results:
+                                break
+
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][RevImg] Google Lens found "
+                        f"{len(unique_seeds) - count_before} new seeds."
+                    )
+
+                except Exception as e:
+                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Google Lens scan failed: {e}")
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[VideoLinkTracker][RevImg] Browser error: {e}")
+
+        finally:
+            await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        return seeds[:max_results]
     # ------------------------------------------------------------------ #
     # Sitemap / Site Crawling Helpers (now using HTTPSSubmanager)
     # ------------------------------------------------------------------ #
@@ -9576,9 +10006,17 @@ class VideoLinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
-        # ------------------------------------------------------------------ #
-        # Search engines (DuckDuckGo + Google CSE)
-        # ------------------------------------------------------------------ #
+
+    async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
+        return await self.react_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
+    # ------------------------------------------------------------------ #
+    # Search engines (DuckDuckGo + Google CSE)
+    # ------------------------------------------------------------------ #
 
     async def _search_duckduckgo(
             self,
@@ -10221,6 +10659,9 @@ class VideoLinkTrackerBlock(BaseBlock):
         use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
         return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
 
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min(min_term_overlap_raw, 12))
 
@@ -10415,13 +10856,81 @@ class VideoLinkTrackerBlock(BaseBlock):
             if not any(x in q_lower for x in ["video", "mp4", "m3u8", "stream"]):
                 sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
             return sq
+        # ------------------ Reverse Image/Video Lookup Logic ------------------ #
+        rev_input_url = str(params.get("reverse_image_url", "")).strip()
+        ffmpeg_bin_path = str(params.get("ffmpeg_bin", "")).strip()
+
+        # Auto-detect from payload if it looks like a media file OR a local path
+        if not rev_input_url and isinstance(payload, str):
+            pl_clean = payload.strip()
+            # Check 1: Is it an existing local file?
+            if os.path.isfile(pl_clean):
+                rev_input_url = pl_clean
+            # Check 2: Is it a URL with media extension?
+            elif pl_clean.lower().startswith("http") and pl_clean.lower().endswith(
+                    tuple(self.VIDEO_EXTENSIONS) + (".jpg", ".png", ".webp", ".jpeg")):
+                rev_input_url = pl_clean
+
+        if rev_input_url:
+            search_seed_url = None
+            is_video = False
+
+            # 1. Determine if input is video (Local/URL extension)
+            if any(rev_input_url.lower().endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                is_video = True
+
+            # 2. If it is an image:
+            if not is_video:
+                if rev_input_url.lower().startswith("http"):
+                    # Use URL directly
+                    search_seed_url = rev_input_url
+                elif os.path.isfile(rev_input_url):
+                    # Local image file -> read bytes -> upload
+                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is local image: {rev_input_url}")
+                    try:
+                        with open(rev_input_url, "rb") as f:
+                            img_bytes = f.read()
+                        search_seed_url = await self._upload_frame_to_host(img_bytes, log)
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Failed to read/upload local image: {e}")
+
+            # 3. If it is a video (Local or URL):
+            if is_video:
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is video. Extracting frame from: {rev_input_url}")
+
+                # FFmpeg handles local paths and URLs here
+                frame_bytes = await self._extract_frame_from_video(rev_input_url, ffmpeg_bin_path, log)
+
+                if frame_bytes:
+                    public_img = await self._upload_frame_to_host(frame_bytes, log)
+                    if public_img:
+                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Generated search thumbnail: {public_img}")
+                        search_seed_url = public_img
+                    else:
+                        DEBUG_LOGGER.log_message("[VideoLinkTracker] Failed to upload video frame.")
+                else:
+                    DEBUG_LOGGER.log_message("[VideoLinkTracker] Failed to extract video frame.")
+
+            # 4. Perform Reverse Search
+            if search_seed_url:
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Triggering Visual Search for: {search_seed_url}")
+                rev_seeds = await self._fetch_reverse_image_seeds(
+                    search_seed_url,
+                    timeout=timeout,
+                    log=log,
+                    max_results=max_pages_total
+                )
+
+                for url in rev_seeds:
+                    if global_mode or _allowed_by_required_sites_check(url):
+                        candidate_pages.append(url)
 
         # ===================== source=database =====================
         if source == "database":
             if not self.store:
-                log.append("[VideoLinkTracker][db] Store missing; cannot use database source.")
+                DEBUG_LOGGER.log_message("[VideoLinkTracker][db] Store missing; cannot use database source.")
             else:
-                log.append("[VideoLinkTracker] Running Advanced Database Intelligence...")
+                DEBUG_LOGGER.log_message("[VideoLinkTracker] Running Advanced Database Intelligence...")
 
                 seeds = self.store.load_database_seeds(
                     sources=db_seed_sources,
@@ -10430,7 +10939,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     include_synthetic=db_include_synthetic_seeds,
                     per_domain_cap=db_seed_per_domain_cap,
                 )
-                log.append(
+                DEBUG_LOGGER.log_message(
                     f"[VideoLinkTracker][db] Loaded {len(seeds)} seed URLs "
                     f"(sources={db_seed_sources}, max_age_days={db_seed_max_age_days}, include_synthetic={db_include_synthetic_seeds})."
                 )
@@ -10440,12 +10949,12 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                 predicted_urls = self._predict_next_in_sequence(known_asset_urls)
                 if predicted_urls:
-                    log.append(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
+                    DEBUG_LOGGER.log_message(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
                     direct_asset_urls.extend(predicted_urls)
 
                 proven_hubs = self.store.fetch_proven_hubs(required_sites, min_hits=1)
                 if proven_hubs:
-                    log.append(f"[db] Identified {len(proven_hubs)} high-yield hubs for re-crawling.")
+                    DEBUG_LOGGER.log_message(f"[db] Identified {len(proven_hubs)} high-yield hubs for re-crawling.")
                     candidate_pages.extend(proven_hubs)
 
                 db_pages, db_assets = self.store.expand_db_seed_urls(
@@ -10463,7 +10972,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     is_probable_video_url_fn=self._is_probable_video_url,
                     archive_ident_to_downloads_fn=self._archive_ident_to_downloads,
                 )
-                log.append(f"[VideoLinkTracker][db] Expanded seeds -> {len(db_pages)} pages, {len(db_assets)} direct assets.")
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][db] Expanded seeds -> {len(db_pages)} pages, {len(db_assets)} direct assets.")
 
                 if extract_urls_from_db_text:
                     hidden_from_text = self.store.extract_urls_from_db_text(
@@ -10473,7 +10982,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         url_regex=self._URL_RE,
                     )
                     if hidden_from_text:
-                        log.append(f"[VideoLinkTracker][db] Extracted {len(hidden_from_text)} hidden URLs from prior manifest/JSON text.")
+                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker][db] Extracted {len(hidden_from_text)} hidden URLs from prior manifest/JSON text.")
                     for hu in hidden_from_text:
                         hp = self._clean_path(hu)
                         if self._is_probable_video_url(hu, hp, hu.lower()):
@@ -10491,26 +11000,27 @@ class VideoLinkTrackerBlock(BaseBlock):
                 direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
 
         # ------------------ pipeline urls / queries ------------------
-        if pipeline_urls and source != "database":
-            skip_search_engine_for_payload = True
-            queries_to_run = ["<URL list>"]
+        if pipeline_urls:
+            skip_search_engine_for_payload = False
 
+            # Deduplicate inputs
             unique_urls = list(dict.fromkeys([str(u).strip() for u in pipeline_urls if str(u).strip()]))
+
+            DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Processing {len(unique_urls)} direct URLs from memory/pipeline.")
+
             for u in unique_urls:
                 if global_mode or _allowed_by_required_sites_check(u):
                     path = self._clean_path(u)
                     url_lower = u.lower()
 
                     if self._is_probable_video_url(u, path, url_lower):
-                        if self._term_overlap_ok_check(u, keywords, min_term_overlap):
-                            direct_asset_urls.append(u)
+                        direct_asset_urls.append(u)
                         continue
 
                     if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                         continue
 
-                    if not keywords or self._term_overlap_ok_check(u, keywords, min_term_overlap):
-                        candidate_pages.append(u)
+                    candidate_pages.append(u)
 
             candidate_pages = candidate_pages[:max_pages_total]
 
@@ -10588,7 +11098,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             elif engine == "duckduckgo":
                 for qv in queries_to_run:
                     sq = _augment_search_query(qv, required_sites)
-                    log.append(f"Searching DuckDuckGo for: {sq}")
+                    DEBUG_LOGGER.log_message(f"Searching DuckDuckGo for: {sq}")
                     urls = await self._search_duckduckgo(
                         sq,
                         max_results=search_results_cap,
@@ -10610,7 +11120,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             elif engine == "google_cse":
                 for qv in queries_to_run:
                     sq = _augment_search_query(qv, required_sites)
-                    log.append(f"Searching Google CSE for: {sq}")
+                    DEBUG_LOGGER.log_message(f"Searching Google CSE for: {sq}")
                     urls = await self._search_google_cse(
                         sq,
                         n=search_results_cap,
@@ -10634,7 +11144,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 else:
                     for qv in queries_to_run:
                         sq = _augment_search_query(qv, required_sites)
-                        log.append(f"Searching SearXNG at {searxng_url} for: {sq}")
+                        DEBUG_LOGGER.log_message(f"Searching SearXNG at {searxng_url} for: {sq}")
                         urls = await self._search_searxng(
                             sq,
                             max_results=search_results_cap,
@@ -10663,7 +11173,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
         all_runtime_hits: List[Dict[str, Any]] = []
-
+        all_react_hits: List[Dict[str, Any]] = []  # [PATCH] Initialize accumulator
         recently_returned_identifiers = set()
         if source == "database" and use_database and output_cooldown_hours > 0 and self.store:
             recently_returned_identifiers = self.store.get_recently_returned(output_cooldown_hours)
@@ -10676,7 +11186,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return False
             return True
 
-        pw_needed = use_js or use_network_sniff or use_runtime_sniff
+        pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff
         pw_p = pw_browser = pw_context = None
 
         ua_http = ua if ua else "promptchat/VideoLinkTracker"
@@ -10888,8 +11398,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_network_links: List[Dict[str, str]] = []
                 local_runtime_hits: List[Dict[str, Any]] = []
                 local_assets: List[Dict[str, Any]] = []
+                local_react_hits: List[Dict[str,Any]] = []
                 next_pages: List[str] = []
-
+                DEBUG_LOGGER.log_message(f"[BFS] processing page: {page_url} (depth={depth})")
                 try:
                     links_on_page: List[Dict[str, str]] = []
                     html = ""
@@ -11013,7 +11524,33 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "text": jl.get("text", ""),
                                 "tag": jl.get("tag", ""),
                             })
+                    if use_react_sniff and pw_context:
+                        try:
+                            # Expects tuple (html, hits) based on standard ReactSniffer
+                            r_html, r_hits = await self._pw_fetch_react_hits(
+                                pw_context, page_url, timeout, local_log
+                            )
+                            # Use React-rendered HTML if we don't have one yet
+                            if r_html and not html:
+                                html = r_html
 
+                            if r_hits:
+                                local_react_hits.extend(r_hits)
+
+                                # Treat React Routes as potential Next Pages in the crawl
+                                for rh in r_hits:
+                                    r_url = rh.get("url")
+                                    if not r_url:
+                                        continue
+
+                                    # Verify site scope
+                                    if _allowed_by_required_sites_check(r_url):
+                                        # Basic deduping happens at BFS level, but we check depth here
+                                        if depth < max_depth:
+                                            next_pages.append(r_url)
+
+                        except Exception as e:
+                            local_log.append(f"[VideoLinkTracker][React] Error on {page_url}: {e}")
                     # 3) Plain HTML via HTTPSSubmanager
                     if not html:
                         try:
@@ -11041,6 +11578,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "js_links": local_js_links,
                             "network_links": local_network_links,
                             "runtime_hits": local_runtime_hits,
+                            "react_hits": local_react_hits,  # [PATCH] Return hits
                             "log": local_log + ["BeautifulSoup missing - cannot parse HTML."],
                         }
 
@@ -11176,7 +11714,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "tag": link["tag"],
                                 "content_id": cid,
                             }
-
+                            DEBUG_LOGGER.log_message(
+                                f"[BFS] FOUND ASSET on {page_url}: {asset['text']} ({asset['url']})")
                             is_hls_manifest = canon.lower().endswith(".m3u8") or (
                                     content_type in self.HLS_CONTENT_TYPES
                             )
@@ -11286,6 +11825,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     "js_links": local_js_links,
                     "network_links": local_network_links,
                     "runtime_hits": local_runtime_hits,
+                    "react_hits": local_react_hits,
                     "log": local_log,
                 }
 
@@ -11317,60 +11857,70 @@ class VideoLinkTrackerBlock(BaseBlock):
             # (you can define this just above the while loop)
             logged_rescan_notice = False
 
-            while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total and len(
-                    final_found_assets_by_content_id) < max_assets:
-                remaining_page_slots = max_pages_total - len(visited_pages)
+            # --- BFS LOOP START ---
+            while frontier and current_depth <= max_depth and len(final_found_assets_by_content_id) < max_assets:
+
+
+                DEBUG_LOGGER.log_message(
+                    f"[VideoLinkTracker][BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} ---"
+                )
 
                 batch: List[str] = []
+                # Calculate remaining slots to strictly enforce page limit
+                slots_left = max_pages_total - len(visited_pages)
+
                 for u in frontier:
-                    if len(batch) >= remaining_page_slots:
+                    if len(batch) >= slots_left:
                         break
+
                     if u in visited_pages:
                         continue
 
-                    # Respect DB "page_scanned" flag unless we explicitly allow rescan
+                    # Respect DB "page_scanned" flag
                     if use_database and self.store and self.store.page_scanned(u):
-                        # Normal behavior: skip already-scanned pages
                         if not (db_allow_rescan and source == "database"):
                             visited_pages.add(u)
                             continue
-                        # Rescan mode: process them again, but log once
                         if not logged_rescan_notice:
-                            log.append(
-                                "[VideoLinkTracker][db] Rescan enabled: "
-                                "processing previously scanned pages from database."
-                            )
+                            DEBUG_LOGGER.log_message("[VideoLinkTracker][db] Rescan enabled.")
                             logged_rescan_notice = True
 
                     batch.append(u)
+                    # CRITICAL: Mark visited immediately so we don't re-queue it in next_frontier
+                    visited_pages.add(u)
 
                 if not batch:
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][BFS] No valid URLs in batch at depth {current_depth}.")
                     break
+
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][BFS] Processing batch of {len(batch)} URLs...")
 
                 if use_camoufox:
                     results: List[Dict[str, Any]] = []
                     for url in batch:
                         try:
-                            res = await _process_page(url, current_depth, http)
+                            res = await _process_page(url, current_depth, smart_sniff)
+                            results.append(res)
                         except Exception as e:
-                            log.append(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                            DEBUG_LOGGER.log_message(f"[VideoLinkTracker][Camoufox] Fatal error on {url}: {e}")
                             continue
-                        results.append(res)
                 else:
-                    # Original concurrent behaviour (Chromium / normal Playwright)
+                    # Parallel execution for standard Playwright
                     results = await asyncio.gather(
-                        *[_process_page(url, current_depth, http) for url in batch]
+                        *[_process_page(url, current_depth, smart_sniff) for url in batch]
                     )
-                next_frontier: List[str] = []
+
+                next_frontier_candidates: List[str] = []
 
                 for res in results:
-                    page_url = res["page"]
-                    visited_pages.add(page_url)
-
+                    # Per-page logging handled in _process_page, but we aggregate lists here
                     log.extend(res["log"])
                     all_js_links.extend(res["js_links"])
                     all_network_links.extend(res["network_links"])
                     all_runtime_hits.extend(res.get("runtime_hits", []))
+                    all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
                     for asset in res["assets"]:
                         cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
                         new_b = self._parse_size_to_bytes(asset.get("size", ""))
@@ -11378,12 +11928,30 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if not old or new_b > self._parse_size_to_bytes(old.get("size", "")):
                             final_found_assets_by_content_id[cid] = asset
 
-                    for nxt in res["next_pages"]:
-                        if nxt not in visited_pages:
-                            next_frontier.append(nxt)
+                    # Only collect next pages if we haven't hit max depth
+                    if current_depth < max_depth:
+                        if res.get("next_pages"):
+                            next_frontier_candidates.extend(res["next_pages"])
+
+                # Deduplicate and filter next frontier against visited
+                next_frontier = []
+                seen_in_next = set()
+
+                for url in next_frontier_candidates:
+                    if url not in visited_pages and url not in seen_in_next:
+                        next_frontier.append(url)
+                        seen_in_next.add(url)
+
+                # Cap the next frontier to prevent exponential explosion
+                # (e.g., if one page returns 5000 links, we don't want to queue them all)
+                frontier = next_frontier[:max_pages_total]
+
+                DEBUG_LOGGER.log_message(
+                    f"[VideoLinkTracker][BFS] Depth {current_depth} complete. "
+                    f"Found {len(frontier)} new unique pages for next depth."
+                )
 
                 current_depth += 1
-                frontier = list(dict.fromkeys(next_frontier))
 
             if pw_needed:
                 await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
@@ -11439,8 +12007,47 @@ class VideoLinkTrackerBlock(BaseBlock):
                         f"- <{nl.get('tag', 'network_sniff')}> "
                         f"[{nl.get('text')}]({nl.get('url')}) @ {host} "
                         f"(ctype={nl.get('content_type', '?')})"
-                    )
+                       )
+            if return_react_sniff_hits and all_react_hits:
+                lines.append("\n### React / SPA Hits (debug)\n")
+                for rh in all_react_hits[:100]:
+                    url = rh.get("url") or "(no url)"
+                    route = rh.get("route") or ""
+                    kind = rh.get("kind") or "react_nav"
+                    lines.append(f"- `{kind}` **{route}** → {url}")
+            if return_runtime_sniff_hits and all_runtime_hits:
+                lines.append("\n### Runtime Sniff Hits (debug)\n")
+                # Cap output to prevent massive message overflow (e.g. 100 items)
+                for hit in all_runtime_hits[:100]:
+                    url = hit.get("url") or "(no url)"
+                    payload = hit.get("json") or {}
 
+                    # Format a readable description based on the hit type
+                    desc_parts = []
+                    if "console" in payload:
+                        desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
+                    elif "ws_frame" in payload:
+                        desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
+                    elif "request_body" in payload:
+                        desc_parts.append("Request Body (JSON)")
+                    elif "media_events" in payload:
+                        evts = payload["media_events"]
+                        desc_parts.append(f"Media Events: {len(evts)}")
+                    elif "storage" in payload:
+                        desc_parts.append(f"Storage Items: {len(payload['storage'])}")
+                    elif "perf_entries" in payload:
+                        desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
+                    else:
+                        # Generic fallback for unknown payloads
+                        import json as _json
+                        try:
+                            dump = _json.dumps(payload)
+                            desc_parts.append(f"Data: {dump[:100]}...")
+                        except:
+                            desc_parts.append("Data: (complex object)")
+
+                    desc = " | ".join(desc_parts)
+                    lines.append(f"- `{desc}` found on **{url}**")
             lines.append(f"\n### Log:\n" + "\n".join(log))
             return "\n".join(lines), {
                 "count": 0,
@@ -11452,6 +12059,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "runtime_hits": all_runtime_hits,
+                "react_hits": all_react_hits,
                 "source": source,
                 "subpipeline": subpipeline,
                 "engine": engine,
@@ -11533,6 +12141,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "return_network_sniff_links": False,
             "use_runtime_sniff": False,
             "return_runtime_sniff_hits": False,
+            "use_react_sniff": False,
+            "return_react_sniff_hits": False,
             "min_term_overlap": 1,
             "subpipeline": "",
 
@@ -11582,6 +12192,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "max_download_bytes": 300 * 1024**2, # NEW: 300 MB per asset safety cap
             "skip_if_no_content_length": True,   # NEW: avoid unknown-size downloads
             "searxng_url": "http://127.0.0.1:8080",
+            "reverse_image_url": "",
+            "ffmpeg_bin": "",
         }
 
 
@@ -13954,3 +14566,2527 @@ class SocketPipeBlock(BaseBlock):
 
 
 BLOCKS.register("socketpipe", SocketPipeBlock)
+
+# ======================= PageTrackerBlock ==================================
+
+@dataclass
+class PageTrackerBlock(BaseBlock):
+    """
+    Async, search + crawl + similar-page finder.
+
+    Similar to LinkTrackerBlock, but instead of extracting file assets,
+    this block focuses on discovering pages (URLs) that look relevant
+    to the query and/or lexicon terms.
+
+      • Supports DuckDuckGo / Google CSE / SearXNG / sites / database engines.
+      • Integrates with DatabaseSubmanager + LinkTrackerStore for seeds.
+      • Uses JS / Network / Runtime sniffers via Playwright/Camoufox.
+      • Returns a ranked list of pages (URLs + titles + hosts).
+    """
+
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite", "icon", "favicon", "logo", "tracking", "pixel", "blank", "placeholder",
+    }
+
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
+    }
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+
+    MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
+    MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
+    MEGA_QUERY_MARKERS = ("mega.nz",)  # fallback
+
+    def __post_init__(self):
+        # Store/submanager are initialized per-run when use_database=True
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[PageTrackerStore] = None
+        self.js_sniffer = submanagers.JSSniffer(
+            submanagers.JSSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+        self.network_sniffer = submanagers.NetworkSniffer(
+            submanagers.NetworkSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+        self.runtime_sniffer = submanagers.RuntimeSniffer(
+            submanagers.RuntimeSniffer.Config()
+        )
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(
+                hook_history_api=True,
+                hook_link_clicks=True,
+                inspect_react_devtools_hook=True,
+            )
+        )
+    # ------------------------------------------------------------------ #
+    # Database lifecycle (Submanager + Store)
+    # ------------------------------------------------------------------ #
+    def _initialize_database(self, db_path: str, logger=None) -> None:
+        """
+        Create and open DBSubmanager + LinkTrackerStore, install schema.
+        Idempotent.
+        """
+        if self.db and self.store:
+            return
+
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "link_corpus.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
+
+        self.store = PageTrackerStore(db=self.db)
+        self.store.ensure_schema()
+    # ------------------------------------------------------------------ #
+    # URL helpers
+    # ------------------------------------------------------------------ #
+    def _is_mega_link(self, u: str) -> bool:
+        try:
+            pu = urlparse(u)
+            host = (pu.netloc or "").lower().split(":")[0]
+            path = (pu.path or "").lower()
+            frag = (pu.fragment or "").lower()
+            full_low = u.lower()
+
+            if host in self.MEGA_HOSTS:
+                if any(m in path for m in self.MEGA_PATH_MARKERS):
+                    return True
+                if frag.startswith("f!") or frag.startswith("!") or "file/" in frag or "folder/" in frag:
+                    return True
+                return True
+            if "mega.nz/#" in full_low or "mega.co.nz/#" in full_low:
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ #
+    # Search engines
+    # ------------------------------------------------------------------ #
+    async def _search_searxng(
+        self,
+        q: str,
+        max_results: int,
+        timeout: float,
+        base_url: Optional[str] = None,
+        page_limit: int = 1,
+    ) -> List[str]:
+        """
+        Query a SearXNG instance and return a list of result URLs.
+
+        - Uses ?format=json
+        - Respects max_results and page_limit
+        - base_url can be passed via params['searxng_url'] or SEARXNG_URL env var.
+        """
+        import os, json
+
+        # Where is SearXNG?
+        base_url = (
+            base_url
+            or os.environ.get("SEARXNG_URL")
+            or "http://127.0.0.1:8080"
+        ).rstrip("/")
+
+        search_url = base_url + "/search"
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(page_limit):
+                    if len(out) >= max_results:
+                        break
+
+                    # SearXNG pagination: 'pageno' is 1-based
+                    params = {
+                        "q": q,
+                        "format": "json",
+                        "pageno": str(page_idx + 1),
+                    }
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                            search_url,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            # Classic misconfig case: JSON disabled -> 403 HTML
+                            if status == 403:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][SearXNG][debug] HTTP 403 "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            if status != 200:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][SearXNG][debug] HTTP {status} "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                DEBUG_LOGGER.log_message(
+                                    f"[PageTracker][SearXNG] JSON decode error: {e}"
+                                )
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][SearXNG][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            results = data.get("results") or []
+                            if not results:
+                                # No more pages.
+                                break
+
+                            for item in results:
+                                u = item.get("url")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_results:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][SearXNG] AIOHTTP error: {e}"
+                        )
+                        if not did_dump_debug and text:
+                            preview = text[:1500].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[PageTracker][SearXNG][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(
+                f"[PageTracker][SearXNG] General error: {e}"
+            )
+
+        return out[:max_results]
+
+    async def _search_duckduckgo(
+        self,
+        q: str,
+        max_results: int,
+        ua: str,
+        timeout: float,
+        page_limit: int = 1,
+        per_page: int = 50,
+    ) -> List[str]:
+        import random
+
+        pages: List[str] = []
+        seen_urls: set[str] = set()
+        did_dump_debug = False
+
+        real_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+
+        headers = {
+            "User-Agent": real_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://duckduckgo.com/",
+            "Origin": "https://duckduckgo.com",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        }
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+        base_url = "https://html.duckduckgo.com/html/"
+
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                for page_idx in range(page_limit):
+                    if len(pages) >= max_results:
+                        break
+
+                    if page_idx > 0:
+                        st = random.uniform(2.0, 5.0)
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker] Sleeping {st:.2f}s between search pages..."
+                        )
+                        await asyncio.sleep(st)
+
+                    offset = page_idx * 30
+                    text = ""
+                    status = None
+                    final_url = base_url
+
+                    try:
+                        data = {"q": q, "s": str(offset), "dc": str(offset)}
+                        async with session.post(
+                            base_url,
+                            data=data,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            final_url = str(resp.url)
+
+                            if status == 403:
+                                DEBUG_LOGGER.log_message(
+                                    f"[PageTracker] 403 Forbidden on page {page_idx}."
+                                )
+                                if not pages and not did_dump_debug:
+                                    text = await resp.text()
+                                    preview = text[:2000].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][DDG][debug] 403 body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                return pages
+
+                            resp.raise_for_status()
+                            text = await resp.text()
+
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker] DuckDuckGo request failed (page {page_idx}): {e}"
+                        )
+                        if not pages and text and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[PageTracker][DDG][debug] Failed page HTML preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+                    if "Unfortunately, bots use DuckDuckGo too." in text:
+                        DEBUG_LOGGER.log_message(
+                            "[PageTracker] Bot detected by DDG."
+                        )
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[PageTracker][DDG][debug] Bot wall preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+                    soup = BeautifulSoup(text, "html.parser")
+                    found_new = False
+
+                    for a in soup.select("a.result__a"):
+                        if len(pages) >= max_results:
+                            break
+                        href = a.get("href")
+                        if not href:
+                            continue
+                        if "uddg=" in href:
+                            try:
+                                href = unquote(
+                                    href.split("uddg=", 1)[1].split("&", 1)[0]
+                                )
+                            except Exception:
+                                pass
+
+                        if href.startswith("http") and href not in seen_urls:
+                            seen_urls.add(href)
+                            pages.append(href)
+                            found_new = True
+
+                    if not found_new and not pages and not did_dump_debug:
+                        preview = text[:2000].replace("\n", " ")
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][DDG][debug] No results on page {page_idx} for query={q!r} "
+                            f"(status={status}, url={final_url}). HTML preview: {preview}"
+                        )
+                        did_dump_debug = True
+
+                    if not found_new:
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(
+                f"[PageTracker] DDG outer error: {e}"
+            )
+
+        return pages[:max_results]
+
+    async def _search_google_cse(
+        self,
+        q: str,
+        n: int,
+        timeout: float,
+        page_limit: int = 1,
+    ) -> List[str]:
+        import os, json
+
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        key = os.environ.get("GOOGLE_API_KEY")
+        if not (cx and key):
+            DEBUG_LOGGER.log_message(
+                "[PageTracker][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY env vars."
+            )
+            return []
+
+        max_total = max(1, min(int(n), 100))
+        per_page = min(10, max_total)
+        max_pages_by_n = (max_total + per_page - 1) // per_page
+        pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(pages_to_fetch):
+                    if len(out) >= max_total:
+                        break
+
+                    start = 1 + page_idx * per_page
+                    if start > 100:
+                        break
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                            "https://www.googleapis.com/customsearch/v1",
+                            params={
+                                "q": q,
+                                "cx": cx,
+                                "key": key,
+                                "num": per_page,
+                                "start": start,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            if status != 200:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][GoogleCSE][debug] HTTP {status} "
+                                        f"query={q!r} start={start}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                DEBUG_LOGGER.log_message(
+                                    f"[PageTracker][GoogleCSE] JSON decode error: {e}"
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][GoogleCSE][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            err_obj = data.get("error")
+                            if err_obj:
+                                msg = err_obj.get("message") or "Unknown CSE error"
+                                reason = ""
+                                errors = err_obj.get("errors") or []
+                                if errors and isinstance(errors, list):
+                                    reason = errors[0].get("reason") or ""
+                                DEBUG_LOGGER.log_message(
+                                    f"[PageTracker][GoogleCSE] API error for query={q!r}, "
+                                    f"start={start}: {msg} ({reason})"
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][GoogleCSE][debug] Error JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            items = data.get("items") or []
+                            if not items:
+                                DEBUG_LOGGER.log_message(
+                                    f"[PageTracker][GoogleCSE] No items for query={q!r}, "
+                                    f"start={start}. Stopping pagination."
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[PageTracker][GoogleCSE][debug] Empty items JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            for item in items:
+                                u = item.get("link")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_total:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][GoogleCSE] AIOHTTP error: {e}"
+                        )
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[PageTracker][GoogleCSE][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(
+                f"[PageTracker][GoogleCSE] General error: {e}"
+            )
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Sitemap helpers
+    # ------------------------------------------------------------------ #
+    def _looks_like_sitemap(self, url: str) -> bool:
+        u = url.lower()
+        return any(
+            u.endswith(x)
+            for x in [".xml", ".xml.gz", "sitemap", "sitemap.xml", "sitemap_index.xml"]
+        )
+
+    def _decompress_if_needed(self, url: str, raw: bytes) -> str:
+        if not raw:
+            return ""
+        if url.lower().endswith(".gz"):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                return ""
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _parse_sitemap_any(self, xml_text: str) -> tuple[list[str], list[str]]:
+        if not xml_text.strip():
+            return [], []
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return [], []
+
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}", 1)[0] + "}"
+
+        sitemap_urls = []
+        page_urls = []
+
+        if root.tag.endswith("sitemapindex"):
+            for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
+                if sm.text and sm.text.strip().startswith("http"):
+                    sitemap_urls.append(sm.text.strip())
+
+        if root.tag.endswith("urlset"):
+            for loc in root.findall(f".//{ns}url/{ns}loc"):
+                if loc.text and loc.text.strip().startswith("http"):
+                    page_urls.append(loc.text.strip())
+
+        return sitemap_urls, page_urls
+
+    # ------------------------------------------------------------------ #
+    # Scoring / pagination helpers
+    # ------------------------------------------------------------------ #
+    def _score_site_url(self, u: str, keywords: list[str], targets: set[str]) -> int:
+        path = urlparse(u).path.lower()
+        score = 0
+
+        for tok, w in [
+            ("/details/", 8),
+            ("/item/", 6),
+            ("/watch/", 4),
+            ("/download/", 9),
+            ("/track/", 4),
+            ("/file/", 4),
+            ("/audio/", 3),
+            ("/video/", 3),
+            ("/docs/", 2),
+        ]:
+            if tok in path:
+                score += w
+
+        for tok, w in [
+            ("/search", -6),
+            ("/tag/", -3),
+            ("/category/", -3),
+            ("/browse", -3),
+            ("/archives", -2),
+        ]:
+            if tok in path:
+                score += w
+
+        if any(path.endswith(ext) for ext in targets):
+            score += 10
+
+        low = u.lower().replace("%20", " ")
+        score += sum(2 for k in keywords if k and k in low)
+
+        return score
+
+    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
+        out = []
+        for a in soup.select(
+            "a[rel=next], a.next, a:-soup-contains('Next'), a:-soup-contains('Older')"
+        ):
+            href = a.get("href")
+            if href:
+                out.append(urljoin(base_url, href))
+        return out[:3]
+
+    def _extract_internal_result_links(
+        self, soup, base_url: str, site_host: str
+    ) -> list[str]:
+        out = []
+        containers = soup.select(
+            "article a[href], .result a[href], .search-result a[href], "
+            ".item a[href], li a[href]"
+        )
+        for a in containers:
+            href = a.get("href")
+            if not href:
+                continue
+            full = urljoin(base_url, href)
+            host = urlparse(full).netloc.lower()
+            if site_host in host:
+                out.append(full)
+            if len(out) >= 200:
+                break
+        return list(dict.fromkeys(out))
+
+    def _archive_ident_to_downloads(self, ident: str) -> list[str]:
+        return [
+            f"https://archive.org/metadata/{ident}",
+            f"https://archive.org/download/{ident}/",
+            f"https://archive.org/details/{ident}",
+        ]
+
+    async def _crawl_sitemaps_for_site(
+        self,
+        http: submanagers.HTTPSSubmanager,
+        root: str,
+        sm_urls: list[str],
+        keywords: list[str],
+        targets: set[str],
+        per_site_cap: int,
+        global_seen: set[str],
+    ) -> list[str]:
+        to_visit = list(dict.fromkeys(sm_urls))
+        visited_sm = set()
+        collected = []
+
+        while to_visit and len(collected) < per_site_cap * 5:
+            sm = to_visit.pop(0)
+            if sm in visited_sm:
+                continue
+            visited_sm.add(sm)
+
+            raw = await http.get_bytes(sm)
+            xml = self._decompress_if_needed(sm, raw)
+            child_sms, pages = self._parse_sitemap_any(xml)
+
+            for c in child_sms:
+                if c not in visited_sm and self._looks_like_sitemap(c):
+                    to_visit.append(c)
+
+            for p in pages:
+                if p in global_seen:
+                    continue
+                global_seen.add(p)
+                collected.append(p)
+
+        collected.sort(
+            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
+        )
+        return collected[:per_site_cap]
+
+    # ------------------------------------------------------------------ #
+    # Playwright shared context manager
+    # ------------------------------------------------------------------ #
+    async def _open_playwright_context(
+        self,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: set[str],
+        block_domains: bool,
+        blocked_domains: set[str],
+        log: List[str],
+        *,
+        use_camoufox: bool = False,
+        camoufox_options: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Open a shared Playwright/Camoufox browser context.
+
+        Returns (p_handle, browser, context) where:
+          - For plain Playwright:
+              p_handle = async_playwright() instance
+          - For Camoufox:
+              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
+        """
+
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return True
+            return False
+
+        # ---- Camoufox path ----
+        if use_camoufox:
+            if AsyncCamoufox is None:
+                log.append(
+                    "[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium."
+                )
+            else:
+                try:
+                    options = {
+                        "headless": True,
+                        "block_images": block_resources,
+                        "block_webrtc": True,
+                        "geoip": False,
+                        "humanize": False,
+                    }
+                    if camoufox_options:
+                        options.update(camoufox_options)
+
+                    cf_cm = AsyncCamoufox(**options)
+                    browser = await cf_cm.__aenter__()
+                    context = await browser.new_context(user_agent=ua)
+
+                    if block_resources or block_domains:
+                        async def route_blocker(route, request):
+                            rtype = (request.resource_type or "").lower()
+                            try:
+                                host = urlparse(request.url).netloc.lower()
+                            except Exception:
+                                host = ""
+
+                            if block_domains and _host_matches_blocked(host):
+                                await route.abort()
+                                return
+
+                            if block_resources and rtype in blocked_resource_types:
+                                await route.abort()
+                                return
+
+                            await route.continue_()
+
+                        await context.route("**/*", route_blocker)
+
+                    log.append("[PlaywrightCtx] Camoufox context ready.")
+                    return cf_cm, browser, context
+
+                except Exception as e:
+                    log.append(
+                        f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium."
+                    )
+
+        # ---- Standard Playwright (Chromium) path ----
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
+            return None, None, None
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=ua)
+
+        if block_resources or block_domains:
+            async def route_blocker(route, request):
+                rtype = (request.resource_type or "").lower()
+                try:
+                    host = urlparse(request.url).netloc.lower()
+                except Exception:
+                    host = ""
+
+                if block_domains and _host_matches_blocked(host):
+                    await route.abort()
+                    return
+
+                if block_resources and rtype in blocked_resource_types:
+                    await route.abort()
+                    return
+
+                await route.continue_()
+
+            await context.route("**/*", route_blocker)
+
+        log.append("Playwright shared context ready.")
+        return p, browser, context
+
+    async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        try:
+            if context:
+                close_ctx = getattr(context, "close", None)
+                if callable(close_ctx):
+                    if asyncio.iscoroutinefunction(close_ctx):
+                        await close_ctx()
+                    else:
+                        close_ctx()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox context: {e}")
+
+        try:
+            if browser:
+                close_browser = getattr(browser, "close", None)
+                if callable(close_browser):
+                    if asyncio.iscoroutinefunction(close_browser):
+                        await close_browser()
+                    else:
+                        close_browser()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox browser: {e}")
+
+        try:
+            if p:
+                stop = getattr(p, "stop", None)
+
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    aexit = getattr(p, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+
+            log.append("Playwright/Camoufox shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox handle: {e}")
+
+    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
+        return await self.network_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+            extensions=extensions,
+        )
+
+    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
+        return await self.js_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+            extensions=extensions,
+        )
+
+    async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
+        return await self.runtime_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
+    async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
+        return await self.react_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Main execution (Async)
+    # ------------------------------------------------------------------ #
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # --------- Natural ChatBlock-style parsing of context / lexicon ---------
+        text = str(payload or "")
+
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        subpipeline = params.get("subpipeline", None)
+
+        # --------- Extract URL seeds from context + lexicon ---------
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
+
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
+
+        # ------------------- DB setup ------------------- #
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "link_corpus.db")
+        if use_database:
+            self._initialize_database(
+                db_path, logger=getattr(self, "logger", None)
+            )
+
+        store = self.store
+
+        # ----------------- Subpipeline ------------------ #
+        pipeline_result: Any = query_raw
+        pipeline_queries: List[str] = []
+        pipeline_urls: List[str] = []
+
+        if subpipeline:
+            subpipe_out: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+                collect=True,
+            )
+
+            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
+                pipeline_result = subpipe_out.get("final")
+                pipeline_queries = list(subpipe_out.get("queries") or [])
+                pipeline_urls = list(subpipe_out.get("urls") or [])
+            else:
+                pipeline_result = subpipe_out
+
+        extra_seed_urls: List[str] = []
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
+
+        if extra_seed_urls:
+            if not pipeline_urls:
+                pipeline_urls = []
+            pipeline_urls.extend(extra_seed_urls)
+
+        # =========================================================================
+        # Memory Sources Ingestion (SocketPipe Bridge)
+        # =========================================================================
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                keys_to_read = [
+                    k.strip()
+                    for k in memory_sources_raw.split(",")
+                    if k.strip()
+                ]
+
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+
+                    items = data if isinstance(data, list) else [data]
+
+                    for item in items:
+                        candidate = None
+
+                        if isinstance(item, dict):
+                            candidate = (
+                                item.get("url")
+                                or item.get("domain")
+                                or item.get("text")
+                            )
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        if "://" in cand_str or cand_str.startswith(
+                            ("http:", "https:")
+                        ):
+                            pipeline_urls.append(cand_str)
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith(
+                            "."
+                        ):
+                            pipeline_urls.append(f"https://{cand_str}")
+                        else:
+                            non_url_lex_terms.append(cand_str)
+
+            except Exception as e:
+                msg = (
+                    f"[PageTracker] Error reading memory sources "
+                    f"'{memory_sources_raw}': {e}"
+                )
+                DEBUG_LOGGER.log_message(msg)
+
+        # ------------------- Config --------------------- #
+        mode = str(params.get("mode", "pages")).lower()
+        scan_limit = int(params.get("scan_limit", 5))
+        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
+
+        timeout = float(params.get("timeout", 5.0))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))
+        search_results_cap = int(params.get("search_results_cap", 256))
+
+        search_page_limit = int(params.get("search_page_limit", 1))
+        search_per_page = int(params.get("search_per_page", 50))
+
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        return_network_sniff_links = bool(
+            params.get("return_network_sniff_links", False)
+        )
+
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(
+            params.get("return_runtime_sniff_hits", False)
+        )
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(
+            params.get("return_react_sniff_hits", False)
+        )
+        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
+        min_term_overlap = max(1, min_term_overlap_raw)
+
+        custom_ext = str(params.get("extensions", "")).split(",")
+        keywords_in_url = str(params.get("url_keywords", "")).split(",")
+        site_require_raw = str(params.get("site_require", "")).split(",")
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        max_depth = max(0, int(params.get("max_depth", 0)))
+
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn_per_host = int(
+            params.get("http_max_conn_per_host", 8)
+        )
+        http_verify_tls = bool(params.get("http_verify_tls", True))
+        http_ca_bundle = params.get("http_ca_bundle", None)
+
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+            t.strip().lower()
+            for t in str(
+                params.get("blocked_resource_types", "")
+            ).split(",")
+            if t.strip()
+        } or {"image", "stylesheet", "font"}
+
+        block_domains = bool(params.get("block_domains", True))
+        user_blocked_domains = {
+            d.strip().lower()
+            for d in str(params.get("blocked_domains", "")).split(",")
+            if d.strip()
+        }
+
+        default_blocked_domains = {
+            "google-analytics.com",
+            "googletagmanager.com",
+            "doubleclick.net",
+            "facebook.com",
+            "facebook.net",
+            "twitter.com",
+            "scorecardresearch.com",
+            "quantserve.com",
+            "hotjar.com",
+            "segment.io",
+            "mixpanel.com",
+            "cloudflareinsights.com",
+            "stats.g.doubleclick.net",
+            "adservice.google.com",
+            "ads.yahoo.com",
+            "adsafeprotected.com",
+        }
+
+        blocked_domains: set[str] = set()
+        if block_domains:
+            blocked_domains = default_blocked_domains.union(
+                user_blocked_domains
+            )
+
+        # ------------------- Targets -------------------- #
+        targets: set[str] = set()
+        # Targets still used for scoring and some site heuristics;
+        # they no longer gate "asset" extraction (since we now extract pages).
+        for e in custom_ext:
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
+
+        # ------------------- Keywords ------------------- #
+        keywords: List[str] = [
+            k.strip().lower() for k in keywords_in_url if k.strip()
+        ]
+        strict_keywords = bool(params.get("strict_keywords", False))
+
+        if query_raw:
+            if strict_keywords:
+                whole = query_raw.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                for qt in [
+                    w.strip().lower() for w in query_raw.split() if w.strip()
+                ]:
+                    if qt not in keywords:
+                        keywords.append(qt)
+
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
+
+        # -------------------- Helpers ------------------- #
+        def _clean_domain(u: str) -> str:
+            try:
+                return urlparse(u).netloc.lower().split(":")[0]
+            except Exception:
+                return ""
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if not required_sites:
+                return True
+            d = _clean_domain(u)
+            return any(req in d for req in required_sites)
+
+        def _term_overlap_ok(haystack: str) -> bool:
+            if not keywords:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in keywords:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_term_overlap:
+                        return True
+            return False
+
+        def _clean_path(u: str) -> str:
+            try:
+                return urlparse(u).path.lower()
+            except Exception:
+                return ""
+
+        def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
+            sq = q.strip()
+            site_clauses = []
+            for raw in required_sites or []:
+                s = (raw or "").strip().lower()
+                if not s:
+                    continue
+                if "://" in s:
+                    s = s.split("://", 1)[1]
+                s = s.split("/", 1)[0].lstrip(".")
+                if s:
+                    site_clauses.append(f"site:{s}")
+
+            if site_clauses:
+                sites_expr = " OR ".join(site_clauses)
+                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+            q_lower = sq.lower()
+            if mode == "media":
+                if not any(x in q_lower for x in ["mp3", "flac", "m4a", "ogg"]):
+                    sq = f"{sq} (mp3 OR flac OR m4a OR ogg)".strip()
+            elif mode == "docs":
+                if "filetype:pdf" not in q_lower:
+                    sq = f"{sq} filetype:pdf".strip()
+            return sq
+
+        def _is_search_url(u: str) -> bool:
+            try:
+                pu = urlparse(u)
+                path = (pu.path or "").lower()
+                q = (pu.query or "").lower()
+                if any(
+                    tok in path
+                    for tok in ["/search", "/results", "/query", "search.php"]
+                ):
+                    return True
+                if any(
+                    k + "=" in q
+                    for k in ["q", "query", "s", "search", "keyword"]
+                ):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        def _dedupe(seq: List[str]) -> List[str]:
+            seen = set()
+            out_ = []
+            for s in seq:
+                if s not in seen:
+                    seen.add(s)
+                    out_.append(s)
+            return out_
+
+        # -------------------- Triage -------------------- #
+        candidate_pages: List[str] = []
+        direct_asset_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine = False
+
+        if pipeline_urls:
+            skip_search_engine = False
+            unique_urls = _dedupe(
+                [str(u).strip() for u in pipeline_urls if str(u).strip()]
+            )
+
+            for u in unique_urls:
+                if not _allowed_by_required_sites(u):
+                    continue
+                path = _clean_path(u)
+
+                if self._is_mega_link(u):
+                    direct_asset_urls.append(u)
+                    continue
+
+                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                    continue
+
+                candidate_pages.append(u)
+
+            candidate_pages = candidate_pages[:max_pages_total]
+
+        if (not skip_search_engine) and pipeline_queries:
+            for qv in pipeline_queries:
+                qv_s = str(qv).strip()
+                if qv_s:
+                    queries_to_run.append(qv_s)
+
+        if not pipeline_urls and not pipeline_queries:
+            if isinstance(pipeline_result, list) and pipeline_result:
+                for qv in pipeline_result:
+                    qv_s = str(qv).strip()
+                    if qv_s:
+                        queries_to_run.append(qv_s)
+            else:
+                base_q: Optional[str] = None
+                if (
+                    isinstance(pipeline_result, str)
+                    and pipeline_result.strip()
+                ):
+                    base_q = pipeline_result.strip()
+                elif query_raw:
+                    base_q = query_raw
+                if base_q:
+                    queries_to_run.append(base_q)
+
+        if not queries_to_run and query_raw and not skip_search_engine:
+            queries_to_run = [query_raw]
+
+        queries_to_run = _dedupe(queries_to_run)
+        query = queries_to_run[0] if queries_to_run else query_raw
+
+        # ---------------- Search discovery --------------- #
+        explicit_site_seeds: set[str] = set()
+        synthetic_search_seeds: set[str] = set()
+
+        if not skip_search_engine and queries_to_run:
+            ua_search = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "PromptChat/PageTracker"
+            )
+            seen_search_urls: set[str] = set()
+
+            # -------- Engine: database -------- #
+            if engine == "database":
+                if not use_database or not self.store:
+                    DEBUG_LOGGER.log_message(
+                        "[PageTracker][db] engine=database requires use_database=True."
+                    )
+                else:
+                    DEBUG_LOGGER.log_message(
+                        "[PageTracker] Running Database Intelligence..."
+                    )
+
+                    db_seed_limit = int(params.get("db_seed_limit", 250))
+
+                    # [PATCH] Use fetch_seed_pages from PageTrackerStore
+                    # This respects site requirements and keywords automatically
+                    db_pages = self.store.fetch_seed_pages(
+                        limit=db_seed_limit,
+                        required_sites=required_sites,
+                        keywords=keywords if strict_keywords else None,
+                        min_score=0
+                    )
+
+                    candidate_pages.extend(db_pages)
+
+                    # Dedupe
+                    candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+
+                    DEBUG_LOGGER.log_message(
+                        f"[PageTracker][db] Loaded {len(db_pages)} seed pages from history."
+                    )
+
+            # -------- Engine: sites -------- #
+            if engine == "sites" and required_sites:
+                seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
+                    required_sites=required_sites,
+                    queries=queries_to_run,
+                    probe_cap_per_site=max(8, len(queries_to_run) * 3),
+                    sitemap_cap_per_site=12,
+                    hub_cap_per_site=10,
+                )
+                synthetic_search_seeds = syn_seeds
+                explicit_site_seeds = exp_seeds
+
+                per_site_cap = max(
+                    5, max_pages_total // max(1, len(required_sites))
+                )
+                global_seen = set()
+
+                ua_http_sites = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "PromptChat/PageTracker"
+                )
+                async with submanagers.HTTPSSubmanager(
+                    user_agent=ua_http_sites,
+                    timeout=timeout,
+                    retries=http_retries,
+                    max_conn_per_host=http_max_conn_per_host,
+                    verify=http_verify_tls,
+                    ca_bundle=http_ca_bundle,
+                ) as http_sites:
+                    for site in required_sites:
+                        root = (
+                            f"https://{site.strip().lstrip('.')}".rstrip("/")
+                            + "/"
+                        )
+                        host = urlparse(root).netloc.lower()
+
+                        robots_url = root + "robots.txt"
+                        try:
+                            robots_txt = await http_sites.get_text(robots_url)
+                        except Exception:
+                            robots_txt = ""
+                        sm_urls = self._extract_sitemap_urls_from_robots(
+                            robots_txt
+                        )
+
+                        if not sm_urls:
+                            sm_urls = [
+                                u
+                                for u in seed_pages
+                                if "sitemap" in u and site in u
+                            ][:8]
+
+                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
+                            http=http_sites,
+                            root=root,
+                            sm_urls=sm_urls,
+                            keywords=keywords,
+                            targets=targets,
+                            per_site_cap=per_site_cap,
+                            global_seen=global_seen,
+                        )
+
+                        hub_like = [
+                            u
+                            for u in seed_pages
+                            if site in u and _is_search_url(u)
+                        ]
+                        expanded_from_hubs: list[str] = []
+
+                        for hub in hub_like[:3]:
+                            try:
+                                html_hub = await http_sites.get_text(hub)
+                                soup_ = BeautifulSoup(
+                                    html_hub or "", "html.parser"
+                                )
+
+                                expanded_from_hubs.extend(
+                                    self._extract_internal_result_links(
+                                        soup_, hub, host
+                                    )
+                                )
+
+                                for nxt in self._extract_next_page_links(
+                                    soup_, hub
+                                ):
+                                    html_nxt = await http_sites.get_text(nxt)
+                                    soup_nxt = BeautifulSoup(
+                                        html_nxt or "", "html.parser"
+                                    )
+                                    expanded_from_hubs.extend(
+                                        self._extract_internal_result_links(
+                                            soup_nxt, nxt, host
+                                        )
+                                    )
+                            except Exception:
+                                pass
+
+                        expanded_from_hubs = list(
+                            dict.fromkeys(expanded_from_hubs)
+                        )
+                        expanded_from_hubs.sort(
+                            key=lambda u: self._score_site_url(
+                                u, keywords, targets
+                            ),
+                            reverse=True,
+                        )
+                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
+
+                        merged = list(
+                            dict.fromkeys(
+                                [root]
+                                + best_from_sitemaps
+                                + expanded_from_hubs
+                                + [u for u in seed_pages if site in u]
+                            )
+                        )
+                        merged.sort(
+                            key=lambda u: self._score_site_url(
+                                u, keywords, targets
+                            ),
+                            reverse=True,
+                        )
+
+                        for u in merged:
+                            if len(candidate_pages) >= max_pages_total:
+                                break
+                            if _allowed_by_required_sites(
+                                u
+                            ) and (not keywords or _term_overlap_ok(u)):
+                                candidate_pages.append(u)
+
+                candidate_pages = list(
+                    dict.fromkeys(candidate_pages)
+                )[:max_pages_total]
+
+            # -------- Engine: duckduckgo -------- #
+            elif engine == "duckduckgo":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_duckduckgo(
+                            sq,
+                            max_results=search_results_cap,
+                            ua=ua_search,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                            per_page=search_per_page,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][search][ddg] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+
+            # -------- Engine: google_cse -------- #
+            elif engine == "google_cse":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_google_cse(
+                            sq,
+                            n=search_results_cap,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][search][cse] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+
+            # -------- Engine: searxng -------- #
+            elif engine == "searxng":
+                searxng_url = params.get("searxng_url") or None
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_searxng(
+                            sq,
+                            max_results=search_results_cap,
+                            timeout=timeout,
+                            base_url=searxng_url,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[PageTracker][search][searxng] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+
+        # ---------------- Crawl state ------------------ #
+        found_pages: List[Dict[str, Any]] = []
+        seen_page_urls: set[str] = set()
+        visited_pages: set[str] = set()
+
+        log: List[str] = []
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
+        all_runtime_hits: List[Dict[str, Any]] = []
+        all_react_hits: List[Dict[str, Any]] = []
+        ua_http = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/PageTracker"
+        )
+
+        async with submanagers.HTTPSSubmanager(
+            user_agent=ua_http,
+            timeout=timeout,
+            retries=http_retries,
+            max_conn_per_host=http_max_conn_per_host,
+            verify=http_verify_tls,
+            ca_bundle=http_ca_bundle,
+        ) as http:
+            def _should_persist_page(u: str) -> bool:
+                if engine != "sites":
+                    return True
+                if u in explicit_site_seeds or u in synthetic_search_seeds:
+                    return False
+                if _is_search_url(u):
+                    return False
+                return True
+
+            pw_needed = use_js or use_network_sniff or use_runtime_sniff
+            pw_p = pw_browser = pw_context = None
+            try:
+                if pw_needed:
+                    ua_pw = (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "PromptChat/PageTracker"
+                    )
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                    )
+            except Exception:
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(
+                        pw_p, pw_browser, pw_context, log
+                    )
+
+            async def _process_page(
+                page_url: str,
+                depth: int,
+                http: submanagers.HTTPSSubmanager,
+            ) -> Dict[str, Any]:
+                local_log: List[str] = []
+                local_js_links: List[Dict[str, str]] = []
+                local_network_links: List[Dict[str, str]] = []
+                local_runtime_hits: List[Dict[str, Any]] = []
+                local_react_hits: List[Dict[str, Any]] = []
+                local_pages: List[Dict[str, Any]] = []
+                next_pages: List[str] = []
+
+                try:
+                    links_on_page: List[Dict[str, str]] = []
+                    html = ""
+
+                    sniff_items: List[Dict[str, str]] = []
+                    sniff_parent_pages: List[str] = []
+
+                    # 1) Network sniff
+                    if use_network_sniff and pw_context:
+                        sniff_html = ""
+                        sniff_json = None
+
+                        sniff_result = await self._pw_fetch_with_sniff(
+                            pw_context, page_url, timeout, local_log, targets
+                        )
+
+                        if isinstance(sniff_result, tuple):
+                            if len(sniff_result) == 3:
+                                sniff_html, sniff_items, sniff_json = sniff_result
+                            elif len(sniff_result) == 2:
+                                sniff_html, sniff_items = sniff_result
+                            elif len(sniff_result) == 1:
+                                sniff_html = sniff_result[0]
+                        else:
+                            sniff_html = sniff_result
+
+                        html = sniff_html or html
+
+                        if "archive.org/metadata/" in page_url:
+                            try:
+                                meta = (
+                                    json.loads(html)
+                                    if html.strip().startswith("{")
+                                    else {}
+                                )
+                                files = meta.get("files") or []
+                                identifier = (
+                                    meta.get("metadata") or {}
+                                ).get("identifier", "")
+                                for f in files:
+                                    name = f.get("name", "")
+                                    if not name:
+                                        continue
+                            except Exception:
+                                pass
+
+                        try:
+                            if sniff_json:
+                                for hit in sniff_json:
+                                    data = hit.get("json") or {}
+                                    docs = (
+                                        (
+                                            (data.get("response") or {}).get(
+                                                "docs"
+                                            )
+                                        )
+                                        or []
+                                    )
+                                    for d in docs:
+                                        ident = d.get("identifier")
+                                        if ident:
+                                            for u2 in self._archive_ident_to_downloads(
+                                                ident
+                                            ):
+                                                if _allowed_by_required_sites(
+                                                    u2
+                                                ):
+                                                    links_on_page.append(
+                                                        {
+                                                            "url": u2,
+                                                            "text": "[Archive identifier]",
+                                                            "tag": "archive_ident",
+                                                        }
+                                                    )
+                        except Exception as e:
+                            local_log.append(
+                                f"JSON sniff parse error on {page_url}: {e}"
+                            )
+
+                        for si in sniff_items:
+                            url_hit = si.get("url", "")
+                            if not url_hit:
+                                continue
+                            local_network_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": url_hit,
+                                    "text": si.get("text", ""),
+                                    "tag": si.get("tag", "network_sniff"),
+                                    "size": si.get("size", "?"),
+                                }
+                            )
+                            local_js_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": url_hit,
+                                    "text": si.get("text", ""),
+                                    "tag": si.get("tag", "network_sniff"),
+                                }
+                            )
+
+                            try:
+                                parsed = urlparse(url_hit)
+                                path = parsed.path or ""
+                                if "/" in path:
+                                    parent_path = path.rsplit("/", 1)[0] + "/"
+                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+                                    if _allowed_by_required_sites(
+                                        parent_url
+                                    ):
+                                        sniff_parent_pages.append(parent_url)
+                            except Exception:
+                                pass
+
+                    # 1b) Runtime sniff
+                    if use_runtime_sniff and pw_context:
+                        rt_html = ""
+                        rt_hits: list[dict[str, Any]] = []
+
+                        rt_result = await self._pw_fetch_runtime_hits(
+                            pw_context, page_url, timeout, local_log
+                        )
+
+                        if isinstance(rt_result, tuple):
+                            if len(rt_result) == 3:
+                                rt_html, _rt_items, rt_hits = rt_result
+                            elif len(rt_result) == 2:
+                                rt_html, rt_hits = rt_result
+                            elif len(rt_result) == 1:
+                                rt_html = rt_result[0]
+                        else:
+                            rt_html = rt_result
+
+                        if rt_html and not html:
+                            html = rt_html
+                        if rt_hits:
+                            local_runtime_hits.extend(rt_hits)
+
+                    # 2) JS render/gather
+                    if use_js and pw_context:
+                        js_html, js_links = await self._pw_fetch_js_links(
+                            pw_context, page_url, timeout, local_log
+                        )
+                        if js_html:
+                            html = js_html
+                        links_on_page.extend(js_links)
+
+                        if not js_links:
+                            preview = (html or "")[:2000].replace(
+                                "\n", " "
+                            )
+                            local_log.append(
+                                f"[debug] JS DOM preview (first 2000 chars): {preview}"
+                            )
+
+                        for jl in js_links:
+                            local_js_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": jl.get("url", ""),
+                                    "text": jl.get("text", ""),
+                                    "tag": jl.get("tag", ""),
+                                }
+                            )
+                    if use_react_sniff and pw_context:
+                        try:
+                            react_html, react_hits = await self._pw_fetch_react_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                        except Exception as e:
+                            local_log.append(f"[PageTracker][React] Error sniffing {page_url}: {e}")
+                            react_html, react_hits = "", []
+
+                        # Prefer React HTML if we still don't have any DOM snapshot
+                        if react_html and not html:
+                            html = react_html
+
+                        if react_hits:
+                            local_react_hits.extend(react_hits)
+
+                            # OPTIONAL: treat React routes as candidate pages
+                            for rh in react_hits:
+                                try:
+                                    rh_url = str(rh.get("url") or "").strip()
+                                    if not rh_url:
+                                        continue
+                                    if not _allowed_by_required_sites(rh_url):
+                                        continue
+
+                                    rpath = urlparse(rh_url).path.lower()
+                                    if any(rpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                        continue
+
+                                    # Basic keyword filter
+                                    if keywords:
+                                        haystack = (rh.get("route") or "") + " " + rh_url
+                                        if not _term_overlap_ok(haystack):
+                                            continue
+
+                                    score = self._score_site_url(rh_url, keywords, targets)
+                                    local_pages.append(
+                                        {
+                                            "title": f"[react-route] {rh.get('route') or '[no title]'}"[:200],
+                                            "url": rh_url,
+                                            "source": page_url,
+                                            "depth": depth + 1,
+                                            "score": score,
+                                        }
+                                    )
+
+                                    # Also allow BFS to walk those URLs
+                                    if depth < max_depth:
+                                        next_pages.append(rh_url)
+                                except Exception:
+                                    # Never let a weird React hit break the crawl
+                                    continue
+                    # 3) Plain HTML
+                    if not html:
+                        try:
+                            html = await http.get_text(page_url)
+                            if not html:
+                                raise RuntimeError("Empty HTML")
+                        except Exception as e:
+                            local_log.append(
+                                f"Error fetching {page_url}: {e}"
+                            )
+                            if use_database and self.store and _should_persist_page(page_url):
+                                self.store.mark_scan_complete(page_url)
+                            return {
+                                "page": page_url,
+                                "pages": local_pages,
+                                "next_pages": next_pages,
+                                "js_links": local_js_links,
+                                "network_links": local_network_links,
+                                "runtime_hits": local_runtime_hits,
+                                "react_hits": local_react_hits,
+                                "log": local_log,
+                            }
+
+                    soup = BeautifulSoup(html or "", "html.parser")
+
+                    page_title = ""
+                    try:
+                        if soup.title and soup.title.string:
+                            page_title = soup.title.string
+                    except Exception:
+                        page_title = ""
+
+                    page_haystack = (page_title or "") + " " + page_url
+                    page_has_keywords = _term_overlap_ok(page_haystack)
+
+                    # The main page itself can be a match
+                    if (
+                        _allowed_by_required_sites(page_url)
+                        and (not keywords or page_has_keywords)
+                    ):
+                        score = self._score_site_url(
+                            page_url, keywords, targets
+                        )
+                        local_pages.append(
+                            {
+                                "title": (page_title or "[no title]")[:200],
+                                "url": page_url,
+                                "source": None,
+                                "depth": depth,
+                                "score": score,
+                            }
+                        )
+
+                    link_count = 0
+                    for a in soup.find_all("a", href=True):
+                        links_on_page.append(
+                            {
+                                "url": a["href"],
+                                "text": a.get_text(strip=True),
+                                "tag": "a",
+                            }
+                        )
+                        link_count += 1
+                        if link_count >= max_links_per_page:
+                            break
+
+                    # Now treat some outgoing links as candidate *pages*
+                    for link in links_on_page:
+                        raw_link = link["url"]
+                        full_url = urljoin(page_url, raw_link)
+                        path = urlparse(full_url).path.lower()
+
+                        if not _allowed_by_required_sites(full_url):
+                            continue
+                        if any(
+                            path.endswith(ext) for ext in self.IGNORED_EXTENSIONS
+                        ):
+                            continue
+
+                        # Only consider non-asset pages
+                        if keywords:
+                            haystack = (
+                                (link.get("text") or "") + " " + full_url
+                            )
+                            if not _term_overlap_ok(haystack):
+                                continue
+
+                        score = self._score_site_url(
+                            full_url, keywords, targets
+                        )
+                        # [PATCH] Construct page data object
+                        page_item = {
+                            "title": (link.get("text") or "[no title]")[:200],
+                            "url": full_url,
+                            "source": page_url,
+                            "depth": depth + 1,
+                            "score": score,
+                            "status": "found"
+                        }
+
+                        local_pages.append(page_item)
+
+                        # [PATCH] Persist immediately to PageTrackerStore
+                        if use_database and self.store:
+                            self.store.upsert_page(page_item)
+
+                    # Next-level pages
+                    if depth < max_depth:
+                        for link in links_on_page:
+                            raw_link = link.get("url") or ""
+                            if not raw_link:
+                                continue
+                            full_url = urljoin(page_url, raw_link)
+                            if not _allowed_by_required_sites(full_url):
+                                continue
+
+                            lpath = urlparse(full_url).path.lower()
+                            if any(
+                                lpath.endswith(ext)
+                                for ext in self.IGNORED_EXTENSIONS
+                            ):
+                                continue
+
+                            if keywords and not page_has_keywords:
+                                haystack = (
+                                    link.get("text") or ""
+                                ) + " " + full_url
+                                if not _term_overlap_ok(haystack):
+                                    continue
+
+                            if engine == "sites":
+                                if _is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                    continue
+
+                            next_pages.append(full_url)
+
+                    if depth < max_depth and sniff_parent_pages:
+                        for parent_url in sniff_parent_pages:
+                            if _allowed_by_required_sites(parent_url):
+                                next_pages.append(parent_url)
+
+                    if use_database and store and _should_persist_page(
+                        page_url
+                    ):
+                        store.mark_page_scanned(page_url)
+
+                except Exception as e:
+                    local_log.append(f"Error scanning {page_url}: {e}")
+                    if use_database and store and _should_persist_page(
+                        page_url
+                    ):
+                        try:
+                            store.mark_page_scanned(page_url)
+                        except Exception as ee:
+                            local_log.append(
+                                f"Error marking page scanned {page_url}: {ee}"
+                            )
+
+                return {
+                    "page": page_url,
+                    "pages": local_pages,
+                    "next_pages": next_pages,
+                    "js_links": local_js_links,
+                    "network_links": local_network_links,
+                    "runtime_hits": local_runtime_hits,
+                    "log": local_log,
+                }
+
+            # ---------------- BFS frontier ----------------- #
+            frontier: List[str] = []
+            site_buckets = {s: [] for s in required_sites} if required_sites else {}
+
+            for u in candidate_pages:
+                if not _allowed_by_required_sites(u):
+                    continue
+                if required_sites:
+                    d = _clean_domain(u)
+                    for s in required_sites:
+                        if s in d:
+                            site_buckets[s].append(u)
+                            break
+                else:
+                    frontier.append(u)
+
+            if required_sites:
+                per_site_cap = max(
+                    3, max_pages_total // len(required_sites)
+                )
+                for s, bucket in site_buckets.items():
+                    frontier.extend(bucket[:per_site_cap])
+
+            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+            current_depth = 0
+
+            logged_rescan_notice = False
+
+            while frontier and current_depth <= max_depth:
+
+                DEBUG_LOGGER.log_message(
+                    f"[PageTracker][BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)}/{max_pages_total} ---"
+                )
+
+                remaining_page_slots = max_pages_total - len(visited_pages)
+                batch: List[str] = []
+
+                for u in frontier:
+                    if len(batch) >= remaining_page_slots:
+                        break
+                    if u in visited_pages:
+                        continue
+
+                    if use_database and self.store and self.store.is_recently_scanned(u):
+                        if not (db_allow_rescan and params.get("source", "database") == "database"):
+                            visited_pages.add(u)
+                            continue
+
+                        if not logged_rescan_notice:
+                            DEBUG_LOGGER.log_message(
+                                "[PageTracker][db] Rescan enabled: "
+                                "processing previously scanned pages from database."
+                            )
+                            logged_rescan_notice = True
+
+                    batch.append(u)
+                    # CRITICAL: Mark visited immediately to prevent circular re-queueing in the same depth
+                    visited_pages.add(u)
+
+                if not batch:
+                    DEBUG_LOGGER.log_message(
+                        f"[PageTracker][BFS] Depth {current_depth}: No unique pages to process. stopping.")
+                    break
+
+                DEBUG_LOGGER.log_message(
+                    f"[PageTracker][BFS] Processing depth {current_depth} batch of {len(batch)} URLs...")
+
+                if use_camoufox:
+                    results: List[Dict[str, Any]] = []
+                    for url in batch:
+                        try:
+                            res = await _process_page(url, current_depth, http)
+                            results.append(res)
+                        except Exception as e:
+                            DEBUG_LOGGER.log_message(f"[PageTracker][Camoufox] Fatal error on {url}: {e}")
+                            continue
+                else:
+                    results = await asyncio.gather(
+                        *[_process_page(url, current_depth, http) for url in batch]
+                    )
+
+                next_frontier_candidates: List[str] = []
+
+                for res in results:
+                    # Per-page logging
+                    log.extend(res.get("log", []))
+                    all_js_links.extend(res.get("js_links", []))
+                    all_network_links.extend(res.get("network_links", []))
+                    all_runtime_hits.extend(res.get("runtime_hits", []))
+                    all_react_hits.extend(res.get("react_hits", []))
+                    # Collect found pages
+                    for p in res.get("pages", []):
+                        p_url = p.get("url")
+                        if p_url and p_url not in seen_page_urls:
+                            seen_page_urls.add(p_url)
+                            found_pages.append(p)
+                            DEBUG_LOGGER.log_message(f"[PageTracker][BFS] FOUND PAGE: {p_url}")
+
+                    # Gather potential pages for the next hop
+                    if current_depth < max_depth:
+                        next_frontier_candidates.extend(res.get("next_pages", []))
+
+                # Filter candidates against visited and current depth to build the clean frontier
+                next_frontier = []
+                seen_in_next = set()
+                for url in next_frontier_candidates:
+                    if url not in visited_pages and url not in seen_in_next:
+                        next_frontier.append(url)
+                        seen_in_next.add(url)
+
+                # Cap the frontier size to the total remaining limit to avoid memory bloat
+                frontier = next_frontier[:max_pages_total]
+
+                DEBUG_LOGGER.log_message(
+                    f"[PageTracker][BFS] Depth {current_depth} complete. "
+                    f"Discovered {len(frontier)} new unique pages for next hop."
+                )
+
+                current_depth += 1
+
+            if pw_needed:
+                await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # ---------------- Output formatting ------------- #
+        from urllib.parse import urlparse as _urlparse
+
+        # De-duplicate final pages, prefer higher score
+        final_map: Dict[str, Dict[str, Any]] = {}
+        for p in found_pages:
+            u = p["url"]
+            score = p.get("score", 0)
+            if u not in final_map or score > final_map[u].get("score", 0):
+                final_map[u] = p
+        final_list = sorted(
+            final_map.values(), key=lambda x: x.get("score", 0), reverse=True
+        )
+
+        if not final_list:
+            base_text = (
+                "### PageTracker: No similar pages found.\n"
+                f"Scanned {len(candidate_pages)} candidate seeds.\n"
+                f"Required keywords: {keywords}\n"
+                f"Required sites: {required_sites or '[none]'}\n"
+                f"min_term_overlap: {min_term_overlap}\n"
+                f"Engine: {engine}\n"
+            )
+            lines = [base_text]
+
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = (
+                        _urlparse(jl["page"]).netloc
+                        if jl.get("page")
+                        else "(unknown)"
+                    )
+                    url = jl["url"]
+                    text = jl["text"] or "(no text)"
+                    tag = jl["tag"] or "a"
+                    lines.append(f"- **[{text}]({url})**")
+                    lines.append(
+                        f"  - *Tag: <{tag}> | From page: {host}*"
+                    )
+
+            if return_network_sniff_links and all_network_links:
+                lines.append("\n### All Network-Sniffed Links (debug)\n")
+                for nl in all_network_links:
+                    host = (
+                        _urlparse(nl["page"]).netloc
+                        if nl.get("page")
+                        else "(unknown)"
+                    )
+                    url = nl["url"]
+                    text = nl["text"] or "(no text)"
+                    tag = nl.get("tag", "network_sniff")
+                    size = nl.get("size", "?")
+                    lines.append(f"- **[{text}]({url})**")
+                    lines.append(
+                        f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*"
+                    )
+
+            return "\n".join(lines), {
+                "count": 0,
+                "keywords_used": keywords,
+                "min_term_overlap": min_term_overlap,
+                "engine": engine,
+                "required_sites": required_sites,
+                "js_links": all_js_links,
+                "network_sniff_links": all_network_links,
+                "runtime_hits": all_runtime_hits,
+                "react_hits": all_react_hits,
+                "log": log,
+                "queries_run": queries_to_run,
+            }
+
+        lines = [f"### PageTracker Found {len(final_list)} Similar Pages"]
+        lines.append(
+            f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
+            f"Required Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
+            f"Required Sites: {required_sites or '[none]'}_"
+        )
+        lines.append("")
+
+        for page in final_list:
+            title = page["title"]
+            url = page["url"]
+            score = page.get("score", 0)
+            host = _urlparse(url).netloc
+            depth = page.get("depth", 0)
+            lines.append(f"- **[{title}]({url})**")
+            lines.append(
+                f"  - *Host: {host} | Score: {score} | Depth: {depth}*"
+            )
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = (
+                    _urlparse(jl["page"]).netloc
+                    if jl.get("page")
+                    else "(unknown)"
+                )
+                url = jl["url"]
+                text = jl["text"] or "(no text)"
+                tag = jl["tag"] or "a"
+                lines.append(f"- **[{text}]({url})**")
+                lines.append(
+                    f"  - *Tag: <{tag}> | From page: {host}*"
+                )
+
+        if return_network_sniff_links and all_network_links:
+            lines.append("\n### All Network-Sniffed Links (debug)\n")
+            for nl in all_network_links:
+                host = (
+                    _urlparse(nl["page"]).netloc
+                    if nl.get("page")
+                    else "(unknown)"
+                )
+                url = nl["url"]
+                text = nl["text"] or "(no text)"
+                tag = nl.get("tag", "network_sniff")
+                size = nl.get("size", "?")
+                lines.append(f"- **[{text}]({url})**")
+                lines.append(
+                    f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*"
+                )
+        if return_react_sniff_hits and all_react_hits:
+            lines.append("\n### React / SPA Hits (debug)\n")
+            for rh in all_react_hits[:100]:
+                url = rh.get("url") or "(no url)"
+                route = rh.get("route") or ""
+                kind = rh.get("kind") or "react_nav"
+                lines.append(f"- `{kind}` **{route}** → {url}")
+        if return_runtime_sniff_hits and all_runtime_hits:
+            lines.append("\n### Runtime Sniff Hits (debug)\n")
+            # Cap output to prevent massive message overflow (e.g. 100 items)
+            for hit in all_runtime_hits[:100]:
+                url = hit.get("url") or "(no url)"
+                payload = hit.get("json") or {}
+
+                # Format a readable description based on the hit type
+                desc_parts = []
+                if "console" in payload:
+                    desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
+                elif "ws_frame" in payload:
+                    desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
+                elif "request_body" in payload:
+                    desc_parts.append("Request Body (JSON)")
+                elif "media_events" in payload:
+                    evts = payload["media_events"]
+                    desc_parts.append(f"Media Events: {len(evts)}")
+                elif "storage" in payload:
+                    desc_parts.append(f"Storage Items: {len(payload['storage'])}")
+                elif "perf_entries" in payload:
+                    desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
+                else:
+                    # Generic fallback for unknown payloads
+                    import json as _json
+                    try:
+                        dump = _json.dumps(payload)
+                        desc_parts.append(f"Data: {dump[:100]}...")
+                    except:
+                        desc_parts.append("Data: (complex object)")
+
+                desc = " | ".join(desc_parts)
+                lines.append(f"- `{desc}` found on **{url}**")
+        return "\n".join(lines), {
+            "found": len(final_list),
+            "scanned_pages": len(visited_pages),
+            "pages": final_list,
+            "keywords_used": keywords,
+            "min_term_overlap": min_term_overlap,
+            "engine": engine,
+            "required_sites": required_sites,
+            "js_links": all_js_links,
+            "network_sniff_links": all_network_links,
+            "runtime_hits": all_runtime_hits,
+            "react_hits": all_react_hits,
+            "log": log,
+            "queries_run": queries_to_run,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Predictive sequencing (unchanged)
+    # ------------------------------------------------------------------ #
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+
+        for u in urls:
+            match = re_seq.search(u)
+            if match:
+                original_num_str = match.group(1)
+                try:
+                    width = len(original_num_str)
+                    val = int(original_num_str)
+                    for i in range(1, 4):
+                        next_val = val + i
+                        next_str = f"{next_val:0{width}d}"
+                        new_url = (
+                            u[: match.start(1)] + next_str + u[match.end(1) :]
+                        )
+                        generated.add(new_url)
+                except ValueError:
+                    pass
+
+        return list(generated)
+
+    # ------------------------------------------------------------------ #
+    # Sites seeding helpers (unchanged)
+    # ------------------------------------------------------------------ #
+    def _seed_pages_from_required_sites(
+        self,
+        required_sites,
+        queries,
+        probe_cap_per_site=5,
+        sitemap_cap_per_site=8,
+        hub_cap_per_site=6,
+    ):
+        out: List[str] = []
+        synthetic_search_seeds: set[str] = set()
+        explicit_site_seeds: set[str] = set()
+
+        norm_sites = []
+        for raw in required_sites or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+            norm_sites.append(
+                s.rstrip("/") if "://" in s else "https://" + s.lstrip(".").rstrip("/")
+            )
+
+        for s in norm_sites:
+            u = s + "/"
+            out.append(u)
+            explicit_site_seeds.add(u)
+
+        common_sitemaps = [
+            "/sitemap.xml",
+            "/sitemap_index.xml",
+            "/sitemap/sitemap.xml",
+            "/sitemap-index.xml",
+            "/sitemap.php",
+            "/sitemap.txt",
+        ]
+        for s in norm_sites:
+            u = s + "/robots.txt"
+            out.append(u)
+            explicit_site_seeds.add(u)
+            added = 0
+            for sm in common_sitemaps:
+                if added >= sitemap_cap_per_site:
+                    break
+                u = s + sm
+                out.append(u)
+                explicit_site_seeds.add(u)
+                added += 1
+
+        hub_paths = [
+            "/tag/",
+            "/tags/",
+            "/category/",
+            "/categories/",
+            "/archive/",
+            "/archives/",
+            "/browse/",
+            "/collections/",
+            "/series/",
+            "/authors/",
+            "/topics/",
+            "/search",
+        ]
+        for s in norm_sites:
+            added = 0
+            for hp in hub_paths:
+                if added >= hub_cap_per_site:
+                    break
+                u = s + hp
+                out.append(u)
+                explicit_site_seeds.add(u)
+                added += 1
+
+        def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
+            host = urlparse(base).netloc.lower()
+            if "archive.org" in host:
+                return [
+                    base + f"/search.php?query={enc_query}",
+                    base + f"/advancedsearch.php?q={enc_query}",
+                    base
+                    + (
+                        f"/advancedsearch.php?q={enc_query}"
+                        f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"
+                    ),
+                    base + f"/details/{enc_query}",
+                    base + f"/browse.php?field=subject&query={enc_query}",
+                ]
+            return []
+
+        if queries:
+            for s in norm_sites:
+                probes_added = 0
+                for qv in queries:
+                    if probes_added >= probe_cap_per_site:
+                        break
+                    qv = (qv or "").strip()
+                    if not qv:
+                        continue
+                    enc = quote_plus(qv)
+
+                    probes = [
+                        s + f"/search?q={enc}",
+                        s + f"/search?query={enc}",
+                        s + f"/?s={enc}",
+                        s + f"/search/{enc}",
+                    ]
+                    probes.extend(_extra_probes_for_site(s, enc))
+
+                    for p in probes:
+                        out.append(p)
+                        synthetic_search_seeds.add(p)
+                        probes_added += 1
+                        if (
+                            probes_added >= probe_cap_per_site
+                            and "archive.org" not in s
+                        ):
+                            break
+
+        return out, synthetic_search_seeds, explicit_site_seeds
+
+    def _extract_sitemap_urls_from_robots(self, text: str) -> list[str]:
+        urls = []
+        for line in (text or "").splitlines():
+            if line.lower().startswith("sitemap:"):
+                u = line.split(":", 1)[1].strip()
+                if u.startswith("http"):
+                    urls.append(u)
+        return urls
+
+    # ------------------------------------------------------------------ #
+    # Sync wrapper
+    # ------------------------------------------------------------------ #
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "rare aphex twin interview",
+            "timeout": 5,
+            "mode": "pages",
+            "scan_limit": 5,
+            "search_results_cap": 256,
+            "search_page_limit": 1,
+            "search_per_page": 50,
+            "verify": False,  # not used for pages
+            "extensions": "",
+            "url_keywords": "archive,download",
+            "engine": "duckduckgo",
+            "site_require": "",
+            "use_js": False,
+            "return_all_js_links": False,
+            "max_links_per_page": 500,
+            "strict_keywords": False,
+            "use_network_sniff": False,
+            "return_network_sniff_links": False,
+            "use_runtime_sniff": False,
+            "return_runtime_sniff_hits": False,
+            "use_react_sniff": False,
+            "return_react_sniff_hits": False,
+            "min_term_overlap": 1,
+            "max_depth": 0,
+            "max_pages_total": 32,
+            "subpipeline": "",
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",
+            "db_seed_limit": 250,
+            "db_seed_max_age_days": None,
+            "db_allow_rescan": False,
+            "memory_sources": "",
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_verify_tls": True,
+            "http_ca_bundle": "",
+            "use_camoufox": False,
+            "camoufox_options": {},
+            "searxng_url": "http://127.0.0.1:8080",
+        }
+
+
+BLOCKS.register("pagetracker", PageTrackerBlock)

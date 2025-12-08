@@ -918,6 +918,174 @@ class VideoTrackerStore(BaseStore):
 
 
 # ======================================================================
+# PageTrackerStore (Add to submanagers.py or near LinkTrackerStore)
+# ======================================================================
+
+class PageTrackerStore(BaseStore):
+    """
+    Store specifically for PageTrackerBlock.
+    Tracks discovered HTML pages, their titles, and scores to build a crawl frontier.
+    """
+
+    # We use a distinct table 'discovered_pages' to avoid polluting the 'assets' table
+    # used by Link/Video trackers.
+    PAGES_DDL = """
+    CREATE TABLE IF NOT EXISTS discovered_pages
+    (
+        url TEXT PRIMARY KEY,
+        title TEXT,
+        source_url TEXT,
+        depth INTEGER DEFAULT 0,
+        score INTEGER DEFAULT 0,
+        status TEXT,
+        last_scanned TIMESTAMP,
+        first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+
+    # We still track visited history to prevent loops
+    HISTORY_DDL = """
+    CREATE TABLE IF NOT EXISTS scan_history
+    (
+        url TEXT PRIMARY KEY,
+        last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """
+
+    INDEXES_DDL = [
+        "CREATE INDEX IF NOT EXISTS idx_dp_score ON discovered_pages (score)",
+        "CREATE INDEX IF NOT EXISTS idx_dp_source ON discovered_pages (source_url)",
+        "CREATE INDEX IF NOT EXISTS idx_sh_last ON scan_history (last_checked)",
+    ]
+
+    def ensure_schema(self) -> None:
+        self.db.ensure_schema([self.PAGES_DDL, self.HISTORY_DDL, *self.INDEXES_DDL])
+
+    # -------------------- Writing Data -------------------- #
+
+    def upsert_page(self, page_data: Dict[str, Any]) -> None:
+        """
+        Save a discovered page. Updates score/title if found again.
+        """
+        url = page_data.get("url", "").strip()
+        if not url:
+            return
+
+        # Simple check if exists
+        exists = self.db.fetchone("SELECT 1 FROM discovered_pages WHERE url = ?", (url,))
+
+        if exists:
+            # Update meta if the new find has better data
+            self.db.execute(
+                """
+                UPDATE discovered_pages
+                SET title = coalesce(?, title),
+                    score = max(score, ?),
+                    depth = min(depth, ?),
+                    status = ?
+                WHERE url = ?
+                """,
+                (
+                    page_data.get("title"),
+                    int(page_data.get("score", 0)),
+                    int(page_data.get("depth", 99)),
+                    page_data.get("status", "found"),
+                    url,
+                ),
+            )
+        else:
+            self.db.execute(
+                """
+                INSERT INTO discovered_pages (url, title, source_url, depth, score, status)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    url,
+                    page_data.get("title", ""),
+                    page_data.get("source", ""),
+                    int(page_data.get("depth", 0)),
+                    int(page_data.get("score", 0)),
+                    page_data.get("status", "found"),
+                ),
+            )
+
+    def mark_scan_complete(self, url: str) -> None:
+        """Mark a page as 'visited' in the history table."""
+        self.db.execute(
+            "INSERT OR REPLACE INTO scan_history (url, last_checked) VALUES (?, CURRENT_TIMESTAMP)",
+            (url,)
+        )
+        # Also update the main table to reflect recent scan
+        self.db.execute(
+            "UPDATE discovered_pages SET last_scanned = CURRENT_TIMESTAMP WHERE url = ?",
+            (url,)
+        )
+
+    # -------------------- Reading Data (Engine=Database) -------------------- #
+
+    def is_recently_scanned(self, url: str, days: Optional[int] = None) -> bool:
+        if days is None:
+            # Just check if it exists in history
+            r = self.db.fetchone("SELECT 1 FROM scan_history WHERE url = ?", (url,))
+            return r is not None
+
+        # Check date
+        q = f"SELECT 1 FROM scan_history WHERE url = ? AND last_checked >= datetime('now', '-{int(days)} days')"
+        r = self.db.fetchone(q, (url,))
+        return r is not None
+
+    def fetch_seed_pages(
+            self,
+            limit: int = 200,
+            required_sites: Optional[List[str]] = None,
+            keywords: Optional[List[str]] = None,
+            min_score: int = 0
+    ) -> List[str]:
+        """
+        Intelligent fetch: Get pages that match site/keyword criteria,
+        prioritizing high scores and those NOT scanned recently.
+        """
+        where_clauses = []
+        args = []
+
+        # Filter by site
+        if required_sites:
+            site_parts = []
+            for s in required_sites:
+                site_parts.append("url LIKE ?")
+                args.append(f"%{s}%")
+            where_clauses.append(f"({' OR '.join(site_parts)})")
+
+        # Filter by keywords (in URL or Title)
+        if keywords:
+            kw_parts = []
+            for k in keywords:
+                term = f"%{k}%"
+                kw_parts.append("(url LIKE ? OR title LIKE ?)")
+                args.extend([term, term])
+            where_clauses.append(f"({' OR '.join(kw_parts)})")
+
+        # Filter by score
+        where_clauses.append("score >= ?")
+        args.append(min_score)
+
+        # Construct SQL
+        where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+        # Order by: Score (High) -> Depth (Low) -> Random
+        query = f"""
+            SELECT url 
+            FROM discovered_pages
+            {where_sql}
+            ORDER BY score DESC, depth ASC
+            LIMIT ?
+        """
+        args.append(limit)
+
+        rows = self.db.fetchall(query, args)
+        return [r["url"] for r in rows]
+
+# ======================================================================
 # WebCorpusStore  (place with your other Stores, e.g. in submanagers.py)
 # ======================================================================
 

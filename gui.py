@@ -16,6 +16,9 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import threading
+
+from PyQt5.QtGui import QTextCursor
+
 import blocks
 import pipeline
 from gui_elements import DatabasePane
@@ -53,7 +56,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QListWidget, QPushButton, QCheckBox, QPlainTextEdit, QTabWidget,
     QStatusBar, QAction, QFileDialog, QListWidgetItem, QAbstractItemView,
-    QGroupBox, QSplitter, QLabel, QMessageBox, QComboBox, QInputDialog  # <-- QInputDialog added
+    QGroupBox, QSplitter, QLabel, QMessageBox, QComboBox, QInputDialog, QLineEdit  # <-- QInputDialog added
 )
 from PyQt5.QtCore import QObject, pyqtSignal, QThread, pyqtSlot, Qt
 
@@ -478,7 +481,8 @@ class PromptChatGUI(QMainWindow):
         self._refresh_block_list()
         self._load_state()
         self._show_main_ui()  # Start on Prompt Chat tab
-
+        # NEW: Store all log lines in memory so we can filter them later
+        self.all_log_lines: List[str] = []
         DEBUG_LOGGER.message_signal.connect(self._append_debug_message)
         DEBUG_LOGGER.log_message("[Debug] Debug logger initialized.")
     # ---------------- UI building ----------------
@@ -678,17 +682,38 @@ class PromptChatGUI(QMainWindow):
         self.meta_text.setLineWrapMode(QPlainTextEdit.NoWrap)
         tabs.addTab(self.meta_text, "Metadata")
 
-        # NEW: Debug Log pane
+        # 🔹 Add this whole Prompt Chat pane as a tab
+        self.main_tabs.addTab(self.main_ui_widget, "Prompt Chat")
+        # =========================================================
+        # NEW: Log Tab with Search Bar
+        # =========================================================
+        log_tab_widget = QWidget()
+        log_tab_layout = QVBoxLayout(log_tab_widget)
+        log_tab_layout.setContentsMargins(5, 5, 5, 5)
+
+        # Search Bar
+        self.log_search_bar = QLineEdit()
+        self.log_search_bar.setPlaceholderText("Search logs... (filters automatically)")
+        self.log_search_bar.setStyleSheet("""
+                QLineEdit {
+                    background-color: #212121;
+                    color: #dcdcdc;
+                    border: 1px solid #4f4f4f;
+                    padding: 4px;
+                    border-radius: 4px;
+                }
+            """)
+        self.log_search_bar.textChanged.connect(self._filter_logs)
+        log_tab_layout.addWidget(self.log_search_bar)
+
+        # Log Text Area
         self.debug_text = QPlainTextEdit()
         self.debug_text.setReadOnly(True)
         self.debug_text.setLineWrapMode(QPlainTextEdit.NoWrap)
-        tabs.addTab(self.debug_text, "Log")
+        log_tab_layout.addWidget(self.debug_text)
 
-        top_level_splitter.setSizes([250, 550])
-
-        # 🔹 Add this whole Prompt Chat pane as a tab
-        self.main_tabs.addTab(self.main_ui_widget, "Prompt Chat")
-
+        tabs.addTab(log_tab_widget, "Log")
+        # =========================================================
     def _build_database_ui(self) -> None:
         """Build the database pane UI as a tab, using DatabasePane."""
         self.db_pane = DatabasePane(APP_TITLE, self)
@@ -698,10 +723,43 @@ class PromptChatGUI(QMainWindow):
     def _append_debug_message(self, msg: str) -> None:
         """
         Slot that appends debug messages to the Debug Log pane.
+        Stores all logs in memory, but only displays them if they match the filter.
         """
-        self.debug_text.appendPlainText(msg)
-    # ---------------- Database Helpers ----------------
+        # 1. Always store the full log
+        self.all_log_lines.append(msg)
 
+        # 2. Check current filter
+        filter_text = self.log_search_bar.text().strip().lower()
+
+        # 3. If no filter, or if filter matches, append to GUI immediately
+        if not filter_text or filter_text in msg.lower():
+            self.debug_text.appendPlainText(msg)
+            # Optional: Scroll to bottom only if user was already at bottom or mostly there
+            self.debug_text.moveCursor(QTextCursor.End)
+    # ---------------- Database Helpers ----------------
+    @pyqtSlot(str)
+    def _filter_logs(self, text: str) -> None:
+        """
+        Re-renders the log window based on the search query.
+        """
+        query = text.strip().lower()
+        self.debug_text.clear()
+
+        if not query:
+            # If search is empty, dump everything back in
+            # Joining is faster than calling appendPlainText thousands of times
+            full_log = "\n".join(self.all_log_lines)
+            self.debug_text.setPlainText(full_log)
+        else:
+            # Filter lines
+            matching_lines = [
+                line for line in self.all_log_lines
+                if query in line.lower()
+            ]
+            self.debug_text.setPlainText("\n".join(matching_lines))
+
+        # Scroll to bottom after filtering
+        self.debug_text.moveCursor(QTextCursor.End)
     def _open_database(self) -> None:
         """Opens a file dialog to select an SQLite database and displays its contents."""
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1179,7 +1237,7 @@ class PromptChatGUI(QMainWindow):
         self.result_text.clear()
         self.meta_text.clear()
         self.debug_text.clear()
-
+        self.all_log_lines.clear()
     @pyqtSlot()
     def _on_thread_finished(self):
         self.run_thread = None
