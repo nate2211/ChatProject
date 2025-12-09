@@ -3464,6 +3464,404 @@ class ReactSniffer:
 
 
 # ======================================================================
+# DatabaseSniffer (Playwright-based DB / persistence sniffer)
+# ======================================================================
+
+class DatabaseSniffer:
+    """
+    Playwright-based sniffer for Data Persistence.
+
+    Targets:
+      1. CLIENT-SIDE: IndexedDB (NoSQL), WebSQL (Legacy), LocalStorage (KV).
+      2. BACKEND INFERENCE: Detects Firebase, Supabase, CouchDB, etc.
+         via global vars, network patterns, and known API error signatures.
+      3. LEAKS: Scans HTTP 4xx/5xx bodies for SQL/NoSQL syntax errors.
+
+    Public API (matches other sniffers like ReactSniffer):
+
+        html, hits = await sniff(
+            context,
+            page_url,
+            timeout,
+            log,
+            extensions=None,
+        )
+
+    Where:
+
+        html: final DOM snapshot from Playwright (str)
+        hits: list of dicts:
+
+            {
+                "page": <page_url>,
+                "url": <offending or related URL>,
+                "tag": "db_sniff",
+                "kind": "backend_leak" | "db_config_detected" | "indexeddb_dump",
+                "meta": {...}
+            }
+    """
+
+    # ------------------------------------------------------------------ #
+    # Config
+    # ------------------------------------------------------------------ #
+    @dataclass
+    class Config:
+        timeout: float = 10.0
+
+        # --- IndexedDB Extraction ---
+        enable_indexeddb_dump: bool = True
+        max_idb_databases: int = 5
+        max_idb_stores: int = 5
+        max_idb_records_per_store: int = 20  # Sample size only
+
+        # --- Backend Inference ---
+        enable_backend_fingerprint: bool = True
+
+        # Known SaaS DB globals to scan for in window object
+        known_globals: Set[str] = field(default_factory=lambda: {
+            "firebase", "_firebaseApp", "Supabase", "supabaseClient",
+            "__FIREBASE_DEFAULTS__", "mongo", "Realm", "couchdb",
+        })
+
+        # --- Error Leak Detection ---
+        enable_error_sniff: bool = True
+        # Regex patterns to find in HTTP 4xx/5xx response bodies
+        db_error_patterns: List[str] = field(default_factory=lambda: [
+            r"SQL syntax.*MySQL",
+            r"valid PostgreSQL result",
+            r"ORA-[0-9]{5}",
+            r"Microsoft SQL Server Native Client",
+            r"MongoError",
+            r"duplicate key error collection",
+            r"violates foreign key constraint",
+        ])
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+    def __init__(self, config: Optional["DatabaseSniffer.Config"] = None, logger=None):
+        self.cfg = config or self.Config()
+        self.logger = logger or DEBUG_LOGGER
+        self._log("DatabaseSniffer Initialized", None)
+
+    # ------------------------------------------------------------------ #
+    # Logging helper
+    # ------------------------------------------------------------------ #
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        full = f"[DatabaseSniffer] {msg}"
+        try:
+            if log_list is not None:
+                log_list.append(full)
+            if self.logger is not None:
+                self.logger.log_message(full)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Public API (matches other sniffers)
+    # ------------------------------------------------------------------ #
+    async def sniff(
+        self,
+        context,              # Playwright BrowserContext
+        page_url: str,
+        timeout: float,
+        log: List[str],
+        extensions=None,      # kept for signature compatibility; unused
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Main entrypoint.
+
+        Returns:
+            (html, hits)
+        """
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        if not context:
+            self._log("No BrowserContext supplied; skipping.", log)
+            return "", []
+
+        tmo = float(timeout or self.cfg.timeout)
+        hits: List[Dict[str, Any]] = []
+        html: str = ""
+
+        page = None
+
+        # ------------ Optional HTTP error leak sniff (network hook) ------------
+        async def handle_response(response):
+            if not self.cfg.enable_error_sniff:
+                return
+            try:
+                status = response.status
+                if status < 400:
+                    return
+
+                # Only inspect text bodies; guard for large responses
+                try:
+                    text = await response.text()
+                except Exception:
+                    return
+                if not text:
+                    return
+
+                for pattern in self.cfg.db_error_patterns:
+                    try:
+                        if re.search(pattern, text, re.IGNORECASE):
+                            hit = {
+                                "page": page_url,
+                                "url": response.url,
+                                "tag": "db_sniff",
+                                "kind": "backend_leak",
+                                "meta": {
+                                    "status": status,
+                                    "pattern_match": pattern,
+                                    "preview": text[:200],
+                                },
+                            }
+                            hits.append(hit)
+                            self._log(f"Found DB Error Leak: {response.url}", log)
+                            break
+                    except re.error:
+                        # Bad regex pattern should never crash the run
+                        continue
+            except Exception:
+                # Never let an error in the handler break page loading
+                pass
+
+        # --------------------- Navigation + extraction -------------------------
+        self._log(f"Start DB sniff: {page_url}", log)
+
+        try:
+            page = await context.new_page()
+
+            if self.cfg.enable_error_sniff:
+                page.on("response", handle_response)
+
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
+            # Give client-side DBs a moment to initialize
+            await page.wait_for_timeout(1000)
+
+            # --- Backend fingerprint (window globals) ---
+            if self.cfg.enable_backend_fingerprint:
+                try:
+                    fingerprints = await page.evaluate(
+                        """
+                        (globals) => {
+                            const found = [];
+                            try {
+                                globals.forEach(g => {
+                                    let val;
+                                    try { val = window[g]; } catch (e) { val = undefined; }
+                                    if (val !== undefined && val !== null) {
+                                        const type = typeof val;
+                                        let keys = [];
+                                        if (type === 'object') {
+                                            try { keys = Object.keys(val).slice(0, 5); } catch (e) {}
+                                        }
+                                        found.push({ name: g, type, keys });
+                                    }
+                                });
+                            } catch (e) {}
+                            return found;
+                        }
+                        """,
+                        list(self.cfg.known_globals),
+                    )
+
+                    for fp in fingerprints or []:
+                        if not isinstance(fp, dict):
+                            continue
+                        hits.append(
+                            {
+                                "page": page_url,
+                                "url": page_url,
+                                "tag": "db_sniff",
+                                "kind": "db_config_detected",
+                                "meta": fp,
+                            }
+                        )
+                except Exception as e:
+                    self._log(f"Backend fingerprint error on {page_url}: {e}", log)
+
+            # --- IndexedDB Extraction ---
+            if self.cfg.enable_indexeddb_dump:
+                try:
+                    idb_data = await self._dump_indexeddb(page, log)
+                    for db in idb_data:
+                        hits.append(
+                            {
+                                "page": page_url,
+                                "url": page_url,
+                                "tag": "db_sniff",
+                                "kind": "indexeddb_dump",
+                                "meta": db,
+                            }
+                        )
+                except Exception as e:
+                    self._log(f"IndexedDB dump error on {page_url}: {e}", log)
+
+            # --- HTML snapshot ---
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"Error getting HTML for {page_url}: {e}", log)
+
+        except PWTimeoutError:
+            self._log(f"Timeout while loading {page_url}", log)
+        except Exception as e:
+            self._log(f"Fatal error during DB sniff on {page_url}: {e}", log)
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as e:
+                    self._log(f"Error closing page for {page_url}: {e}", log)
+
+        self._log(f"Finished DB sniff for {page_url}: hits={len(hits)}", log)
+        return html or "", hits
+
+    # ------------------------------------------------------------------ #
+    # IndexedDB dumper (runs inside Playwright page)
+    # ------------------------------------------------------------------ #
+    async def _dump_indexeddb(self, page, log: Optional[List[str]]) -> List[Dict[str, Any]]:
+        """
+        Injects a script to open available IndexedDB databases, iterate
+        object stores, and sample records.
+
+        Returns a list of DB descriptors:
+
+            {
+                "name": <db name>,
+                "version": <db version>,
+                "stores": [
+                    {
+                        "name": <store name>,
+                        "count_preview": <number of items returned>,
+                        "records": <JSON-serializable sample>,
+                    },
+                    ...
+                ],
+                "error": <optional error string>,
+            }
+        """
+        self._log("Attempting IndexedDB dump...", log)
+
+        script = """
+        async (config) => {
+            const { maxDbs, maxStores, maxRecords } = config;
+
+            if (!window.indexedDB) {
+                return [{ error: "IndexedDB not available in this context" }];
+            }
+
+            if (!window.indexedDB.databases) {
+                // Older browsers: still try a generic fallback
+                return [{ error: "IndexedDB Enumeration API not supported in this browser context" }];
+            }
+
+            try {
+                const dbs = await window.indexedDB.databases();
+                const results = [];
+
+                const targetDbs = dbs.slice(0, maxDbs);
+
+                for (const dbInfo of targetDbs) {
+                    if (!dbInfo || !dbInfo.name) continue;
+
+                    const dbData = {
+                        name: dbInfo.name,
+                        version: dbInfo.version,
+                        stores: []
+                    };
+
+                    const db = await new Promise((resolve) => {
+                        try {
+                            const req = window.indexedDB.open(dbInfo.name, dbInfo.version);
+                            req.onsuccess = () => resolve(req.result);
+                            req.onerror = () => resolve(null);
+                            req.onblocked = () => resolve(null);
+                        } catch (e) {
+                            resolve(null);
+                        }
+                    });
+
+                    if (!db) {
+                        dbData.error = "Could not open DB (blocked or error)";
+                        results.push(dbData);
+                        continue;
+                    }
+
+                    const storeNames = Array.from(db.objectStoreNames || []).slice(0, maxStores);
+
+                    if (storeNames.length > 0) {
+                        try {
+                            const tx = db.transaction(storeNames, 'readonly');
+
+                            for (const storeName of storeNames) {
+                                try {
+                                    const store = tx.objectStore(storeName);
+                                    const records = await new Promise((resolve) => {
+                                        try {
+                                            const req = store.getAll(null, maxRecords);
+                                            req.onsuccess = () => resolve(req.result || []);
+                                            req.onerror = () => resolve(["Error reading store"]);
+                                        } catch (e) {
+                                            resolve(["Error reading store"]);
+                                        }
+                                    });
+
+                                    let safeRecords = [];
+                                    try {
+                                        safeRecords = JSON.parse(JSON.stringify(records));
+                                    } catch (_) {
+                                        safeRecords = ["(Unserializable Data)"];
+                                    }
+
+                                    dbData.stores.push({
+                                        name: storeName,
+                                        count_preview: Array.isArray(records) ? records.length : 0,
+                                        records: safeRecords,
+                                    });
+                                } catch (e) {
+                                    dbData.stores.push({
+                                        name: storeName,
+                                        count_preview: 0,
+                                        records: ["Error reading store: " + (e && e.message ? e.message : String(e || ""))]
+                                    });
+                                }
+                            }
+                        } catch (e) {
+                            dbData.error = "Transaction failed: " + (e && e.message ? e.message : String(e || ""));
+                        }
+                    }
+
+                    try { db.close(); } catch (_) {}
+                    results.push(dbData);
+                }
+
+                return results;
+            } catch (e) {
+                return [{ error: "Global dump error: " + (e && e.message ? e.message : String(e || "")) }];
+            }
+        }
+        """
+
+        try:
+            args = {
+                "maxDbs": self.cfg.max_idb_databases,
+                "maxStores": self.cfg.max_idb_stores,
+                "maxRecords": self.cfg.max_idb_records_per_store,
+            }
+            result = await page.evaluate(script, args)
+            if not isinstance(result, list):
+                result = []
+            count = len(result)
+            self._log(f"IndexedDB dump complete. Found {count} database entries.", log)
+            return result
+        except Exception as e:
+            self._log(f"IndexedDB script failed: {e}", log)
+            return []
+
+# ======================================================================
 # Database
 # ======================================================================
 
