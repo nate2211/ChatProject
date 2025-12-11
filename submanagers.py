@@ -3469,13 +3469,24 @@ class ReactSniffer:
 
 class DatabaseSniffer:
     """
-    Playwright-based sniffer for Data Persistence.
+    Playwright-based sniffer for Data Persistence + Safe Link Extraction.
 
     Targets:
-      1. CLIENT-SIDE: IndexedDB (NoSQL), WebSQL (Legacy), LocalStorage (KV).
-      2. BACKEND INFERENCE: Detects Firebase, Supabase, CouchDB, etc.
-         via global vars, network patterns, and known API error signatures.
-      3. LEAKS: Scans HTTP 4xx/5xx bodies for SQL/NoSQL syntax errors.
+      1. CLIENT-SIDE PERSISTENCE (SAFE):
+           - IndexedDB (NoSQL), WebSQL (Legacy), LocalStorage (KV)
+           - This implementation only collects high-level IndexedDB metadata
+             (DB names, store names, approximate counts), NOT individual records.
+
+      2. BACKEND INFERENCE:
+           - Detects Firebase, Supabase, CouchDB, etc. via global vars.
+           - Additionally, scans those globals for URL-like strings and returns
+             ONLY the URLs (no full config objects).
+
+      3. LINK-ONLY EXTRACTION (MAIN PURPOSE):
+           - Regex-based URL extraction from:
+               • Final HTML
+               • Backend config globals (link-only)
+           - We never keep arbitrary data; we keep only things that look like URLs.
 
     Public API (matches other sniffers like ReactSniffer):
 
@@ -3490,16 +3501,19 @@ class DatabaseSniffer:
     Where:
 
         html: final DOM snapshot from Playwright (str)
-        hits: list of dicts:
+        hits: list of dicts, e.g.:
 
             {
                 "page": <page_url>,
-                "url": <offending or related URL>,
+                "url": <related URL or page>,
                 "tag": "db_sniff",
-                "kind": "backend_leak" | "db_config_detected" | "indexeddb_dump",
-                "meta": {...}
+                "kind": "db_config_detected" | "indexeddb_dump" | "content_link",
+                "meta": {...}   # for content_link, contains {"url": <link>, "source": "..."}
             }
     """
+
+    # URL regex for link-only extraction
+    _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
     # ------------------------------------------------------------------ #
     # Config
@@ -3508,11 +3522,12 @@ class DatabaseSniffer:
     class Config:
         timeout: float = 10.0
 
-        # --- IndexedDB Extraction ---
+        # --- IndexedDB Extraction (metadata only) ---
+        # We only enumerate DBs + stores and approximate counts.
         enable_indexeddb_dump: bool = True
         max_idb_databases: int = 5
         max_idb_stores: int = 5
-        max_idb_records_per_store: int = 20  # Sample size only
+        max_idb_records_per_store: int = 20  # kept for backwards compat; unused
 
         # --- Backend Inference ---
         enable_backend_fingerprint: bool = True
@@ -3523,18 +3538,9 @@ class DatabaseSniffer:
             "__FIREBASE_DEFAULTS__", "mongo", "Realm", "couchdb",
         })
 
-        # --- Error Leak Detection ---
-        enable_error_sniff: bool = True
-        # Regex patterns to find in HTTP 4xx/5xx response bodies
-        db_error_patterns: List[str] = field(default_factory=lambda: [
-            r"SQL syntax.*MySQL",
-            r"valid PostgreSQL result",
-            r"ORA-[0-9]{5}",
-            r"Microsoft SQL Server Native Client",
-            r"MongoError",
-            r"duplicate key error collection",
-            r"violates foreign key constraint",
-        ])
+        # --- Link extraction toggles ---
+        enable_html_link_scan: bool = True
+        enable_backend_link_scan: bool = True
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -3542,7 +3548,7 @@ class DatabaseSniffer:
     def __init__(self, config: Optional["DatabaseSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
-        self._log("DatabaseSniffer Initialized", None)
+        self._log("DatabaseSniffer Initialized (no error sniffing, link-only mode)", None)
 
     # ------------------------------------------------------------------ #
     # Logging helper
@@ -3556,6 +3562,47 @@ class DatabaseSniffer:
                 self.logger.log_message(full)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Link extraction helpers
+    # ------------------------------------------------------------------ #
+    def _extract_links_from_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        urls = self._URL_RE.findall(text)
+        # Basic normalization / de-dup
+        seen = set()
+        out: List[str] = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _add_link_hits(
+        self,
+        page_url: str,
+        urls: List[str],
+        hits: List[Dict[str, Any]],
+        source: str,
+        log: Optional[List[str]],
+    ) -> None:
+        if not urls:
+            return
+        self._log(f"Link scan ({source}) found {len(urls)} URLs", log)
+        for u in urls:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": u,
+                    "tag": "db_sniff",
+                    "kind": "content_link",
+                    "meta": {
+                        "url": u,
+                        "source": source,
+                    },
+                }
+            )
 
     # ------------------------------------------------------------------ #
     # Public API (matches other sniffers)
@@ -3586,63 +3633,21 @@ class DatabaseSniffer:
 
         page = None
 
-        # ------------ Optional HTTP error leak sniff (network hook) ------------
-        async def handle_response(response):
-            if not self.cfg.enable_error_sniff:
-                return
-            try:
-                status = response.status
-                if status < 400:
-                    return
-
-                # Only inspect text bodies; guard for large responses
-                try:
-                    text = await response.text()
-                except Exception:
-                    return
-                if not text:
-                    return
-
-                for pattern in self.cfg.db_error_patterns:
-                    try:
-                        if re.search(pattern, text, re.IGNORECASE):
-                            hit = {
-                                "page": page_url,
-                                "url": response.url,
-                                "tag": "db_sniff",
-                                "kind": "backend_leak",
-                                "meta": {
-                                    "status": status,
-                                    "pattern_match": pattern,
-                                    "preview": text[:200],
-                                },
-                            }
-                            hits.append(hit)
-                            self._log(f"Found DB Error Leak: {response.url}", log)
-                            break
-                    except re.error:
-                        # Bad regex pattern should never crash the run
-                        continue
-            except Exception:
-                # Never let an error in the handler break page loading
-                pass
-
         # --------------------- Navigation + extraction -------------------------
         self._log(f"Start DB sniff: {page_url}", log)
 
         try:
             page = await context.new_page()
 
-            if self.cfg.enable_error_sniff:
-                page.on("response", handle_response)
-
             await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
             # Give client-side DBs a moment to initialize
             await page.wait_for_timeout(1000)
 
             # --- Backend fingerprint (window globals) ---
+            backend_urls: List[str] = []
             if self.cfg.enable_backend_fingerprint:
                 try:
+                    # 1) Shallow shape: what globals exist & basic keys
                     fingerprints = await page.evaluate(
                         """
                         (globals) => {
@@ -3657,6 +3662,7 @@ class DatabaseSniffer:
                                         if (type === 'object') {
                                             try { keys = Object.keys(val).slice(0, 5); } catch (e) {}
                                         }
+                                        // We only return a shallow shape, not full configs.
                                         found.push({ name: g, type, keys });
                                     }
                                 });
@@ -3682,7 +3688,74 @@ class DatabaseSniffer:
                 except Exception as e:
                     self._log(f"Backend fingerprint error on {page_url}: {e}", log)
 
-            # --- IndexedDB Extraction ---
+                # 2) Link-only deep scan of those same globals
+                if self.cfg.enable_backend_link_scan:
+                    try:
+                        backend_urls = await page.evaluate(
+                            """
+                            (globals) => {
+                                const urls = [];
+                                const seen = new Set();
+
+                                const isUrl = (s) =>
+                                    typeof s === 'string' &&
+                                    /^https?:\\/\\//i.test(s);
+
+                                const addUrl = (u) => {
+                                    if (isUrl(u) && !seen.has(u)) {
+                                        seen.add(u);
+                                        urls.push(u);
+                                    }
+                                };
+
+                                const scanValue = (v, depth) => {
+                                    if (depth <= 0 || v == null) return;
+                                    if (isUrl(v)) {
+                                        addUrl(v);
+                                        return;
+                                    }
+                                    if (Array.isArray(v)) {
+                                        for (const item of v) {
+                                            scanValue(item, depth - 1);
+                                        }
+                                        return;
+                                    }
+                                    if (typeof v === 'object') {
+                                        let keys;
+                                        try {
+                                            keys = Object.keys(v);
+                                        } catch (_) {
+                                            return;
+                                        }
+                                        for (const k of keys.slice(0, 50)) {
+                                            try {
+                                                scanValue(v[k], depth - 1);
+                                            } catch (e) {}
+                                        }
+                                    }
+                                };
+
+                                try {
+                                    globals.forEach(g => {
+                                        let val;
+                                        try { val = window[g]; } catch (e) { val = undefined; }
+                                        if (val !== undefined && val !== null) {
+                                            scanValue(val, 2);  // depth limit
+                                        }
+                                    });
+                                } catch (e) {}
+
+                                return urls;
+                            }
+                            """,
+                            list(self.cfg.known_globals),
+                        )
+                        if not isinstance(backend_urls, list):
+                            backend_urls = []
+                    except Exception as e:
+                        self._log(f"Backend link scan error on {page_url}: {e}", log)
+
+            # --- IndexedDB Metadata Extraction (NO RECORD CONTENTS) ---
             if self.cfg.enable_indexeddb_dump:
                 try:
                     idb_data = await self._dump_indexeddb(page, log)
@@ -3705,6 +3778,15 @@ class DatabaseSniffer:
             except Exception as e:
                 self._log(f"Error getting HTML for {page_url}: {e}", log)
 
+            # --- Link-only extraction from HTML ---
+            if self.cfg.enable_html_link_scan and html:
+                html_links = self._extract_links_from_text(html)
+                self._add_link_hits(page_url, html_links, hits, source="html", log=log)
+
+            # --- Link-only extraction from backend globals ---
+            if backend_urls:
+                self._add_link_hits(page_url, backend_urls, hits, source="backend_globals", log=log)
+
         except PWTimeoutError:
             self._log(f"Timeout while loading {page_url}", log)
         except Exception as e:
@@ -3720,12 +3802,12 @@ class DatabaseSniffer:
         return html or "", hits
 
     # ------------------------------------------------------------------ #
-    # IndexedDB dumper (runs inside Playwright page)
+    # IndexedDB dumper (metadata-only; runs inside Playwright page)
     # ------------------------------------------------------------------ #
     async def _dump_indexeddb(self, page, log: Optional[List[str]]) -> List[Dict[str, Any]]:
         """
-        Injects a script to open available IndexedDB databases, iterate
-        object stores, and sample records.
+        Enumerates IndexedDB databases and object store names WITHOUT
+        fetching or returning individual records.
 
         Returns a list of DB descriptors:
 
@@ -3735,26 +3817,25 @@ class DatabaseSniffer:
                 "stores": [
                     {
                         "name": <store name>,
-                        "count_preview": <number of items returned>,
-                        "records": <JSON-serializable sample>,
+                        "approx_count": <integer or null>,
                     },
                     ...
                 ],
                 "error": <optional error string>,
             }
         """
-        self._log("Attempting IndexedDB dump...", log)
+        self._log("Attempting IndexedDB metadata dump (no records)...", log)
 
         script = """
         async (config) => {
-            const { maxDbs, maxStores, maxRecords } = config;
+            const { maxDbs, maxStores } = config;
 
             if (!window.indexedDB) {
                 return [{ error: "IndexedDB not available in this context" }];
             }
 
             if (!window.indexedDB.databases) {
-                // Older browsers: still try a generic fallback
+                // Older browsers: we don't try hacks; respect limitations.
                 return [{ error: "IndexedDB Enumeration API not supported in this browser context" }];
             }
 
@@ -3797,37 +3878,27 @@ class DatabaseSniffer:
                             const tx = db.transaction(storeNames, 'readonly');
 
                             for (const storeName of storeNames) {
+                                let approxCount = null;
                                 try {
                                     const store = tx.objectStore(storeName);
-                                    const records = await new Promise((resolve) => {
+                                    // Use count() only; do not read actual records.
+                                    approxCount = await new Promise((resolve) => {
                                         try {
-                                            const req = store.getAll(null, maxRecords);
-                                            req.onsuccess = () => resolve(req.result || []);
-                                            req.onerror = () => resolve(["Error reading store"]);
+                                            const req = store.count();
+                                            req.onsuccess = () => resolve(req.result ?? null);
+                                            req.onerror = () => resolve(null);
                                         } catch (e) {
-                                            resolve(["Error reading store"]);
+                                            resolve(null);
                                         }
                                     });
-
-                                    let safeRecords = [];
-                                    try {
-                                        safeRecords = JSON.parse(JSON.stringify(records));
-                                    } catch (_) {
-                                        safeRecords = ["(Unserializable Data)"];
-                                    }
-
-                                    dbData.stores.push({
-                                        name: storeName,
-                                        count_preview: Array.isArray(records) ? records.length : 0,
-                                        records: safeRecords,
-                                    });
                                 } catch (e) {
-                                    dbData.stores.push({
-                                        name: storeName,
-                                        count_preview: 0,
-                                        records: ["Error reading store: " + (e && e.message ? e.message : String(e || ""))]
-                                    });
+                                    // leave approxCount as null on failure
                                 }
+
+                                dbData.stores.push({
+                                    name: storeName,
+                                    approx_count: approxCount,
+                                });
                             }
                         } catch (e) {
                             dbData.error = "Transaction failed: " + (e && e.message ? e.message : String(e || ""));
@@ -3840,7 +3911,7 @@ class DatabaseSniffer:
 
                 return results;
             } catch (e) {
-                return [{ error: "Global dump error: " + (e && e.message ? e.message : String(e || "")) }];
+                return [{ error: "Global metadata dump error: " + (e && e.message ? e.message : String(e || "")) }];
             }
         }
         """
@@ -3849,17 +3920,17 @@ class DatabaseSniffer:
             args = {
                 "maxDbs": self.cfg.max_idb_databases,
                 "maxStores": self.cfg.max_idb_stores,
-                "maxRecords": self.cfg.max_idb_records_per_store,
             }
             result = await page.evaluate(script, args)
             if not isinstance(result, list):
                 result = []
             count = len(result)
-            self._log(f"IndexedDB dump complete. Found {count} database entries.", log)
+            self._log(f"IndexedDB metadata dump complete. Found {count} database entries.", log)
             return result
         except Exception as e:
-            self._log(f"IndexedDB script failed: {e}", log)
+            self._log(f"IndexedDB metadata script failed: {e}", log)
             return []
+
 
 # ======================================================================
 # Database

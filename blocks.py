@@ -6414,6 +6414,14 @@ class LinkTrackerBlock(BaseBlock):
                 inspect_react_devtools_hook=True,
             )
         )
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,  # Get Metadata
+                enable_backend_fingerprint=True,  # Get Tech Stack
+                enable_html_link_scan=True,  # Scan HTML for raw links
+                enable_backend_link_scan=True  # Scan JS Globals for links
+            )
+        )
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -7181,6 +7189,13 @@ class LinkTrackerBlock(BaseBlock):
             log=log,
         )
 
+    async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
+        return await self.database_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -7360,6 +7375,11 @@ class LinkTrackerBlock(BaseBlock):
         return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
         use_react_sniff = bool(params.get("use_react_sniff", False))
         return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(
+            params.get("return_database_sniff_hits", False)
+        )
 
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
@@ -7822,6 +7842,7 @@ class LinkTrackerBlock(BaseBlock):
         all_network_links: List[Dict[str, str]] = []
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []  # [PATCH] New list
+        all_database_hits: List[Dict[str, Any]] = []
         # choose UA for HTTP engine
         ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
 
@@ -7886,7 +7907,7 @@ class LinkTrackerBlock(BaseBlock):
                 return True
 
             # --- Shared Playwright context, if needed --- #
-            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff
+            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -7916,6 +7937,7 @@ class LinkTrackerBlock(BaseBlock):
                 local_runtime_hits: List[Dict[str, Any]] = []  # NEW
                 local_assets: List[Dict[str, Any]] = []
                 local_react_hits: List[Dict[str, Any]] = []
+                local_database_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
                 try:
@@ -8018,6 +8040,43 @@ class LinkTrackerBlock(BaseBlock):
                                         sniff_parent_pages.append(parent_url)
                             except Exception:
                                 pass
+                    if use_database_sniff and pw_context:
+                        try:
+                            db_html, db_hits = await self._pw_fetch_database_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                            # Use this HTML if previous sniffers failed to get it
+                            if db_html and not html:
+                                html = db_html
+
+                            if db_hits:
+                                local_database_hits.extend(db_hits)
+
+                                # Feed content links back into the processing loop
+                                for hit in db_hits:
+                                    if hit.get("kind") == "content_link":
+                                        u = hit.get("url")
+                                        if u:
+                                            # Add to links_on_page.
+                                            # The subsequent loop will check if 'u' ends with a target extension (.pdf, .zip).
+                                            links_on_page.append({
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"
+                                            })
+
+                                            # Also add to debug links list for visibility
+                                            local_js_links.append({
+                                                "page": page_url,
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"
+                                            })
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][DB] Error on {page_url}: {e}")
                     # 1b) Runtime sniff (WebSockets, perf, storage, media events, etc.)
                     if use_runtime_sniff and pw_context:
                         rt_html = ""
@@ -8105,6 +8164,7 @@ class LinkTrackerBlock(BaseBlock):
                                 "network_links": local_network_links,
                                 "runtime_hits": local_runtime_hits,
                                 "react_hits": local_react_hits,
+                                "database_hits": local_database_hits,  # [PATCH] Return hits
                                 "log": local_log,
                             }
 
@@ -8397,6 +8457,7 @@ class LinkTrackerBlock(BaseBlock):
                     all_network_links.extend(res.get("network_links", []))
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
+                    all_database_hits.extend(res.get("database_hits", []))
                     # Collect Assets
                     for asset in res.get("assets", []):
                         a_url = asset.get("url")
@@ -8468,7 +8529,24 @@ class LinkTrackerBlock(BaseBlock):
                     size = nl.get("size", "?")
                     lines.append(f"- **[{text}]({url})**")
                     lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+            if return_database_sniff_hits and all_database_hits:
+                lines.append("\n### Database / Content Sniff Hits (debug)\n")
+                for dbh in all_database_hits[:100]:
+                    kind = dbh.get("kind")
+                    url = dbh.get("url")
+                    meta = dbh.get("meta") or {}
 
+                    if kind == "content_link":
+                        src = meta.get("source", "?")
+                        lines.append(f"- `db_link` ({src}) **{url}**")
+                    elif kind == "indexeddb_dump":
+                        db_name = meta.get("name", "?")
+                        stores = meta.get("stores", [])
+                        store_str = ", ".join([f"{s['name']}(~{s.get('approx_count')})" for s in stores])
+                        lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
+                    elif kind == "db_config_detected":
+                        name = meta.get("name")
+                        lines.append(f"- `backend_config` **{name}** detected")
             return "\n".join(lines), {
                 "count": 0,
                 "keywords_used": keywords,
@@ -8478,6 +8556,8 @@ class LinkTrackerBlock(BaseBlock):
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "runtime_hits": all_runtime_hits,
+                "react_hits": all_react_hits,
+                "database_hits": all_database_hits,
                 "log": log,
                 "queries_run": queries_to_run,
             }
@@ -9115,6 +9195,14 @@ class VideoLinkTrackerBlock(BaseBlock):
                 hook_history_api=True,
                 hook_link_clicks=True,
                 inspect_react_devtools_hook=True,
+            )
+        )
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,  # Get Metadata
+                enable_backend_fingerprint=True,  # Get Tech Stack
+                enable_html_link_scan=True,  # Scan HTML for raw links
+                enable_backend_link_scan=True  # Scan JS Globals for links
             )
         )
     # ------------------------------------------------------------------ #
@@ -10011,6 +10099,14 @@ class VideoLinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
+
+    async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
+        return await self.database_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
     # ------------------------------------------------------------------ #
     # Search engines (DuckDuckGo + Google CSE)
     # ------------------------------------------------------------------ #
@@ -10659,6 +10755,11 @@ class VideoLinkTrackerBlock(BaseBlock):
         use_react_sniff = bool(params.get("use_react_sniff", False))
         return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
 
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(
+            params.get("return_database_sniff_hits", False)
+        )
+
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min(min_term_overlap_raw, 12))
 
@@ -11171,6 +11272,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         all_network_links: List[Dict[str, str]] = []
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []  # [PATCH] Initialize accumulator
+        all_database_hits: List[Dict[str, Any]] = []
         recently_returned_identifiers = set()
         if source == "database" and use_database and output_cooldown_hours > 0 and self.store:
             recently_returned_identifiers = self.store.get_recently_returned(output_cooldown_hours)
@@ -11183,7 +11285,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return False
             return True
 
-        pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff
+        pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
         pw_p = pw_browser = pw_context = None
 
         ua_http = ua if ua else "promptchat/VideoLinkTracker"
@@ -11396,6 +11498,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_runtime_hits: List[Dict[str, Any]] = []
                 local_assets: List[Dict[str, Any]] = []
                 local_react_hits: List[Dict[str,Any]] = []
+                local_database_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
                 DEBUG_LOGGER.log_message(f"[BFS] processing page: {page_url} (depth={depth})")
                 try:
@@ -11548,6 +11651,44 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         except Exception as e:
                             local_log.append(f"[VideoLinkTracker][React] Error on {page_url}: {e}")
+                    if use_database_sniff and pw_context:
+                        try:
+                            db_html, db_hits = await self._pw_fetch_database_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                            # Use this HTML if previous sniffers failed to get it
+                            if db_html and not html:
+                                html = db_html
+
+                            if db_hits:
+                                local_database_hits.extend(db_hits)
+
+                                # CRITICAL: Feed content links back into the loop
+                                # This allows the video heuristics (below) to check if
+                                # these DB links are actually .mp4, .m3u8, or blob: videos.
+                                for hit in db_hits:
+                                    if hit.get("kind") == "content_link":
+                                        u = hit.get("url")
+                                        if u:
+                                            # Add to links_on_page so the loop below processes it
+                                            links_on_page.append({
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"  # Special tag
+                                            })
+
+                                            # Also add to debug links list
+                                            local_js_links.append({
+                                                "page": page_url,
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"
+                                            })
+                        except Exception as e:
+                            local_log.append(f"[VideoLinkTracker][DB] Error on {page_url}: {e}")
                     # 3) Plain HTML via HTTPSSubmanager
                     if not html:
                         try:
@@ -11576,6 +11717,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "network_links": local_network_links,
                             "runtime_hits": local_runtime_hits,
                             "react_hits": local_react_hits,  # [PATCH] Return hits
+                            "database_hits": local_database_hits,
                             "log": local_log + ["BeautifulSoup missing - cannot parse HTML."],
                         }
 
@@ -11630,8 +11772,9 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         tag = link.get("tag") or ""
                         is_sniff_or_db = (
-                            tag == "network_sniff"
-                            or tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic")
+                                tag == "network_sniff"
+                                or tag == "db_link"  # <--- Added this
+                                or tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic")
                         )
 
                         if not is_sniff_or_db:
@@ -11823,6 +11966,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     "network_links": local_network_links,
                     "runtime_hits": local_runtime_hits,
                     "react_hits": local_react_hits,
+                    "database_hits": local_database_hits,
                     "log": local_log,
                 }
 
@@ -11918,6 +12062,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     all_network_links.extend(res["network_links"])
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
+                    all_database_hits.extend(res.get("database_hits", []))
                     for asset in res["assets"]:
                         cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
                         new_b = self._parse_size_to_bytes(asset.get("size", ""))
@@ -12012,6 +12157,24 @@ class VideoLinkTrackerBlock(BaseBlock):
                     route = rh.get("route") or ""
                     kind = rh.get("kind") or "react_nav"
                     lines.append(f"- `{kind}` **{route}** → {url}")
+            if return_database_sniff_hits and all_database_hits:
+                lines.append("\n### Database / Content Sniff Hits (debug)\n")
+                for dbh in all_database_hits[:100]:
+                    kind = dbh.get("kind")
+                    url = dbh.get("url")
+                    meta = dbh.get("meta") or {}
+
+                    if kind == "content_link":
+                        src = meta.get("source", "?")
+                        lines.append(f"- `db_link` ({src}) **{url}**")
+                    elif kind == "indexeddb_dump":
+                        db_name = meta.get("name", "?")
+                        stores = meta.get("stores", [])
+                        store_str = ", ".join([f"{s['name']}(~{s.get('approx_count')})" for s in stores])
+                        lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
+                    elif kind == "db_config_detected":
+                        name = meta.get("name")
+                        lines.append(f"- `backend_config` **{name}** detected")
             if return_runtime_sniff_hits and all_runtime_hits:
                 lines.append("\n### Runtime Sniff Hits (debug)\n")
                 # Cap output to prevent massive message overflow (e.g. 100 items)
@@ -12057,6 +12220,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "network_sniff_links": all_network_links,
                 "runtime_hits": all_runtime_hits,
                 "react_hits": all_react_hits,
+                "database_hits": all_database_hits,
                 "source": source,
                 "subpipeline": subpipeline,
                 "engine": engine,
@@ -12140,6 +12304,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "return_runtime_sniff_hits": False,
             "use_react_sniff": False,
             "return_react_sniff_hits": False,
+            "use_database_sniff": False,
+            "return_database_sniff_hits": False,
             "min_term_overlap": 1,
             "subpipeline": "",
 
@@ -14624,6 +14790,14 @@ class PageTrackerBlock(BaseBlock):
                 inspect_react_devtools_hook=True,
             )
         )
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,
+                enable_backend_fingerprint=True,
+                enable_html_link_scan=True,
+                enable_backend_link_scan=True
+            )
+        )
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -15435,6 +15609,13 @@ class PageTrackerBlock(BaseBlock):
             log=log,
         )
 
+    async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
+        return await self.database_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log,
+        )
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -15618,6 +15799,10 @@ class PageTrackerBlock(BaseBlock):
         use_react_sniff = bool(params.get("use_react_sniff", False))
         return_react_sniff_hits = bool(
             params.get("return_react_sniff_hits", False)
+        )
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(
+            params.get("return_database_sniff_hits", False)
         )
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
@@ -16128,6 +16313,7 @@ class PageTrackerBlock(BaseBlock):
         all_network_links: List[Dict[str, str]] = []
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []
+        all_database_hits: List[Dict[str, Any]] = []
         ua_http = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/PageTracker"
         )
@@ -16149,7 +16335,7 @@ class PageTrackerBlock(BaseBlock):
                     return False
                 return True
 
-            pw_needed = use_js or use_network_sniff or use_runtime_sniff
+            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -16184,6 +16370,7 @@ class PageTrackerBlock(BaseBlock):
                 local_runtime_hits: List[Dict[str, Any]] = []
                 local_react_hits: List[Dict[str, Any]] = []
                 local_pages: List[Dict[str, Any]] = []
+                local_database_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
                 try:
@@ -16324,6 +16511,35 @@ class PageTrackerBlock(BaseBlock):
                         if rt_hits:
                             local_runtime_hits.extend(rt_hits)
 
+                    if use_database_sniff and pw_context:
+                        try:
+                            db_html, db_hits = await self._pw_fetch_database_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                            # Use this HTML if previous sniffers failed to get it
+                            if db_html and not html:
+                                html = db_html
+
+                            if db_hits:
+                                local_database_hits.extend(db_hits)
+
+                                # Optional: If we found content links, treat them as outgoing links
+                                for hit in db_hits:
+                                    if hit.get("kind") == "content_link":
+                                        u = hit.get("url")
+                                        if u:
+                                            # Add to js_links so it appears in debug output
+                                            local_js_links.append({
+                                                "page": page_url,
+                                                "url": u,
+                                                "text": "[DB Content Link]",
+                                                "tag": "db_link"
+                                            })
+                        except Exception as e:
+                            local_log.append(f"[PageTracker][DB] Error sniffing {page_url}: {e}")
                     # 2) JS render/gather
                     if use_js and pw_context:
                         js_html, js_links = await self._pw_fetch_js_links(
@@ -16425,6 +16641,7 @@ class PageTrackerBlock(BaseBlock):
                                 "network_links": local_network_links,
                                 "runtime_hits": local_runtime_hits,
                                 "react_hits": local_react_hits,
+                                "database_hits": local_database_hits,
                                 "log": local_log,
                             }
 
@@ -16569,7 +16786,9 @@ class PageTrackerBlock(BaseBlock):
                     "next_pages": next_pages,
                     "js_links": local_js_links,
                     "network_links": local_network_links,
+                    "react_hits": local_react_hits,
                     "runtime_hits": local_runtime_hits,
+                    "database_hits": local_database_hits,
                     "log": local_log,
                 }
 
@@ -16664,6 +16883,7 @@ class PageTrackerBlock(BaseBlock):
                     all_network_links.extend(res.get("network_links", []))
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))
+                    all_database_hits.extend(res.get("database_hits", []))
                     # Collect found pages
                     for p in res.get("pages", []):
                         p_url = p.get("url")
@@ -16860,6 +17080,25 @@ class PageTrackerBlock(BaseBlock):
 
                 desc = " | ".join(desc_parts)
                 lines.append(f"- `{desc}` found on **{url}**")
+        if return_database_sniff_hits and all_database_hits:
+            lines.append("\n### Database / Content Sniff Hits (debug)\n")
+            for dbh in all_database_hits[:100]:
+                kind = dbh.get("kind")
+                url = dbh.get("url")
+                meta = dbh.get("meta") or {}
+
+                if kind == "content_link":
+                    src = meta.get("source", "?")
+                    lines.append(f"- `db_link` ({src}) **{url}**")
+                elif kind == "indexeddb_dump":
+                    db_name = meta.get("name", "?")
+                    stores = meta.get("stores", [])
+                    store_str = ", ".join([f"{s['name']}(~{s.get('approx_count')})" for s in stores])
+                    lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
+                elif kind == "db_config_detected":
+                    name = meta.get("name")
+                    lines.append(f"- `backend_config` **{name}** detected")
+
         return "\n".join(lines), {
             "found": len(final_list),
             "scanned_pages": len(visited_pages),
@@ -16872,6 +17111,7 @@ class PageTrackerBlock(BaseBlock):
             "network_sniff_links": all_network_links,
             "runtime_hits": all_runtime_hits,
             "react_hits": all_react_hits,
+            "database_hits": all_database_hits,
             "log": log,
             "queries_run": queries_to_run,
         }
@@ -17062,6 +17302,8 @@ class PageTrackerBlock(BaseBlock):
             "return_runtime_sniff_hits": False,
             "use_react_sniff": False,
             "return_react_sniff_hits": False,
+            "use_database_sniff": False,
+            "return_database_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
