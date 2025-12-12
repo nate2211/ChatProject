@@ -11509,186 +11509,118 @@ class VideoLinkTrackerBlock(BaseBlock):
                     sniff_json_hits: List[Dict[str, Any]] = []
                     sniff_parent_pages: List[str] = []
 
-                    # 1) Network sniff
-                    if use_network_sniff and pw_context:
-                        sniff_result = await self._pw_fetch_with_sniff(
-                            pw_context, page_url, timeout, local_log
-                        )
-                        # Backwards-compatible: accept (html, items) or (html, items, json_hits)
-                        if isinstance(sniff_result, tuple):
-                            if len(sniff_result) == 3:
-                                sniff_html, sniff_items, sniff_json = sniff_result
-                            elif len(sniff_result) == 2:
-                                sniff_html, sniff_items = sniff_result
-                            elif len(sniff_result) == 1:
-                                sniff_html = sniff_result[0]
-                        else:
-                            # e.g. if you ever change sniff() to return a dict
-                            sniff_html = sniff_result
+                    # ======================= PARALLEL SNIFFER PATCH START =======================
+                    # We define small wrapper tasks to capture specific return types
 
-                        html = sniff_html or html
-                        html = sniff_html or html
+                    async def _run_net():
+                        if use_network_sniff and pw_context:
+                            return await self._pw_fetch_with_sniff(pw_context, page_url, timeout, local_log)
+                        return None
 
-                        if sniff_json_hits:
-                            for hit in sniff_json_hits:
-                                data = hit.get("json")
+                    async def _run_runtime():
+                        if use_runtime_sniff and pw_context:
+                            return await self._pw_fetch_runtime_hits(pw_context, page_url, timeout, local_log)
+                        return None
 
-                                if isinstance(data, dict):
-                                    docs = ((data.get("response") or {}).get("docs")) or []
-                                    for d in docs:
-                                        ident = d.get("identifier")
-                                        if ident:
-                                            for au in self._archive_ident_to_downloads(ident):
-                                                links_on_page.append(
-                                                    {"url": au, "text": "Archive Item", "tag": "archive_ident"})
+                    async def _run_js():
+                        if use_js and pw_context:
+                            return await self._pw_fetch_js_links(pw_context, page_url, timeout, local_log)
+                        return None
 
+                    async def _run_react():
+                        if use_react_sniff and pw_context:
+                            return await self._pw_fetch_react_hits(pw_context, page_url, timeout, local_log)
+                        return None
+
+                    async def _run_db():
+                        if use_database_sniff and pw_context:
+                            return await self._pw_fetch_database_hits(pw_context, page_url, timeout, local_log)
+                        return None
+
+                    # Execute all sniffers simultaneously
+                    # This ensures total wait time is max(sniffer_times) instead of sum(sniffer_times)
+                    sniff_results = await asyncio.gather(
+                        _run_net(),
+                        _run_runtime(),
+                        _run_js(),
+                        _run_react(),
+                        _run_db(),
+                        return_exceptions=True
+                    )
+
+                    # Unpack results (order matches the gather list)
+                    res_net, res_runtime, res_js, res_react, res_db = sniff_results
+
+                    # --- 1. Process Network Results ---
+                    if isinstance(res_net, tuple) or isinstance(res_net, str):
+                        # Normalize return signature
+                        s_html = res_net[0] if isinstance(res_net, tuple) else res_net
+                        s_items = res_net[1] if isinstance(res_net, tuple) and len(res_net) > 1 else []
+                        s_json = res_net[2] if isinstance(res_net, tuple) and len(res_net) > 2 else []
+
+                        if s_html and not html: html = s_html  # Capture HTML if missing
+
+                        for si in s_items:
+                            u = si.get("url", "")
+                            if u:
+                                # Add to local debug lists
+                                local_network_links.append({
+                                    "page": page_url, "url": u, "text": si.get("text", ""),
+                                    "tag": si.get("tag", "network_sniff"),
+                                    "content_type": si.get("content_type", "?")
+                                })
+                                # Add to processing queue
+                                links_on_page.append({"url": u, "text": si.get("text"), "tag": "network_sniff"})
+
+                                # Heuristic: Check for parent paths
                                 try:
-                                    json_str = json.dumps(data)
-                                    for m in self._URL_RE.finditer(json_str):
-                                        u_found = m.group(0).replace("\\/", "/")
-                                        if self._allowed_by_required_sites(u_found, required_sites, global_mode):
-                                            links_on_page.append(
-                                                {"url": u_found, "text": "JSON Extract", "tag": "json_extract"})
-                                except Exception:
+                                    parsed = urlparse(u)
+                                    if "/" in parsed.path:
+                                        parent = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rsplit('/', 1)[0]}/"
+                                        if _allowed_by_required_sites_check(parent):
+                                            next_pages.append(parent)  # Add to parent discovery
+                                except:
                                     pass
 
-                        for si in sniff_items:
-                            url = si.get("url", "")
-                            if not url:
-                                continue
+                    # --- 2. Process Runtime Results ---
+                    if isinstance(res_runtime, tuple) or isinstance(res_runtime, str):
+                        rt_html = res_runtime[0] if isinstance(res_runtime, tuple) else res_runtime
+                        rt_hits = res_runtime[1] if isinstance(res_runtime, tuple) and len(res_runtime) > 1 else []
 
-                            local_network_links.append({
-                                "page": page_url,
-                                "url": url,
-                                "text": si.get("text", ""),
-                                "tag": si.get("tag", "network_sniff"),
-                                "size": si.get("size", "?"),
-                                "content_type": si.get("content_type", "?"),
-                            })
+                        # Runtime HTML (DOM snapshot) is usually better than Network HTML
+                        if rt_html: html = rt_html
+                        if rt_hits: local_runtime_hits.extend(rt_hits)
 
-                            local_js_links.append({
-                                "page": page_url,
-                                "url": url,
-                                "text": si.get("text", ""),
-                                "tag": si.get("tag", "network_sniff"),
-                            })
+                    # --- 3. Process JS Results ---
+                    if isinstance(res_js, tuple):
+                        j_html, j_links = res_js
+                        if j_html and not html: html = j_html
+                        if j_links:
+                            links_on_page.extend(j_links)
+                            for jl in j_links:
+                                local_js_links.append(
+                                    {"page": page_url, "url": jl.get("url"), "text": jl.get("text"), "tag": "js_link"})
 
-                            links_on_page.append({
-                                "url": url,
-                                "text": si.get("text") or "[Network Stream]",
-                                "tag": "network_sniff"
-                            })
+                    # --- 4. Process React Results ---
+                    if isinstance(res_react, tuple):
+                        r_html, r_hits = res_react
+                        if r_html: html = r_html  # React HTML is high fidelity
+                        if r_hits:
+                            local_react_hits.extend(r_hits)
+                            for rh in r_hits:
+                                if rh.get("url") and _allowed_by_required_sites_check(rh.get("url")):
+                                    next_pages.append(rh.get("url"))
 
-                            try:
-                                parsed = urlparse(url)
-                                path = parsed.path or ""
-                                if "/" in path:
-                                    parent_path = path.rsplit("/", 1)[0] + "/"
-                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
-                                    if _allowed_by_required_sites_check(parent_url):
-                                        sniff_parent_pages.append(parent_url)
-                            except Exception:
-                                pass
-                    if use_runtime_sniff and pw_context:
-                        rt_result = await self._pw_fetch_runtime_hits(
-                            pw_context, page_url, timeout, local_log
-                        )
-                        # Accept (html, items, hits) or (html, hits)
-                        if isinstance(rt_result, tuple):
-                            if len(rt_result) == 3:
-                                rt_html, _rt_items, rt_hits = rt_result
-                            elif len(rt_result) == 2:
-                                rt_html, rt_hits = rt_result
-                            elif len(rt_result) == 1:
-                                rt_html = rt_result[0]
-                        else:
-                            rt_html = rt_result
-
-                        if rt_html and not html:
-                            html = rt_html
-                        if rt_hits:
-                            local_runtime_hits.extend(rt_hits)
-                    # 2) JS render/gather
-                    if use_js and pw_context:
-                        js_html, js_links = await self._pw_fetch_js_links(
-                            pw_context, page_url, timeout, local_log
-                        )
-                        if js_html:
-                            html = js_html
-                        links_on_page.extend(js_links)
-
-                        for jl in js_links:
-                            local_js_links.append({
-                                "page": page_url,
-                                "url": jl.get("url", ""),
-                                "text": jl.get("text", ""),
-                                "tag": jl.get("tag", ""),
-                            })
-                    if use_react_sniff and pw_context:
-                        try:
-                            # Expects tuple (html, hits) based on standard ReactSniffer
-                            r_html, r_hits = await self._pw_fetch_react_hits(
-                                pw_context, page_url, timeout, local_log
-                            )
-                            # Use React-rendered HTML if we don't have one yet
-                            if r_html and not html:
-                                html = r_html
-
-                            if r_hits:
-                                local_react_hits.extend(r_hits)
-
-                                # Treat React Routes as potential Next Pages in the crawl
-                                for rh in r_hits:
-                                    r_url = rh.get("url")
-                                    if not r_url:
-                                        continue
-
-                                    # Verify site scope
-                                    if _allowed_by_required_sites_check(r_url):
-                                        # Basic deduping happens at BFS level, but we check depth here
-                                        if depth < max_depth:
-                                            next_pages.append(r_url)
-
-                        except Exception as e:
-                            local_log.append(f"[VideoLinkTracker][React] Error on {page_url}: {e}")
-                    if use_database_sniff and pw_context:
-                        try:
-                            db_html, db_hits = await self._pw_fetch_database_hits(
-                                pw_context,
-                                page_url,
-                                timeout,
-                                local_log,
-                            )
-                            # Use this HTML if previous sniffers failed to get it
-                            if db_html and not html:
-                                html = db_html
-
-                            if db_hits:
-                                local_database_hits.extend(db_hits)
-
-                                # CRITICAL: Feed content links back into the loop
-                                # This allows the video heuristics (below) to check if
-                                # these DB links are actually .mp4, .m3u8, or blob: videos.
-                                for hit in db_hits:
-                                    if hit.get("kind") == "content_link":
-                                        u = hit.get("url")
-                                        if u:
-                                            # Add to links_on_page so the loop below processes it
-                                            links_on_page.append({
-                                                "url": u,
-                                                "text": "[DB Content]",
-                                                "tag": "db_link"  # Special tag
-                                            })
-
-                                            # Also add to debug links list
-                                            local_js_links.append({
-                                                "page": page_url,
-                                                "url": u,
-                                                "text": "[DB Content]",
-                                                "tag": "db_link"
-                                            })
-                        except Exception as e:
-                            local_log.append(f"[VideoLinkTracker][DB] Error on {page_url}: {e}")
+                    # --- 5. Process DB Results ---
+                    if isinstance(res_db, tuple):
+                        d_html, d_hits = res_db
+                        if d_html and not html: html = d_html
+                        if d_hits:
+                            local_database_hits.extend(d_hits)
+                            for hit in d_hits:
+                                if hit.get("kind") == "content_link" and hit.get("url"):
+                                    links_on_page.append(
+                                        {"url": hit.get("url"), "text": "[DB Content]", "tag": "db_link"})
                     # 3) Plain HTML via HTTPSSubmanager
                     if not html:
                         try:
