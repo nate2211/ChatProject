@@ -3931,6 +3931,732 @@ class DatabaseSniffer:
             self._log(f"IndexedDB metadata script failed: {e}", log)
             return []
 
+# ======================================================================
+# InteractionSniffer (CDP-based Event & Overlay Analysis)
+# ======================================================================
+
+class InteractionSniffer:
+    """
+    Playwright + CDP sniffer for "Invisible" interactivity & UI barriers.
+
+    Matches your other sniffers' contract:
+
+        html, hits = await sniff(
+            context,
+            page_url,
+            timeout,
+            log,
+            extensions=None,
+        )
+
+    hits schema (consistent with your suite):
+
+        {
+            "page": <page_url>,
+            "url": <page_url or derived>,
+            "tag": "interaction",
+            "kind": "event_listener" | "overlay_detected" | "form_definition" | "summary",
+            "meta": {...}
+        }
+
+    Key difference:
+      • CDP can ask Chromium which DOM nodes have event listeners attached in memory,
+        even if the HTML has no onclick=... and no href.
+
+    Notes:
+      • CDP requires Chromium. On Firefox/WebKit/Camoufox, we skip CDP gracefully.
+      • Overlay + Form extraction are JS-based and work everywhere.
+    """
+
+    # ------------------------------------------------------------------ #
+    # Config
+    # ------------------------------------------------------------------ #
+    @dataclass
+    class Config:
+        # generic controls
+        timeout: float = 8.0
+        max_hits: int = 250
+
+        # small settle time after DOMContentLoaded
+        wait_after_load_ms: int = 1000
+
+        # ---------------- CDP: Event Listener Extraction ----------------
+        enable_cdp_listeners: bool = True
+
+        # only keep these listener types to reduce noise
+        listener_types: Set[str] = field(default_factory=lambda: {
+            "click", "mousedown", "mouseup",
+            "submit",
+            "keydown", "keyup",
+            "touchstart", "touchend",
+            "pointerdown", "pointerup",
+        })
+
+        # how many "nodes with relevant listeners" to emit
+        max_listener_hits: int = 120
+
+        # how many candidate nodes to inspect via CDP (upper bound)
+        # (CDP calls are expensive; keep this modest)
+        max_candidate_nodes: int = 500
+
+        # CSS selector for candidate nodes (broad but bounded by max_candidate_nodes)
+        candidate_selector: str = (
+            "button, a, input, select, textarea, summary, details, label, "
+            "[role='button'], [role='link'], [tabindex], [contenteditable='true'], "
+            "div, span, li, svg"
+        )
+
+        # include capturing / passive info if available
+        include_listener_flags: bool = True
+
+        # Try to pull a short DOM snippet to help identify the element (safe bounded)
+        include_outer_html_snippet: bool = True
+        outer_html_max_chars: int = 280
+
+        # ---------------- Overlay / Modal Detection (JS) ----------------
+        enable_overlay_detection: bool = True
+        min_z_index: int = 900
+        coverage_threshold_percent: float = 50.0
+        max_overlay_hits: int = 50
+
+        # ---------------- Form Extraction (JS) ----------------
+        enable_form_extraction: bool = True
+        max_form_hits: int = 80
+        max_inputs_per_form: int = 80
+
+        # redact values for sensitive-ish inputs
+        redact_input_types: Set[str] = field(default_factory=lambda: {
+            "password",
+        })
+
+        # additionally redact if field name looks token-ish
+        redact_name_regex: str = r"(csrf|token|auth|bearer|secret|key|session|jwt)"
+
+        # emit aggregate summary hit
+        emit_summary_hit: bool = True
+
+    # ------------------------------------------------------------------ #
+    # Internal memory dataclasses
+    # ------------------------------------------------------------------ #
+    @dataclass
+    class ListenerMem:
+        node_id: int
+        node_name: str
+        types: List[str]
+        attributes: Dict[str, str]
+        flags: Dict[str, Any] = field(default_factory=dict)
+        outer_html: Optional[str] = None
+
+    @dataclass
+    class OverlayMem:
+        tag_name: str
+        id: str
+        class_name: str
+        z_index: int
+        coverage: str
+        text_preview: str
+
+    @dataclass
+    class FormMem:
+        action: str
+        method: str
+        id: str
+        class_name: str
+        input_count: int
+        inputs: List[Dict[str, Any]]
+
+    # ------------------------------------------------------------------ #
+    # Lifecycle
+    # ------------------------------------------------------------------ #
+    def __init__(self, config: Optional["InteractionSniffer.Config"] = None, logger=None):
+        self.cfg = config or self.Config()
+        self.logger = logger or DEBUG_LOGGER
+        self._reset_memory()
+        self._log("InteractionSniffer Initialized", None)
+
+    def _reset_memory(self) -> None:
+        self._listeners: List[InteractionSniffer.ListenerMem] = []
+        self._overlays: List[InteractionSniffer.OverlayMem] = []
+        self._forms: List[InteractionSniffer.FormMem] = []
+        self._seen_fingerprints: Set[Tuple[Any, ...]] = set()
+
+    # ------------------------------------------------------------------ #
+    # Logging helper
+    # ------------------------------------------------------------------ #
+    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        full = f"[InteractionSniffer] {msg}"
+        try:
+            if log_list is not None:
+                log_list.append(full)
+            if self.logger is not None:
+                self.logger.log_message(full)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    # Public API (matches other sniffers)
+    # ------------------------------------------------------------------ #
+    async def sniff(
+        self,
+        context,              # Playwright BrowserContext
+        page_url: str,
+        timeout: float,
+        log: List[str],
+        extensions=None,      # unused; kept for signature compatibility
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Main entrypoint.
+
+        Returns:
+            (html, hits)
+        """
+        from playwright.async_api import TimeoutError as PWTimeoutError
+
+        self._reset_memory()
+
+        if not context:
+            self._log("No BrowserContext supplied; skipping.", log)
+            return "", []
+
+        tmo = float(timeout or self.cfg.timeout)
+        html: str = ""
+        hits: List[Dict[str, Any]] = []
+        page = None
+
+        self._log(f"Start interaction sniff: {page_url} timeout={tmo}s", log)
+
+        try:
+            page = await context.new_page()
+            await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
+            await page.wait_for_timeout(int(self.cfg.wait_after_load_ms))
+
+            # 1) JS-based: forms + overlays (works on all browsers)
+            if self.cfg.enable_form_extraction:
+                await self._collect_forms(page, page_url, log)
+
+            if self.cfg.enable_overlay_detection:
+                await self._collect_overlays(page, page_url, log)
+
+            # 2) CDP-based: event listeners (Chromium only)
+            if self.cfg.enable_cdp_listeners:
+                await self._collect_cdp_listeners(context, page, page_url, log)
+
+            # HTML snapshot
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"Error getting HTML for {page_url}: {e}", log)
+                html = ""
+
+            # materialize final hits
+            hits = self._materialize_hits(page_url)
+
+        except PWTimeoutError:
+            self._log(f"Timeout while loading {page_url}", log)
+        except Exception as e:
+            self._log(f"Fatal error on {page_url}: {e}", log)
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as e:
+                    self._log(f"Error closing page for {page_url}: {e}", log)
+
+        # global cap
+        if len(hits) > self.cfg.max_hits:
+            hits = hits[: self.cfg.max_hits]
+
+        self._log(f"Finished interaction sniff for {page_url}: hits={len(hits)}", log)
+        return html or "", hits
+
+    # ------------------------------------------------------------------ #
+    # JS: Forms
+    # ------------------------------------------------------------------ #
+    def _should_redact_field(self, name: str, input_type: str) -> bool:
+        try:
+            t = (input_type or "").lower().strip()
+            if t in self.cfg.redact_input_types:
+                return True
+            n = (name or "").lower()
+            if n and re.search(self.cfg.redact_name_regex, n, re.IGNORECASE):
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def _collect_forms(self, page, page_url: str, log: Optional[List[str]]) -> None:
+        """
+        Extract form structures; redact sensitive values.
+        """
+        try:
+            forms = await page.evaluate(
+                """
+                (cfg) => {
+                    const maxForms = cfg.maxForms;
+                    const maxInputs = cfg.maxInputs;
+
+                    const out = [];
+                    const forms = Array.from(document.querySelectorAll('form')).slice(0, maxForms);
+
+                    for (const f of forms) {
+                        const inputs = [];
+                        const els = Array.from(f.querySelectorAll('input, textarea, select, button'))
+                                         .slice(0, maxInputs);
+
+                        for (const i of els) {
+                            inputs.push({
+                                name: i.name || i.id || "",
+                                type: (i.type || i.tagName || "").toLowerCase(),
+                                value: (typeof i.value === "string" ? i.value : ""),
+                                required: !!i.required,
+                                disabled: !!i.disabled,
+                                autocomplete: (i.autocomplete || "")
+                            });
+                        }
+
+                        out.push({
+                            action: f.action || "",
+                            method: (f.method || "get").toLowerCase(),
+                            id: f.id || "",
+                            className: f.className || "",
+                            input_count: inputs.length,
+                            inputs: inputs
+                        });
+                    }
+
+                    return out;
+                }
+                """,
+                {
+                    "maxForms": int(self.cfg.max_form_hits),
+                    "maxInputs": int(self.cfg.max_inputs_per_form),
+                },
+            )
+
+            if not isinstance(forms, list):
+                forms = []
+
+            # redact values safely in Python side (more flexible)
+            for f in forms[: self.cfg.max_form_hits]:
+                if not isinstance(f, dict):
+                    continue
+                inputs = f.get("inputs") or []
+                if not isinstance(inputs, list):
+                    inputs = []
+
+                redacted_inputs: List[Dict[str, Any]] = []
+                for inp in inputs[: self.cfg.max_inputs_per_form]:
+                    if not isinstance(inp, dict):
+                        continue
+                    name = str(inp.get("name") or "")
+                    itype = str(inp.get("type") or "")
+                    val = str(inp.get("value") or "")
+                    if self._should_redact_field(name, itype):
+                        val = "[REDACTED]"
+                    else:
+                        # keep bounded; we do not want massive values
+                        if len(val) > 200:
+                            val = val[:200] + "…"
+
+                    redacted_inputs.append(
+                        {
+                            "name": name,
+                            "type": itype,
+                            "value": val,
+                            "required": bool(inp.get("required", False)),
+                            "disabled": bool(inp.get("disabled", False)),
+                            "autocomplete": str(inp.get("autocomplete") or ""),
+                        }
+                    )
+
+                self._forms.append(
+                    InteractionSniffer.FormMem(
+                        action=str(f.get("action") or ""),
+                        method=str(f.get("method") or "get"),
+                        id=str(f.get("id") or ""),
+                        class_name=str(f.get("className") or ""),
+                        input_count=int(f.get("input_count") or len(redacted_inputs)),
+                        inputs=redacted_inputs,
+                    )
+                )
+
+            if self._forms:
+                self._log(f"Extracted {len(self._forms)} form definitions", log)
+
+        except Exception as e:
+            self._log(f"Form extraction error: {e}", log)
+
+    # ------------------------------------------------------------------ #
+    # JS: Overlays / Modals
+    # ------------------------------------------------------------------ #
+    async def _collect_overlays(self, page, page_url: str, log: Optional[List[str]]) -> None:
+        """
+        Detect high z-index, fixed/absolute elements covering big viewport area.
+        """
+        try:
+            overlays = await page.evaluate(
+                """
+                (config) => {
+                    const { minZ, minCoverage, maxHits } = config;
+                    const results = [];
+
+                    const all = document.querySelectorAll('div, section, aside, iframe, dialog, [role="dialog"]');
+
+                    const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+                    const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+                    const viewportArea = Math.max(1, vw * vh);
+
+                    for (const el of all) {
+                        if (results.length >= maxHits) break;
+
+                        const style = window.getComputedStyle(el);
+                        const z = parseInt(style.zIndex, 10);
+                        const pos = style.position;
+                        const vis = style.visibility;
+                        const disp = style.display;
+                        const opac = parseFloat(style.opacity || "1");
+
+                        if (Number.isNaN(z)) continue;
+
+                        if (
+                            z >= minZ &&
+                            vis !== 'hidden' && disp !== 'none' && opac > 0 &&
+                            (pos === 'fixed' || pos === 'absolute')
+                        ) {
+                            const rect = el.getBoundingClientRect();
+                            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+                            if (area <= 0) continue;
+
+                            const coveragePct = (area / viewportArea) * 100;
+                            if (coveragePct >= minCoverage) {
+                                results.push({
+                                    tagName: el.tagName.toLowerCase(),
+                                    id: el.id || "",
+                                    className: (typeof el.className === "string" ? el.className : ""),
+                                    zIndex: z,
+                                    coverage: coveragePct.toFixed(1) + '%',
+                                    textPreview: (el.innerText || "").trim().slice(0, 80)
+                                });
+                            }
+                        }
+                    }
+
+                    return results;
+                }
+                """,
+                {
+                    "minZ": int(self.cfg.min_z_index),
+                    "minCoverage": float(self.cfg.coverage_threshold_percent),
+                    "maxHits": int(self.cfg.max_overlay_hits),
+                },
+            )
+
+            if not isinstance(overlays, list):
+                overlays = []
+
+            for ov in overlays[: self.cfg.max_overlay_hits]:
+                if not isinstance(ov, dict):
+                    continue
+                self._overlays.append(
+                    InteractionSniffer.OverlayMem(
+                        tag_name=str(ov.get("tagName") or ""),
+                        id=str(ov.get("id") or ""),
+                        class_name=str(ov.get("className") or ""),
+                        z_index=int(ov.get("zIndex") or 0),
+                        coverage=str(ov.get("coverage") or ""),
+                        text_preview=str(ov.get("textPreview") or ""),
+                    )
+                )
+
+            if self._overlays:
+                self._log(f"Overlay detection: {len(self._overlays)} hits", log)
+
+        except Exception as e:
+            self._log(f"Overlay detection error: {e}", log)
+
+    # ------------------------------------------------------------------ #
+    # CDP: Event listeners (Chromium only)
+    # ------------------------------------------------------------------ #
+    async def _collect_cdp_listeners(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
+        """
+        Use CDP DOMDebugger.getEventListeners to find nodes with in-memory listeners.
+
+        Important:
+          • Works only on Chromium.
+          • We query candidates with a broad selector, then filter by actual listeners.
+        """
+        # Best-effort detection of browser type
+        browser_name = "unknown"
+        try:
+            if getattr(context, "browser", None) and context.browser:
+                browser_name = context.browser.browser_type.name
+        except Exception:
+            browser_name = "unknown"
+
+        if browser_name != "chromium":
+            self._log(f"Skipping CDP scan (browser is {browser_name}, need chromium)", log)
+            return
+
+        try:
+            cdp = await context.new_cdp_session(page)
+        except Exception as e:
+            self._log(f"CDP session failed (non-critical): {e}", log)
+            return
+
+        found = 0
+        inspected = 0
+
+        try:
+            # 1) Get document root
+            doc = await cdp.send("DOM.getDocument", {"depth": 1, "pierce": True})
+            root_node_id = (doc or {}).get("root", {}).get("nodeId")
+            if not root_node_id:
+                self._log("CDP: no DOM root nodeId", log)
+                return
+
+            # 2) Query candidate nodes
+            sel = str(self.cfg.candidate_selector or "div,span,button,a,input")
+            qs = await cdp.send("DOM.querySelectorAll", {"nodeId": root_node_id, "selector": sel})
+            node_ids = (qs or {}).get("nodeIds", []) or []
+            if not node_ids:
+                self._log("CDP: no candidates matched selector", log)
+                return
+
+            node_ids = node_ids[: int(self.cfg.max_candidate_nodes)]
+
+            # helper: flatten CDP attributes list into dict
+            def _attr_list_to_dict(attr_list: List[str]) -> Dict[str, str]:
+                try:
+                    return dict(zip(attr_list[0::2], attr_list[1::2]))
+                except Exception:
+                    return {}
+
+            # 3) For each candidate, resolve -> getEventListeners -> filter
+            for nid in node_ids:
+                if found >= int(self.cfg.max_listener_hits):
+                    break
+
+                inspected += 1
+
+                try:
+                    remote_obj = await cdp.send("DOM.resolveNode", {"nodeId": nid})
+                    object_id = (remote_obj or {}).get("object", {}).get("objectId")
+                    if not object_id:
+                        continue
+
+                    # Correct CDP method name is getEventListeners (plural)
+                    listeners_resp = await cdp.send(
+                        "DOMDebugger.getEventListeners",
+                        {
+                            "objectId": object_id,
+                            "depth": 1,
+                        },
+                    )
+                    listeners = (listeners_resp or {}).get("listeners", []) or []
+                    if not listeners:
+                        continue
+
+                    # filter to relevant types
+                    relevant = []
+                    for l in listeners:
+                        if not isinstance(l, dict):
+                            continue
+                        lt = str(l.get("type") or "")
+                        if lt in self.cfg.listener_types:
+                            relevant.append(l)
+
+                    if not relevant:
+                        continue
+
+                    # attributes + nodeName
+                    attrs_resp = await cdp.send("DOM.getAttributes", {"nodeId": nid})
+                    attr_list = (attrs_resp or {}).get("attributes", []) or []
+                    attr_dict = _attr_list_to_dict(attr_list)
+
+                    desc = await cdp.send("DOM.describeNode", {"nodeId": nid})
+                    node_name = ""
+                    try:
+                        node_name = str((desc or {}).get("node", {}).get("nodeName") or "")
+                    except Exception:
+                        node_name = ""
+
+                    flags: Dict[str, Any] = {}
+                    if self.cfg.include_listener_flags:
+                        # Keep only small, non-explosive fields
+                        flags = {
+                            "count": len(relevant),
+                            "capture": any(bool(r.get("useCapture")) for r in relevant),
+                            "passive": any(bool(r.get("passive")) for r in relevant),
+                            "once": any(bool(r.get("once")) for r in relevant),
+                        }
+
+                    outer_html = None
+                    if self.cfg.include_outer_html_snippet:
+                        try:
+                            oh = await cdp.send("DOM.getOuterHTML", {"nodeId": nid})
+                            outer_html = str((oh or {}).get("outerHTML") or "")
+                            if outer_html and len(outer_html) > int(self.cfg.outer_html_max_chars):
+                                outer_html = outer_html[: int(self.cfg.outer_html_max_chars)] + "…"
+                        except Exception:
+                            outer_html = None
+
+                    # dedupe fingerprint (node + listener types + id/class)
+                    fp = (
+                        int(nid),
+                        node_name,
+                        tuple(sorted({str(r.get("type") or "") for r in relevant})),
+                        attr_dict.get("id", ""),
+                        attr_dict.get("class", ""),
+                    )
+                    if fp in self._seen_fingerprints:
+                        continue
+                    self._seen_fingerprints.add(fp)
+
+                    self._listeners.append(
+                        InteractionSniffer.ListenerMem(
+                            node_id=int(nid),
+                            node_name=node_name,
+                            types=sorted({str(r.get("type") or "") for r in relevant}),
+                            attributes=attr_dict,
+                            flags=flags,
+                            outer_html=outer_html,
+                        )
+                    )
+                    found += 1
+
+                except Exception:
+                    continue
+
+            self._log(
+                f"CDP listener scan: inspected={inspected} candidates, found={found} interactive nodes",
+                log,
+            )
+
+        except Exception as e:
+            self._log(f"CDP listener scan failed: {e}", log)
+        finally:
+            try:
+                await cdp.detach()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Memory -> Final hits
+    # ------------------------------------------------------------------ #
+    def _materialize_hits(self, page_url: str) -> List[Dict[str, Any]]:
+        hits: List[Dict[str, Any]] = []
+
+        # 1) Event listener hits
+        for l in self._listeners:
+            meta = {
+                "nodeId": l.node_id,
+                "nodeName": l.node_name,
+                "types": list(l.types),
+                "attributes": dict(l.attributes or {}),
+                "flags": dict(l.flags or {}),
+                "is_pure_js": True,  # indicates discovered via CDP memory, not HTML attrs
+            }
+            if l.outer_html:
+                meta["outerHTML"] = l.outer_html
+
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": page_url,
+                    "tag": "interaction",
+                    "kind": "event_listener",
+                    "meta": meta,
+                }
+            )
+
+        # 2) Overlay hits
+        for ov in self._overlays:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": page_url,
+                    "tag": "interaction",
+                    "kind": "overlay_detected",
+                    "meta": {
+                        "tagName": ov.tag_name,
+                        "id": ov.id,
+                        "className": ov.class_name,
+                        "zIndex": ov.z_index,
+                        "coverage": ov.coverage,
+                        "textPreview": ov.text_preview,
+                    },
+                }
+            )
+
+        # 3) Form definition hits
+        for f in self._forms:
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": (f.action or page_url),
+                    "tag": "interaction",
+                    "kind": "form_definition",
+                    "meta": {
+                        "action": f.action,
+                        "method": f.method,
+                        "id": f.id,
+                        "class": f.class_name,
+                        "input_count": f.input_count,
+                        "inputs": f.inputs,
+                    },
+                }
+            )
+
+        # 4) Summary hit (optional)
+        if self.cfg.emit_summary_hit:
+            summary = self._build_summary_hit(page_url)
+            if summary is not None:
+                hits.append(summary)
+
+        return hits
+
+    def _build_summary_hit(self, page_url: str) -> Optional[Dict[str, Any]]:
+        if not self._listeners and not self._overlays and not self._forms:
+            return None
+
+        # counts + quick highlights
+        top_listener_types: Dict[str, int] = {}
+        for l in self._listeners:
+            for t in l.types:
+                top_listener_types[t] = top_listener_types.get(t, 0) + 1
+
+        top_types = sorted(top_listener_types.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
+        # overlay severity heuristic: max coverage / max z
+        max_coverage = None
+        max_z = None
+        for ov in self._overlays:
+            try:
+                cov = float(str(ov.coverage).replace("%", ""))
+                max_coverage = cov if max_coverage is None else max(max_coverage, cov)
+            except Exception:
+                pass
+            try:
+                max_z = ov.z_index if max_z is None else max(max_z, ov.z_index)
+            except Exception:
+                pass
+
+        meta: Dict[str, Any] = {
+            "listener_count": len(self._listeners),
+            "overlay_count": len(self._overlays),
+            "form_count": len(self._forms),
+            "top_listener_types": top_types,
+            "max_overlay_coverage_percent": max_coverage,
+            "max_overlay_z_index": max_z,
+        }
+
+        return {
+            "page": page_url,
+            "url": page_url,
+            "tag": "interaction",
+            "kind": "summary",
+            "meta": meta,
+        }
 
 # ======================================================================
 # Database

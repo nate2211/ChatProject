@@ -8812,6 +8812,8 @@ class LinkTrackerBlock(BaseBlock):
             "return_runtime_sniff_hits": False,
             "use_react_sniff": False,
             "return_react_sniff_hits": False,
+            "use_database_sniff": False,
+            "return_database_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
@@ -9151,6 +9153,9 @@ class VideoLinkTrackerBlock(BaseBlock):
         "doubleclick", "googlesyndication", "adservice", "adserver",
         "adsystem", "adnxs", "trk.", "tracking", "analytics",
         "metrics", "scorecardresearch", "ads.", "ad.", "pixel.", "stat.",
+        # [PATCH] Add Video-Specific Ad Hosts
+        "cdn.jwplayer.com", "anyclip", "primis", "connatix", "taboola",
+        "outbrain", "vidzoo", "spotx", "springserve", "sascdn", "smartadserver"
     }
     AD_PATH_KEYWORDS = {
         "/ads/", "/adserver/", "/banner/", "/banners/", "/promo/",
@@ -9308,10 +9313,20 @@ class VideoLinkTrackerBlock(BaseBlock):
         p = path.lower()
         if self._looks_like_ad(netloc, p):
             return False
+
+        # [PATCH] Add "/a/" and "/gallery/" to hints
         content_hints = [
             "/details/", "/video/", "/videos/", "/watch/",
             "/title/", "/entry/", "/post/", "/show/", "/episode/",
+            "/a/", "/album/", "/gallery/", "/view/", "/g/"
         ]
+
+        # Also allow if the path is basically just a short ID (common on Erome)
+        # e.g., site.com/a/12345
+        path_parts = p.strip("/").split("/")
+        if len(path_parts) == 2 and path_parts[0] in ["a", "v", "g"]:
+            return True
+
         return any(h in p for h in content_hints)
 
     def _is_search_url(self, u: str) -> bool:
@@ -9345,6 +9360,56 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return True
         return False
 
+    # ------------------------------------------------------------------ #
+    # [PATCH] Content Scoring Logic
+    # ------------------------------------------------------------------ #
+
+    def _score_video_asset(self, url: str, text: str, keywords: List[str]) -> int:
+        """
+        Scoring heuristics:
+        + Positive for keyword matches in URL/Text
+        + Positive for high-quality container types (.mkv, .m3u8)
+        - Heavy penalty for ad-like filenames (trailer, promo, preview)
+        - Penalty for missing link text
+        """
+        score = 0
+        u_lower = url.lower()
+        t_lower = (text or "").lower()
+
+        # 1. Critical Filters (Immediate penalties)
+        negative_hints = {
+            "trailer", "promo", "preview", "teaser", "sample",
+            "intro", "ad_", "advert", "pixel", "tracker", "overlay"
+        }
+        if any(h in u_lower for h in negative_hints):
+            score -= 50
+        if any(h in t_lower for h in negative_hints):
+            score -= 50
+
+        # 2. Keyword Relevance
+        for k in keywords:
+            k = k.lower()
+            if k in u_lower:
+                score += 20
+            if k in t_lower:
+                score += 10
+
+        # 3. Format preferences
+        # .m3u8 often implies a full stream; .mkv implies high quality rip
+        if ".m3u8" in u_lower or ".mpd" in u_lower:
+            score += 15
+        elif ".mkv" in u_lower:
+            score += 10
+        elif ".mp4" in u_lower:
+            score += 5  # Generic, could be ad or content
+
+        # 4. Context heuristics
+        if "1080p" in u_lower or "720p" in u_lower:
+            score += 5
+        if not t_lower:
+            score -= 5  # Blind links are riskier
+
+        return score
     # ------------------------------------------------------------------ #
     # Reverse Image/Video Lookup Helpers
     # ------------------------------------------------------------------ #
@@ -9638,6 +9703,39 @@ class VideoLinkTrackerBlock(BaseBlock):
             await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
 
         return seeds[:max_results]
+
+    def _decompress_if_needed(self, url: str, content: bytes) -> str:
+        """
+        Detects if content is GZIP compressed (via magic bytes or extension)
+        and decompresses it. Returns decoded UTF-8 string.
+        """
+        import gzip
+
+        if not content:
+            return ""
+
+        # 1. Check GZIP magic bytes (0x1f 0x8b)
+        # This is more reliable than trusting the file extension or headers alone.
+        is_gzipped = content.startswith(b"\x1f\x8b")
+
+        # 2. Fallback: If magic bytes fail but URL ends in .gz, try forcing decompression
+        if not is_gzipped and url and url.lower().endswith(".gz"):
+            is_gzipped = True
+
+        if is_gzipped:
+            try:
+                content = gzip.decompress(content)
+            except Exception:
+                # If decompression fails (e.g. corrupt file or false positive),
+                # keep original content and try to decode as plain text.
+                pass
+
+        try:
+            # Decode to string, replacing errors to prevent crashing on bad characters
+            return content.decode("utf-8", errors="replace")
+        except Exception:
+            # If standard decoding fails entirely, return empty
+            return ""
     # ------------------------------------------------------------------ #
     # Sitemap / Site Crawling Helpers (now using HTTPSSubmanager)
     # ------------------------------------------------------------------ #
@@ -10951,7 +11049,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
 
             q_lower = sq.lower()
-            if not any(x in q_lower for x in ["video", "mp4", "m3u8", "stream"]):
+            if not any(x in q_lower for x in ["video", "mp4", "m3u8"]):
                 sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
             return sq
         # ------------------ Reverse Image/Video Lookup Logic ------------------ #
@@ -11539,13 +11637,18 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     # Execute all sniffers simultaneously
                     # This ensures total wait time is max(sniffer_times) instead of sum(sniffer_times)
-                    sniff_results = await asyncio.gather(
-                        _run_net(),
-                        _run_runtime(),
-                        _run_js(),
-                        _run_react(),
-                        _run_db(),
-                        return_exceptions=True
+                    hard_limit = timeout + 5.0
+
+                    sniff_results = await asyncio.wait_for(
+                        asyncio.gather(
+                            _run_net(),
+                            _run_runtime(),
+                            _run_js(),
+                            _run_react(),
+                            _run_db(),
+                            return_exceptions=True
+                        ),
+                        timeout=hard_limit
                     )
 
                     # Unpack results (order matches the gather list)
@@ -11698,7 +11801,21 @@ class VideoLinkTrackerBlock(BaseBlock):
                         asset_netloc = parsed_asset_url.netloc
                         asset_path = parsed_asset_url.path.lower()
                         asset_url_lower = canon.lower()
+                        tag_type = link.get("tag", "")
 
+                        # Rule 1: If it's a <video> or <source> tag, TRUST IT.
+                        # Don't require it to look like .mp4
+                        if tag_type in ["video", "source"]:
+                            is_video = True
+
+                        # Rule 2: If it's a Network Sniff hit, TRUST IT.
+                        # The sniffer already validated it was media traffic.
+                        elif tag_type == "network_sniff":
+                            is_video = True
+
+                        # Rule 3: Otherwise, run the standard heuristics (for <a> tags)
+                        else:
+                            is_video = self._is_probable_video_url(canon, asset_path, asset_url_lower)
                         if self._looks_like_ad(asset_netloc, asset_path):
                             continue
 
@@ -11741,7 +11858,11 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         if not is_video:
                             continue
-
+                        asset_text = link.get("text", "")
+                        asset_score = self._score_video_asset(canon, asset_text, keywords)
+                        if asset_score < 0:
+                            local_log.append(f"Skipped low-score asset ({asset_score}): {canon}")
+                            continue
                         if not (source == "database" and is_sniff_or_db):
                             if keywords and not page_has_keywords and link.get("tag") != "network_sniff":
                                 haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace("%20", " ")
@@ -11854,7 +11975,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                             full_url = urljoin(page_url, raw_link)
                             if not _allowed_by_required_sites_check(full_url):
                                 continue
-
+                            if link.get("tag") in ["iframe", "embed"]:
+                                # Always queue iframes for the next depth,
+                                # regardless of keywords or extensions.
+                                # This allows the crawler to "step inside" the player.
+                                if _allowed_by_required_sites_check(full_url):
+                                    next_pages.append(full_url)
+                                continue
                             lpath = urlparse(full_url).path.lower()
                             if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                                 continue
@@ -12037,7 +12164,13 @@ class VideoLinkTrackerBlock(BaseBlock):
         )
 
         found_assets = list(final_found_assets_by_content_id.values())
-        found_assets.sort(key=lambda a: len(a.get("url", "")))
+        found_assets.sort(
+            key=lambda a: (
+                a.get("score", 0),
+                self._parse_size_to_bytes(a.get("size", "0"))
+            ),
+            reverse=True
+        )
 
         # cooldown on output, then mark returned
         if source == "database" and output_cooldown_hours > 0 and use_database and self.store:
@@ -14089,6 +14222,139 @@ class SocketPipeBlock(BaseBlock):
         except Exception:
             return ""
 
+    @staticmethod
+    def _looks_like_html(s: str) -> bool:
+        if not s:
+            return False
+        t = s.lstrip().lower()
+        # quick/cheap signals
+        return (
+            "<html" in t
+            or "<!doctype" in t
+            or "<a " in t
+            or "<script" in t
+            or "<link" in t
+            or "<img" in t
+            or ("</" in t and "<" in t)
+        )
+
+    @staticmethod
+    def _extract_base_url(ev: dict) -> str:
+        """
+        Best-effort base URL for resolving relative links.
+        Looks for common keys like url/request_url/response_url in event.
+        Falls back to host candidate -> https://host/
+        """
+        url_keys = {
+            "url", "request_url", "response_url", "page_url", "origin_url", "full_url"
+        }
+        found = ""
+
+        def _walk(obj: Any):
+            nonlocal found
+            if found:
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if found:
+                        return
+                    kl = str(k).lower()
+                    if kl in url_keys and isinstance(v, str) and v.startswith(("http://", "https://")):
+                        found = v.strip()
+                        return
+                    _walk(v)
+            elif isinstance(obj, (list, tuple, set)):
+                for v in obj:
+                    _walk(v)
+
+        _walk(ev)
+
+        if found:
+            return found
+
+        # fallback: host candidate
+        hosts = SocketPipeBlock._extract_host_candidates(ev)
+        if hosts:
+            h = hosts[0].strip()
+            if h:
+                # assume https for modern traffic; adjust if your router knows scheme
+                if not h.startswith(("http://", "https://")):
+                    return f"https://{h}/"
+                return h
+        return ""
+
+    @staticmethod
+    def _extract_links_from_html(html: str, *, base_url: str = "") -> list[str]:
+        """
+        Extract href/src/action/data-src/srcset/CSS url(...) links from an HTML-ish blob.
+        Resolves relative links using base_url when possible.
+        """
+        if not html:
+            return []
+
+        from urllib.parse import urljoin
+
+        out: list[str] = []
+        seen: set[str] = set()
+
+        # 1) raw absolute URLs
+        for u in SocketPipeBlock._extract_urls(html):
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+
+        # 2) attribute-style links
+        #    capture quoted OR unquoted until whitespace or >
+        attr_re = re.compile(
+            r"""(?is)\b(?:href|src|action|data-src)\s*=\s*(?:
+                    ["']([^"']+)["'] |
+                    ([^\s>]+)
+                )""",
+            re.VERBOSE,
+        )
+
+        def _push(raw: str):
+            if not raw:
+                return
+            raw = raw.strip()
+            # ignore anchors / javascript / mailto
+            low = raw.lower()
+            if low.startswith(("#", "javascript:", "mailto:", "data:")):
+                return
+            # srcset can be "url1 1x, url2 2x"
+            if " " in raw and ("," in raw):
+                parts = [p.strip().split(" ")[0] for p in raw.split(",") if p.strip()]
+            else:
+                parts = [raw]
+
+            for p in parts:
+                if not p:
+                    continue
+                if p.startswith(("http://", "https://")):
+                    u = p
+                elif base_url:
+                    u = urljoin(base_url, p)
+                else:
+                    # no base; keep only if it looks like a domain-ish path
+                    u = p
+                if u and u not in seen and u.startswith(("http://", "https://")):
+                    seen.add(u)
+                    out.append(u)
+
+        for m in attr_re.finditer(html):
+            _push(m.group(1) or m.group(2) or "")
+
+        # 3) srcset explicitly (common)
+        srcset_re = re.compile(r"""(?is)\bsrcset\s*=\s*["']([^"']+)["']""")
+        for m in srcset_re.finditer(html):
+            _push(m.group(1) or "")
+
+        # 4) CSS url(...)
+        css_url_re = re.compile(r"""(?is)\burl\(\s*['"]?([^'")]+)['"]?\s*\)""")
+        for m in css_url_re.finditer(html):
+            _push(m.group(1) or "")
+
+        return out
     # ------------------- socket setup -------------------
 
     def _ensure_socket(self, host: str, port: int, mode: str, recv_timeout: float, log: list[str]) -> None:
@@ -14400,17 +14666,27 @@ class SocketPipeBlock(BaseBlock):
                     all_domains_set.add(d)
 
             # Walk text fields
+            base_url = self._extract_base_url(ev)
+
             for t in self._iter_text_fields({"analysis": analysis, "metadata": metadata, "summary": summary}):
                 if not t:
                     continue
                 all_text_chunks.append(t)
 
-                # URLs
+                # URLs (plain text)
                 for u in self._extract_urls(t):
                     all_urls_set.add(u)
                     d = self._domain_from_url_or_host(u)
                     if d:
                         all_domains_set.add(d)
+
+                # HTML blob link scraping (NEW)
+                if self._looks_like_html(t):
+                    for u in self._extract_links_from_html(t, base_url=base_url):
+                        all_urls_set.add(u)
+                        d = self._domain_from_url_or_host(u)
+                        if d:
+                            all_domains_set.add(d)
 
                 # IPs
                 for ip in self._extract_ips(t):
@@ -14419,7 +14695,6 @@ class SocketPipeBlock(BaseBlock):
                 # Emails
                 for em in self._extract_emails(t):
                     all_emails_set.add(em)
-
         all_text = " ".join(all_text_chunks)
         tokens = self._tokenize(all_text)
         word_freq = Counter(tokens)
