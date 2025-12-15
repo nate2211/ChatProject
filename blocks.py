@@ -6422,6 +6422,13 @@ class LinkTrackerBlock(BaseBlock):
                 enable_backend_link_scan=True  # Scan JS Globals for links
             )
         )
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True
+            )
+        )
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -7196,6 +7203,14 @@ class LinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
+
+    async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
+        return await self.interaction_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log
+        )
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -7375,6 +7390,9 @@ class LinkTrackerBlock(BaseBlock):
         return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
         use_react_sniff = bool(params.get("use_react_sniff", False))
         return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
 
         use_database_sniff = bool(params.get("use_database_sniff", False))
         return_database_sniff_hits = bool(
@@ -7843,6 +7861,7 @@ class LinkTrackerBlock(BaseBlock):
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []  # [PATCH] New list
         all_database_hits: List[Dict[str, Any]] = []
+        all_interaction_hits: List[Dict[str, Any]] = []
         # choose UA for HTTP engine
         ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
 
@@ -7907,7 +7926,14 @@ class LinkTrackerBlock(BaseBlock):
                 return True
 
             # --- Shared Playwright context, if needed --- #
-            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
+            pw_needed = (
+                    use_js or
+                    use_network_sniff or
+                    use_runtime_sniff or
+                    use_react_sniff or
+                    use_database_sniff or
+                    use_interaction_sniff
+            )
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -7938,6 +7964,7 @@ class LinkTrackerBlock(BaseBlock):
                 local_assets: List[Dict[str, Any]] = []
                 local_react_hits: List[Dict[str, Any]] = []
                 local_database_hits: List[Dict[str, Any]] = []
+                local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
                 try:
@@ -8146,6 +8173,20 @@ class LinkTrackerBlock(BaseBlock):
                                             next_pages.append(r_url)
                         except Exception as e:
                             local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
+
+                    if use_interaction_sniff and pw_context:
+                        try:
+                            i_html, i_hits = await self._pw_fetch_interaction_hits(
+                                pw_context, page_url, timeout, local_log
+                            )
+                            # Use interaction HTML if we don't have a snapshot yet
+                            if i_html and not html:
+                                html = i_html
+
+                            if i_hits:
+                                local_interaction_hits.extend(i_hits)
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
                     # 3) Plain HTML if PW didn't fill html
                     if not html:
                         try:
@@ -8165,6 +8206,7 @@ class LinkTrackerBlock(BaseBlock):
                                 "runtime_hits": local_runtime_hits,
                                 "react_hits": local_react_hits,
                                 "database_hits": local_database_hits,  # [PATCH] Return hits
+                                "interaction_hits": local_interaction_hits,
                                 "log": local_log,
                             }
 
@@ -8344,6 +8386,9 @@ class LinkTrackerBlock(BaseBlock):
                     "js_links": local_js_links,
                     "network_links": local_network_links,
                     "runtime_hits": local_runtime_hits,  # NEW
+                    "react_hits": local_react_hits,
+                    "database_hits": local_database_hits,
+                    "interaction_hits": local_interaction_hits,
                     "log": local_log,
                 }
 
@@ -8458,6 +8503,7 @@ class LinkTrackerBlock(BaseBlock):
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
                     all_database_hits.extend(res.get("database_hits", []))
+                    all_interaction_hits.extend(res.get("interaction_hits", []))
                     # Collect Assets
                     for asset in res.get("assets", []):
                         a_url = asset.get("url")
@@ -8558,6 +8604,7 @@ class LinkTrackerBlock(BaseBlock):
                 "runtime_hits": all_runtime_hits,
                 "react_hits": all_react_hits,
                 "database_hits": all_database_hits,
+                "interaction_hits": all_interaction_hits,
                 "log": log,
                 "queries_run": queries_to_run,
             }
@@ -8637,6 +8684,29 @@ class LinkTrackerBlock(BaseBlock):
 
                 desc = " | ".join(desc_parts)
                 lines.append(f"- `{desc}` found on **{url}**")
+        if return_interaction_sniff_hits and all_interaction_hits:
+            lines.append("\n### Interaction / CDP Hits (debug)\n")
+            for ih in all_interaction_hits[:100]:
+                kind = ih.get("kind")
+                meta = ih.get("meta") or {}
+                url = ih.get("url")
+
+                if kind == "event_listener":
+                    node = meta.get("nodeName", "UNK")
+                    types = meta.get("types", [])
+                    lines.append(f"- `listener` **{node}** {types} on {url}")
+                elif kind == "form_definition":
+                    ins = meta.get("input_count", 0)
+                    method = meta.get("method", "get")
+                    lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
+                elif kind == "overlay_detected":
+                    cov = meta.get("coverage", "?")
+                    z = meta.get("zIndex", "?")
+                    lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
+                elif kind == "summary":
+                    lc = meta.get("listener_count", 0)
+                    fc = meta.get("form_count", 0)
+                    lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
         return "\n".join(lines), {
             "found": len(found_assets),
             "scanned_pages": len(visited_pages),
@@ -8648,7 +8718,9 @@ class LinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "runtime_hits": all_runtime_hits,
-            "react_hits": all_react_hits,  # [PATCH]
+            "react_hits": all_react_hits,
+            "database_hits": all_database_hits,
+            "interaction_hits": all_interaction_hits,
             "log": log,
             "queries_run": queries_to_run,
         }
@@ -8814,6 +8886,8 @@ class LinkTrackerBlock(BaseBlock):
             "return_react_sniff_hits": False,
             "use_database_sniff": False,
             "return_database_sniff_hits": False,
+            "use_interaction_sniff": False,
+            "return_interaction_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
@@ -9208,6 +9282,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                 enable_backend_fingerprint=True,  # Get Tech Stack
                 enable_html_link_scan=True,  # Scan HTML for raw links
                 enable_backend_link_scan=True  # Scan JS Globals for links
+            )
+        )
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True
             )
         )
     # ------------------------------------------------------------------ #
@@ -10205,6 +10286,14 @@ class VideoLinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
+
+    async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
+        return await self.interaction_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log
+        )
     # ------------------------------------------------------------------ #
     # Search engines (DuckDuckGo + Google CSE)
     # ------------------------------------------------------------------ #
@@ -10858,6 +10947,9 @@ class VideoLinkTrackerBlock(BaseBlock):
             params.get("return_database_sniff_hits", False)
         )
 
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min(min_term_overlap_raw, 12))
 
@@ -11371,6 +11463,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []  # [PATCH] Initialize accumulator
         all_database_hits: List[Dict[str, Any]] = []
+        all_interaction_hits: List[Dict[str, Any]] = []
         recently_returned_identifiers = set()
         if source == "database" and use_database and output_cooldown_hours > 0 and self.store:
             recently_returned_identifiers = self.store.get_recently_returned(output_cooldown_hours)
@@ -11383,7 +11476,14 @@ class VideoLinkTrackerBlock(BaseBlock):
                     return False
             return True
 
-        pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
+        pw_needed = (
+                use_js or
+                use_network_sniff or
+                use_runtime_sniff or
+                use_react_sniff or
+                use_database_sniff or
+                use_interaction_sniff
+        )
         pw_p = pw_browser = pw_context = None
 
         ua_http = ua if ua else "promptchat/VideoLinkTracker"
@@ -11597,6 +11697,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_assets: List[Dict[str, Any]] = []
                 local_react_hits: List[Dict[str,Any]] = []
                 local_database_hits: List[Dict[str, Any]] = []
+                local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
                 DEBUG_LOGGER.log_message(f"[BFS] processing page: {page_url} (depth={depth})")
                 try:
@@ -11635,6 +11736,11 @@ class VideoLinkTrackerBlock(BaseBlock):
                             return await self._pw_fetch_database_hits(pw_context, page_url, timeout, local_log)
                         return None
 
+                    async def _run_interaction():
+                        if use_interaction_sniff and pw_context:
+                            return await self._pw_fetch_interaction_hits(pw_context, page_url, timeout, local_log)
+                        return None
+
                     # Execute all sniffers simultaneously
                     # This ensures total wait time is max(sniffer_times) instead of sum(sniffer_times)
                     hard_limit = timeout + 5.0
@@ -11646,13 +11752,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                             _run_js(),
                             _run_react(),
                             _run_db(),
+                            _run_interaction(),  # [PATCH] Add to gather
                             return_exceptions=True
                         ),
                         timeout=hard_limit
                     )
-
                     # Unpack results (order matches the gather list)
-                    res_net, res_runtime, res_js, res_react, res_db = sniff_results
+                    res_net, res_runtime, res_js, res_react, res_db, res_interaction = sniff_results
 
                     # --- 1. Process Network Results ---
                     if isinstance(res_net, tuple) or isinstance(res_net, str):
@@ -11724,6 +11830,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 if hit.get("kind") == "content_link" and hit.get("url"):
                                     links_on_page.append(
                                         {"url": hit.get("url"), "text": "[DB Content]", "tag": "db_link"})
+
+                    if isinstance(res_interaction, tuple):
+                        i_html, i_hits = res_interaction
+                        # Use interaction HTML if others failed (rare, but good fallback)
+                        if i_html and not html: html = i_html
+                        if i_hits:
+                            local_interaction_hits.extend(i_hits)
                     # 3) Plain HTML via HTTPSSubmanager
                     if not html:
                         try:
@@ -11739,6 +11852,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "js_links": local_js_links,
                                 "network_links": local_network_links,
                                 "runtime_hits": local_runtime_hits,
+                                "react_hits": local_react_hits,  # [PATCH] Return hits
+                                "database_hits": local_database_hits,
+                                "interaction_hits": local_interaction_hits,
                                 "log": local_log,
                             }
 
@@ -11753,6 +11869,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             "runtime_hits": local_runtime_hits,
                             "react_hits": local_react_hits,  # [PATCH] Return hits
                             "database_hits": local_database_hits,
+                            "interaction_hits": local_interaction_hits,
                             "log": local_log + ["BeautifulSoup missing - cannot parse HTML."],
                         }
 
@@ -12026,6 +12143,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     "runtime_hits": local_runtime_hits,
                     "react_hits": local_react_hits,
                     "database_hits": local_database_hits,
+                    "interaction_hits": local_interaction_hits,
                     "log": local_log,
                 }
 
@@ -12068,7 +12186,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                 batch: List[str] = []
                 # Calculate remaining slots to strictly enforce page limit
-                slots_left = max_pages_total - len(visited_pages)
+                slots_left = max_pages_total
 
                 for u in frontier:
                     if len(batch) >= slots_left:
@@ -12122,6 +12240,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
                     all_database_hits.extend(res.get("database_hits", []))
+                    all_interaction_hits.extend(res.get("interaction_hits", []))
                     for asset in res["assets"]:
                         cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
                         new_b = self._parse_size_to_bytes(asset.get("size", ""))
@@ -12273,6 +12392,30 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     desc = " | ".join(desc_parts)
                     lines.append(f"- `{desc}` found on **{url}**")
+
+            if return_interaction_sniff_hits and all_interaction_hits:
+                lines.append("\n### Interaction / CDP Hits (debug)\n")
+                for ih in all_interaction_hits[:100]:
+                    kind = ih.get("kind")
+                    meta = ih.get("meta") or {}
+                    url = ih.get("url")
+
+                    if kind == "event_listener":
+                        node = meta.get("nodeName", "UNK")
+                        types = meta.get("types", [])
+                        lines.append(f"- `listener` **{node}** {types} on {url}")
+                    elif kind == "form_definition":
+                        ins = meta.get("input_count", 0)
+                        method = meta.get("method", "get")
+                        lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
+                    elif kind == "overlay_detected":
+                        cov = meta.get("coverage", "?")
+                        z = meta.get("zIndex", "?")
+                        lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
+                    elif kind == "summary":
+                        lc = meta.get("listener_count", 0)
+                        fc = meta.get("form_count", 0)
+                        lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
             lines.append(f"\n### Log:\n" + "\n".join(log))
             return "\n".join(lines), {
                 "count": 0,
@@ -12286,6 +12429,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "runtime_hits": all_runtime_hits,
                 "react_hits": all_react_hits,
                 "database_hits": all_database_hits,
+                "interaction_hits": all_interaction_hits,
                 "source": source,
                 "subpipeline": subpipeline,
                 "engine": engine,
@@ -12337,6 +12481,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "runtime_hits": all_runtime_hits,
+            "database_hits": all_database_hits,
+            "interaction_hits": all_interaction_hits,
             "source": source,
             "subpipeline": subpipeline,
             "engine": engine,
@@ -12371,6 +12517,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             "return_react_sniff_hits": False,
             "use_database_sniff": False,
             "return_database_sniff_hits": False,
+            "use_interaction_sniff": False,
+            "return_interaction_sniff_hits": False,
             "min_term_overlap": 1,
             "subpipeline": "",
 
@@ -15005,6 +15153,13 @@ class PageTrackerBlock(BaseBlock):
                 enable_backend_link_scan=True
             )
         )
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True
+            )
+        )
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -15823,6 +15978,14 @@ class PageTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
         )
+
+    async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
+        return await self.interaction_sniffer.sniff(
+            context,
+            page_url,
+            timeout=timeout,
+            log=log
+        )
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -16011,6 +16174,9 @@ class PageTrackerBlock(BaseBlock):
         return_database_sniff_hits = bool(
             params.get("return_database_sniff_hits", False)
         )
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+
         min_term_overlap_raw = int(params.get("min_term_overlap", 1))
         min_term_overlap = max(1, min_term_overlap_raw)
 
@@ -16521,6 +16687,7 @@ class PageTrackerBlock(BaseBlock):
         all_runtime_hits: List[Dict[str, Any]] = []
         all_react_hits: List[Dict[str, Any]] = []
         all_database_hits: List[Dict[str, Any]] = []
+        all_interaction_hits: List[Dict[str, Any]] = []
         ua_http = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/PageTracker"
         )
@@ -16542,7 +16709,14 @@ class PageTrackerBlock(BaseBlock):
                     return False
                 return True
 
-            pw_needed = use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or use_database_sniff
+            pw_needed = (
+                    use_js or
+                    use_network_sniff or
+                    use_runtime_sniff or
+                    use_react_sniff or
+                    use_database_sniff or
+                    use_interaction_sniff  # <--- Added
+            )
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -16578,6 +16752,7 @@ class PageTrackerBlock(BaseBlock):
                 local_react_hits: List[Dict[str, Any]] = []
                 local_pages: List[Dict[str, Any]] = []
                 local_database_hits: List[Dict[str, Any]] = []
+                local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
 
                 try:
@@ -16828,6 +17003,22 @@ class PageTrackerBlock(BaseBlock):
                                 except Exception:
                                     # Never let a weird React hit break the crawl
                                     continue
+                    if use_interaction_sniff and pw_context:
+                        try:
+                            int_html, int_hits = await self._pw_fetch_interaction_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log
+                            )
+                            # Use this HTML if previous sniffers failed
+                            if int_html and not html:
+                                html = int_html
+
+                            if int_hits:
+                                local_interaction_hits.extend(int_hits)
+                        except Exception as e:
+                            local_log.append(f"[PageTracker][Interaction] Error sniffing {page_url}: {e}")
                     # 3) Plain HTML
                     if not html:
                         try:
@@ -16849,6 +17040,7 @@ class PageTrackerBlock(BaseBlock):
                                 "runtime_hits": local_runtime_hits,
                                 "react_hits": local_react_hits,
                                 "database_hits": local_database_hits,
+                                "interaction_hits": local_interaction_hits,
                                 "log": local_log,
                             }
 
@@ -16973,7 +17165,7 @@ class PageTrackerBlock(BaseBlock):
                     if use_database and store and _should_persist_page(
                         page_url
                     ):
-                        store.mark_page_scanned(page_url)
+                        store.mark_scan_complete(page_url)
 
                 except Exception as e:
                     local_log.append(f"Error scanning {page_url}: {e}")
@@ -16981,7 +17173,7 @@ class PageTrackerBlock(BaseBlock):
                         page_url
                     ):
                         try:
-                            store.mark_page_scanned(page_url)
+                            store.mark_scan_complete(page_url)
                         except Exception as ee:
                             local_log.append(
                                 f"Error marking page scanned {page_url}: {ee}"
@@ -16996,6 +17188,7 @@ class PageTrackerBlock(BaseBlock):
                     "react_hits": local_react_hits,
                     "runtime_hits": local_runtime_hits,
                     "database_hits": local_database_hits,
+                    "interaction_hits": all_interaction_hits,
                     "log": local_log,
                 }
 
@@ -17034,7 +17227,7 @@ class PageTrackerBlock(BaseBlock):
                     f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)}/{max_pages_total} ---"
                 )
 
-                remaining_page_slots = max_pages_total - len(visited_pages)
+                remaining_page_slots = max_pages_total
                 batch: List[str] = []
 
                 for u in frontier:
@@ -17091,6 +17284,7 @@ class PageTrackerBlock(BaseBlock):
                     all_runtime_hits.extend(res.get("runtime_hits", []))
                     all_react_hits.extend(res.get("react_hits", []))
                     all_database_hits.extend(res.get("database_hits", []))
+                    all_interaction_hits.extend(res.get("interaction_hits", []))
                     # Collect found pages
                     for p in res.get("pages", []):
                         p_url = p.get("url")
@@ -17192,6 +17386,7 @@ class PageTrackerBlock(BaseBlock):
                 "network_sniff_links": all_network_links,
                 "runtime_hits": all_runtime_hits,
                 "react_hits": all_react_hits,
+                "interaction_hits": all_interaction_hits,
                 "log": log,
                 "queries_run": queries_to_run,
             }
@@ -17305,7 +17500,29 @@ class PageTrackerBlock(BaseBlock):
                 elif kind == "db_config_detected":
                     name = meta.get("name")
                     lines.append(f"- `backend_config` **{name}** detected")
+        if return_interaction_sniff_hits and all_interaction_hits:
+            lines.append("\n### Interaction / CDP Hits (debug)\n")
+            for ih in all_interaction_hits[:100]:
+                kind = ih.get("kind")
+                meta = ih.get("meta") or {}
+                url = ih.get("url")
 
+                if kind == "event_listener":
+                    node = meta.get("nodeName", "UNK")
+                    types = meta.get("types", [])
+                    lines.append(f"- `listener` **{node}** {types} on {url}")
+                elif kind == "form_definition":
+                    ins = meta.get("input_count", 0)
+                    method = meta.get("method", "get")
+                    lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
+                elif kind == "overlay_detected":
+                    cov = meta.get("coverage", "?")
+                    z = meta.get("zIndex", "?")
+                    lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
+                elif kind == "summary":
+                    lc = meta.get("listener_count", 0)
+                    fc = meta.get("form_count", 0)
+                    lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
         return "\n".join(lines), {
             "found": len(final_list),
             "scanned_pages": len(visited_pages),
@@ -17319,6 +17536,7 @@ class PageTrackerBlock(BaseBlock):
             "runtime_hits": all_runtime_hits,
             "react_hits": all_react_hits,
             "database_hits": all_database_hits,
+            "interaction_hits": all_interaction_hits,
             "log": log,
             "queries_run": queries_to_run,
         }
@@ -17511,6 +17729,8 @@ class PageTrackerBlock(BaseBlock):
             "return_react_sniff_hits": False,
             "use_database_sniff": False,
             "return_database_sniff_hits": False,
+            "use_interaction_sniff": False,
+            "return_interaction_sniff_hits": False,
             "min_term_overlap": 1,
             "max_depth": 0,
             "max_pages_total": 32,
