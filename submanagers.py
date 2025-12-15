@@ -152,7 +152,7 @@ class NetworkSniffer:
         })
 
         deny_content_substrings: Set[str] = field(default_factory=lambda: {
-            "javascript", "css", "text/html", "font/"
+            "javascript", "css", "font/"
         })
         deny_resource_types: Set[str] = field(default_factory=lambda: {
             "stylesheet", "font", "manifest", "other"
