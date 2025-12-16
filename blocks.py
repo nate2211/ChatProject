@@ -1500,7 +1500,6 @@ class CorpusBlock(BaseBlock):
         }
 
 
-
 # keep registration
 BLOCKS.register("corpus", CorpusBlock)
 
@@ -1710,7 +1709,6 @@ class WebCorpusBlock(BaseBlock):
             self._net_sniffer = submanagers.NetworkSniffer(logger=logger or getattr(self, "logger", None))
 
     # ---------------- Main execute ---------------- #
-
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         import os, re, time, hashlib, json, sys, traceback
         from math import log
@@ -3248,7 +3246,6 @@ class PlaywrightBlock(BaseBlock):
             "use_network_sniff": False,
             "use_js_sniff": False,
         }
-
 
 
 BLOCKS.register("playwright", PlaywrightBlock)
