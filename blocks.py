@@ -17756,3 +17756,418 @@ class PageTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("pagetracker", PageTrackerBlock)
+
+# ======================= LinkCrawlerBlock ==================================
+@dataclass
+class LinkCrawlerBlock(BaseBlock):
+    """
+    LinkCrawlerBlock
+
+    A lightweight, high-speed discovery block designed to feed `VideoLinkTracker`.
+    Instead of deep analysis, it performs broad searches and heuristic scraping to
+    populate the shared Memory with candidate URLs.
+
+    It mimics `SocketPipe`'s output structure so downstream blocks can use
+    `memory_sources` to ingest the findings.
+
+    Features:
+      - Multi-engine search (DuckDuckGo, Google CSE, SearXNG).
+      - Regex-based HTML scraping (fast, low overhead).
+      - heuristic ranking of "Content" vs "Junk" links.
+      - Extracts and stores:
+          • Candidate URLs (links_key)
+          • Unique Domains (domains_key)
+          • Keywords/Lexicon (lexicon_key)
+    """
+
+    # ------------------ Configuration ------------------
+
+    # Regex for fast link extraction
+    _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
+    _TEXT_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+
+    # Heuristics for "Good" content links
+    _CONTENT_HINTS = {
+        "video", "watch", "player", "embed", "download", "gallery", "album",
+        "archive", "clip", "movie", "film", "series", "episode", "season",
+        "mp4", "mkv", "m3u8", "webm"
+    }
+
+    _JUNK_HINTS = {
+        "login", "signin", "signup", "register", "forgot", "password",
+        "terms", "privacy", "policy", "contact", "about", "dmca",
+        "facebook.com", "twitter.com", "linkedin.com", "mailto:", "javascript:"
+    }
+
+    # ------------------ Search Helpers ------------------
+
+    async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
+        """Scrapes DDG HTML version for fast, non-API results."""
+        import aiohttp
+        urls = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Iterate pages if limit > 30
+                pages = (limit // 30) + 1
+                for i in range(pages):
+                    data = {'q': query, 'b': '', 'kl': 'us-en', 's': str(i * 30)}
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                    }
+                    async with session.post("https://html.duckduckgo.com/html/", data=data, headers=headers) as resp:
+                        if resp.status != 200:
+                            break
+                        text = await resp.text()
+
+                        # Extract result links (DDG HTML specific)
+                        for m in re.finditer(r'class="result__a" href="(.*?)"', text):
+                            u = m.group(1)
+                            # DDG redirect unwrap
+                            if "uddg=" in u:
+                                try:
+                                    from urllib.parse import unquote
+                                    u = unquote(u.split("uddg=")[1].split("&")[0])
+                                except:
+                                    pass
+                            urls.append(u)
+                            if len(urls) >= limit:
+                                return urls
+            log.append(f"[Crawler][DDG] Found {len(urls)} results.")
+        except Exception as e:
+            log.append(f"[Crawler][DDG] Error: {e}")
+        return urls
+
+    async def _search_searxng_json(self, base_url: str, query: str, limit: int, log: List[str]) -> List[str]:
+        """Queries a self-hosted SearXNG instance."""
+        import aiohttp
+        urls = []
+        if not base_url:
+            return []
+        try:
+            async with aiohttp.ClientSession() as session:
+                params = {'q': query, 'format': 'json', 'safesearch': '0'}
+                async with session.get(f"{base_url.rstrip('/')}/search", params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        results = data.get('results', [])
+                        for res in results:
+                            u = res.get('url')
+                            if u:
+                                urls.append(u)
+                            if len(urls) >= limit:
+                                break
+            log.append(f"[Crawler][SearXNG] Found {len(urls)} results.")
+        except Exception as e:
+            log.append(f"[Crawler][SearXNG] Error: {e}")
+        return urls
+
+    async def _search_google_cse(self, query: str, limit: int, log: List[str]) -> List[str]:
+        """
+        Queries Google Custom Search Engine JSON API.
+        Requires env vars: GOOGLE_CSE_ID and GOOGLE_API_KEY.
+        """
+        import aiohttp
+
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        key = os.environ.get("GOOGLE_API_KEY")
+
+        if not cx or not key:
+            log.append("[Crawler][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY.")
+            return []
+
+        urls = []
+        base_url = "https://www.googleapis.com/customsearch/v1"
+        # Google allows max 10 results per page, max 100 results total via API
+        limit = min(limit, 100)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                # We need to loop because API returns max 10 items per request
+                for start_index in range(1, limit + 1, 10):
+                    params = {
+                        'q': query,
+                        'cx': cx,
+                        'key': key,
+                        'num': '10',
+                        'start': str(start_index)
+                    }
+
+                    async with session.get(base_url, params=params) as resp:
+                        if resp.status != 200:
+                            log.append(f"[Crawler][GoogleCSE] API Error: {resp.status}")
+                            break
+
+                        data = await resp.json()
+                        items = data.get('items', [])
+
+                        if not items:
+                            break
+
+                        for item in items:
+                            link = item.get('link')
+                            if link:
+                                urls.append(link)
+
+                        if len(urls) >= limit:
+                            break
+
+            log.append(f"[Crawler][GoogleCSE] Found {len(urls)} results.")
+        except Exception as e:
+            log.append(f"[Crawler][GoogleCSE] Error: {e}")
+
+        return urls[:limit]
+
+    # ------------------ Parsing Logic ------------------
+
+    def _extract_links(self, html: str, base_url: str) -> Tuple[List[str], List[str]]:
+        """
+        Fast regex extraction of links. Returns (all_links, content_candidates).
+        """
+        all_links = set()
+        content_candidates = set()
+
+        # Simple domain extraction for filtering
+        try:
+            base_domain = urlparse(base_url).netloc
+        except:
+            base_domain = ""
+
+        for m in self._HREF_RE.finditer(html):
+            raw = m.group(1)
+            # Basic cleanup
+            if not raw or raw.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
+                continue
+
+            try:
+                full_url = urljoin(base_url, raw)
+                parsed = urlparse(full_url)
+
+                # Protocol check
+                if parsed.scheme not in ('http', 'https'):
+                    continue
+
+                # Junk check
+                u_lower = full_url.lower()
+                if any(bad in u_lower for bad in self._JUNK_HINTS):
+                    continue
+
+                all_links.add(full_url)
+
+                # Heuristic Content Scoring
+                # 1. Path contains video keywords
+                # 2. Path ends with video extension
+                # 3. Requesting a 'view' or 'watch' endpoint
+                score = 0
+                path_lower = parsed.path.lower()
+
+                if any(hint in u_lower for hint in self._CONTENT_HINTS):
+                    score += 1
+
+                # Check for direct file extensions
+                if re.search(r'\.(mp4|mkv|mov|avi|wmv|flv|webm|m3u8|ts)$', path_lower):
+                    score += 5
+
+                if score > 0:
+                    content_candidates.add(full_url)
+
+            except:
+                continue
+
+        return list(all_links), list(content_candidates)
+
+    def _extract_lexicon(self, html: str) -> List[str]:
+        """Extracts most frequent significant words to seed future queries."""
+        from collections import Counter
+        # Strip HTML tags coarsely
+        text = re.sub(r'<[^>]+>', ' ', html)
+        text = re.sub(r'\s+', ' ', text).lower()
+
+        words = self._TEXT_TOKEN_RE.findall(text)
+        # Very basic stoplist
+        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what",
+                 "can"}
+        filtered = [w for w in words if w not in stops]
+
+        counts = Counter(filtered)
+        return [w for w, c in counts.most_common(20)]
+
+    # ------------------ Execution ------------------
+
+    async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        log = []
+        query = str(params.get("query", "") or str(payload or "")).strip()
+        engine = str(params.get("engine", "duckduckgo")).lower()
+        max_results = int(params.get("max_results", 20))
+        searxng_url = str(params.get("searxng_url", ""))
+
+        # Memory Keys
+        links_key = str(params.get("links_key", "scraped_links"))
+        domains_key = str(params.get("domains_key", "scraped_domains"))
+        lexicon_key = str(params.get("lexicon_key", "scraped_lexicon"))
+
+        # Crawl Settings
+        crawl_depth = 1  # Keep it shallow: Search -> Visit -> Extract
+        http_timeout = float(params.get("timeout", 10.0))
+
+        # 1. Gather Seeds (Search Phase)
+        seed_urls = []
+
+        if params.get("seeds"):
+            # Direct seeds provided in params
+            raw_seeds = str(params.get("seeds")).split(",")
+            seed_urls.extend([s.strip() for s in raw_seeds if s.strip()])
+            log.append(f"[Crawler] Using {len(seed_urls)} explicit seeds.")
+
+        elif query:
+            log.append(f"[Crawler] Searching {engine} for: {query}")
+            if engine == "searxng":
+                seed_urls = await self._search_searxng_json(searxng_url, query, max_results, log)
+            elif engine == "google_cse":
+                seed_urls = await self._search_google_cse(query, max_results, log)
+            else:
+                seed_urls = await self._search_duckduckgo_html(query, max_results, log)
+        else:
+            log.append("[Crawler] No query or seeds provided.")
+            return "No operation.", {}
+
+        # 2. Shallow Crawl (Extraction Phase)
+        import aiohttp
+
+        collected_links = set()
+        collected_domains = set()
+        collected_lexicon = set()
+
+        # Add seeds themselves to the collection (they might be the content)
+        for s in seed_urls:
+            collected_links.add(s)
+            try:
+                collected_domains.add(urlparse(s).netloc)
+            except:
+                pass
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout)) as session:
+            # We process seeds concurrently
+            async def fetch_and_parse(url):
+                try:
+                    async with session.get(url, allow_redirects=True) as resp:
+                        if resp.status != 200:
+                            return
+                        # Only parse text content
+                        ctype = resp.headers.get("Content-Type", "").lower()
+                        if "text/html" not in ctype:
+                            return  # Skip binary files in this phase, VLT will handle them
+
+                        html = await resp.text(errors='ignore')
+
+                        # Extract Links
+                        links, candidates = self._extract_links(html, str(resp.url))
+
+                        # Extract Lexicon
+                        lex = self._extract_lexicon(html)
+                        for w in lex:
+                            collected_lexicon.add(w)
+
+                        # Store high-value candidates
+                        for c in candidates:
+                            collected_links.add(c)
+                            try:
+                                collected_domains.add(urlparse(c).netloc)
+                            except:
+                                pass
+
+                        log.append(f"[Crawler] Visited {url}: Found {len(links)} links ({len(candidates)} candidates).")
+                except Exception as e:
+                    # Silent fail on bad pages to keep speed up
+                    pass
+
+            # Limit concurrency to avoid blocking
+            tasks = [fetch_and_parse(u) for u in seed_urls]
+            await asyncio.gather(*tasks)
+
+        # 3. Write to Memory (The "SocketPipe" Behavior)
+        try:
+            store = Memory.load()
+
+            # --- Links ---
+            existing_links = store.get(links_key, [])
+            if not isinstance(existing_links, list): existing_links = []
+
+            # Format: SocketPipe style dictionaries or plain strings
+            # VideoLinkTracker supports both, but dicts carry timestamp info
+            new_link_objs = []
+            ts = time.time()
+            existing_urls = {str(x.get("url")) for x in existing_links if isinstance(x, dict)}
+
+            for u in collected_links:
+                if u not in existing_urls:
+                    new_link_objs.append({
+                        "url": u,
+                        "source": "linkcrawler",
+                        "query": query,
+                        "first_seen": ts
+                    })
+
+            # Append and cap
+            combined_links = existing_links + new_link_objs
+            if len(combined_links) > 2000:
+                combined_links = combined_links[-2000:]
+            store[links_key] = combined_links
+
+            # --- Domains ---
+            existing_domains = set(store.get(domains_key, []))
+            existing_domains.update(collected_domains)
+            store[domains_key] = sorted(list(existing_domains))[:500]
+
+            # --- Lexicon ---
+            existing_lex = set(store.get(lexicon_key, []))
+            existing_lex.update(collected_lexicon)
+            store[lexicon_key] = list(existing_lex)[:200]
+
+            Memory.save(store)
+            log.append(f"[Crawler] Memory Updated: {len(new_link_objs)} new links added to '{links_key}'.")
+
+        except Exception as e:
+            log.append(f"[Crawler] Memory Write Error: {e}")
+
+        # 4. Reporting
+        lines = [
+            f"### 🕷️ LinkCrawler Report",
+            f"_Query: '{query}' | Engine: {engine} | Seeds: {len(seed_urls)}_",
+            "",
+            f"**Candidates Found:** {len(collected_links)}",
+            f"**Domains Scanned:** {len(collected_domains)}",
+            "",
+            "**Sample Candidates (fed to Memory):**"
+        ]
+        for u in list(collected_links)[:10]:
+            lines.append(f"- {u}")
+
+        if log:
+            lines.append("\n**Log:**")
+            lines.extend(log)
+
+        return "\n".join(lines), {
+            "found_count": len(collected_links),
+            "memory_key": links_key,
+            "log": log
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "Scraping query",
+            "seeds": "Comma-separated list of starting URLs (optional override)",
+            "engine": "duckduckgo",  # "searxng", "google_cse"
+            "searxng_url": "http://127.0.0.1:8080",
+            "max_results": 20,
+            "timeout": 10.0,
+            # Memory Keys (Must match what VideoLinkTracker expects in 'memory_sources')
+            "links_key": "scraped_links",
+            "domains_key": "scraped_domains",
+            "lexicon_key": "scraped_lexicon"
+        }
+
+
+BLOCKS.register("linkcrawler", LinkCrawlerBlock)
