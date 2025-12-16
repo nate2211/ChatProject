@@ -305,6 +305,20 @@ class HFLocalLLMModel(BaseChatModel):
                 f"{style_hint}{lex_hint}\n\n"
                 f"Text:\n{user_text}\n\nAnswer:"
             )
+        elif self.mode == "coding":
+            # We inject the "lexicon" (context) as comments at the top of the file
+            context_str = ""
+            if lexicon:
+                # Assuming 'lexicon' here actually contains the full RAG context string
+                # passed via the pipeline, not just keywords.
+                lines = [f"# {line}" for line in lexicon if line.strip()]
+                context_str = "\n".join(lines[:20])  # Limit context to top 20 lines to save tokens
+                prompt = (
+                    f"{context_str}\n\n"
+                    f"# TASK: {user_text}\n"
+                    f"# SOLUTION:\n"
+                    f"```python\n"
+                )
         else:
             prompt = (
                 "User:\n"
@@ -377,7 +391,6 @@ class HFLocalLLMModel(BaseChatModel):
         }
 
 
-
 class LexiconFinalizeModel(BaseChatModel):
     """
     A "model" that doesn't generate text, but instead consolidates a messy
@@ -414,6 +427,7 @@ class LexiconFinalizeModel(BaseChatModel):
         return {
             "info": "This model finalizes output. It has no parameters."
         }
+
 
 
 # --- simple factory ---

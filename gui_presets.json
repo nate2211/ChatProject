@@ -45,7 +45,7 @@
     "blocks": [
       "linktracker"
     ],
-    "extras": "# Finds .mp3, .wav, .flac, etc. (with JS rendering)\n# The prompt {payload} is used as the query.\nlinktracker.query={payload}\n\n# Set mode to media\nlinktracker.mode=media\n\n# How many search result pages to scan?\nlinktracker.scan_limit=5\n\n# Verify links are 200 OK before returning?\nlinktracker.verify=true\n\n# Optional: only find links with these keywords\n# linktracker.url_keywords=interview,live\n\n# Optional: limit to specific domains\n# linktracker.site_require=archive.org,ca.archive.org\n\n# Use DuckDuckGo or Google CSE\nlinktracker.engine=duckduckgo\n\n# NEW: enable Playwright JS rendering\nlinktracker.use_js=true\n\n# NEW: dump all JS links for debugging\nlinktracker.return_all_js_links=true\n",
+    "extras": "# Finds .mp3, .wav, .flac, etc. (with JS rendering)\n# The prompt {payload} is used as the query.\nlinktracker.query={payload}\n\n# Set mode to media\nlinktracker.mode=media\n\n# How many search result pages to scan?\nlinktracker.scan_limit=5\n\n# Verify links are 200 OK before returning?\nlinktracker.verify=true\n\n# Use DuckDuckGo or Google CSE\nlinktracker.engine=duckduckgo\n\n# NEW: enable Playwright JS rendering\nlinktracker.use_js=true\n\n# NEW: dump all JS links for debugging\nlinktracker.return_all_js_links=true",
     "model": "lexicon"
   },
   {
@@ -115,7 +115,7 @@
     "model": "lexicon"
   },
   {
-    "name": "NASA (Image of the Day)",
+    "name": "NASA (Image of Day)",
     "blocks": [
       "nasa"
     ],
@@ -227,7 +227,7 @@
       "prompt",
       "chat"
     ],
-    "extras": "# Scrapes the web, analyzes the text, then chats.\nwebcorpus.query={payload}\nwebcorpus.max_fetch=20\nwebcorpus.timeout=15.0\nwebcorup.num_results=20\nwebcorpus.lexicon_key=web_lexicon\nwebcorpus.context_key=web_context\nwebcorpus.min_term_overlap=2\nwebcorpus.subpipeline=prompt_query\nplaywright.query={payload}\nplaywright.lexicon_key=web_lexicon\nplaywright.context_key=web_context\nplaywright.min_term_overlap=2\nplaywright.num_per_site=10\nplaywright.num_general=20\nplaywright.subpipeline=prompt_query\nintelligence.code_concepts_key=intel_code\nintelligence.prose_concepts_key=intel_prose\ncorpus.query={payload}\ncorpus.db_path=webcorpus.db\nchat.lexicon_key=intel_prose\nchat.style=bullets\nchat.max_bullets=20\nchat.subpipeline=english_chat\nprompt.context_key=web_context\nprompt.leixcon_key=web_lexicon\nhf-llm.max_new_tokens=1000\n",
+    "extras": "# Scrapes the web, analyzes the text, then chats.\nwebcorpus.query={payload}\nwebcorpus.max_fetch=20\nwebcorpus.timeout=15.0\nwebcorpus.num_results=20\nwebcorpus.lexicon_key=web_lexicon\nwebcorpus.context_key=web_context\nwebcorpus.min_term_overlap=2\nwebcorpus.subpipeline=prompt_query\nplaywright.query={payload}\nplaywright.lexicon_key=web_lexicon\nplaywright.context_key=web_context\nplaywright.min_term_overlap=2\nplaywright.num_per_site=10\nplaywright.num_general=20\nplaywright.subpipeline=prompt_query\nintelligence.code_concepts_key=intel_code\nintelligence.prose_concepts_key=intel_prose\ncorpus.query={payload}\ncorpus.db_path=webcorpus.db\nchat.lexicon_key=intel_prose\nchat.style=bullets\nchat.max_bullets=20\nchat.subpipeline=english_chat\nprompt.context_key=web_context\nprompt.lexicon_key=web_lexicon\nhf-llm.max_new_tokens=1000\n",
     "model": "hf-llm"
   },
   {
@@ -235,7 +235,7 @@
     "blocks": [
       "linktracker"
     ],
-    "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=archive.org\nlinktracker.engine=sites\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.min_term_overlap=3\nlinktracker.max_depth=20\nlinktracker.max_pages_total=200\nlinktracker.max_links_per_page=1000\nlinktracker.timeout=50\nlinktracker.subpipeline=prompt_query|xml|sitemap\nlinktracker.block_resources=true\nlinktracker.block_domains=true\nlinktracker.search_results_cap=1000\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100",
+    "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=archive.org\nlinktracker.engine=sites\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.min_term_overlap={payload.length}\nlinktracker.max_depth=20\nlinktracker.max_pages_total=200\nlinktracker.max_links_per_page=1000\nlinktracker.timeout=50\nlinktracker.subpipeline=prompt_query|xml|sitemap\nlinktracker.block_resources=true\nlinktracker.block_domains=true\nlinktracker.search_results_cap=1000\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100",
     "model": "lexicon"
   },
   {
@@ -251,7 +251,7 @@
     "blocks": [
       "linktracker"
     ],
-    "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=\nlinktracker.engine=duckduckgo\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.use_runtime_sniff=true\nlinktracker.return_runtime_sniff_links=true\nlinktracker.min_term_overlap={payload.length}\nlinktracker.max_depth=5\nlinktracker.max_pages_total=10\nlinktracker.max_links_per_page=100\nlinktracker.timeout=5\nlinktracker.subpipeline=xml|sitemap\nlinktracker.block_resources=true\nlinktracker.block_domains=true\nlinktracker.search_results_cap=100\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100\nlinktracker.use_camoufox=true\nlinktracker.blocked_resource_types=\"image,stylesheet,font,media,video,audio\"",
+    "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=\nlinktracker.engine=duckduckgo\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.min_term_overlap={payload.length}\nlinktracker.max_depth=5\nlinktracker.max_pages_total=10\nlinktracker.max_links_per_page=100\nlinktracker.timeout=5\nlinktracker.subpipeline=xml|sitemap\nlinktracker.block_resources=true\nlinktracker.block_domains=true\nlinktracker.search_results_cap=100\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100\nlinktracker.use_camoufox=true\nlinktracker.blocked_resource_types=\"image,stylesheet,font,media,video,audio\"\n\n# --- Full Sniffer Suite ---\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.use_runtime_sniff=true\nlinktracker.return_runtime_sniff_links=true\nlinktracker.use_react_sniff=true\nlinktracker.return_react_sniff_hits=true\nlinktracker.use_interaction_sniff=true\nlinktracker.return_interaction_sniff_hits=true\nlinktracker.use_database_sniff=true\nlinktracker.return_database_sniff_hits=true",
     "model": "lexicon"
   },
   {
@@ -259,7 +259,31 @@
     "blocks": [
       "videotracker"
     ],
-    "extras": "videotracker.query={payload}\nvideotracker.source=search\nvideotracker.sites=\nvideotracker.scan_limit=10\nvideotracker.timeout=8.0\nvideotracker.engine=duckduckgo\nvideotracker.verify=true\nvideotracker.use_js=true\nvideotracker.return_all_js_links=true\nvideotracker.smart_sniff=true\nvideotracker.max_depth=4\nvideotracker.child_page_limit=8\nvideotracker.max_pages_total=10\nvideotracker.max_links_per_page=60\nvideotracker.max_assets=200\nvideotracker.use_network_sniff=true\nvideotracker.return_network_sniff_links=true\nvideotracker.use_runtime_sniff=true\nvideotracker.return_runtime_sniff_links=true\nvideotracker.min_term_overlap={payload.length}\nvideotracker.subpipeline=xml|sitemap\nvideotracker.use_database=true\nvideotracker.db_path=video_corpus.db\nvideotracker.block_resources=true\nvideotracker.blocked_resource_types=image,stylesheet,font,video,media,audio\nvideotracker.block_domains=true\nvideotracker.blocked_domains=\nvideotracker.search_results_cap=256\nvideotracker.search_page_limit=5\nvideotracker.search_per_page=50\nvideotracer.use_camoufox=true",
+    "extras": "videotracker.query={payload}\nvideotracker.source=search\nvideotracker.sites=\nvideotracker.scan_limit=10\nvideotracker.timeout=8.0\nvideotracker.engine=duckduckgo\nvideotracker.verify=true\nvideotracker.use_js=true\nvideotracker.return_all_js_links=true\nvideotracker.smart_sniff=true\nvideotracker.max_depth=4\nvideotracker.child_page_limit=8\nvideotracker.max_pages_total=10\nvideotracker.max_links_per_page=60\nvideotracker.max_assets=200\nvideotracker.min_term_overlap={payload.length}\nvideotracker.subpipeline=xml|sitemap\nvideotracker.use_database=true\nvideotracker.db_path=video_corpus.db\nvideotracker.block_resources=true\nvideotracker.blocked_resource_types=image,stylesheet,font,video,media,audio\nvideotracker.block_domains=true\nvideotracker.blocked_domains=\nvideotracker.search_results_cap=256\nvideotracker.search_page_limit=5\nvideotracker.search_per_page=50\nvideotracker.use_camoufox=true\n\n# --- Full Sniffer Suite ---\nvideotracker.use_network_sniff=true\nvideotracker.return_network_sniff_links=true\nvideotracker.use_runtime_sniff=true\nvideotracker.return_runtime_sniff_links=true\nvideotracker.use_react_sniff=true\nvideotracker.return_react_sniff_hits=true\nvideotracker.use_interaction_sniff=true\nvideotracker.return_interaction_sniff_hits=true\nvideotracker.use_database_sniff=true\nvideotracker.return_database_sniff_hits=true",
+    "model": "lexicon"
+  },
+  {
+    "name": "PageTracker Camoufox",
+    "blocks": [
+      "pagetracker"
+    ],
+    "extras": "pagetracker.query={payload}\npagetracker.mode=pages\npagetracker.scan_limit=10\npagetracker.timeout=10.0\npagetracker.engine=duckduckgo\npagetracker.verify=false\npagetracker.use_js=true\npagetracker.return_all_js_links=true\npagetracker.use_database=true\npagetracker.db_path=link_corpus.db\npagetracker.min_term_overlap={payload.length}\npagetracker.max_depth=5\npagetracker.max_pages_total=20\npagetracker.max_links_per_page=100\npagetracker.subpipeline=xml|sitemap\npagetracker.block_resources=true\npagetracker.blocked_resource_types=image,stylesheet,font,media,video,audio\npagetracker.block_domains=true\npagetracker.search_results_cap=100\npagetracker.search_page_limit=5\npagetracker.search_per_page=50\npagetracker.use_camoufox=true\n\n# --- Full Sniffer Suite ---\npagetracker.use_network_sniff=true\npagetracker.return_network_sniff_links=true\npagetracker.use_runtime_sniff=true\npagetracker.return_runtime_sniff_hits=true\npagetracker.use_react_sniff=true\npagetracker.return_react_sniff_hits=true\npagetracker.use_interaction_sniff=true\npagetracker.return_interaction_sniff_hits=true\npagetracker.use_database_sniff=true\npagetracker.return_database_sniff_hits=true",
+    "model": "lexicon"
+  },
+  {
+    "name": "Deep Discovery (Crawler + Camoufox)",
+    "blocks": [
+      "pipeline"
+    ],
+    "extras": "# Pipeline: LinkCrawler (Fast) -> VideoTracker (Deep Camoufox)\npipeline.stages=linkcrawler|videotracker\n\n# --- Stage 1: LinkCrawler ---\npipeline.linkcrawler.query={payload}\npipeline.linkcrawler.max_results=40\npipeline.linkcrawler.links_key=crawled_seeds\npipeline.linkcrawler.timeout=8.0\n\n# --- Stage 2: VideoTracker ---\npipeline.videotracker.memory_sources=crawled_seeds\npipeline.videotracker.query={payload}\npipeline.videotracker.source=search\npipeline.videotracker.use_camoufox=true\npipeline.videotracker.block_domains=true\npipeline.videotracker.block_resources=true\npipeline.videotracker.blocked_resource_types=image,stylesheet,font\npipeline.videotracker.use_js=true\npipeline.videotracker.smart_sniff=true\npipeline.videotracker.min_term_overlap={payload.length}\npipeline.videotracker.max_pages_total=25\npipeline.videotracker.max_links_per_page=100\npipeline.videotracker.return_all_js_links=true\npipeline.videotracker.use_database=true\npipeline.videotracker.db_path=video_corpus.db\n\n# --- Full Sniffer Suite ---\npipeline.videotracker.use_network_sniff=true\npipeline.videotracker.return_network_sniff_links=true\npipeline.videotracker.use_runtime_sniff=true\npipeline.videotracker.return_runtime_sniff_links=true\npipeline.videotracker.use_react_sniff=true\npipeline.videotracker.return_react_sniff_hits=true\npipeline.videotracker.use_interaction_sniff=true\npipeline.videotracker.return_interaction_sniff_hits=true\npipeline.videotracker.use_database_sniff=true\npipeline.videotracker.return_database_sniff_hits=true",
+    "model": "lexicon"
+  },
+  {
+    "name": "Deep Asset Discovery (Crawler + LinkTracker)",
+    "blocks": [
+      "pipeline"
+    ],
+    "extras": "# Pipeline: LinkCrawler (Fast) -> LinkTracker (Deep Camoufox)\n# Finds generic assets (docs, archives, etc) using the same logic as VideoTracker\npipeline.stages=linkcrawler|linktracker\n\n# --- Stage 1: LinkCrawler ---\npipeline.linkcrawler.query={payload}\npipeline.linkcrawler.max_results=40\npipeline.linkcrawler.links_key=crawled_asset_seeds\npipeline.linkcrawler.timeout=8.0\n\n# --- Stage 2: LinkTracker ---\npipeline.linktracker.memory_sources=crawled_asset_seeds\npipeline.linktracker.query={payload}\n# Mode 'media' captures audio/video; change to 'docs' or 'archives' if needed\npipeline.linktracker.mode=media\npipeline.linktracker.use_camoufox=true\npipeline.linktracker.block_domains=true\npipeline.linktracker.block_resources=true\npipeline.linktracker.blocked_resource_types=image,stylesheet,font\npipeline.linktracker.use_js=true\npipeline.linktracker.min_term_overlap={payload.length}\npipeline.linktracker.max_pages_total=25\npipeline.linktracker.max_links_per_page=100\npipeline.linktracker.return_all_js_links=true\npipeline.linktracker.use_database=true\npipeline.linktracker.db_path=link_corpus.db\n\n# --- Full Sniffer Suite ---\npipeline.linktracker.use_network_sniff=true\npipeline.linktracker.return_network_sniff_links=true\npipeline.linktracker.use_runtime_sniff=true\npipeline.linktracker.return_runtime_sniff_links=true\npipeline.linktracker.use_react_sniff=true\npipeline.linktracker.return_react_sniff_hits=true\npipeline.linktracker.use_interaction_sniff=true\npipeline.linktracker.return_interaction_sniff_hits=true\npipeline.linktracker.use_database_sniff=true\npipeline.linktracker.return_database_sniff_hits=true",
     "model": "lexicon"
   }
 ]

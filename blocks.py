@@ -3745,21 +3745,17 @@ class CodeBlock(BaseBlock):
             ctx = ctx[:context_chars]
 
         if ctx:
-            final_prompt = f"""
-        You are an expert developer.
+            final_prompt = f"""### Context
+            The following code snippets are provided for reference. Do not copy them blindly.
 
-        You are given CONTEXT CODE SNIPPETS that should inform your solution.
-        Use them for patterns, APIs, or structure — but DO NOT copy or repeat 
-        the snippets verbatim. Build a new, original solution.
+            {ctx}
 
-        -------------------- CONTEXT --------------------
-        {ctx}
-        -------------------- END CONTEXT ----------------
+            ### Instruction
+            You are an expert developer. {user_prompt}
 
-        -------------------- TASK -----------------------
-        {user_prompt}
-        -------------------- END TASK -------------------
-        """
+            ### Response
+            ```python
+            """
         else:
             final_prompt = user_prompt
 
@@ -4684,175 +4680,415 @@ class CodeCorpusBlock(BaseBlock):
 # Register the block
 BLOCKS.register("codecorpus", CodeCorpusBlock)
 
+# ================ CodeSearch ================
 @dataclass
 class CodeSearchBlock(BaseBlock):
     """
-    "Smarter" Code Retrieval using SQLite FTS + Numpy Vector Reranking.
+    Code Retrieval + Lexicon Builder for CodeBlock.
 
-    Features:
-      • Retrieval: Fetches a large pool of candidates (top_k * 5) using SQLite FTS5.
-      • Vectorization: Uses Numpy to build a Term-Document Matrix based on query terms.
-      • Scoring: Computes Cosine Similarity (Query vs. Candidates).
-      • Heuristics: Boosts scores for 'code' vs 'prose', and penalizes 'spaghetti' code.
-      • Diversity: Penalizes multiple chunks from the same file to ensure broad context.
+    Exports:
+      - Memory[export_context_key] -> formatted context blocks (fenced when code-like)
+      - Memory[export_lexicon_key] -> list[str] lexicon tokens (API names etc.)
 
-    Inputs:
-      --extra codesearch.query="how to implement a router in python"
+    Context packing is designed to feed CodeBlock:
+      - prioritizes code-kind docs and code-like prose
+      - adds minimal headers and stable fences
+      - clamps snippet sizes to avoid blowing input window
 
-    Requires:
-      `pip install numpy` (Falls back to standard python scoring if missing).
+    Lexicon is designed to help generation:
+      - identifiers (snake/camel/dotted), imports/using/includes, class/function names
+      - bigrams (e.g., "tf.keras", "async_playwright", "sqlite3.connect")
+      - weighted by where they came from (title > code > prose), plus frequency across docs
     """
+
+    # ----------------- config -----------------
 
     _SEARCH_STOP_WORDS = {
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
         "how", "in", "is", "it", "of", "on", "or", "show", "tell", "that",
         "the", "this", "to", "what", "when", "where", "which", "with",
-        "me", "give", "using", "write", "basic", "script", "code", "function"
+        "me", "give", "using", "write", "basic", "script", "code", "function",
+        "block", "class", "method", "model", "example", "examples", "guide",
     }
 
-    # --- 1. Text Processing & Helpers ---
+    _WS_RE = re.compile(r"\s+")
+    _WORD_RE = re.compile(r"\w+")
+    _IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    _DOTTED_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+    _CAMEL_RE = re.compile(r"[A-Za-z][a-z0-9]+(?:[A-Z][a-z0-9]+)+")
 
-    def _tokenize(self, text: str) -> List[str]:
-        """Splits text into lowercase alphanumeric tokens."""
-        return re.findall(r"\w+", (text or "").lower())
+    # Keep lexicon sane
+    _LEX_STOP = {
+        # general + code boilerplate
+        "true", "false", "none", "null", "self", "this", "that", "these", "those",
+        "return", "returns", "value", "values", "param", "params", "parameter", "parameters",
+        "args", "kwargs", "var", "let", "const", "function", "class", "public", "private",
+        "static", "void", "int", "float", "string", "bool", "dict", "list", "set", "tuple",
+        "import", "from", "using", "namespace", "include", "define",
+    }
 
-    def _extract_identifiers(self, text: str) -> Set[str]:
-        """Extracts likely variable/function names (snake_case, camelCase)."""
-        # (Simplified regex for speed)
-        return set(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", text))
+    # ----------------- tokenize / extract -----------------
 
-    def _guess_code_lang(self, code_snippet: str) -> str:
-        """Heuristic language detection for code blocks."""
-        s = code_snippet.lower()
-        if "def " in s and "import " in s: return "python"
-        if "function" in s and "{" in s: return "javascript"
-        if "public class" in s or "system.out" in s: return "java"
-        if "#include" in s and "std::" in s: return "cpp"
-        if "using system" in s or "namespace" in s: return "csharp"
-        return ""
+    def _tokenize_words(self, text: str) -> List[str]:
+        return [t.lower() for t in self._WORD_RE.findall(text or "")]
 
-    def _format_fts_query(self, query: str) -> str:
-        """Formats a raw string into a valid SQLite FTS5 query string."""
-        tokens = [t for t in self._tokenize(query) if t not in self._SEARCH_STOP_WORDS]
+    def _extract_identifiers(self, text: str) -> List[str]:
+        """
+        Return identifiers including dotted APIs and camelCase/PascalCase.
+        We keep them as original case where possible (better for APIs),
+        but we also dedupe case-insensitively later.
+        """
+        t = text or ""
+        out: List[str] = []
+
+        for m in self._DOTTED_RE.finditer(t):
+            out.append(m.group(0))
+
+        # raw identifiers
+        for m in self._IDENT_RE.finditer(t):
+            s = m.group(0)
+            if len(s) >= 3:
+                out.append(s)
+
+        # camelCase / PascalCase (often API types)
+        for m in self._CAMEL_RE.finditer(t):
+            s = m.group(0)
+            if len(s) >= 4:
+                out.append(s)
+
+        return out
+
+    def _extract_import_hints(self, text: str) -> List[str]:
+        """
+        Pull common "import-ish" hints:
+          - python: import x / from x import y
+          - js/ts: from 'x'
+          - c#: using X.Y;
+          - cpp: #include <x>
+        """
+        t = text or ""
+        out: List[str] = []
+
+        # python
+        for m in re.finditer(r"^\s*import\s+([A-Za-z0-9_\.]+)", t, re.MULTILINE):
+            out.append(m.group(1))
+        for m in re.finditer(r"^\s*from\s+([A-Za-z0-9_\.]+)\s+import\s+([A-Za-z0-9_\,\s]+)", t, re.MULTILINE):
+            mod = m.group(1)
+            out.append(mod)
+            items = [x.strip() for x in m.group(2).split(",") if x.strip()]
+            for it in items[:8]:
+                out.append(f"{mod}.{it}")
+
+        # js/ts
+        for m in re.finditer(r"\bfrom\s+['\"]([^'\"]+)['\"]", t):
+            pkg = m.group(1).strip()
+            if pkg:
+                out.append(pkg)
+
+        # c#
+        for m in re.finditer(r"^\s*using\s+([A-Za-z0-9_\.]+)\s*;", t, re.MULTILINE):
+            out.append(m.group(1))
+
+        # c/cpp
+        for m in re.finditer(r"^\s*#include\s+[<\"]([^>\"]+)[>\"]", t, re.MULTILINE):
+            out.append(m.group(1))
+
+        return out
+
+    def _extract_def_names(self, text: str) -> List[str]:
+        """
+        Grab function/class names across common languages.
+        """
+        t = text or ""
+        out: List[str] = []
+
+        # python
+        out += [m.group(1) for m in re.finditer(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", t, re.MULTILINE)]
+        out += [m.group(1) for m in re.finditer(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|:)", t, re.MULTILINE)]
+
+        # js/ts
+        out += [m.group(1) for m in re.finditer(r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", t)]
+        out += [m.group(1) for m in re.finditer(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b", t)]
+
+        # c#/java
+        out += [m.group(1) for m in re.finditer(r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)\b", t)]
+        out += [m.group(1) for m in re.finditer(r"\binterface\s+([A-Za-z_][A-Za-z0-9_]*)\b", t)]
+
+        # go
+        out += [m.group(1) for m in re.finditer(r"^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", t, re.MULTILINE)]
+
+        # rust
+        out += [m.group(1) for m in re.finditer(r"^\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", t, re.MULTILINE)]
+        out += [m.group(1) for m in re.finditer(r"^\s*struct\s+([A-Za-z_][A-Za-z0-9_]*)\b", t, re.MULTILINE)]
+        out += [m.group(1) for m in re.finditer(r"^\s*enum\s+([A-Za-z_][A-Za-z0-9_]*)\b", t, re.MULTILINE)]
+
+        return out
+
+    # ----------------- scoring -----------------
+
+    def _code_likeness(self, text: str) -> float:
+        if not text:
+            return 0.0
+        lines = (text or "").splitlines()
+        punct = sum(c in "{}[]();:.,+-=*/<>|&^%#@" for c in text)
+        letters = sum(c.isalpha() for c in text)
+        indented = sum(1 for ln in lines if ln.startswith((" ", "\t")))
+        lower = text.lower()
+        kw = 0
+        for k in ("def ", "class ", "import ", "return ", "if ", "for ", "while ",
+                  "function ", "const ", "let ", "#include", "std::", "namespace ",
+                  "public ", "fn ", "impl ", "await ", "async "):
+            if k in lower:
+                kw += 1
+        ratio = punct / max(letters, 1)
+        return float((ratio * 3.0) + (indented * 0.05) + (kw * 0.8))
+
+    def _normalize_query(self, query: str) -> Dict[str, Any]:
+        raw = (query or "").strip()
+        toks = [t for t in self._tokenize_words(raw) if t not in self._SEARCH_STOP_WORDS]
+        idents = {t for t in self._extract_identifiers(raw) if len(t) >= 3}
+        return {"raw": raw, "tokens": toks, "idents": idents}
+
+    def _format_fts_query(self, query: str, tokens: List[str]) -> str:
+        q = (query or "").strip().replace('"', '""')
+        phrase = f"\"{q}\"" if q else ""
         if not tokens:
-            return query.replace('"', '""')  # Fallback
-
-        # Strategy: (term1* AND term2*) OR (term1* OR term2*)
-        and_part = " AND ".join(f'"{t}"*' for t in tokens)
-        or_part = " OR ".join(f'"{t}"*' for t in tokens)
+            return phrase or q or ""
+        toks = tokens[:12]
+        and_part = " AND ".join(f"\"{t}\"*" for t in toks)
+        or_part = " OR ".join(f"\"{t}\"*" for t in toks)
+        if phrase:
+            return f"({phrase}) OR ({and_part}) OR ({or_part})"
         return f"({and_part}) OR ({or_part})"
 
-    # --- 2. Numpy Scoring Engine ---
+    def _origin_key(self, url: str) -> str:
+        u = (url or "")
+        return u.split("::", 1)[0].strip()
 
-    def _rank_with_numpy(
-            self,
-            query: str,
-            candidates: List[Dict[str, Any]]
-    ) -> List[Tuple[float, Dict[str, Any]]]:
+    def _score_doc(self, q_tokens: Set[str], q_idents: Set[str], doc: Dict[str, Any]) -> float:
+        content = doc.get("content") or ""
+        title = doc.get("title") or ""
+        kind = (doc.get("kind") or "prose").lower()
+
+        ctoks = set(self._tokenize_words(content))
+        ttoks = set(self._tokenize_words(title))
+
+        token_hits = (len(ctoks & q_tokens) * 1.0) + (len(ttoks & q_tokens) * 2.0)
+
+        doc_idents = set(self._extract_identifiers(content)) | set(self._extract_identifiers(title))
+        # normalize to lower for overlap
+        doc_idents_l = {x.lower() for x in doc_idents}
+        q_idents_l = {x.lower() for x in q_idents}
+        ident_hits = len(doc_idents_l & q_idents_l) * 2.8
+
+        # kind bias
+        kind_boost = 1.35 if "code" in kind else 0.90
+
+        # code-likeness
+        cl = 1.0 + min(0.8, self._code_likeness(content) * 0.18)
+
+        # size bell curve (prefer medium snippets)
+        ln = len(content)
+        if ln < 80:
+            size = 0.45
+        elif ln > 9000:
+            size = 0.65
+        else:
+            size = 1.0
+
+        return float((token_hits + ident_hits) * kind_boost * cl * size)
+
+    # ----------------- context packing -----------------
+
+    def _guess_code_lang(self, kind: str, snippet: str) -> str:
+        k = (kind or "").lower()
+        if "code:" in k:
+            return k.split("code:", 1)[1].strip()
+        s = (snippet or "").lower()
+        if "def " in s and ("import " in s or "async " in s): return "python"
+        if "function" in s and "{" in s: return "javascript"
+        if "public class" in s or "system.out" in s: return "java"
+        if "#include" in s or "std::" in s: return "cpp"
+        if "using system" in s or "namespace" in s: return "csharp"
+        if "fn " in s and "let " in s: return "rust"
+        if "package " in s and "func " in s: return "go"
+        return ""
+
+    def _clamp_snippet(self, s: str, max_chars: int) -> str:
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars].rstrip() + "\n# ...clamped...\n"
+        return s
+
+    def _render_context(self, selected: List[Tuple[float, Dict[str, Any]]], *, per_snippet_chars: int) -> str:
+        blocks: List[str] = []
+        for score, doc in selected:
+            title = (doc.get("title") or "").strip()
+            kind = (doc.get("kind") or "prose").strip()
+            url = (doc.get("url") or "").strip()
+            content = (doc.get("content") or "").rstrip()
+            if not content:
+                continue
+
+            content = self._clamp_snippet(content, per_snippet_chars)
+
+            lang = self._guess_code_lang(kind, content)
+            is_codeish = ("code" in (kind or "").lower()) or (self._code_likeness(content) >= 1.2) or bool(lang)
+
+            header = f"### {kind.upper()} | {title}".strip()
+            if url:
+                header += f"\n# source: {url}"
+
+            if is_codeish:
+                fence = lang or ""
+                block = f"{header}\n```{fence}\n{content}\n```"
+            else:
+                block = f"{header}\n{content}"
+
+            blocks.append(block)
+
+        return "\n\n".join(blocks).strip()
+
+    def _pack_diverse(
+        self,
+        ranked: List[Tuple[float, Dict[str, Any]]],
+        *,
+        top_k: int,
+        max_chars: int,
+        per_origin_cap: int,
+        per_snippet_chars: int,
+    ) -> Tuple[List[Tuple[float, Dict[str, Any]]], Dict[str, Any]]:
+        chosen: List[Tuple[float, Dict[str, Any]]] = []
+        per_origin: Dict[str, int] = {}
+        total = 0
+
+        for score, doc in ranked:
+            if len(chosen) >= top_k:
+                break
+
+            origin = self._origin_key(doc.get("url", ""))
+            if per_origin.get(origin, 0) >= per_origin_cap:
+                continue
+
+            content = doc.get("content") or ""
+            if not content:
+                continue
+
+            # pre-clamp for packing estimate
+            content_est = content if per_snippet_chars <= 0 else content[:per_snippet_chars]
+            add_len = len(content_est) + 128  # header/fence overhead
+
+            if max_chars > 0 and (total + add_len) > max_chars:
+                continue
+
+            chosen.append((score, doc))
+            per_origin[origin] = per_origin.get(origin, 0) + 1
+            total += add_len
+
+        return chosen, {"diversity_groups": len(per_origin), "packed_chars": total}
+
+    # ----------------- lexicon build -----------------
+
+    def _add_lex_counts(self, counts: Dict[str, float], items: List[str], weight: float) -> None:
+        for it in items:
+            tok = (it or "").strip()
+            if not tok:
+                continue
+
+            low = tok.lower()
+            if low in self._LEX_STOP:
+                continue
+            if len(low) < 3:
+                continue
+            if low.isdigit():
+                continue
+
+            # Keep case for API aesthetics, but dedupe by lowercase
+            counts[low] = counts.get(low, 0.0) + float(weight)
+
+    def _bigrams(self, toks: List[str]) -> List[str]:
+        out = []
+        for i in range(len(toks) - 1):
+            a, b = toks[i], toks[i + 1]
+            if not a or not b:
+                continue
+            if a in self._SEARCH_STOP_WORDS or b in self._SEARCH_STOP_WORDS:
+                continue
+            if len(a) < 3 or len(b) < 3:
+                continue
+            out.append(f"{a}_{b}")
+        return out
+
+    def _build_lexicon(
+        self,
+        query: str,
+        q_tokens: List[str],
+        selected: List[Tuple[float, Dict[str, Any]]],
+        *,
+        top_k: int,
+    ) -> List[str]:
         """
-        Uses Numpy to perform Cosine Similarity + Heuristic weighting.
+        Weighted lexicon from:
+          - query tokens (seed)
+          - titles (strong)
+          - identifiers/imports/defnames from content (strong)
+          - frequent words (weak)
+          - bigrams from titles/query (medium)
         """
-        if not candidates:
-            return []
+        counts: Dict[str, float] = {}
 
-        # --- A. Prepare Vocabulary (Query-Centric) ---
-        # We only care about dimensions (words) that exist in the query.
-        q_tokens = [t for t in self._tokenize(query) if t not in self._SEARCH_STOP_WORDS]
-        vocab = sorted(list(set(q_tokens)))
+        # seed query tokens
+        self._add_lex_counts(counts, q_tokens, weight=3.0)
 
-        if not vocab:
-            # If query was only stopwords, return SQLite order
-            return [(1.0, c) for c in candidates]
+        # seed from raw query identifiers too
+        self._add_lex_counts(counts, self._extract_identifiers(query), weight=4.0)
 
-        n_docs = len(candidates)
-        n_terms = len(vocab)
-
-        # --- B. Build Matrices ---
-        # Query Vector (1 x V)
-        # Doc Matrix   (N x V)
-
-        # 1. Query Vector (Binary: 1 if term exists)
-        Q = np.ones(n_terms, dtype=np.float32)
-
-        # 2. Document Matrix (Term Counts)
-        D = np.zeros((n_docs, n_terms), dtype=np.float32)
-
-        # 3. Feature Arrays for Heuristics
-        kinds_score = np.zeros(n_docs, dtype=np.float32)
-        lengths_score = np.zeros(n_docs, dtype=np.float32)
-
-        vocab_map = {term: i for i, term in enumerate(vocab)}
-
-        for i, doc in enumerate(candidates):
-            content = (doc.get("content") or "").lower()
-            title = (doc.get("title") or "").lower()
+        for score, doc in selected:
+            title = (doc.get("title") or "")
+            content = (doc.get("content") or "")
             kind = (doc.get("kind") or "prose").lower()
 
-            # Fill Document Matrix
-            # We give 2x weight to matches in the Title
-            doc_tokens = self._tokenize(content) + (self._tokenize(title) * 2)
+            # weights by kind
+            w_kind = 1.25 if "code" in kind else 1.0
+            w_score = 1.0 + min(1.5, score / 6.0)  # mild boost for top-ranked
 
-            for t in doc_tokens:
-                if t in vocab_map:
-                    D[i, vocab_map[t]] += 1.0
+            # title words + bigrams
+            title_words = [t for t in self._tokenize_words(title) if t not in self._SEARCH_STOP_WORDS]
+            self._add_lex_counts(counts, title_words, weight=2.6 * w_kind * w_score)
+            self._add_lex_counts(counts, self._bigrams(title_words), weight=1.8 * w_kind * w_score)
 
-            # Fill Heuristic Arrays
-            # 1. Kind Boost: Code > Prose
-            if "code" in kind:
-                kinds_score[i] = 1.2
-            else:
-                kinds_score[i] = 0.9
+            # identifiers + import hints + def/class names
+            idents = self._extract_identifiers(content)
+            imps = self._extract_import_hints(content)
+            defs = self._extract_def_names(content)
 
-            # 2. Length Heuristic (Bell curve preference for medium chunks)
-            # Small (<100 chars) = bad. Huge (>3000 chars) = bad.
-            ln = len(content)
-            if ln < 100:
-                lengths_score[i] = 0.5
-            elif ln > 3000:
-                lengths_score[i] = 0.7
-            else:
-                lengths_score[i] = 1.0
+            self._add_lex_counts(counts, idents, weight=2.2 * w_kind * w_score)
+            self._add_lex_counts(counts, imps, weight=3.0 * w_kind * w_score)
+            self._add_lex_counts(counts, defs, weight=3.2 * w_kind * w_score)
 
-        # --- C. TF-IDF Weighing (Simplified) ---
-        # Calculate Document Frequency (how many docs contain term t)
-        df = np.sum(D > 0, axis=0)
-        # Avoid divide by zero
-        idf = np.log((n_docs + 1) / (df + 1)) + 1
+            # dotted APIs deserve a little extra
+            dotted = [x for x in idents if "." in x]
+            self._add_lex_counts(counts, dotted, weight=2.6 * w_kind * w_score)
 
-        # Apply IDF to Document Matrix
-        D_tfidf = D * idf
+        # rank: weight desc, then token
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
-        # --- D. Cosine Similarity ---
-        # Dot product of Query and Docs
-        # Q is all 1s (scaled by IDF effectively in dot product if we weighed Q,
-        # but here we map Q against D_tfidf directly)
+        # post-filter: avoid super-generic tokens
+        out: List[str] = []
+        for tok, w in ranked:
+            if tok in self._LEX_STOP:
+                continue
+            # avoid "one-letter-ish" and noisy underscore bigrams that are too long
+            if len(tok) > 64:
+                continue
+            out.append(tok)
+            if len(out) >= top_k:
+                break
 
-        # Dot product: sum of weights for matched terms
-        dot_products = np.dot(D_tfidf, Q)
+        # Keep original casing? We stored lowercase keys.
+        # For now, return lowercase (stable + matches your Memory usage).
+        return out
 
-        # Norms (magnitude of vectors)
-        doc_norms = np.linalg.norm(D_tfidf, axis=1)
-        q_norm = np.linalg.norm(Q)
-
-        # Avoid zero division
-        doc_norms[doc_norms == 0] = 1.0
-
-        cosine_sim = dot_products / (doc_norms * q_norm)
-
-        # --- E. Final Weighted Score ---
-        # Score = CosineSim * KindBoost * LengthBoost
-        final_scores = cosine_sim * kinds_score * lengths_score
-
-        # Zip and Sort
-        results = []
-        for i in range(n_docs):
-            results.append((float(final_scores[i]), candidates[i]))
-
-        # Sort Descending
-        results.sort(key=lambda x: x[0], reverse=True)
-        return results
-
-    # --- 3. Main Execution ---
+    # ----------------- main -----------------
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         query = str(params.get("query", "")).strip()
@@ -4860,117 +5096,126 @@ class CodeSearchBlock(BaseBlock):
             return str(payload), {"error": "CodeSearchBlock: 'query' parameter is required."}
 
         db_path = str(params.get("db_path", "code_corpus.db"))
-        top_k = int(params.get("top_k", 5))
-        export_key = str(params.get("export_key", "code_search_context"))
-        max_chars = int(params.get("max_chars", 6000))
+
+        # retrieval
+        top_k = int(params.get("top_k", 6))
+        fetch_mult = int(params.get("fetch_mult", 10))
+        fetch_limit = max(20, top_k * fetch_mult)
+
+        # context packing
+        max_chars = int(params.get("max_chars", 6500))
+        per_origin_cap = int(params.get("per_origin_cap", 2))
+        per_snippet_chars = int(params.get("per_snippet_chars", 1800))
+
+        # exports
+        export_context_key = str(params.get("export_context_key", "code_search_context"))
+        export_lexicon_key = str(params.get("export_lexicon_key", "code_search_lexicon"))
+        lexicon_top_k = int(params.get("lexicon_top_k", 80))
+
         inject = bool(params.get("inject", True))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
 
-        # 1. Fetch Candidates from SQLite
-        # We fetch 4x top_k to give the Numpy reranker a good pool to filter from.
-        fetch_limit = top_k * 4
-        fts_query = self._format_fts_query(query)
+        qn = self._normalize_query(query)
+        fts_query = self._format_fts_query(qn["raw"], qn["tokens"])
 
-        rows = []
+        # 1) fetch
         try:
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                # Fetch basic matches
-                sql = f"""
-                    SELECT url, title, content, kind 
-                    FROM docs 
-                    WHERE docs MATCH ? 
+                sql = """
+                    SELECT url, title, content, kind
+                    FROM docs
+                    WHERE docs MATCH ?
                     LIMIT ?
                 """
-                cursor = conn.execute(sql, (fts_query, fetch_limit))
-                # Convert to list of dicts so we can mutate/score easily
-                rows = [dict(row) for row in cursor.fetchall()]
+                cur = conn.execute(sql, (fts_query, fetch_limit))
+                rows = [dict(r) for r in cur.fetchall()]
         except sqlite3.Error as e:
-            return str(payload), {"error": f"DB Error: {e}", "query": query}
+            return str(payload), {"error": f"DB Error: {e}", "query": query, "fts_query": fts_query}
 
         if not rows:
-            return str(payload), {"note": "No results found in SQLite.", "hits": 0}
+            return str(payload), {"note": "No results found in SQLite.", "hits": 0, "fts_query": fts_query}
 
-        # 2. Re-rank (Vector vs Fallback)
-        scored_candidates = self._rank_with_numpy(query, rows)
-        ranker_used = "numpy_cosine"
+        # 2) score + rank (pure python, deterministic)
+        qtok_set = set(qn["tokens"])
+        ranked: List[Tuple[float, Dict[str, Any]]] = []
+        for doc in rows:
+            ranked.append((self._score_doc(qtok_set, qn["idents"], doc), doc))
+        ranked.sort(key=lambda x: x[0], reverse=True)
 
-        # 3. Apply Diversity Filter & Final Selection
-        # We want to avoid filling the context with 5 chunks from the exact same file.
-        final_selection = []
-        seen_files = {}  # filename -> count
+        # 3) pack context with diversity
+        selected, pack_meta = self._pack_diverse(
+            ranked,
+            top_k=top_k,
+            max_chars=max_chars,
+            per_origin_cap=per_origin_cap,
+            per_snippet_chars=per_snippet_chars,
+        )
 
-        total_chars = 0
+        # 4) render context
+        full_context = self._render_context(selected, per_snippet_chars=per_snippet_chars)
 
-        for score, doc in scored_candidates:
-            if len(final_selection) >= top_k:
-                break
+        # 5) build lexicon from selected docs
+        lexicon = self._build_lexicon(
+            query=query,
+            q_tokens=qn["tokens"],
+            selected=selected,
+            top_k=lexicon_top_k,
+        )
 
-            # Extract file path/name from URL or Title for grouping
-            # Usually URL is "path/to/file::chunk_name"
-            origin = doc['url'].split("::")[0]
-
-            # Diversity Penalty: Skip if we already have 2 chunks from this file
-            if seen_files.get(origin, 0) >= 2:
-                continue
-
-            # Length cap check
-            content = doc['content']
-            if total_chars + len(content) > max_chars:
-                continue
-
-            final_selection.append(doc)
-            seen_files[origin] = seen_files.get(origin, 0) + 1
-            total_chars += len(content)
-
-        # 4. Format Output
-        context_blocks = []
-        for doc in final_selection:
-            title = doc['title']
-            kind = doc['kind']
-            content = doc['content']
-
-            # Add nice markdown fencing
-            lang = ""
-            if "code" in kind:
-                lang = kind.split(":")[-1] if ":" in kind else self._guess_code_lang(content)
-
-            header = f"### {kind.upper()} | {title}"
-            if lang and "code" in kind:
-                block = f"{header}\n```{lang}\n{content}\n```"
-            else:
-                block = f"{header}\n{content}"
-
-            context_blocks.append(block)
-
-        full_context = "\n\n".join(context_blocks)
-
-        # 5. Save & Return
+        # 6) export
         store = Memory.load()
-        store[export_key] = full_context
+        store[export_context_key] = full_context
+        store[export_lexicon_key] = lexicon
         Memory.save(store)
+
+        out_text = "" if payload is None else str(payload)
+
+        if inject and full_context:
+            out_text += f"\n\n[{export_context_key}]\n{full_context}"
+        if inject and inject_lexicon and lexicon:
+            out_text += f"\n\n[{export_lexicon_key}]\n" + ", ".join(lexicon)
 
         meta = {
             "query": query,
+            "fts_query": fts_query,
             "hits_found": len(rows),
-            "hits_returned": len(final_selection),
-            "ranker": ranker_used,
-            "diversity_groups": len(seen_files)
+            "hits_returned": len(selected),
+            "ranker": "py_weighted_code_rank",
+            "export_context_key": export_context_key,
+            "export_lexicon_key": export_lexicon_key,
+            "lexicon_size": len(lexicon),
+            "top_k": top_k,
+            "fetch_limit": fetch_limit,
+            "max_chars": max_chars,
+            "per_snippet_chars": per_snippet_chars,
+            "per_origin_cap": per_origin_cap,
+            **pack_meta,
         }
-
-        out_text = str(payload)
-        if inject and full_context:
-            out_text += f"\n\n[{export_key}]\n{full_context}"
-
         return out_text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "REQUIRED. The search string.",
             "db_path": "code_corpus.db",
-            "top_k": 5,
+
+            # retrieval
+            "top_k": 6,
+            "fetch_mult": 10,
+
+            # context packing
+            "max_chars": 6500,
+            "per_origin_cap": 2,
+            "per_snippet_chars": 1800,
+
+            # exports
+            "export_context_key": "code_search_context",
+            "export_lexicon_key": "code_search_lexicon",
+            "lexicon_top_k": 80,
+
+            # output
             "inject": True,
-            "export_key": "code_search_context",
-            "max_chars": 6000
+            "inject_lexicon": True,
         }
 
 
