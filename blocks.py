@@ -18065,29 +18065,81 @@ class LinkCrawlerBlock(BaseBlock):
             log.append(f"[Crawler][DDG] Error: {e}")
         return urls
 
-    async def _search_searxng_json(self, base_url: str, query: str, limit: int, log: List[str]) -> List[str]:
-        """Queries a self-hosted SearXNG instance."""
+    async def _search_searxng_json(self, base_url: str, query: str, limit: int, timeout: float, log: List[str]) -> List[
+        str]:
+        """
+        Queries a self-hosted SearXNG instance with pagination support.
+        """
         import aiohttp
+        import json
+
         urls = []
+        # Fallback default if somehow None is passed, though params usually handles it
         if not base_url:
-            return []
+            base_url = "http://127.0.0.1:8080"
+
+        search_url = base_url.rstrip("/") + "/search"
+
+        # Calculate simplistic max pages (assuming ~20 results per page)
+        # We cap at 5 pages to prevent infinite loops on weird instances
+        max_pages = min(5, (limit // 10) + 1)
+
         try:
             async with aiohttp.ClientSession() as session:
-                params = {'q': query, 'format': 'json', 'safesearch': '0'}
-                async with session.get(f"{base_url.rstrip('/')}/search", params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        results = data.get('results', [])
-                        for res in results:
-                            u = res.get('url')
-                            if u:
-                                urls.append(u)
-                            if len(urls) >= limit:
+                for page_idx in range(1, max_pages + 1):
+                    if len(urls) >= limit:
+                        break
+
+                    params = {
+                        'q': query,
+                        'format': 'json',
+                        'pageno': str(page_idx),
+                        # 'safesearch': '0'  # Uncomment if your instance supports/needs this
+                    }
+
+                    try:
+                        async with session.get(
+                                search_url,
+                                params=params,
+                                timeout=aiohttp.ClientTimeout(total=timeout)
+                        ) as resp:
+                            if resp.status == 403:
+                                log.append(f"[Crawler][SearXNG] HTTP 403 on page {page_idx}. Stopping.")
                                 break
+
+                            if resp.status != 200:
+                                log.append(f"[Crawler][SearXNG] HTTP {resp.status} on page {page_idx}.")
+                                break
+
+                            text = await resp.text()
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError:
+                                log.append(f"[Crawler][SearXNG] Invalid JSON response on page {page_idx}.")
+                                break
+
+                            results = data.get('results', [])
+                            if not results:
+                                # No more results, stop paging
+                                break
+
+                            for res in results:
+                                u = res.get('url')
+                                if u:
+                                    urls.append(u)
+                                if len(urls) >= limit:
+                                    break
+
+                    except Exception as req_err:
+                        log.append(f"[Crawler][SearXNG] Request error page {page_idx}: {req_err}")
+                        break
+
             log.append(f"[Crawler][SearXNG] Found {len(urls)} results.")
         except Exception as e:
-            log.append(f"[Crawler][SearXNG] Error: {e}")
-        return urls
+            log.append(f"[Crawler][SearXNG] General Error: {e}")
+
+        return urls[:limit]
 
     async def _search_google_cse(self, query: str, limit: int, log: List[str]) -> List[str]:
         """
