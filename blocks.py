@@ -16324,7 +16324,7 @@ class PageTrackerBlock(BaseBlock):
                     for k in memory_sources_raw.split(",")
                     if k.strip()
                 ]
-                DEBUG_LOGGER.log_message(f"[BFS] Memory Sources Keys to Read {len(keys_to_read)}")
+
                 for key in keys_to_read:
                     data = mem_data.get(key)
                     if not data:
