@@ -7,7 +7,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Callable, ClassVar
 from urllib.parse import urlparse
-
+import time
 from submanagers import DatabaseSubmanager
 
 
@@ -1445,3 +1445,106 @@ class CodeCorpusStore:
             """,
             (url, content, url, title, content, kind, url, content),
         )
+
+# ======================================================================
+# LinkCrawler
+# ======================================================================
+
+class LinkCrawlerStore(BaseStore):
+    """
+    Store for LinkCrawlerBlock.
+
+    Responsibilities:
+      - Persist "already emitted" URLs so subsequent runs won't re-feed them.
+      - Persist seed fetch history so we can skip re-fetching pages too frequently.
+    """
+
+    EMITTED_DDL = """
+    CREATE TABLE IF NOT EXISTS linkcrawler_emitted
+    (
+        url TEXT PRIMARY KEY,
+        first_seen_ts REAL NOT NULL,
+        last_seen_ts REAL NOT NULL,
+        mode TEXT,
+        query TEXT
+    )
+    """
+
+    SEED_FETCH_DDL = """
+    CREATE TABLE IF NOT EXISTS linkcrawler_seed_fetch
+    (
+        seed_url TEXT PRIMARY KEY,
+        last_fetch_ts REAL NOT NULL,
+        last_status INTEGER NOT NULL
+    )
+    """
+
+    INDEXES_DDL = [
+        "CREATE INDEX IF NOT EXISTS idx_lc_emitted_last_seen ON linkcrawler_emitted (last_seen_ts)",
+        "CREATE INDEX IF NOT EXISTS idx_lc_seed_last_fetch ON linkcrawler_seed_fetch (last_fetch_ts)",
+    ]
+
+    def ensure_schema(self) -> None:
+        self.db.ensure_schema([self.EMITTED_DDL, self.SEED_FETCH_DDL, *self.INDEXES_DDL])
+
+    # -------------------- Emitted -------------------- #
+
+    def has_emitted(self, url: str) -> bool:
+        url = (url or "").strip()
+        if not url:
+            return False
+        r = self.db.fetchone("SELECT 1 FROM linkcrawler_emitted WHERE url=? LIMIT 1", (url,))
+        return r is not None
+
+    def mark_emitted(self, url: str, *, mode: str, query: str, now_ts: Optional[float] = None) -> None:
+        url = (url or "").strip()
+        if not url:
+            return
+        ts = float(now_ts if now_ts is not None else time.time())
+        self.db.execute(
+            """
+            INSERT INTO linkcrawler_emitted(url, first_seen_ts, last_seen_ts, mode, query)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+                last_seen_ts=excluded.last_seen_ts,
+                mode=excluded.mode,
+                query=excluded.query
+            """,
+            (url, ts, ts, mode or "", query or ""),
+        )
+
+    # -------------------- Seed fetch TTL -------------------- #
+
+    def seed_should_fetch(self, seed_url: str, *, ttl_seconds: float, now_ts: Optional[float] = None) -> bool:
+        seed_url = (seed_url or "").strip()
+        if not seed_url:
+            return False
+        ts = float(now_ts if now_ts is not None else time.time())
+        ttl = float(ttl_seconds)
+
+        r = self.db.fetchone(
+            "SELECT last_fetch_ts FROM linkcrawler_seed_fetch WHERE seed_url=? LIMIT 1",
+            (seed_url,),
+        )
+        if not r:
+            return True
+
+        last_ts = float(r["last_fetch_ts"] or 0.0)
+        return (ts - last_ts) >= ttl
+
+    def seed_mark_fetched(self, seed_url: str, *, status: int, now_ts: Optional[float] = None) -> None:
+        seed_url = (seed_url or "").strip()
+        if not seed_url:
+            return
+        ts = float(now_ts if now_ts is not None else time.time())
+        self.db.execute(
+            """
+            INSERT INTO linkcrawler_seed_fetch(seed_url, last_fetch_ts, last_status)
+            VALUES(?, ?, ?)
+            ON CONFLICT(seed_url) DO UPDATE SET
+                last_fetch_ts=excluded.last_fetch_ts,
+                last_status=excluded.last_status
+            """,
+            (seed_url, ts, int(status)),
+        )
+

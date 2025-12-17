@@ -24,7 +24,7 @@ from typing import Any, Dict, Tuple, List, Optional, Set
 import json as _json
 import os as _os
 import time
-from urllib.parse import urlencode, urlparse, urljoin, unquote, quote_plus, parse_qsl, urlunparse
+from urllib.parse import urlencode, urlparse, urljoin, unquote, quote_plus, parse_qsl, urlunparse, quote
 
 import aiohttp
 import feedparser
@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore, PageTrackerStore
+    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore
 from loggers import DEBUG_LOGGER
 load_dotenv()
 # ---------------- Paths & helpers ----------------
@@ -16314,6 +16314,7 @@ class PageTrackerBlock(BaseBlock):
         # =========================================================================
         # Memory Sources Ingestion (SocketPipe Bridge)
         # =========================================================================
+        memory_source_url_count = 0
         memory_sources_raw = str(params.get("memory_sources", "")).strip()
 
         if memory_sources_raw:
@@ -16368,7 +16369,7 @@ class PageTrackerBlock(BaseBlock):
                     f"'{memory_sources_raw}': {e}"
                 )
                 DEBUG_LOGGER.log_message(msg)
-
+        DEBUG_LOGGER.log_message(f"[PageTracker][memory] Ingested {len(pipeline_urls)} unique URL(s)")
         # ------------------- Config --------------------- #
         mode = str(params.get("mode", "pages")).lower()
         scan_limit = int(params.get("scan_limit", 5))
@@ -17991,30 +17992,26 @@ class LinkCrawlerBlock(BaseBlock):
     """
     LinkCrawlerBlock
 
-    A lightweight, high-speed discovery block designed to feed `VideoLinkTracker`.
-    Instead of deep analysis, it performs broad searches and heuristic scraping to
-    populate the shared Memory with candidate URLs.
+    NEW PARAMS:
+      - use_database: bool = False
+      - db_path: str = "link_corpus.db"
+      - seed_ttl_seconds: float = 21600 (6 hours)
 
-    It mimics `SocketPipe`'s output structure so downstream blocks can use
-    `memory_sources` to ingest the findings.
+    Behavior:
+      - Always does Memory-level dedupe (existing behavior).
+      - If use_database=True:
+          * Suppresses URLs previously emitted (cross-run).
+          * Skips re-fetching seed URLs recently fetched (TTL).
 
-    Features:
-      - Multi-engine search (DuckDuckGo, Google CSE, SearXNG).
-      - Regex-based HTML scraping (fast, low overhead).
-      - heuristic ranking of "Content" vs "Junk" links.
-      - Extracts and stores:
-          • Candidate URLs (links_key)
-          • Unique Domains (domains_key)
-          • Keywords/Lexicon (lexicon_key)
+    Logging:
+      - Uses DEBUG_LOGGER.log_message() for detailed crawl-per-page messages.
     """
 
     # ------------------ Configuration ------------------
 
-    # Regex for fast link extraction
     _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
     _TEXT_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
 
-    # Heuristics for "Good" content links
     _CONTENT_HINTS = {
         "video", "watch", "player", "embed", "download", "gallery", "album",
         "archive", "clip", "movie", "film", "series", "episode", "season",
@@ -18027,35 +18024,79 @@ class LinkCrawlerBlock(BaseBlock):
         "facebook.com", "twitter.com", "linkedin.com", "mailto:", "javascript:"
     }
 
+    _DOC_HINTS = {
+        "pdf", "ebook", "epub", "paper", "whitepaper", "research", "report",
+        "document", "documentation", "manual", "guide", "spec", "datasheet",
+        "arxiv", "doi", "slides", "ppt", "pptx"
+    }
+
+    _MEDIA_HINTS = {
+        "video", "watch", "player", "embed", "download", "stream", "play",
+        "m3u8", "mpd", "dash", "hls", "mp4", "mkv", "webm", "mov",
+        "mp3", "flac", "m4a", "wav", "ogg", "aac", "ts"
+    }
+
+    _IMAGE_HINTS = {
+        "image", "img", "photo", "jpg", "jpeg", "png", "gif", "webp", "avif",
+        "gallery", "thumbnail", "thumb", "cdn", "media"
+    }
+
+    _DOC_EXT_RE = re.compile(r"\.(pdf|epub|mobi|djvu|doc|docx|ppt|pptx|xls|xlsx|txt|rtf)$", re.IGNORECASE)
+    _MEDIA_EXT_RE = re.compile(r"\.(mp4|mkv|mov|avi|wmv|flv|webm|m3u8|mpd|ts|m4a|mp3|flac|wav|ogg|aac)$", re.IGNORECASE)
+    _IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|avif|bmp|tiff|svg)$", re.IGNORECASE)
+
+    # ------------------ Query Augmentation ------------------
+
+    def _augment_query_by_mode(self, q: str, mode: str) -> str:
+        q = (q or "").strip()
+        mode = (mode or "search").lower().strip()
+
+        if mode == "docs":
+            if "filetype:" not in q.lower():
+                q = f'{q} (pdf OR filetype:pdf OR doc OR docx OR ppt OR pptx)'
+            return q.strip()
+
+        if mode == "media":
+            low = q.lower()
+            if not any(x in low for x in ("m3u8", "mp4", "webm", "mpd", "mp3", "flac")):
+                q = f'{q} (m3u8 OR mp4 OR webm OR mpd OR mp3 OR flac)'
+            return q.strip()
+
+        if mode == "images":
+            low = q.lower()
+            if not any(x in low for x in ("jpg", "jpeg", "png", "webp", "image", "gallery")):
+                q = f'{q} (jpg OR png OR webp OR image OR gallery)'
+            return q.strip()
+
+        return q
+
     # ------------------ Search Helpers ------------------
 
     async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
-        """Scrapes DDG HTML version for fast, non-API results."""
         import aiohttp
-        urls = []
+        urls: List[str] = []
         try:
             async with aiohttp.ClientSession() as session:
-                # Iterate pages if limit > 30
                 pages = (limit // 30) + 1
                 for i in range(pages):
-                    data = {'q': query, 'b': '', 'kl': 'us-en', 's': str(i * 30)}
+                    data = {"q": query, "b": "", "kl": "us-en", "s": str(i * 30)}
                     headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/91.0.4472.124 Safari/537.36"
+                        )
                     }
                     async with session.post("https://html.duckduckgo.com/html/", data=data, headers=headers) as resp:
                         if resp.status != 200:
                             break
                         text = await resp.text()
-
-                        # Extract result links (DDG HTML specific)
                         for m in re.finditer(r'class="result__a" href="(.*?)"', text):
                             u = m.group(1)
-                            # DDG redirect unwrap
                             if "uddg=" in u:
                                 try:
-                                    from urllib.parse import unquote
                                     u = unquote(u.split("uddg=")[1].split("&")[0])
-                                except:
+                                except Exception:
                                     pass
                             urls.append(u)
                             if len(urls) >= limit:
@@ -18063,25 +18104,15 @@ class LinkCrawlerBlock(BaseBlock):
             log.append(f"[Crawler][DDG] Found {len(urls)} results.")
         except Exception as e:
             log.append(f"[Crawler][DDG] Error: {e}")
-        return urls
+        return urls[:limit]
 
-    async def _search_searxng_json(self, base_url: str, query: str, limit: int, timeout: float, log: List[str]) -> List[
-        str]:
-        """
-        Queries a self-hosted SearXNG instance with pagination support.
-        """
-        import aiohttp
-        import json
-
-        urls = []
-        # Fallback default if somehow None is passed, though params usually handles it
+    async def _search_searxng_json(self, base_url: str, query: str, limit: int, timeout: float, log: List[str]) -> List[str]:
+        import aiohttp, json
+        urls: List[str] = []
         if not base_url:
             base_url = "http://127.0.0.1:8080"
 
         search_url = base_url.rstrip("/") + "/search"
-
-        # Calculate simplistic max pages (assuming ~20 results per page)
-        # We cap at 5 pages to prevent infinite loops on weird instances
         max_pages = min(5, (limit // 10) + 1)
 
         try:
@@ -18090,42 +18121,23 @@ class LinkCrawlerBlock(BaseBlock):
                     if len(urls) >= limit:
                         break
 
-                    params = {
-                        'q': query,
-                        'format': 'json',
-                        'pageno': str(page_idx),
-                        # 'safesearch': '0'  # Uncomment if your instance supports/needs this
-                    }
-
+                    params = {"q": query, "format": "json", "pageno": str(page_idx)}
                     try:
-                        async with session.get(
-                                search_url,
-                                params=params,
-                                timeout=aiohttp.ClientTimeout(total=timeout)
-                        ) as resp:
+                        async with session.get(search_url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
                             if resp.status == 403:
                                 log.append(f"[Crawler][SearXNG] HTTP 403 on page {page_idx}. Stopping.")
                                 break
-
                             if resp.status != 200:
                                 log.append(f"[Crawler][SearXNG] HTTP {resp.status} on page {page_idx}.")
                                 break
 
-                            text = await resp.text()
-
-                            try:
-                                data = json.loads(text)
-                            except json.JSONDecodeError:
-                                log.append(f"[Crawler][SearXNG] Invalid JSON response on page {page_idx}.")
-                                break
-
-                            results = data.get('results', [])
+                            data = json.loads(await resp.text())
+                            results = data.get("results", []) or []
                             if not results:
-                                # No more results, stop paging
                                 break
 
                             for res in results:
-                                u = res.get('url')
+                                u = res.get("url")
                                 if u:
                                     urls.append(u)
                                 if len(urls) >= limit:
@@ -18142,55 +18154,35 @@ class LinkCrawlerBlock(BaseBlock):
         return urls[:limit]
 
     async def _search_google_cse(self, query: str, limit: int, log: List[str]) -> List[str]:
-        """
-        Queries Google Custom Search Engine JSON API.
-        Requires env vars: GOOGLE_CSE_ID and GOOGLE_API_KEY.
-        """
-        import aiohttp
-
+        import aiohttp, os
         cx = os.environ.get("GOOGLE_CSE_ID")
         key = os.environ.get("GOOGLE_API_KEY")
-
         if not cx or not key:
             log.append("[Crawler][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY.")
             return []
 
-        urls = []
+        urls: List[str] = []
         base_url = "https://www.googleapis.com/customsearch/v1"
-        # Google allows max 10 results per page, max 100 results total via API
         limit = min(limit, 100)
 
         try:
             async with aiohttp.ClientSession() as session:
-                # We need to loop because API returns max 10 items per request
                 for start_index in range(1, limit + 1, 10):
-                    params = {
-                        'q': query,
-                        'cx': cx,
-                        'key': key,
-                        'num': '10',
-                        'start': str(start_index)
-                    }
-
+                    params = {"q": query, "cx": cx, "key": key, "num": "10", "start": str(start_index)}
                     async with session.get(base_url, params=params) as resp:
                         if resp.status != 200:
                             log.append(f"[Crawler][GoogleCSE] API Error: {resp.status}")
                             break
-
                         data = await resp.json()
-                        items = data.get('items', [])
-
+                        items = data.get("items", []) or []
                         if not items:
                             break
-
                         for item in items:
-                            link = item.get('link')
+                            link = item.get("link")
                             if link:
                                 urls.append(link)
-
                         if len(urls) >= limit:
                             break
-
             log.append(f"[Crawler][GoogleCSE] Found {len(urls)} results.")
         except Exception as e:
             log.append(f"[Crawler][GoogleCSE] Error: {e}")
@@ -18199,228 +18191,325 @@ class LinkCrawlerBlock(BaseBlock):
 
     # ------------------ Parsing Logic ------------------
 
-    def _extract_links(self, html: str, base_url: str) -> Tuple[List[str], List[str]]:
-        """
-        Fast regex extraction of links. Returns (all_links, content_candidates).
-        """
-        all_links = set()
-        content_candidates = set()
+    def _extract_links(self, html: str, base_url: str, mode: str = "search") -> Tuple[List[str], List[str]]:
+        all_links: set[str] = set()
+        content_candidates: set[str] = set()
 
-        # Simple domain extraction for filtering
-        try:
-            base_domain = urlparse(base_url).netloc
-        except:
-            base_domain = ""
+        mode = (mode or "search").lower().strip()
 
-        for m in self._HREF_RE.finditer(html):
+        if mode == "docs":
+            hint_set = self._DOC_HINTS
+            ext_re = self._DOC_EXT_RE
+        elif mode == "media":
+            hint_set = self._MEDIA_HINTS
+            ext_re = self._MEDIA_EXT_RE
+        elif mode == "images":
+            hint_set = self._IMAGE_HINTS
+            ext_re = self._IMAGE_EXT_RE
+        else:
+            hint_set = self._CONTENT_HINTS
+            ext_re = self._MEDIA_EXT_RE
+
+        for m in self._HREF_RE.finditer(html or ""):
             raw = m.group(1)
-            # Basic cleanup
-            if not raw or raw.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
+            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
 
             try:
                 full_url = urljoin(base_url, raw)
                 parsed = urlparse(full_url)
-
-                # Protocol check
-                if parsed.scheme not in ('http', 'https'):
+                if parsed.scheme not in ("http", "https"):
                     continue
 
-                # Junk check
                 u_lower = full_url.lower()
                 if any(bad in u_lower for bad in self._JUNK_HINTS):
                     continue
 
                 all_links.add(full_url)
 
-                # Heuristic Content Scoring
-                # 1. Path contains video keywords
-                # 2. Path ends with video extension
-                # 3. Requesting a 'view' or 'watch' endpoint
                 score = 0
-                path_lower = parsed.path.lower()
+                path_lower = (parsed.path or "").lower()
 
-                if any(hint in u_lower for hint in self._CONTENT_HINTS):
+                if any(hint in u_lower for hint in hint_set):
+                    score += 2
+                if ext_re.search(path_lower):
+                    score += 6
+                if any(tok in path_lower for tok in ("/watch", "/player", "/embed", "/download", "/view", "/details")):
                     score += 1
 
-                # Check for direct file extensions
-                if re.search(r'\.(mp4|mkv|mov|avi|wmv|flv|webm|m3u8|ts)$', path_lower):
-                    score += 5
+                if mode in ("docs", "media", "images") and score <= 0:
+                    continue
 
                 if score > 0:
                     content_candidates.add(full_url)
 
-            except:
+            except Exception:
                 continue
 
         return list(all_links), list(content_candidates)
 
     def _extract_lexicon(self, html: str) -> List[str]:
-        """Extracts most frequent significant words to seed future queries."""
         from collections import Counter
-        # Strip HTML tags coarsely
-        text = re.sub(r'<[^>]+>', ' ', html)
-        text = re.sub(r'\s+', ' ', text).lower()
+        text = re.sub(r"<[^>]+>", " ", html or "")
+        text = re.sub(r"\s+", " ", text).lower()
 
         words = self._TEXT_TOKEN_RE.findall(text)
-        # Very basic stoplist
-        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what",
-                 "can"}
+        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what", "can"}
         filtered = [w for w in words if w not in stops]
 
         counts = Counter(filtered)
-        return [w for w, c in counts.most_common(20)]
+        return [w for w, _c in counts.most_common(20)]
+
+    # ------------------ DB wiring ------------------
+
+    def _make_store(self, db_path: str) -> LinkCrawlerStore:
+        cfg = submanagers.DatabaseConfig(path=db_path)
+        db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
+        store = LinkCrawlerStore(db=db)
+        store.ensure_schema()
+        return store
 
     # ------------------ Execution ------------------
 
     async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        log = []
+        log: List[str] = []
+
         query = str(params.get("query", "") or str(payload or "")).strip()
         engine = str(params.get("engine", "duckduckgo")).lower()
+        mode = str(params.get("mode", "search") or "search").lower().strip()
+
         max_results = int(params.get("max_results", 20))
         searxng_url = str(params.get("searxng_url", ""))
+        http_timeout = float(params.get("timeout", 10.0))
 
-        # Memory Keys
         links_key = str(params.get("links_key", "scraped_links"))
         domains_key = str(params.get("domains_key", "scraped_domains"))
         lexicon_key = str(params.get("lexicon_key", "scraped_lexicon"))
 
-        # Crawl Settings
-        crawl_depth = 1  # Keep it shallow: Search -> Visit -> Extract
-        http_timeout = float(params.get("timeout", 10.0))
+        use_database = bool(params.get("use_database", False))
+        db_path = str(params.get("db_path", "link_corpus.db"))
+        seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
 
-        # 1. Gather Seeds (Search Phase)
-        seed_urls = []
+        DEBUG_LOGGER.log_message(
+            f"[Crawler] start | query={query!r} mode={mode} engine={engine} "
+            f"max_results={max_results} timeout={http_timeout} use_database={use_database} "
+            f"links_key={links_key!r}"
+        )
 
+        store: LinkCrawlerStore | None = None
+        if use_database:
+            try:
+                store = self._make_store(db_path)
+                log.append(f"[Crawler][DB] Enabled db_path={db_path} seed_ttl_seconds={seed_ttl_seconds:.0f}")
+                DEBUG_LOGGER.log_message(f"[Crawler][DB] init ok | db_path={db_path}")
+            except Exception as e:
+                store = None
+                use_database = False
+                log.append(f"[Crawler][DB] Init failed: {e} (continuing without DB)")
+                DEBUG_LOGGER.log_message(f"[Crawler][DB] init FAILED: {e} (DB disabled)")
+
+        # 1) Gather seeds
+        seed_urls: List[str] = []
         if params.get("seeds"):
-            # Direct seeds provided in params
             raw_seeds = str(params.get("seeds")).split(",")
-            seed_urls.extend([s.strip() for s in raw_seeds if s.strip()])
+            seed_urls = [s.strip() for s in raw_seeds if s.strip()]
             log.append(f"[Crawler] Using {len(seed_urls)} explicit seeds.")
-
+            DEBUG_LOGGER.log_message(f"[Crawler] seeds=explicit count={len(seed_urls)}")
         elif query:
-            DEBUG_LOGGER.log_message(f"[Crawler] Searching {engine} for: {query}")
+            search_q = self._augment_query_by_mode(query, mode)
+            DEBUG_LOGGER.log_message(f"[Crawler] search | engine={engine} mode={mode} q={search_q!r}")
+
             if engine == "searxng":
-                seed_urls = await self._search_searxng_json(searxng_url, query, max_results, http_timeout, log)
+                seed_urls = await self._search_searxng_json(searxng_url, search_q, max_results, http_timeout, log)
             elif engine == "google_cse":
-                seed_urls = await self._search_google_cse(query, max_results, log)
+                seed_urls = await self._search_google_cse(search_q, max_results, log)
             else:
-                seed_urls = await self._search_duckduckgo_html(query, max_results, log)
+                seed_urls = await self._search_duckduckgo_html(search_q, max_results, log)
         else:
             log.append("[Crawler] No query or seeds provided.")
+            DEBUG_LOGGER.log_message("[Crawler] no-op: missing query and seeds")
             return "No operation.", {}
 
-        # 2. Shallow Crawl (Extraction Phase)
+        DEBUG_LOGGER.log_message(f"[Crawler] seeds collected | count={len(seed_urls)}")
+
+        # 2) Shallow crawl (with seed TTL gating if DB enabled)
         import aiohttp
 
-        collected_links = set()
-        collected_domains = set()
-        collected_lexicon = set()
+        collected_links: set[str] = set()
+        collected_domains: set[str] = set()
+        collected_lexicon: set[str] = set()
 
-        # Add seeds themselves to the collection (they might be the content)
         for s in seed_urls:
             collected_links.add(s)
             try:
                 collected_domains.add(urlparse(s).netloc)
-            except:
+            except Exception:
                 pass
 
+        now_ts = time.time()
+        seeds_to_fetch = seed_urls
+
+        if store:
+            seeds_to_fetch = [
+                s for s in seed_urls
+                if store.seed_should_fetch(s, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)
+            ]
+            skipped = len(seed_urls) - len(seeds_to_fetch)
+            if skipped:
+                msg = f"[Crawler][DB] Skipping {skipped} seed(s) due to TTL."
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+
+        DEBUG_LOGGER.log_message(f"[Crawler] fetch plan | total_seeds={len(seed_urls)} to_fetch={len(seeds_to_fetch)}")
+
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout)) as session:
-            # We process seeds concurrently
-            async def fetch_and_parse(url):
-                try:
-                    async with session.get(url, allow_redirects=True) as resp:
-                        if resp.status != 200:
-                            return
-                        # Only parse text content
-                        ctype = resp.headers.get("Content-Type", "").lower()
-                        if "text/html" not in ctype:
-                            return  # Skip binary files in this phase, VLT will handle them
 
-                        html = await resp.text(errors='ignore')
+            sem = asyncio.Semaphore(int(params.get("max_concurrency", 12)))
 
-                        # Extract Links
-                        links, candidates = self._extract_links(html, str(resp.url))
+            async def fetch_and_parse(url: str):
+                # ---- per-page crawl message (requested) ----
+                DEBUG_LOGGER.log_message(f"[Crawler][Page] crawling seed={url}")
 
-                        # Extract Lexicon
-                        lex = self._extract_lexicon(html)
-                        for w in lex:
-                            collected_lexicon.add(w)
+                async with sem:
+                    start = time.time()
+                    try:
+                        async with session.get(url, allow_redirects=True) as resp:
+                            final_url = str(resp.url)
+                            status = int(resp.status)
+                            ctype = (resp.headers.get("Content-Type", "") or "").lower()
 
-                        # Store high-value candidates
-                        for c in candidates:
-                            collected_links.add(c)
-                            try:
-                                collected_domains.add(urlparse(c).netloc)
-                            except:
-                                pass
+                            if store:
+                                try:
+                                    store.seed_mark_fetched(url, status=status, now_ts=time.time())
+                                except Exception as e:
+                                    DEBUG_LOGGER.log_message(f"[Crawler][DB] seed_mark_fetched failed url={url} err={e}")
 
-                        DEBUG_LOGGER.log_message(f"[Crawler] Visited {url}: Found {len(links)} links ({len(candidates)} candidates).")
-                except Exception as e:
-                    # Silent fail on bad pages to keep speed up
-                    pass
+                            DEBUG_LOGGER.log_message(
+                                f"[Crawler][Page] fetched status={status} ms={int((time.time()-start)*1000)} "
+                                f"final={final_url} ctype={ctype[:60]!r}"
+                            )
 
-            # Limit concurrency to avoid blocking
-            tasks = [fetch_and_parse(u) for u in seed_urls]
-            await asyncio.gather(*tasks)
+                            if status != 200:
+                                return
 
-        # 3. Write to Memory (The "SocketPipe" Behavior)
-        try:
-            store = Memory.load()
+                            if "text/html" not in ctype:
+                                DEBUG_LOGGER.log_message(f"[Crawler][Page] skip non-html final={final_url} ctype={ctype[:80]!r}")
+                                return
 
-            # --- Links ---
-            existing_links = store.get(links_key, [])
-            if not isinstance(existing_links, list): existing_links = []
+                            html = await resp.text(errors="ignore")
+                            _links, candidates = self._extract_links(html, final_url, mode=mode)
+                            lex = self._extract_lexicon(html)
 
-            # Format: SocketPipe style dictionaries or plain strings
-            # VideoLinkTracker supports both, but dicts carry timestamp info
-            new_link_objs = []
-            ts = time.time()
-            existing_urls = {str(x.get("url")) for x in existing_links if isinstance(x, dict)}
+                            # per-page extracted summary
+                            DEBUG_LOGGER.log_message(
+                                f"[Crawler][Page] parsed final={final_url} hrefs_total={len(_links)} "
+                                f"candidates_scored={len(candidates)} lexicon_terms={len(lex)}"
+                            )
 
-            for u in collected_links:
-                if u not in existing_urls:
-                    new_link_objs.append({
-                        "url": u,
-                        "source": "linkcrawler",
-                        "query": query,
-                        "first_seen": ts
-                    })
+                            for w in lex:
+                                collected_lexicon.add(w)
 
-            # Append and cap
-            combined_links = existing_links + new_link_objs
-            if len(combined_links) > 2000:
-                combined_links = combined_links[-2000:]
-            store[links_key] = combined_links
+                            for c in candidates:
+                                collected_links.add(c)
+                                try:
+                                    collected_domains.add(urlparse(c).netloc)
+                                except Exception:
+                                    pass
 
-            # --- Domains ---
-            existing_domains = set(store.get(domains_key, []))
-            existing_domains.update(collected_domains)
-            store[domains_key] = sorted(list(existing_domains))[:500]
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(f"[Crawler][Page] ERROR seed={url} err={e}")
+                        return
 
-            # --- Lexicon ---
-            existing_lex = set(store.get(lexicon_key, []))
-            existing_lex.update(collected_lexicon)
-            store[lexicon_key] = list(existing_lex)[:200]
+            await asyncio.gather(*[fetch_and_parse(u) for u in seeds_to_fetch])
 
-            Memory.save(store)
-            log.append(f"[Crawler] Memory Updated: {len(new_link_objs)} new links added to '{links_key}'.")
+        DEBUG_LOGGER.log_message(
+            f"[Crawler] crawl done | collected_links={len(collected_links)} domains={len(collected_domains)} lex={len(collected_lexicon)}"
+        )
 
-        except Exception as e:
-            log.append(f"[Crawler] Memory Write Error: {e}")
+        # 3) Write to Memory (dedupe via Memory + optional DB)
+        store_obj = Memory.load()
 
-        # 4. Reporting
+        existing_links = store_obj.get(links_key, [])
+        if not isinstance(existing_links, list):
+            existing_links = []
+
+        existing_urls = {
+            str(x.get("url")) for x in existing_links
+            if isinstance(x, dict) and x.get("url")
+        }
+
+        new_link_objs: List[Dict[str, Any]] = []
+        suppressed_by_db = 0
+        ts = time.time()
+
+        for u in collected_links:
+            if not u:
+                continue
+
+            if store and store.has_emitted(u):
+                suppressed_by_db += 1
+                continue
+
+            if u in existing_urls:
+                if store:
+                    store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+                continue
+
+            new_link_objs.append({
+                "url": u,
+                "source": "linkcrawler",
+                "query": query,
+                "mode": mode,
+                "first_seen": ts,
+            })
+
+            if store:
+                store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+
+        combined_links = existing_links + new_link_objs
+        if len(combined_links) > 2000:
+            combined_links = combined_links[-2000:]
+        store_obj[links_key] = combined_links
+
+        existing_domains = store_obj.get(domains_key, [])
+        if not isinstance(existing_domains, list):
+            existing_domains = []
+        dom_set = set(existing_domains)
+        dom_set.update(collected_domains)
+        store_obj[domains_key] = sorted(list(dom_set))[:500]
+
+        existing_lex = store_obj.get(lexicon_key, [])
+        if not isinstance(existing_lex, list):
+            existing_lex = []
+        lex_set = set(existing_lex)
+        lex_set.update(collected_lexicon)
+        store_obj[lexicon_key] = list(lex_set)[:200]
+
+        Memory.save(store_obj)
+
+        DEBUG_LOGGER.log_message(
+            f"[Crawler] memory write | existing={len(existing_links)} new_added={len(new_link_objs)} "
+            f"suppressed_by_db={suppressed_by_db} links_key={links_key!r}"
+        )
+
+        # 4) Reporting (text output)
         lines = [
-            f"### 🕷️ LinkCrawler Report",
-            f"_Query: '{query}' | Engine: {engine} | Seeds: {len(seed_urls)}_",
+            "### 🕷️ LinkCrawler Report",
+            f"_Query: '{query}' | Mode: {mode} | Engine: {engine} | Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)}_",
             "",
-            f"**Candidates Found:** {len(collected_links)}",
+            f"**Candidates Found (raw):** {len(collected_links)}",
+            f"**New Links Added to Memory:** {len(new_link_objs)}",
             f"**Domains Scanned:** {len(collected_domains)}",
-            "",
-            "**Sample Candidates (fed to Memory):**"
+            f"**DB Cache:** {'ON' if use_database else 'OFF'}",
         ]
-        for u in list(collected_links)[:10]:
-            lines.append(f"- {u}")
+        if use_database:
+            lines.append(f"**db_path:** {db_path}")
+            lines.append(f"**Suppressed By DB:** {suppressed_by_db}")
+
+        lines.append("")
+        lines.append("**Sample New Links (added to Memory):**")
+        for o in new_link_objs[:10]:
+            lines.append(f"- {o['url']}")
 
         if log:
             lines.append("\n**Log:**")
@@ -18428,8 +18517,16 @@ class LinkCrawlerBlock(BaseBlock):
 
         return "\n".join(lines), {
             "found_count": len(collected_links),
+            "new_added": len(new_link_objs),
+            "suppressed_by_db": suppressed_by_db,
             "memory_key": links_key,
-            "log": log
+            "mode": mode,
+            "engine": engine,
+            "seed_count": len(seed_urls),
+            "fetched_seed_count": len(seeds_to_fetch),
+            "use_database": use_database,
+            "db_path": db_path if use_database else None,
+            "log": log,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -18438,16 +18535,1048 @@ class LinkCrawlerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "Scraping query",
+            "mode": "search",  # "docs" | "media" | "images" | "search"
             "seeds": "Comma-separated list of starting URLs (optional override)",
             "engine": "duckduckgo",  # "searxng", "google_cse"
             "searxng_url": "http://127.0.0.1:8080",
             "max_results": 20,
             "timeout": 10.0,
-            # Memory Keys (Must match what VideoLinkTracker expects in 'memory_sources')
+            "max_concurrency": 12,
+
             "links_key": "scraped_links",
             "domains_key": "scraped_domains",
-            "lexicon_key": "scraped_lexicon"
+            "lexicon_key": "scraped_lexicon",
+
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "seed_ttl_seconds": 21600,
         }
 
-
 BLOCKS.register("linkcrawler", LinkCrawlerBlock)
+
+# ======================= URLScraperBlock ==================================
+@dataclass
+class URLScraperBlock(BaseBlock):
+    """
+    URLScraperBlock
+    ---------------
+    Reads one or more Memory keys (memory_sources), extracts URL candidates,
+    canonicalizes/dedupes them, and OVERWRITES those SAME Memory keys with
+    the cleaned URL list.
+
+    This is meant to sit between LinkCrawler -> PageTracker:
+      - LinkCrawler writes Memory["linkcrawler_urls"] = [...]
+      - URLScraper reads Memory["linkcrawler_urls"], cleans, writes it back
+      - PageTracker reads Memory["linkcrawler_urls"] and gets clean URLs
+
+    Outputs:
+      - urls_clean (merged across keys)
+      - urls_rejected (with reasons)
+      - canonical_map (original -> canonical)
+      - per_key_stats
+    """
+
+    # Fast URL extraction (good enough for messy logs)
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
+
+    # Common trash extensions that aren’t "pages"
+    DEFAULT_IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg",
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico",
+        ".woff", ".woff2", ".ttf", ".eot", ".map",
+        ".mp4", ".webm", ".m4v", ".mp3", ".m4a", ".wav", ".flac", ".ogg",
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    }
+
+    # Params to always drop (tracking / affiliate noise)
+    DEFAULT_DROP_QUERY_KEYS = {
+        # utm
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_name", "utm_reader", "utm_viz_id",
+        # ad platforms
+        "gclid", "dclid", "gbraid", "wbraid", "fbclid", "msclkid",
+        "ttclid", "twclid", "yclid", "mc_cid", "mc_eid",
+        # generic trackers
+        "ref", "ref_src", "ref_url", "spm", "spm_id_from",
+        "igshid", "si", "feature", "app", "mkt_tok",
+        # common session-ish keys
+        "session", "sessionid", "sid", "phpsessid", "jsessionid",
+    }
+
+    # Paths that often represent index documents
+    INDEX_FILENAMES = {
+        "index.html", "index.htm", "default.asp", "default.aspx",
+        "index.php", "home.html", "home.htm",
+    }
+
+    # Lowercase host and optionally strip common mobile subdomains
+    DEFAULT_STRIP_SUBDOMAINS = {
+        "m", "mobile", "amp",
+    }
+
+    def __post_init__(self):
+        pass
+
+    # ------------------------------
+    # Public execution
+    # ------------------------------
+    async def _execute_async(
+        self, payload: Any, *, params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+        memory_sources_raw = str(params.get("memory_sources", "") or "").strip()
+        keys = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+        if not keys:
+            txt = "[context]\n\n[lexicon]\n\n"
+            return txt, {"count": 0, "error": "URLScraper requires params['memory_sources']"}
+
+        # Tuning knobs
+        max_url_len = int(params.get("max_url_len", 4096))
+        strip_fragments = bool(params.get("strip_fragments", True))
+        force_https = bool(params.get("force_https", False))
+        keep_www = bool(params.get("keep_www", True))
+        sort_query = bool(params.get("sort_query", True))
+        drop_tracking_params = bool(params.get("drop_tracking_params", True))
+        drop_query_keys_raw = params.get("drop_query_keys", "")
+        write_sidecars = bool(params.get("write_sidecars", True))
+        normalize_slash = bool(params.get("normalize_slash", True))
+        drop_default_ports = bool(params.get("drop_default_ports", True))
+        strip_known_subdomains = bool(params.get("strip_known_subdomains", False))
+
+        # Filtering controls
+        ignored_exts_raw = params.get("ignored_extensions", "")
+        blocked_domains_raw = params.get("blocked_domains", "")
+
+        ignored_exts = self._parse_csv_set(ignored_exts_raw) or set(self.DEFAULT_IGNORED_EXTENSIONS)
+        blocked_domains = self._parse_csv_set(blocked_domains_raw)
+
+        drop_query_keys = set(self.DEFAULT_DROP_QUERY_KEYS)
+        if isinstance(drop_query_keys_raw, str) and drop_query_keys_raw.strip():
+            drop_query_keys |= {x.strip().lower() for x in drop_query_keys_raw.split(",") if x.strip()}
+
+        # Load memory
+        try:
+            mem = Memory.load()
+        except Exception as e:
+            txt = "[context]\n\n[lexicon]\n\n"
+            return txt, {"count": 0, "error": f"Memory.load failed: {e}"}
+
+        all_clean: List[str] = []
+        all_rejected: List[Dict[str, Any]] = []
+        all_map: Dict[str, str] = {}
+        per_key_stats: Dict[str, Dict[str, Any]] = {}
+
+        for key in keys:
+            raw = mem.get(key)
+            if not raw:
+                per_key_stats[key] = {"in": 0, "candidates": 0, "accepted": 0, "rejected": 0}
+                # Also overwrite missing/empty to empty list to stabilize pipelines
+                mem[key] = []
+                if write_sidecars:
+                    mem[f"{key}_rejected"] = []
+                    mem[f"{key}_canonical_map"] = {}
+                    mem[f"{key}_stats"] = per_key_stats[key]
+                continue
+
+            # 1) extract candidates
+            candidates = self._extract_url_candidates(raw)
+            in_count = self._estimate_in_count(raw)
+
+            # 2) canonicalize / dedupe
+            clean_list: List[str] = []
+            rejected: List[Dict[str, Any]] = []
+            cmap: Dict[str, str] = {}
+            seen = set()
+
+            for original in candidates:
+                rec = self._canonicalize(
+                    original=original,
+                    max_url_len=max_url_len,
+                    ignored_exts=ignored_exts,
+                    blocked_domains=blocked_domains,
+                    strip_fragments=strip_fragments,
+                    force_https=force_https,
+                    keep_www=keep_www,
+                    sort_query=sort_query,
+                    drop_tracking_params=drop_tracking_params,
+                    drop_query_keys=drop_query_keys,
+                    normalize_slash=normalize_slash,
+                    drop_default_ports=drop_default_ports,
+                    strip_known_subdomains=strip_known_subdomains,
+                )
+
+                if rec["status"] != "accepted":
+                    rejected.append({"url": original, "reason": rec.get("reason", "rejected")})
+                    continue
+
+                canon = rec["canonical"]
+                cmap[original] = canon
+
+                if canon in seen:
+                    continue
+                seen.add(canon)
+                clean_list.append(canon)
+
+            # 3) OVERWRITE the same key
+            mem[key] = clean_list
+
+            # 4) sidecars
+            st = {
+                "in": int(in_count),
+                "candidates": len(candidates),
+                "accepted": len(clean_list),
+                "rejected": len(rejected),
+            }
+            per_key_stats[key] = st
+
+            if write_sidecars:
+                mem[f"{key}_rejected"] = rejected
+                mem[f"{key}_canonical_map"] = cmap
+                mem[f"{key}_stats"] = st
+
+            all_clean.extend(clean_list)
+            all_rejected.extend(rejected)
+            all_map.update(cmap)
+
+        # Save memory back
+        try:
+            Memory.save(mem)
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[URLScraper] Memory.save failed: {e}")
+
+        merged_clean = list(dict.fromkeys(all_clean))
+
+        DEBUG_LOGGER.log_message(
+            f"[URLScraper] keys={keys} merged_accepted={len(merged_clean)} merged_rejected={len(all_rejected)}"
+        )
+
+        out_text = "[context]\n" + "\n".join(merged_clean) + "\n\n[lexicon]\n\n"
+        meta = {
+            "count": len(merged_clean),
+            "urls_clean": merged_clean,
+            "urls_rejected": all_rejected,
+            "canonical_map": all_map,
+            "per_key_stats": per_key_stats,
+            "memory_sources": keys,
+            # for collectors
+            "urls": merged_clean,
+        }
+        return out_text, meta
+
+    # Sync wrapper
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "memory_sources": "scraped_links",
+            "max_url_len": 4096,
+            "strip_fragments": True,
+            "force_https": False,
+            "keep_www": True,
+            "sort_query": True,
+            "drop_tracking_params": True,
+            "drop_query_keys": "",  # extra keys
+            "write_sidecars": True,
+            "normalize_slash": True,
+            "drop_default_ports": True,
+            "strip_known_subdomains": False,  # strip m./amp./mobile if True
+            "ignored_extensions": "",          # csv override
+            "blocked_domains": "",             # csv
+        }
+
+    # ------------------------------
+    # Candidate extraction
+    # ------------------------------
+    def _estimate_in_count(self, raw: Any) -> int:
+        # Just a rough number so stats are stable
+        if raw is None:
+            return 0
+        if isinstance(raw, list):
+            return len(raw)
+        return 1
+
+    def _extract_url_candidates(self, raw: Any) -> List[str]:
+        out: List[str] = []
+        seen = set()
+
+        def push(s: str):
+            s = (s or "").strip()
+            if not s:
+                return
+            # If it looks like a URL, keep
+            if s.startswith(("http://", "https://")):
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+                return
+            # If it's a blob of text, scan for URLs
+            for m in self._URL_RE.finditer(s[:250_000]):
+                u = m.group(0)
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+
+        def walk(x: Any):
+            if x is None:
+                return
+            if isinstance(x, str):
+                push(x)
+                return
+            if isinstance(x, (int, float)):
+                push(str(x))
+                return
+            if isinstance(x, dict):
+                # prioritize known URL-ish fields
+                for k in ("url", "href", "link", "final_url", "source_url", "page", "request_url"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                # sometimes dicts store text blobs
+                for k in ("text", "html", "body", "snippet"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                # and nested
+                for v in x.values():
+                    if isinstance(v, (list, dict)):
+                        walk(v)
+                return
+            if isinstance(x, list):
+                for it in x:
+                    walk(it)
+                return
+            # fallback stringify
+            push(str(x))
+
+        walk(raw)
+        return out
+
+    # ------------------------------
+    # Canonicalization
+    # ------------------------------
+    def _canonicalize(
+        self,
+        *,
+        original: str,
+        max_url_len: int,
+        ignored_exts: set[str],
+        blocked_domains: set[str],
+        strip_fragments: bool,
+        force_https: bool,
+        keep_www: bool,
+        sort_query: bool,
+        drop_tracking_params: bool,
+        drop_query_keys: set[str],
+        normalize_slash: bool,
+        drop_default_ports: bool,
+        strip_known_subdomains: bool,
+    ) -> Dict[str, Any]:
+        s = (original or "").strip()
+        if not s:
+            return {"status": "rejected", "reason": "empty"}
+
+        if len(s) > max_url_len:
+            return {"status": "rejected", "reason": "too_long"}
+
+        if not s.startswith(("http://", "https://")):
+            # try to salvage "www.foo.com/path"
+            if s.startswith("www."):
+                s = "https://" + s
+            else:
+                return {"status": "rejected", "reason": "not_http"}
+
+        try:
+            pu = urlparse(s)
+        except Exception:
+            return {"status": "rejected", "reason": "malformed"}
+
+        scheme = (pu.scheme or "https").lower()
+        netloc = (pu.netloc or "").strip()
+        path = pu.path or ""
+        query = pu.query or ""
+        frag = pu.fragment or ""
+
+        if not netloc:
+            return {"status": "rejected", "reason": "missing_host"}
+
+        # Split host:port
+        host = netloc.lower()
+        port = ""
+        if ":" in host:
+            host, port = host.rsplit(":", 1)
+
+        host = host.strip(".")
+        if not host:
+            return {"status": "rejected", "reason": "bad_host"}
+
+        # Blocked domain matching (exact or suffix)
+        if blocked_domains:
+            for bd in blocked_domains:
+                bd = bd.lower().strip()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return {"status": "rejected", "reason": "blocked_domain"}
+
+        # Optionally strip m./amp./mobile.
+        if strip_known_subdomains:
+            parts = host.split(".")
+            if len(parts) >= 3 and parts[0] in self.DEFAULT_STRIP_SUBDOMAINS:
+                host = ".".join(parts[1:])
+
+        # Normalize www.
+        if not keep_www and host.startswith("www."):
+            host = host[4:]
+
+        # Scheme normalization
+        if force_https:
+            scheme = "https"
+
+        # Default port stripping
+        if drop_default_ports and port:
+            if (scheme == "http" and port == "80") or (scheme == "https" and port == "443"):
+                port = ""
+
+        netloc2 = host + (f":{port}" if port else "")
+
+        # Path normalization
+        path = self._safe_unquote_path(path)
+
+        # Drop index filenames (index.html etc.)
+        low_path = path.lower()
+        if low_path.endswith(tuple("/" + x for x in self.INDEX_FILENAMES)):
+            path = path[: path.rfind("/")] + "/"
+
+        # Collapse multiple slashes, remove dot segments
+        if normalize_slash:
+            path = re.sub(r"/{2,}", "/", path)
+            path = self._remove_dot_segments(path)
+
+        # File extension filtering
+        ext = ""
+        try:
+            if "." in path.rsplit("/", 1)[-1]:
+                ext = "." + path.rsplit(".", 1)[-1].lower()
+        except Exception:
+            ext = ""
+
+        if ext and ext in ignored_exts:
+            return {"status": "rejected", "reason": f"ignored_ext:{ext}"}
+
+        # Fragment handling
+        if strip_fragments:
+            frag = ""
+
+        # Query normalization
+        if query:
+            try:
+                qsl = parse_qsl(query, keep_blank_values=True)
+            except Exception:
+                qsl = []
+
+            q_out = []
+            for k, v in qsl:
+                kl = (k or "").strip().lower()
+                if drop_tracking_params and kl in drop_query_keys:
+                    continue
+                # strip empty tracking-like values
+                if drop_tracking_params and kl.startswith("utm_"):
+                    continue
+                q_out.append((k, v))
+
+            if sort_query and q_out:
+                # stable sort by key then value
+                q_out.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+
+            query = urlencode(q_out, doseq=True)
+
+        canonical = urlunparse((scheme, netloc2, path or "/", "", query, frag))
+
+        if len(canonical) > max_url_len:
+            return {"status": "rejected", "reason": "too_long_after_canon"}
+
+        return {"status": "accepted", "canonical": canonical}
+
+    def _safe_unquote_path(self, path: str) -> str:
+        # Unquote only "safe" parts to reduce %2F weirdness
+        try:
+            # keep '/' as delimiter; unquote everything else
+            parts = path.split("/")
+            parts2 = [unquote(p) for p in parts]
+            # re-quote minimally (spaces etc.)
+            parts3 = [quote(p, safe=":@+$,;=-._~") for p in parts2]
+            return "/".join(parts3)
+        except Exception:
+            return path or "/"
+
+    def _remove_dot_segments(self, path: str) -> str:
+        # RFC-ish dot segment removal
+        if not path:
+            return "/"
+        segs = []
+        for seg in path.split("/"):
+            if seg == "" or seg == ".":
+                continue
+            if seg == "..":
+                if segs:
+                    segs.pop()
+                continue
+            segs.append(seg)
+        out = "/" + "/".join(segs)
+        if path.endswith("/") and not out.endswith("/"):
+            out += "/"
+        return out
+
+    def _parse_csv_set(self, raw: Any) -> set[str]:
+        if not raw:
+            return set()
+        if isinstance(raw, set):
+            return raw
+        if isinstance(raw, list):
+            return {str(x).strip().lower() for x in raw if str(x).strip()}
+        if isinstance(raw, str):
+            return {x.strip().lower() for x in raw.split(",") if x.strip()}
+        return set()
+
+# Register
+BLOCKS.register("urlscraper", URLScraperBlock)
+
+# ======================= URLExpanderBlock ==================================
+@dataclass
+class URLExpanderBlock(BaseBlock):
+    """
+    URLExpanderBlock
+    ----------------
+    Reads one or more Memory keys (memory_sources), extracts URL candidates,
+    EXPANDS them (follows redirects / shorteners), canonicalizes lightly,
+    and OVERWRITES those SAME Memory keys with the expanded URL list.
+
+    Outputs:
+      - urls_expanded (merged across keys)
+      - urls_rejected (with reasons)
+      - expand_map (original -> expanded)
+      - per_key_stats
+    """
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
+
+    # tracking keys to drop (after expansion)
+    DEFAULT_DROP_QUERY_KEYS = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_name", "utm_reader", "utm_viz_id",
+        "gclid", "dclid", "gbraid", "wbraid", "fbclid", "msclkid",
+        "ttclid", "twclid", "yclid", "mc_cid", "mc_eid",
+        "ref", "ref_src", "ref_url", "spm", "spm_id_from",
+        "igshid", "si", "feature", "app", "mkt_tok",
+        "session", "sessionid", "sid", "phpsessid", "jsessionid",
+    }
+
+    def __post_init__(self):
+        pass
+
+    # ------------------------------
+    # Public execution
+    # ------------------------------
+    async def _execute_async(
+        self, payload: Any, *, params: Dict[str, Any]
+    ) -> Tuple[str, Dict[str, Any]]:
+
+        memory_sources_raw = str(params.get("memory_sources", "") or "").strip()
+        keys = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+        if not keys:
+            txt = "[context]\n\n[lexicon]\n\n"
+            return txt, {"count": 0, "error": "URLExpander requires params['memory_sources']"}
+
+        # ---- HTTPSSubmanager knobs ----
+        timeout = float(params.get("timeout", 6.0))
+        ua_http = str(params.get("user_agent", "Mozilla/5.0 PromptChat/URLExpander"))
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn = int(params.get("http_max_conn_per_host", 8))
+        http_verify_tls = bool(params.get("http_verify_tls", True))
+        http_ca_bundle = params.get("http_ca_bundle") or None
+
+        # ---- Expander knobs ----
+        max_url_len = int(params.get("max_url_len", 4096))
+        max_hops = int(params.get("max_hops", 8))
+        use_head_first = bool(params.get("use_head_first", True))
+        allow_get_fallback = bool(params.get("allow_get_fallback", True))
+
+        # HTML-based expansion (optional but very useful)
+        parse_meta_refresh = bool(params.get("parse_meta_refresh", True))
+        extract_canonical = bool(params.get("extract_canonical", True))
+        max_html_chars = int(params.get("max_html_chars", 200_000))
+
+        # Post-expand normalization
+        strip_fragments = bool(params.get("strip_fragments", True))
+        drop_tracking_params = bool(params.get("drop_tracking_params", True))
+        drop_query_keys_raw = str(params.get("drop_query_keys", "") or "").strip()
+        sort_query = bool(params.get("sort_query", True))
+        force_https = bool(params.get("force_https", False))
+        keep_www = bool(params.get("keep_www", True))
+
+        write_sidecars = bool(params.get("write_sidecars", True))
+
+        drop_query_keys = set(self.DEFAULT_DROP_QUERY_KEYS)
+        if drop_query_keys_raw:
+            drop_query_keys |= {x.strip().lower() for x in drop_query_keys_raw.split(",") if x.strip()}
+
+        # Load memory
+        try:
+            mem = Memory.load()
+        except Exception as e:
+            txt = "[context]\n\n[lexicon]\n\n"
+            return txt, {"count": 0, "error": f"Memory.load failed: {e}"}
+
+        all_expanded: List[str] = []
+        all_rejected: List[Dict[str, Any]] = []
+        all_map: Dict[str, str] = {}
+        per_key_stats: Dict[str, Dict[str, Any]] = {}
+
+        async with submanagers.HTTPSSubmanager(
+            user_agent=ua_http,
+            timeout=timeout,
+            retries=http_retries,
+            max_conn_per_host=http_max_conn,
+            verify=http_verify_tls,
+            ca_bundle=http_ca_bundle,
+        ) as http:
+
+            for key in keys:
+                raw = mem.get(key)
+
+                if not raw:
+                    st = {"in": 0, "candidates": 0, "accepted": 0, "rejected": 0, "expanded": 0}
+                    per_key_stats[key] = st
+                    mem[key] = []
+                    if write_sidecars:
+                        mem[f"{key}_rejected"] = []
+                        mem[f"{key}_expand_map"] = {}
+                        mem[f"{key}_stats"] = st
+                    continue
+
+                candidates = self._extract_url_candidates(raw)
+                in_count = self._estimate_in_count(raw)
+
+                expanded_list: List[str] = []
+                rejected: List[Dict[str, Any]] = []
+                emap: Dict[str, str] = {}
+                seen = set()
+
+                # Expand sequentially (safer for shorteners); you can parallelize later if you want.
+                for original in candidates:
+                    rec = await self._expand_one(
+                        http=http,
+                        original=original,
+                        max_url_len=max_url_len,
+                        max_hops=max_hops,
+                        use_head_first=use_head_first,
+                        allow_get_fallback=allow_get_fallback,
+                        parse_meta_refresh=parse_meta_refresh,
+                        extract_canonical=extract_canonical,
+                        max_html_chars=max_html_chars,
+                        strip_fragments=strip_fragments,
+                        drop_tracking_params=drop_tracking_params,
+                        drop_query_keys=drop_query_keys,
+                        sort_query=sort_query,
+                        force_https=force_https,
+                        keep_www=keep_www,
+                    )
+
+                    if rec["status"] != "accepted":
+                        rejected.append({"url": original, "reason": rec.get("reason", "rejected")})
+                        continue
+
+                    final_u = rec["expanded"]
+                    emap[original] = final_u
+
+                    if final_u in seen:
+                        continue
+                    seen.add(final_u)
+                    expanded_list.append(final_u)
+
+                # OVERWRITE the same key
+                mem[key] = expanded_list
+
+                st = {
+                    "in": int(in_count),
+                    "candidates": len(candidates),
+                    "accepted": len(expanded_list),
+                    "rejected": len(rejected),
+                    "expanded": len(emap),
+                }
+                per_key_stats[key] = st
+
+                if write_sidecars:
+                    mem[f"{key}_rejected"] = rejected
+                    mem[f"{key}_expand_map"] = emap
+                    mem[f"{key}_stats"] = st
+
+                all_expanded.extend(expanded_list)
+                all_rejected.extend(rejected)
+                all_map.update(emap)
+
+        # Save memory back
+        try:
+            Memory.save(mem)
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[URLExpander] Memory.save failed: {e}")
+
+        merged = list(dict.fromkeys(all_expanded))
+        DEBUG_LOGGER.log_message(
+            f"[URLExpander] keys={keys} merged_accepted={len(merged)} merged_rejected={len(all_rejected)}"
+        )
+
+        out_text = "[context]\n" + "\n".join(merged) + "\n\n[lexicon]\n\n"
+        meta = {
+            "count": len(merged),
+            "urls_expanded": merged,
+            "urls_rejected": all_rejected,
+            "expand_map": all_map,
+            "per_key_stats": per_key_stats,
+            "memory_sources": keys,
+            "urls": merged,
+        }
+        return out_text, meta
+
+    # Sync wrapper
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "memory_sources": "scraped_links",
+            "timeout": 6.0,
+            "user_agent": "Mozilla/5.0 PromptChat/URLExpander",
+
+            # HTTPS engine tuning
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_verify_tls": True,
+            "http_ca_bundle": "",
+
+            # Expander knobs
+            "max_url_len": 4096,
+            "max_hops": 8,
+            "use_head_first": True,
+            "allow_get_fallback": True,
+
+            # HTML redirect / canonical
+            "parse_meta_refresh": True,
+            "extract_canonical": True,
+            "max_html_chars": 200000,
+
+            # Post-expand normalization
+            "strip_fragments": True,
+            "drop_tracking_params": True,
+            "drop_query_keys": "",   # extra csv keys
+            "sort_query": True,
+            "force_https": False,
+            "keep_www": True,
+
+            "write_sidecars": True,
+        }
+
+    # ------------------------------
+    # Candidate extraction (same spirit as URLScraper)
+    # ------------------------------
+    def _estimate_in_count(self, raw: Any) -> int:
+        if raw is None:
+            return 0
+        if isinstance(raw, list):
+            return len(raw)
+        return 1
+
+    def _extract_url_candidates(self, raw: Any) -> List[str]:
+        out: List[str] = []
+        seen = set()
+
+        def push(s: str):
+            s = (s or "").strip()
+            if not s:
+                return
+            if s.startswith(("http://", "https://")):
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+                return
+            for m in self._URL_RE.finditer(s[:250_000]):
+                u = m.group(0)
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+
+        def walk(x: Any):
+            if x is None:
+                return
+            if isinstance(x, str):
+                push(x)
+                return
+            if isinstance(x, (int, float)):
+                push(str(x))
+                return
+            if isinstance(x, dict):
+                for k in ("url", "href", "link", "final_url", "source_url", "page", "request_url"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for k in ("text", "html", "body", "snippet"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for v in x.values():
+                    if isinstance(v, (list, dict)):
+                        walk(v)
+                return
+            if isinstance(x, list):
+                for it in x:
+                    walk(it)
+                return
+            push(str(x))
+
+        walk(raw)
+        return out
+
+    # ------------------------------
+    # Expansion core
+    # ------------------------------
+    async def _expand_one(
+        self,
+        *,
+        http: Any,  # submanagers.HTTPSSubmanager
+        original: str,
+        max_url_len: int,
+        max_hops: int,
+        use_head_first: bool,
+        allow_get_fallback: bool,
+        parse_meta_refresh: bool,
+        extract_canonical: bool,
+        max_html_chars: int,
+        strip_fragments: bool,
+        drop_tracking_params: bool,
+        drop_query_keys: set[str],
+        sort_query: bool,
+        force_https: bool,
+        keep_www: bool,
+    ) -> Dict[str, Any]:
+
+        s = (original or "").strip()
+        if not s:
+            return {"status": "rejected", "reason": "empty"}
+        if len(s) > max_url_len:
+            return {"status": "rejected", "reason": "too_long"}
+        if not s.startswith(("http://", "https://")):
+            return {"status": "rejected", "reason": "not_http"}
+
+        # We do a bounded redirect chase ourselves so we can stop early.
+        cur = s
+        visited = set()
+
+        for hop in range(max_hops + 1):
+            if cur in visited:
+                return {"status": "rejected", "reason": "redirect_loop"}
+            visited.add(cur)
+
+            # Try HEAD first (fast)
+            if use_head_first:
+                nxt = await self._try_expand_via_head(http, cur)
+                if nxt and nxt != cur:
+                    cur = nxt
+                    continue
+
+            # Fallback to GET + potential HTML hints
+            if allow_get_fallback:
+                nxt, html = await self._try_expand_via_get(http, cur, max_html_chars=max_html_chars)
+                if nxt and nxt != cur:
+                    cur = nxt
+                    continue
+
+                # If no redirect, optionally parse meta-refresh / canonical from HTML
+                if html and (parse_meta_refresh or extract_canonical):
+                    hinted = self._html_hint_url(
+                        html=html,
+                        base_url=cur,
+                        parse_meta_refresh=parse_meta_refresh,
+                        extract_canonical=extract_canonical,
+                    )
+                    if hinted and hinted != cur:
+                        cur = hinted
+                        continue
+
+            # No more progress
+            break
+
+        # Post-normalize (tracking params, fragments, scheme, www)
+        cur2 = self._post_normalize(
+            cur,
+            strip_fragments=strip_fragments,
+            drop_tracking_params=drop_tracking_params,
+            drop_query_keys=drop_query_keys,
+            sort_query=sort_query,
+            force_https=force_https,
+            keep_www=keep_www,
+        )
+
+        if not cur2 or len(cur2) > max_url_len:
+            return {"status": "rejected", "reason": "bad_final_url"}
+
+        return {"status": "accepted", "expanded": cur2}
+
+    async def _try_expand_via_head(self, http: Any, url: str) -> Optional[str]:
+        """
+        Uses the shared session (if available) to capture final URL after redirects.
+        Falls back to submanager.head if we can't access the session.
+        """
+        # Best path: use the submanager's live session so we can read resp.url.
+        sess = getattr(http, "_session", None)
+        if sess:
+            try:
+                async with sess.request(
+                    "HEAD",
+                    url,
+                    allow_redirects=True,
+                    timeout=getattr(http, "timeout", 6.0),
+                ) as resp:
+                    final = str(resp.url)
+                    return final
+            except Exception:
+                return None
+
+        # Fallback: submanager.head (may not expose final URL)
+        try:
+            _st, hdrs = await http.head(url)
+            loc = (hdrs or {}).get("Location")
+            if loc:
+                return urljoin(url, loc)
+        except Exception:
+            return None
+        return None
+
+    async def _try_expand_via_get(self, http: Any, url: str, *, max_html_chars: int) -> Tuple[Optional[str], str]:
+        sess = getattr(http, "_session", None)
+        if sess:
+            try:
+                async with sess.request(
+                    "GET",
+                    url,
+                    allow_redirects=True,
+                    timeout=getattr(http, "timeout", 6.0),
+                    headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+                ) as resp:
+                    final = str(resp.url)
+                    # Only sample HTML-ish bodies (bounded)
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    if "html" in ctype or ctype == "" or "text/" in ctype:
+                        txt = await resp.text(errors="ignore")
+                        if len(txt) > max_html_chars:
+                            txt = txt[:max_html_chars]
+                        return final, txt
+                    return final, ""
+            except Exception:
+                return None, ""
+
+        # If we can't access session, use get_text (but we lose final URL knowledge)
+        try:
+            html = await http.get_text(url)
+            if len(html) > max_html_chars:
+                html = html[:max_html_chars]
+            return url, html
+        except Exception:
+            return None, ""
+
+    def _html_hint_url(
+        self,
+        *,
+        html: str,
+        base_url: str,
+        parse_meta_refresh: bool,
+        extract_canonical: bool,
+    ) -> Optional[str]:
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+
+            # meta refresh: <meta http-equiv="refresh" content="0; url=/next">
+            if parse_meta_refresh:
+                m = soup.find("meta", attrs={"http-equiv": re.compile(r"refresh", re.I)})
+                if m:
+                    content = (m.get("content") or "").strip()
+                    # naive parse "0; url=..."
+                    if "url=" in content.lower():
+                        try:
+                            part = content.split("url=", 1)[1].strip(" '\"")
+                            if part:
+                                return urljoin(base_url, part)
+                        except Exception:
+                            pass
+
+            # canonical: <link rel="canonical" href="...">
+            if extract_canonical:
+                c = soup.find("link", attrs={"rel": re.compile(r"canonical", re.I)})
+                if c:
+                    href = (c.get("href") or "").strip()
+                    if href:
+                        return urljoin(base_url, href)
+
+        except Exception:
+            return None
+        return None
+
+    def _post_normalize(
+        self,
+        url: str,
+        *,
+        strip_fragments: bool,
+        drop_tracking_params: bool,
+        drop_query_keys: set[str],
+        sort_query: bool,
+        force_https: bool,
+        keep_www: bool,
+    ) -> str:
+        try:
+            pu = urlparse(url)
+        except Exception:
+            return url
+
+        scheme = (pu.scheme or "https").lower()
+        netloc = (pu.netloc or "").strip()
+        path = pu.path or ""
+        query = pu.query or ""
+        frag = pu.fragment or ""
+
+        if force_https:
+            scheme = "https"
+
+        # www handling
+        host = netloc
+        port = ""
+        if ":" in host:
+            host, port = host.rsplit(":", 1)
+        host = host.lower().strip(".")
+        if not keep_www and host.startswith("www."):
+            host = host[4:]
+        netloc = host + (f":{port}" if port else "")
+
+        if strip_fragments:
+            frag = ""
+
+        if query and drop_tracking_params:
+            try:
+                qsl = parse_qsl(query, keep_blank_values=True)
+            except Exception:
+                qsl = []
+            q2 = []
+            for k, v in qsl:
+                kl = (k or "").strip().lower()
+                if kl in drop_query_keys or kl.startswith("utm_"):
+                    continue
+                q2.append((k, v))
+            if sort_query and q2:
+                q2.sort(key=lambda kv: (kv[0].lower(), kv[1]))
+            query = urlencode(q2, doseq=True)
+
+        return urlunparse((scheme, netloc, path or "/", "", query, frag))
+
+
+# Register
+BLOCKS.register("urlexpander", URLExpanderBlock)
