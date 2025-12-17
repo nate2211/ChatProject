@@ -18301,7 +18301,7 @@ class LinkCrawlerBlock(BaseBlock):
         elif query:
             log.append(f"[Crawler] Searching {engine} for: {query}")
             if engine == "searxng":
-                seed_urls = await self._search_searxng_json(searxng_url, query, max_results, log)
+                seed_urls = await self._search_searxng_json(searxng_url, query, max_results, http_timeout, log)
             elif engine == "google_cse":
                 seed_urls = await self._search_google_cse(query, max_results, log)
             else:
