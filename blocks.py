@@ -18299,7 +18299,7 @@ class LinkCrawlerBlock(BaseBlock):
             log.append(f"[Crawler] Using {len(seed_urls)} explicit seeds.")
 
         elif query:
-            log.append(f"[Crawler] Searching {engine} for: {query}")
+            DEBUG_LOGGER.log_message(f"[Crawler] Searching {engine} for: {query}")
             if engine == "searxng":
                 seed_urls = await self._search_searxng_json(searxng_url, query, max_results, http_timeout, log)
             elif engine == "google_cse":
@@ -18355,7 +18355,7 @@ class LinkCrawlerBlock(BaseBlock):
                             except:
                                 pass
 
-                        log.append(f"[Crawler] Visited {url}: Found {len(links)} links ({len(candidates)} candidates).")
+                        DEBUG_LOGGER.log_message(f"[Crawler] Visited {url}: Found {len(links)} links ({len(candidates)} candidates).")
                 except Exception as e:
                     # Silent fail on bad pages to keep speed up
                     pass
