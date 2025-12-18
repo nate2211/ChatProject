@@ -9536,6 +9536,121 @@ class VideoLinkTrackerBlock(BaseBlock):
                 enable_form_extraction=True
             )
         )
+
+    def _get_visual_signature(self, image_bytes: bytes) -> Optional[dict]:
+        """
+        Generates a content-aware visual signature:
+          - perceptual hash (pHash)
+          - edge histogram (structure)
+          - HSV color histogram (appearance)
+        """
+        import cv2
+        import numpy as np
+
+        try:
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            if img is None:
+                return None
+
+            # ------------------------------
+            # Resize for stability
+            # ------------------------------
+            img_small = cv2.resize(img, (256, 256), interpolation=cv2.INTER_AREA)
+
+            # ------------------------------
+            # 1) Perceptual Hash (pHash)
+            # ------------------------------
+            gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
+            dct = cv2.dct(np.float32(gray))
+            dct_low = dct[:8, :8]
+            med = np.median(dct_low)
+            phash = (dct_low > med).astype(np.uint8)
+
+            # ------------------------------
+            # 2) Edge Histogram (structure)
+            # ------------------------------
+            edges = cv2.Canny(gray, 80, 160)
+            edge_hist = cv2.calcHist([edges], [0], None, [64], [0, 256])
+            cv2.normalize(edge_hist, edge_hist, 0, 1, cv2.NORM_MINMAX)
+
+            # ------------------------------
+            # 3) HSV Color Histogram
+            # ------------------------------
+            hsv = cv2.cvtColor(img_small, cv2.COLOR_BGR2HSV)
+            color_hist = cv2.calcHist(
+                [hsv],
+                [0, 1],
+                None,
+                [64, 64],
+                [0, 180, 0, 256],
+            )
+            cv2.normalize(color_hist, color_hist, 0, 1, cv2.NORM_MINMAX)
+
+            return {
+                "phash": phash,
+                "edge_hist": edge_hist,
+                "color_hist": color_hist,
+            }
+
+        except Exception:
+            return None
+
+    def _compare_visual_signatures(self, sig1: dict, sig2: dict) -> float:
+        """
+        Returns similarity score in [0, 1]
+        Combines:
+          - pHash similarity (global structure)
+          - edge histogram correlation (shapes)
+          - color histogram correlation (appearance)
+        """
+        import cv2
+        import numpy as np
+
+        if not sig1 or not sig2:
+            return 0.0
+
+        try:
+            # ------------------------------
+            # pHash similarity (Hamming)
+            # ------------------------------
+            h1, h2 = sig1["phash"], sig2["phash"]
+            hamming = np.count_nonzero(h1 != h2)
+            phash_score = 1.0 - (hamming / h1.size)
+
+            # ------------------------------
+            # Edge structure similarity
+            # ------------------------------
+            edge_score = cv2.compareHist(
+                sig1["edge_hist"],
+                sig2["edge_hist"],
+                cv2.HISTCMP_CORREL,
+            )
+
+            # ------------------------------
+            # Color similarity
+            # ------------------------------
+            color_score = cv2.compareHist(
+                sig1["color_hist"],
+                sig2["color_hist"],
+                cv2.HISTCMP_CORREL,
+            )
+
+            # Normalize correlations → [0,1]
+            edge_score = max(0.0, min(1.0, (edge_score + 1) / 2))
+            color_score = max(0.0, min(1.0, (color_score + 1) / 2))
+
+            # ------------------------------
+            # Weighted fusion
+            # ------------------------------
+            return (
+                    0.45 * phash_score +
+                    0.35 * edge_score +
+                    0.20 * color_score
+            )
+
+        except Exception:
+            return 0.0
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
@@ -11510,6 +11625,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         direct_asset_urls: List[str] = []
         queries_to_run: List[str] = []
         skip_search_engine_for_payload = False
+        seed_visual_sig = None
 
         def _allowed_by_required_sites_check(u: str) -> bool:
             return self._allowed_by_required_sites(u, required_sites, global_mode)
@@ -11554,25 +11670,45 @@ class VideoLinkTrackerBlock(BaseBlock):
         if rev_input_url:
             search_seed_url = None
             is_video = False
+            is_image = False
+            img_bytes = None
 
             # 1. Determine if input is video (Local/URL extension)
-            if any(rev_input_url.lower().endswith(ext) for ext in self.VIDEO_EXTENSIONS):
-                is_video = True
+            if rev_input_url.lower().startswith("http"):
+                try:
+                    async with submanagers.HTTPSSubmanager(timeout=5.0) as checker:
+                        status, headers = await checker.head(rev_input_url)
+                        ctype = (headers.get("Content-Type", "") or "").lower()
 
+                        if any(x in ctype for x in self.VIDEO_CONTENT_PREFIXES) or "video" in ctype:
+                            is_video = True
+                        elif "image" in ctype:
+                            is_image = True
+                        elif "text/html" in ctype:
+                            DEBUG_LOGGER.log_message(
+                                f"[VideoLinkTracker] Input is a web page ({rev_input_url}). Skipping visual signature.")
+                except Exception as e:
+                    log.append(f"[VideoLinkTracker][Verify] HEAD check failed: {e}")
+            else:
+                # Local file logic
+                if any(rev_input_url.lower().endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                    is_video = True
+                elif rev_input_url.lower().endswith((".jpg", ".png", ".webp", ".jpeg")):
+                    is_image = True
             # 2. If it is an image:
-            if not is_video:
+            if is_image:
+                DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is image: {rev_input_url}")
                 if rev_input_url.lower().startswith("http"):
-                    # Use URL directly
+                    async with submanagers.HTTPSSubmanager(timeout=timeout) as downloader:
+                        img_bytes = await downloader.get_bytes(rev_input_url)
                     search_seed_url = rev_input_url
-                elif os.path.isfile(rev_input_url):
-                    # Local image file -> read bytes -> upload
-                    DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is local image: {rev_input_url}")
-                    try:
-                        with open(rev_input_url, "rb") as f:
-                            img_bytes = f.read()
-                        search_seed_url = await self._upload_frame_to_host(img_bytes, log)
-                    except Exception as e:
-                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Failed to read/upload local image: {e}")
+                else:
+                    with open(rev_input_url, "rb") as f:
+                        img_bytes = f.read()
+                    search_seed_url = await self._upload_frame_to_host(img_bytes, log)
+
+                if img_bytes:
+                    seed_visual_sig = self._get_visual_signature(img_bytes)
 
             # 3. If it is a video (Local or URL):
             if is_video:
@@ -11582,6 +11718,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 frame_bytes = await self._extract_frame_from_video(rev_input_url, ffmpeg_bin_path, log)
 
                 if frame_bytes:
+                    seed_visual_sig = self._get_visual_signature(frame_bytes)
                     public_img = await self._upload_frame_to_host(frame_bytes, log)
                     if public_img:
                         DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Generated search thumbnail: {public_img}")
@@ -12353,16 +12490,42 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         if not is_video:
                             continue
+                        is_visual_match = False
+
+                        if seed_visual_sig is not None:
+                            discovery_frame = None
+                            if self._is_probable_video_url(canon, asset_path, asset_url_lower):
+                                discovery_frame = await self._extract_frame_from_video(
+                                    canon,
+                                    ffmpeg_bin_path,
+                                    local_log
+                                )
+
+                            if discovery_frame:
+                                discovery_sig = self._get_visual_signature(discovery_frame)
+                                similarity = self._compare_visual_signatures(seed_visual_sig, discovery_sig)
+
+                                if similarity > 0.75:
+                                    is_visual_match = True
+                                    DEBUG_LOGGER.log_message(f"[[VideoLinkTracker][Image] Visual match found! Score: {similarity:.2f} for {canon}")
+
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
+                        if is_visual_match:
+                            asset_score += 100
                         if asset_score < 0:
                             local_log.append(f"Skipped low-score asset ({asset_score}): {canon}")
                             continue
+
                         if not (source == "database" and is_sniff_or_db):
                             if keywords and not page_has_keywords and link.get("tag") != "network_sniff":
                                 haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace("%20", " ")
                                 if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
-                                    continue
+                                    if seed_visual_sig is not None:
+                                        if not is_visual_match:
+                                            continue
+                                    else:
+                                        continue
 
                         status = "unverified"
                         size = "?"
@@ -12609,7 +12772,6 @@ class VideoLinkTrackerBlock(BaseBlock):
                     )
 
                 next_frontier_candidates: List[str] = []
-
                 for res in results:
                     # Per-page logging handled in _process_page, but we aggregate lists here
                     log.extend(res["log"])
@@ -12955,6 +13117,7 @@ BLOCKS.register("videotracker", VideoLinkTrackerBlock)
 
 
 # ======================= TorOnionBlock =============================
+
 @dataclass
 class TorOnionBlock(BaseBlock):
     """
@@ -13165,6 +13328,7 @@ BLOCKS.register("toronion", TorOnionBlock)
 
 
 # ======================= DirectLinkTrackerBlock =============================
+
 @dataclass
 class DirectLinkTrackerBlock(BaseBlock):
     """
@@ -14615,6 +14779,7 @@ class DirectLinkTrackerBlock(BaseBlock):
 BLOCKS.register("directlinktracker", DirectLinkTrackerBlock)
 
 # ======================= SocketPipe (packet ingest + deep scraping) =======================
+
 @dataclass
 class SocketPipeBlock(BaseBlock):
     """
@@ -18289,6 +18454,32 @@ class LinkCrawlerBlock(BaseBlock):
 
         return ""
 
+    async def _upload_frame_to_host(self, image_path: str, log: List[str]) -> Optional[str]:
+        """
+        Uploads the local temp image to Catbox to get a public URL.
+        This is the secret sauce that makes VideoLinkTracker work.
+        """
+        import aiohttp
+        if not os.path.exists(image_path):
+            return None
+
+        upload_url = "https://catbox.moe/user/api.php"
+        try:
+            with open(image_path, "rb") as f:
+                img_bytes = f.read()
+
+            data = aiohttp.FormData()
+            data.add_field("reqtype", "fileupload")
+            data.add_field("fileToUpload", img_bytes, filename="frame.png", content_type="image/png")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(upload_url, data=data, timeout=15) as resp:
+                    if resp.status == 200:
+                        url = await resp.text()
+                        return url.strip()
+        except Exception as e:
+            log.append(f"[Crawler][Upload] Failed: {e}")
+        return None
     # ------------------ FFmpeg “screenshot” (frame extract) ------------------
 
     async def _screenshot_url_to_temp_image(
@@ -18437,65 +18628,54 @@ class LinkCrawlerBlock(BaseBlock):
     # ------------------ Coercion logic (video/page → image input) ------------------
 
     async def _coerce_reverse_image_inputs(
-        self,
-        *,
-        image_url: str,
-        image_path: str,
-        timeout: float,
-        log: List[str],
-        ffmpeg_bin: str = "ffmpeg",
+            self,
+            *,
+            image_url: str,
+            image_path: str,
+            timeout: float,
+            log: List[str],
+            ffmpeg_bin: str = "ffmpeg",
     ) -> Tuple[str, str, List[str]]:
-        """
-        Normalize inputs so reverse-image search always receives either:
-          - a real image_url (direct image), OR
-          - an image_path (temp extracted frame) if URL/path was video OR page
-        Returns: (final_image_url, final_image_path, temp_files_to_cleanup)
-        """
         import os
-
         image_url = (image_url or "").strip()
         image_path = (image_path or "").strip()
         temps: List[str] = []
 
-        # Local real image -> keep
-        if image_path and os.path.exists(image_path) and not self._looks_like_video_url(image_path):
-            return image_url, image_path, temps
-
-        # Local video -> FFmpeg extract frame
+        # Case 1: Local Video -> Extract Frame -> Upload to Catbox
         if image_path and os.path.exists(image_path) and self._looks_like_video_url(image_path):
-            tmp = await self._screenshot_url_to_temp_image(
-                image_path, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
-            )
+            tmp = await self._screenshot_url_to_temp_image(image_path, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
             if tmp:
                 temps.append(tmp)
-                return "", tmp, temps
+                public_url = await self._upload_frame_to_host(tmp, log)
+                if public_url:
+                    log.append(f"[Crawler][RevImg] Coerced video to public image URL: {public_url}")
+                    return public_url, "", temps
+                return "", tmp, temps  # Fallback to local path if upload fails
 
-        # Direct image URL -> keep
+        # Case 2: Direct image URL -> Keep as is
         if image_url and self._looks_like_image_url(image_url) and not self._looks_like_video_url(image_url):
             return image_url, "", temps
 
-        # Video URL/manifest -> FFmpeg extract frame
+        # Case 3: Video URL -> Extract Frame -> Upload to Catbox
         if image_url and self._looks_like_video_url(image_url):
-            tmp = await self._screenshot_url_to_temp_image(
-                image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
-            )
+            tmp = await self._screenshot_url_to_temp_image(image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
             if tmp:
                 temps.append(tmp)
+                public_url = await self._upload_frame_to_host(tmp, log)
+                if public_url:
+                    return public_url, "", temps
                 return "", tmp, temps
-            return image_url, "", temps  # last resort
 
-        # Otherwise treat as a web page:
+        # Case 4: Standard Web Page -> Try OG Tags or Screenshot -> Upload
         if image_url:
             og = await self._try_extract_og_image(image_url, timeout=timeout, log=log)
-            if og:
-                return og, "", temps
+            if og: return og, "", temps
 
-            # last-ditch: try FFmpeg anyway (some pages are direct streams behind redirects)
-            tmp = await self._screenshot_url_to_temp_image(
-                image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
-            )
+            tmp = await self._screenshot_url_to_temp_image(image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
             if tmp:
                 temps.append(tmp)
+                public_url = await self._upload_frame_to_host(tmp, log)
+                if public_url: return public_url, "", temps
                 return "", tmp, temps
 
         return image_url, image_path, temps
@@ -19214,6 +19394,7 @@ class LinkCrawlerBlock(BaseBlock):
 BLOCKS.register("linkcrawler", LinkCrawlerBlock)
 
 # ======================= URLScraperBlock ==================================
+
 @dataclass
 class URLScraperBlock(BaseBlock):
     """
@@ -19702,6 +19883,7 @@ class URLScraperBlock(BaseBlock):
 BLOCKS.register("urlscraper", URLScraperBlock)
 
 # ======================= URLExpanderBlock ==================================
+
 @dataclass
 class URLExpanderBlock(BaseBlock):
     """

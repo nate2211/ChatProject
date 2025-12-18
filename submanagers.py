@@ -9,6 +9,7 @@ import sqlite3
 import ssl
 import threading
 from dataclasses import dataclass, field
+from datetime import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
@@ -5709,17 +5710,36 @@ class HLSSubManager:
 # HTTPS
 # ======================================================================
 
+@dataclass
+class _HTTPResult:
+    ok: bool
+    status: Optional[int]
+    headers: Dict[str, str]
+    final_url: str
+    body: bytes
+    error: str = ""
+
+
 class HTTPSSubmanager:
     """
-    Shared HTTPS engine for LinkTrackerBlock and other crawlers.
+    Industrial-grade shared HTTPS engine (aiohttp-only).
+
+    Goals:
+      - Keep integration simple: callers just use get_text/get_bytes/head.
+      - Add resiliency, rate-limit friendliness, proxy rotation, and browser mimicry.
+      - Fix response lifetime: never return a closed aiohttp response object.
 
     Features:
-    - One aiohttp session for the entire crawl (fast, low overhead).
-    - Retries with exponential backoff.
-    - Per-host concurrency limiting.
-    - Unified GET/HEAD/text/bytes interfaces.
-    - Optional automatic proxy rotation.
-    - Explicit TLS control (verify, custom CA bundle).
+      - Single pooled ClientSession + TCPConnector
+      - DNS cache + keepalive + happy eyeballs
+      - Per-host concurrency semaphores
+      - Per-host cooldown (429/503 aware) + Retry-After support
+      - Retry with exponential backoff + jitter (status + network exception aware)
+      - Proxy rotation per-attempt (pool)
+      - Browser-like headers + adaptive referer/origin per host
+      - Safe bounded reads (max_bytes) with streaming accumulation
+      - TLS controls: verify on/off + custom CA bundle
+      - Cookie jar enabled (helps doc portals / soft WAFs)
     """
 
     def __init__(
@@ -5728,47 +5748,87 @@ class HTTPSSubmanager:
         timeout: float = 6.0,
         retries: int = 2,
         backoff_base: float = 0.35,
+        backoff_cap: float = 8.0,
         max_conn_per_host: int = 8,
-        proxy: Optional[str] = None,          # "http://127.0.0.1:8888"
-        proxy_pool: Optional[list] = None,    # list of proxies to rotate
+        max_total_conn: int = 0,  # 0 => aiohttp default (unbounded by connector limit) - set if you want
+        proxy: Optional[str] = None,
+        proxy_pool: Optional[list] = None,
         verify: bool = True,
-        ca_bundle: Optional[str] = None,      # e.g. path to certifi bundle in PyInstaller exe
+        ca_bundle: Optional[str] = None,
+
+        # safety / “don’t melt”
+        max_bytes: int = 4_000_000,     # bound for get_text/get_bytes (4MB)
+        max_html_chars: int = 600_000,  # bound for decoded text
+        respect_retry_after: bool = True,
+        enable_cookies: bool = True,
+        allow_redirects: bool = True,
     ):
         self.ua = user_agent
-        self.timeout = timeout
-        self.retries = retries
-        self.backoff_base = backoff_base
-        self.max_conn_per_host = max_conn_per_host
+        self.timeout = float(timeout)
+        self.retries = int(retries)
+        self.backoff_base = float(backoff_base)
+        self.backoff_cap = float(backoff_cap)
+
+        self.max_conn_per_host = int(max_conn_per_host)
+        self.max_total_conn = int(max_total_conn)
 
         self.proxy = proxy
         self.proxy_pool = proxy_pool or []
 
-        self.verify = verify
+        self.verify = bool(verify)
         self.ca_bundle = ca_bundle
+
+        self.max_bytes = int(max_bytes)
+        self.max_html_chars = int(max_html_chars)
+        self.respect_retry_after = bool(respect_retry_after)
+        self.allow_redirects = bool(allow_redirects)
+
+        self.enable_cookies = bool(enable_cookies)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
-
-        # Fair per-host concurrency limit
-        self._host_limiters: Dict[str, asyncio.Semaphore] = {}
-
-        # SSL context initialized in __aenter__
         self._ssl_context: Optional[ssl.SSLContext] = None
+
+        # Per-host concurrency (fairness)
+        self._host_sem: Dict[str, asyncio.Semaphore] = {}
+
+        # Per-host cooldown timestamp (rate-limit friendliness)
+        self._host_cooldown_until: Dict[str, float] = {}
+
+        # Per-host last successful URL (for referer/origin mimicry)
+        self._host_last_ok_url: Dict[str, str] = {}
+
+        # tiny lock to avoid stampedes updating cooldown
+        self._cooldown_lock = asyncio.Lock()
 
     # ------------------------------------------------------------- #
     # Context manager
     # ------------------------------------------------------------- #
     async def __aenter__(self):
-        # Build SSL context for HTTPS
         self._ssl_context = self._build_ssl_context()
 
+        # DNS caching and connection pooling
         self._connector = aiohttp.TCPConnector(
+            ssl=self._ssl_context,
+            limit=(self.max_total_conn if self.max_total_conn > 0 else 0),
             limit_per_host=self.max_conn_per_host,
-            ssl=self._ssl_context,  # applies to HTTPS URLs
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+            keepalive_timeout=30,
+            happy_eyeballs_delay=0.25,
         )
+
+        jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
+
+        # Base headers: browser-ish defaults
+        base_headers = self._base_browser_headers()
+
         self._session = aiohttp.ClientSession(
             connector=self._connector,
-            headers={"User-Agent": self.ua},
+            cookie_jar=jar,
+            headers=base_headers,
+            auto_decompress=True,
+            trust_env=True,  # respects env proxies if present
         )
         return self
 
@@ -5778,119 +5838,277 @@ class HTTPSSubmanager:
         self._session = None
         self._connector = None
         self._ssl_context = None
+        self._host_sem.clear()
+        self._host_cooldown_until.clear()
+        self._host_last_ok_url.clear()
 
     # ------------------------------------------------------------- #
     # SSL / TLS helpers
     # ------------------------------------------------------------- #
     def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
-        """
-        Build an SSLContext depending on verify + ca_bundle.
-        aiohttp will use system defaults if we return None.
-        """
-        # If we don't want to customize anything, let aiohttp use defaults.
+        # If verify ON and no custom CA, let aiohttp use system defaults.
         if self.verify and not self.ca_bundle:
             return None
 
-        # Explicit context
         if self.verify:
-            # Verify ON with custom CA bundle (or default if path is None)
-            ctx = ssl.create_default_context(
-                cafile=self.ca_bundle if self.ca_bundle else None
-            )
-            # default: verify_mode = CERT_REQUIRED, check_hostname = True
-            return ctx
+            # Verify ON with explicit CA bundle (or default context)
+            return ssl.create_default_context(cafile=self.ca_bundle if self.ca_bundle else None)
 
-        # verify = False: disable certificate verification (dangerous, but useful behind intercepting proxies)
+        # verify OFF (dangerous but sometimes necessary behind MITM proxies)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         return ctx
 
     # ------------------------------------------------------------- #
-    # Internal helpers
+    # Host helpers
     # ------------------------------------------------------------- #
-    def _get_host_semaphore(self, url: str) -> asyncio.Semaphore:
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower()
-        if host not in self._host_limiters:
-            self._host_limiters[host] = asyncio.Semaphore(self.max_conn_per_host)
-        return self._host_limiters[host]
+    def _host(self, url: str) -> str:
+        try:
+            return urlparse(url).netloc.lower()
+        except Exception:
+            return ""
 
+    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
+        if not host: host = "_"
+        # No need for a complex lock, just use dict.setdefault
+        return self._host_sem.setdefault(host, asyncio.Semaphore(self.max_conn_per_host))
+
+    async def _respect_host_cooldown(self, host: str):
+        if not host:
+            return
+        until = self._host_cooldown_until.get(host, 0.0)
+        now = time.time()
+        if until > now:
+            await asyncio.sleep(min(5.0, until - now))
+
+    async def _set_host_cooldown(self, host: str, seconds: float):
+        if not host or seconds <= 0:
+            return
+        async with self._cooldown_lock:
+            now = time.time()
+            cur = self._host_cooldown_until.get(host, 0.0)
+            self._host_cooldown_until[host] = max(cur, now + seconds)
+
+    # ------------------------------------------------------------- #
+    # Proxy + headers
+    # ------------------------------------------------------------- #
     def _choose_proxy(self) -> Optional[str]:
         if self.proxy:
             return self.proxy
         if self.proxy_pool:
-            import random
             return random.choice(self.proxy_pool)
         return None
 
-    # ------------------------------------------------------------- #
-    # Core request with retries + host limit
-    # ------------------------------------------------------------- #
-    async def _request(self, method: str, url: str, **kwargs):
-        if not self._session:
-            raise RuntimeError("HTTPSSubmanager must be used in an async context.")
+    def _base_browser_headers(self) -> Dict[str, str]:
+        # Note: aiohttp does gzip/deflate by default; brotli would require extra dependency.
+        return {
+            "User-Agent": self.ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "DNT": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+        }
 
-        sem = self._get_host_semaphore(url)
-        proxy = self._choose_proxy()
+    def _per_request_headers(self, url: str) -> Dict[str, str]:
+        host = self._host(url)
+        last_ok = self._host_last_ok_url.get(host, "")
+        h: Dict[str, str] = {}
+
+        # If we’ve successfully hit this host before, mimic navigation flow.
+        if last_ok:
+            h["Referer"] = last_ok
+            # If same host, Sec-Fetch-Site becomes same-origin-ish
+            h["Sec-Fetch-Site"] = "same-origin"
+
+        # Slight variability to avoid being “too static”
+        if random.random() < 0.10:
+            h["Accept-Language"] = "en-US,en;q=0.8"
+
+        return h
+
+    # ------------------------------------------------------------- #
+    # Retry policy
+    # ------------------------------------------------------------- #
+    def _is_retryable_status(self, status: int) -> bool:
+        # Typical transient statuses
+        if status in (408, 425, 429, 500, 502, 503, 504):
+            return True
+        return False
+
+    def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
+        # If server provides Retry-After and we respect it, honor up to cap
+        if server_hint is not None and server_hint > 0:
+            return min(self.backoff_cap, float(server_hint))
+
+        # Exponential backoff + jitter
+        base = self.backoff_base * (2 ** attempt)
+        jitter = random.uniform(0.0, base * 0.25)
+        return min(self.backoff_cap, base + jitter)
+
+    def _parse_retry_after(self, hdrs: Dict[str, str]) -> Optional[float]:
+        if not hdrs:
+            return None
+        ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+        if not ra:
+            return None
+        ra = str(ra).strip()
+        # Retry-After can be seconds or HTTP date; we handle seconds only (fast + common)
+        try:
+            return float(ra)
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------- #
+    # Safe bounded read
+    # ------------------------------------------------------------- #
+    async def _read_bounded(self, resp: aiohttp.ClientResponse, max_bytes: int) -> bytes:
+        buf = bytearray()
+        try:
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                if not chunk:
+                    break
+                buf.extend(chunk)
+                if len(buf) >= max_bytes:
+                    break
+        except Exception:
+            pass
+        return bytes(buf)
+
+    # ------------------------------------------------------------- #
+    # Core request (never returns a closed aiohttp response)
+    # ------------------------------------------------------------- #
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        want_body: bool,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+    ) -> _HTTPResult:
+        if not self._session:
+            raise RuntimeError("HTTPSSubmanager must be used in an async context (async with HTTPSSubmanager(...) as http).")
+
+        method = (method or "GET").upper().strip()
+        allow_redirects = self.allow_redirects if allow_redirects is None else bool(allow_redirects)
+        max_bytes = self.max_bytes if max_bytes is None else int(max_bytes)
+
+        host = self._host(url)
+        sem = self._get_host_semaphore(host)
 
         for attempt in range(self.retries + 1):
+            await self._respect_host_cooldown(host)
+
+            proxy = self._choose_proxy()
+            req_headers = {}
+            req_headers.update(self._per_request_headers(url))
+            if headers:
+                req_headers.update(headers)
+
             try:
                 async with sem:
+                    timeout = ClientTimeout(total=self.timeout)
                     async with self._session.request(
                         method,
                         url,
+                        allow_redirects=allow_redirects,
                         proxy=proxy,
-                        timeout=ClientTimeout(total=self.timeout),
-                        **kwargs,
+                        timeout=timeout,
+                        headers=req_headers,
                     ) as resp:
-                        return resp
 
-            except Exception:
+                        final_url = str(resp.url)
+                        status = int(resp.status)
+                        hdrs = dict(resp.headers) if resp.headers else {}
+
+                        # Rate-limit friendliness: set cooldown when server says so
+                        if self.respect_retry_after and status in (429, 503):
+                            ra = self._parse_retry_after(hdrs)
+                            if ra:
+                                await self._set_host_cooldown(host, ra)
+
+                        body = b""
+                        if want_body:
+                            body = await self._read_bounded(resp, max_bytes=max_bytes)
+
+                        # Track last-ok url for referer mimicry
+                        if status and 200 <= status < 300:
+                            self._host_last_ok_url[host] = final_url
+
+                        # Retryable HTTP statuses
+                        if status and self._is_retryable_status(status) and attempt < self.retries:
+                            server_hint = self._parse_retry_after(hdrs) if self.respect_retry_after else None
+                            await asyncio.sleep(self._retry_delay(attempt, server_hint=server_hint))
+                            continue
+
+                        return _HTTPResult(
+                            ok=(status is not None and 200 <= status < 300),
+                            status=status,
+                            headers=hdrs,
+                            final_url=final_url,
+                            body=body,
+                            error="",
+                        )
+
+            except (aiohttp.ClientConnectorError,
+                    aiohttp.ClientOSError,
+                    aiohttp.ServerDisconnectedError,
+                    aiohttp.ClientPayloadError,
+                    asyncio.TimeoutError,
+                    ssl.SSLError) as e:
+                # Transient-ish network/TLS errors: retry
                 if attempt >= self.retries:
-                    return None
-                await asyncio.sleep(self.backoff_base * (1 + attempt))
+                    return _HTTPResult(False, None, {}, url, b"", error=str(e))
+                await asyncio.sleep(self._retry_delay(attempt))
+                continue
+            except Exception as e:
+                # Unknown: usually not worth hammering
+                return _HTTPResult(False, None, {}, url, b"", error=str(e))
 
-        return None
+        return _HTTPResult(False, None, {}, url, b"", error="exhausted_retries")
 
     # ------------------------------------------------------------- #
-    # Public GET/HEAD helpers
+    # Public helpers (same API as your current version)
     # ------------------------------------------------------------- #
     async def get_text(self, url: str) -> str:
         """
-        GET url and return decoded text ("" on non-200 or error).
-        Works for both HTTPS and HTTP URLs; HTTPS uses the SSL context.
+        GET url and return decoded text ("" on non-2xx or error).
         """
-        resp = await self._request("GET", url)
-        if not resp or resp.status != 200:
+        r = await self._request("GET", url, want_body=True)
+        if not r.ok or not r.body:
             return ""
         try:
-            return await resp.text()
+            # Let aiohttp do charset detection? We only have bytes now, so do a safe decode.
+            txt = r.body.decode("utf-8", errors="ignore")
         except Exception:
             return ""
 
+        if len(txt) > self.max_html_chars:
+            txt = txt[: self.max_html_chars]
+        return txt
+
     async def get_bytes(self, url: str) -> bytes:
         """
-        GET url and return raw bytes (b"" on non-200 or error).
+        GET url and return raw bytes (b"" on non-2xx or error).
         """
-        resp = await self._request("GET", url)
-        if not resp or resp.status != 200:
+        r = await self._request("GET", url, want_body=True)
+        if not r.ok:
             return b""
-        try:
-            return await resp.read()
-        except Exception:
-            return b""
+        return r.body or b""
 
     async def head(self, url: str) -> Tuple[Optional[int], Dict[str, str]]:
         """
         HEAD url and return (status, headers).
-        If the server doesn't like HEAD, you'll just get (None, {}).
         """
-        resp = await self._request("HEAD", url, allow_redirects=True)
-        if not resp:
+        r = await self._request("HEAD", url, want_body=False, allow_redirects=True)
+        if r.status is None:
             return None, {}
-        try:
-            return resp.status, dict(resp.headers)
-        except Exception:
-            return resp.status, {}
-
+        return r.status, r.headers
