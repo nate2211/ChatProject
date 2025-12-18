@@ -44,6 +44,7 @@ import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
     CodeCorpusStore, PageTrackerStore, LinkCrawlerStore
 from loggers import DEBUG_LOGGER
+
 load_dotenv()
 # ---------------- Paths & helpers ----------------
 APP_DIR = _os.path.join(_os.path.expanduser("~"), ".promptchat")
@@ -9158,6 +9159,8 @@ BLOCKS.register("linktracker", LinkTrackerBlock)
 
 
 # ======================= YouTubeDataBlock ==================================
+
+
 @dataclass
 class YouTubeDataBlock(BaseBlock):
     """
@@ -9741,56 +9744,203 @@ class VideoLinkTrackerBlock(BaseBlock):
             self,
             video_input: str,
             ffmpeg_bin: str,
-            log: List[str]
+            log: List[str],
     ) -> Optional[bytes]:
         """
-        Uses FFmpeg to extract a single frame from a video (local path or URL)
-        at timestamp 00:00:01.
-        """
-        import shutil
+        Uses FFmpeg to extract a single RANDOM frame from a video (local path or URL).
 
-        # Resolve binary
-        exe = ffmpeg_bin if ffmpeg_bin else "ffmpeg"
-        if not shutil.which(exe) and not os.path.exists(exe):
-            log.append(f"[VideoLinkTracker][ffmpeg] FFmpeg binary not found at '{exe}'.")
+        Improvements:
+          - Robust ffmpeg/ffprobe resolution (Windows-friendly)
+          - Multiple duration probe strategies (format duration, stream duration)
+          - Safe timestamp selection for short videos
+          - Two extraction attempts: fast-seek (-ss before -i) then accurate (-ss after -i)
+          - Uses PNG + image2pipe for reliability
+        """
+        import os
+        import shutil
+        import random
+        import json
+        import asyncio
+        from typing import Optional
+
+        video_input = (video_input or "").strip()
+        if not video_input:
+            log.append("[VideoLinkTracker][ffmpeg] Missing video_input.")
             return None
 
-        log.append(f"[VideoLinkTracker][ffmpeg] Extracting frame from {video_input} using {exe}...")
+        # ----------------------------
+        # Resolve binaries robustly
+        # ----------------------------
+        def _resolve_bin(name_or_path: str) -> Optional[str]:
+            if not name_or_path:
+                return None
+            # If it's a file path
+            if os.path.exists(name_or_path):
+                return os.path.abspath(name_or_path)
+            # Try PATH lookup
+            found = shutil.which(name_or_path)
+            if found:
+                return found
+            # On Windows callers sometimes pass "ffmpeg" but have ffmpeg.exe
+            if not name_or_path.lower().endswith(".exe"):
+                found = shutil.which(name_or_path + ".exe")
+                if found:
+                    return found
+            return None
 
-        # FFmpeg command: Seek to 1s, input file/url, grab 1 frame, output to pipe as JPEG
-        cmd = [
-            exe,
-            "-hide_banner", "-loglevel", "error",
-            "-ss", "00:00:01",
-            "-i", video_input,
-            "-vframes", "1",
-            "-f", "image2",
-            "-c:v", "mjpeg",
-            "pipe:1"
-        ]
+        exe = _resolve_bin(ffmpeg_bin) or _resolve_bin("ffmpeg")
+        if not exe:
+            log.append(f"[VideoLinkTracker][ffmpeg] FFmpeg binary not found (ffmpeg_bin={ffmpeg_bin!r}).")
+            return None
 
-        try:
-            # Run FFmpeg asynchronously
+        # Derive ffprobe name from ffmpeg name, but also try PATH lookups
+        ffprobe_guess = os.path.join(os.path.dirname(exe), "ffprobe" + (".exe" if exe.lower().endswith(".exe") else ""))
+        ffprobe = _resolve_bin(ffprobe_guess) or _resolve_bin("ffprobe")
+        if not ffprobe:
+            log.append("[VideoLinkTracker][ffmpeg] FFprobe binary not found. Will fall back to non-random timestamp.")
+            ffprobe = None
+
+        # ----------------------------
+        # Probe duration (best-effort)
+        # ----------------------------
+        duration: Optional[float] = None
+
+        async def _run_ffprobe(cmd: list[str]) -> tuple[int, bytes, bytes]:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
+            out, err = await proc.communicate()
+            return proc.returncode, out, err
 
-            if proc.returncode != 0:
-                log.append(f"[VideoLinkTracker][ffmpeg] Error (code {proc.returncode}): {stderr.decode().strip()}")
-                return None
+        if ffprobe:
+            # Try 1: container/format duration
+            probe_cmd_1 = [
+                ffprobe, "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "format=duration",
+                "-of", "json",
+                video_input,
+            ]
+            try:
+                rc, out, err = await _run_ffprobe(probe_cmd_1)
+                if rc == 0 and out:
+                    info = json.loads(out.decode(errors="ignore") or "{}")
+                    dur_s = (info.get("format") or {}).get("duration")
+                    if dur_s is not None:
+                        d = float(dur_s)
+                        if d > 0:
+                            duration = d
+            except Exception as e:
+                log.append(f"[VideoLinkTracker][ffmpeg] ffprobe(format.duration) exception: {e}")
 
-            if not stdout:
-                log.append("[VideoLinkTracker][ffmpeg] No data produced by FFmpeg.")
-                return None
+            # Try 2: stream duration (some formats don’t set format.duration)
+            if not duration:
+                probe_cmd_2 = [
+                    ffprobe, "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=duration",
+                    "-of", "json",
+                    video_input,
+                ]
+                try:
+                    rc, out, err = await _run_ffprobe(probe_cmd_2)
+                    if rc == 0 and out:
+                        info = json.loads(out.decode(errors="ignore") or "{}")
+                        streams = info.get("streams") or []
+                        if streams:
+                            dur_s = (streams[0] or {}).get("duration")
+                            if dur_s is not None:
+                                d = float(dur_s)
+                                if d > 0:
+                                    duration = d
+                except Exception as e:
+                    log.append(f"[VideoLinkTracker][ffmpeg] ffprobe(stream.duration) exception: {e}")
 
-            return stdout
+            if duration:
+                log.append(f"[VideoLinkTracker][ffmpeg] Probed duration={duration:.3f}s")
+            else:
+                # Useful stderr if probe fails
+                try:
+                    rc, out, err = await _run_ffprobe(probe_cmd_1)
+                    if rc != 0 and err:
+                        log.append(
+                            f"[VideoLinkTracker][ffmpeg] ffprobe error: {err.decode(errors='ignore').strip()[:500]}")
+                except Exception:
+                    pass
 
-        except Exception as e:
-            log.append(f"[VideoLinkTracker][ffmpeg] Exception: {e}")
-            return None
+        # ----------------------------
+        # Pick timestamp safely
+        # ----------------------------
+        # If we can't probe duration, pick a reasonable mid-ish timestamp and hope.
+        if not duration or duration <= 0:
+            timestamp = 1.0
+            log.append("[VideoLinkTracker][ffmpeg] Duration unknown; using timestamp=1.0s fallback.")
+        else:
+            # Avoid start/end; handle short videos safely.
+            # Use a margin that scales down for very short clips.
+            margin = min(1.0, duration * 0.05)
+            start = margin
+            end = max(start, duration - margin)
+
+            # If clip is extremely short, just sample near middle.
+            if end - start < 0.25:
+                timestamp = max(0.0, duration * 0.5)
+            else:
+                timestamp = random.uniform(start, end)
+
+            log.append(
+                f"[VideoLinkTracker][ffmpeg] Extracting random frame at {timestamp:.3f}s (duration={duration:.2f}s)"
+            )
+
+        timestamp_str = f"{timestamp:.3f}"
+
+        # ----------------------------
+        # Extract frame (two attempts)
+        # ----------------------------
+        async def _run_ffmpeg(cmd: list[str]) -> tuple[int, bytes, bytes]:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            return proc.returncode, out, err
+
+        common_out = [
+            "-hide_banner", "-loglevel", "error",
+            "-an",
+            "-frames:v", "1",
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "pipe:1",
+        ]
+
+        # Attempt A: fast seek (-ss before -i)
+        cmd_a = [exe, "-ss", timestamp_str, "-i", video_input] + common_out
+
+        # Attempt B: accurate seek (-ss after -i) (often works when A fails)
+        cmd_b = [exe, "-i", video_input, "-ss", timestamp_str] + common_out
+
+        # Some URLs are twitchy; a tiny reconnect/timeout can help, but keep it minimal/portable
+        # (If you want, you can add: "-rw_timeout", "15000000" for some builds)
+        for label, cmd in (("fast", cmd_a), ("accurate", cmd_b)):
+            try:
+                rc, out, err = await _run_ffmpeg(cmd)
+                if rc == 0 and out:
+                    return out
+
+                err_txt = (err.decode(errors="ignore") if err else "").strip()
+                log.append(
+                    f"[VideoLinkTracker][ffmpeg] {label} extract failed (code {rc}). "
+                    f"{err_txt[:800]}"
+                )
+            except Exception as e:
+                log.append(f"[VideoLinkTracker][ffmpeg] {label} extract exception: {e}")
+
+        log.append("[VideoLinkTracker][ffmpeg] Failed to extract frame from video (all strategies).")
+        return None
 
     async def _upload_frame_to_host(self, image_bytes: bytes, log: List[str]) -> Optional[str]:
         """
@@ -17987,6 +18137,7 @@ class PageTrackerBlock(BaseBlock):
 BLOCKS.register("pagetracker", PageTrackerBlock)
 
 # ======================= LinkCrawlerBlock ==================================
+
 @dataclass
 class LinkCrawlerBlock(BaseBlock):
     """
@@ -17996,6 +18147,7 @@ class LinkCrawlerBlock(BaseBlock):
       - use_database: bool = False
       - db_path: str = "link_corpus.db"
       - seed_ttl_seconds: float = 21600 (6 hours)
+      - ffmpeg_bin: str = "ffmpeg"
 
     Behavior:
       - Always does Memory-level dedupe (existing behavior).
@@ -18070,6 +18222,455 @@ class LinkCrawlerBlock(BaseBlock):
 
         return q
 
+    def _looks_like_image_url(self, u: str) -> bool:
+        u = (u or "").lower()
+        return bool(self._IMAGE_EXT_RE.search(u)) or any(x in u for x in ("image", "img", "photo"))
+
+    def _looks_like_video_url(self, u: str) -> bool:
+        u = (u or "").lower()
+        return bool(self._MEDIA_EXT_RE.search(u)) or any(u.endswith(x) for x in (".m3u8", ".mpd"))
+
+    # ------------------ OG-image fallback ------------------
+
+    async def _try_extract_og_image(self, page_url: str, timeout: float, log: List[str]) -> str:
+        import aiohttp
+        from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
+
+        if not page_url:
+            return ""
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+                async with session.get(page_url, allow_redirects=True) as resp:
+                    ctype = (resp.headers.get("Content-Type", "") or "").lower()
+                    if resp.status != 200:
+                        return ""
+                    if "text/html" not in ctype:
+                        return ""
+                    html = await resp.text(errors="ignore")
+        except Exception as e:
+            log.append(f"[Crawler][RevImg][coerce] og:image fetch failed: {e}")
+            return ""
+
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+            candidates: List[str] = []
+
+            for sel in [
+                ("meta", {"property": "og:image"}),
+                ("meta", {"name": "twitter:image"}),
+                ("meta", {"property": "twitter:image"}),
+                ("link", {"rel": "image_src"}),
+            ]:
+                tag = soup.find(*sel)
+                if not tag:
+                    continue
+                val = tag.get("content") if tag.name == "meta" else tag.get("href")
+                if val:
+                    candidates.append(val.strip())
+
+            for tag in soup.find_all("meta"):
+                prop = (tag.get("property") or "").lower()
+                name = (tag.get("name") or "").lower()
+                if prop in ("og:image:secure_url",) or name in ("twitter:image:src",):
+                    val = tag.get("content")
+                    if val:
+                        candidates.append(val.strip())
+
+            for c in candidates:
+                img = urljoin(page_url, c)
+                if self._looks_like_image_url(img):
+                    log.append(f"[Crawler][RevImg][coerce] using og/twitter image: {img}")
+                    return img
+
+        except Exception as e:
+            log.append(f"[Crawler][RevImg][coerce] og:image parse failed: {e}")
+
+        return ""
+
+    # ------------------ FFmpeg “screenshot” (frame extract) ------------------
+
+    async def _screenshot_url_to_temp_image(
+        self,
+        url: str,
+        timeout: float,
+        log: List[str],
+        ffmpeg_bin: str = "ffmpeg"
+    ) -> str:
+        """
+        Uses FFmpeg to extract a single frame from a video (URL or local path).
+        Ported from VideoLinkTracker for maximum reliability and speed.
+        """
+        import os
+        import shutil
+        import random
+        import json
+        import tempfile
+
+        if not url:
+            return ""
+
+        # 1) Resolve binaries robustly
+        def _resolve_bin(name_or_path: str) -> Optional[str]:
+            if not name_or_path:
+                return None
+            if os.path.exists(name_or_path):
+                return os.path.abspath(name_or_path)
+            found = shutil.which(name_or_path)
+            if found:
+                return found
+            if not name_or_path.lower().endswith(".exe"):
+                found = shutil.which(name_or_path + ".exe")
+                if found:
+                    return found
+            return None
+
+        exe = _resolve_bin(ffmpeg_bin) or _resolve_bin("ffmpeg")
+        if not exe:
+            log.append(f"[Crawler][ffmpeg] Binary not found: {ffmpeg_bin}")
+            return ""
+
+        ffprobe_guess = os.path.join(
+            os.path.dirname(exe),
+            "ffprobe" + (".exe" if exe.lower().endswith(".exe") else "")
+        )
+        ffprobe = _resolve_bin(ffprobe_guess) or _resolve_bin("ffprobe")
+
+        # 2) Subprocess runner
+        async def _run_tool(cmd: List[str]) -> Tuple[int, bytes, bytes]:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await proc.communicate()
+            return proc.returncode, out or b"", err or b""
+
+        # 3) Probe duration (best-effort)
+        duration: Optional[float] = None
+        if ffprobe:
+            probe_cmds = [
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "format=duration", "-of", "json", url],
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=duration", "-of", "json", url],
+            ]
+            for pcmd in probe_cmds:
+                try:
+                    rc, out, _err = await _run_tool(pcmd)
+                    if rc == 0 and out:
+                        info = json.loads(out.decode(errors="ignore") or "{}")
+                        dur_s = (info.get("format") or {}).get("duration")
+                        if dur_s is None:
+                            streams = info.get("streams") or []
+                            if streams:
+                                dur_s = (streams[0] or {}).get("duration")
+                        if dur_s:
+                            d = float(dur_s)
+                            if d > 0:
+                                duration = d
+                                break
+                except Exception:
+                    pass
+
+        # 4) Determine safe timestamp
+        if not duration or duration <= 0:
+            timestamp = 1.0
+        else:
+            # Keep near start-ish to preserve "seed context", but avoid black first frames
+            margin = min(1.0, duration * 0.05)
+            lo = margin
+            hi = min(30.0, max(margin, duration - margin))
+            if hi <= lo + 0.05:
+                timestamp = max(0.0, duration * 0.5)
+            else:
+                timestamp = random.uniform(lo, hi)
+
+        timestamp_str = f"{timestamp:.3f}"
+
+        # 5) Extract into temp file (PNG)
+        tmp_path = ""
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix="crawler_ff_", suffix=".png")
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+            common_args = [
+                "-hide_banner", "-loglevel", "error",
+                "-an",
+                "-frames:v", "1",
+                "-vcodec", "png",
+                "-y",
+                tmp_path
+            ]
+
+            # Attempt A: fast seek (ss before i)
+            cmd_fast = [exe, "-ss", timestamp_str, "-i", url] + common_args
+            # Attempt B: accurate seek (ss after i)
+            cmd_acc = [exe, "-i", url, "-ss", timestamp_str] + common_args
+
+            for label, cmd in (("fast", cmd_fast), ("accurate", cmd_acc)):
+                try:
+                    rc, _out, err = await _run_tool(cmd)
+                    if rc == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                        log.append(f"[Crawler][ffmpeg] Frame extracted ({label}) @ {timestamp_str}s -> {tmp_path}")
+                        return tmp_path
+                    log.append(f"[Crawler][ffmpeg] {label} seek failed rc={rc}: {err.decode(errors='ignore')[:300]}")
+                except Exception as e:
+                    log.append(f"[Crawler][ffmpeg] {label} exception: {e}")
+
+        except Exception as e:
+            log.append(f"[Crawler][ffmpeg] General extraction error: {e}")
+
+        # cleanup on failure
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+        return ""
+
+    # ------------------ Coercion logic (video/page → image input) ------------------
+
+    async def _coerce_reverse_image_inputs(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        timeout: float,
+        log: List[str],
+        ffmpeg_bin: str = "ffmpeg",
+    ) -> Tuple[str, str, List[str]]:
+        """
+        Normalize inputs so reverse-image search always receives either:
+          - a real image_url (direct image), OR
+          - an image_path (temp extracted frame) if URL/path was video OR page
+        Returns: (final_image_url, final_image_path, temp_files_to_cleanup)
+        """
+        import os
+
+        image_url = (image_url or "").strip()
+        image_path = (image_path or "").strip()
+        temps: List[str] = []
+
+        # Local real image -> keep
+        if image_path and os.path.exists(image_path) and not self._looks_like_video_url(image_path):
+            return image_url, image_path, temps
+
+        # Local video -> FFmpeg extract frame
+        if image_path and os.path.exists(image_path) and self._looks_like_video_url(image_path):
+            tmp = await self._screenshot_url_to_temp_image(
+                image_path, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
+            )
+            if tmp:
+                temps.append(tmp)
+                return "", tmp, temps
+
+        # Direct image URL -> keep
+        if image_url and self._looks_like_image_url(image_url) and not self._looks_like_video_url(image_url):
+            return image_url, "", temps
+
+        # Video URL/manifest -> FFmpeg extract frame
+        if image_url and self._looks_like_video_url(image_url):
+            tmp = await self._screenshot_url_to_temp_image(
+                image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
+            )
+            if tmp:
+                temps.append(tmp)
+                return "", tmp, temps
+            return image_url, "", temps  # last resort
+
+        # Otherwise treat as a web page:
+        if image_url:
+            og = await self._try_extract_og_image(image_url, timeout=timeout, log=log)
+            if og:
+                return og, "", temps
+
+            # last-ditch: try FFmpeg anyway (some pages are direct streams behind redirects)
+            tmp = await self._screenshot_url_to_temp_image(
+                image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin
+            )
+            if tmp:
+                temps.append(tmp)
+                return "", tmp, temps
+
+        return image_url, image_path, temps
+
+    # ------------------ Reverse image search (Playwright) ------------------
+
+    async def _reverse_image_search_seeds(
+        self,
+        *,
+        image_url: str = "",
+        image_path: str = "",
+        engine: str = "both",  # "yandex" | "google" | "both"
+        limit: int = 20,
+        timeout: float = 20.0,
+        log: List[str],
+    ) -> List[str]:
+        import os
+        from urllib.parse import quote, urlparse, unquote
+        from playwright.async_api import async_playwright
+
+        engine = (engine or "both").lower().strip()
+        image_url = (image_url or "").strip()
+        image_path = (image_path or "").strip()
+
+        if not image_url and not image_path:
+            return []
+
+        if image_path and not os.path.exists(image_path):
+            log.append(f"[Crawler][RevImg] image_path not found: {image_path}")
+            return []
+
+        def _good_seed(u: str) -> bool:
+            try:
+                pu = urlparse(u)
+                if pu.scheme not in ("http", "https"):
+                    return False
+                host = (pu.netloc or "").lower()
+                if any(bad in host for bad in ("yandex.", "google.", "lens.google.", "gstatic.com")):
+                    return False
+                return True
+            except Exception:
+                return False
+
+        seeds: List[str] = []
+        seen: set[str] = set()
+
+        async def _collect_links_from_page(page):
+            hrefs = await page.eval_on_selector_all(
+                "a[href]",
+                "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
+            )
+            for h in hrefs or []:
+                if not h:
+                    continue
+                u = h
+                if "url=" in u and ("yandex" in u or "redir" in u):
+                    try:
+                        part = u.split("url=", 1)[1]
+                        part = part.split("&", 1)[0]
+                        u = unquote(part)
+                    except Exception:
+                        pass
+
+                if _good_seed(u) and u not in seen:
+                    seen.add(u)
+                    seeds.append(u)
+                    if len(seeds) >= limit:
+                        return
+
+        yandex_url = ""
+        google_url = ""
+        if image_url:
+            yandex_url = f"https://yandex.com/images/search?rpt=imageview&url={quote(image_url)}"
+            google_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url)}"
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context()
+
+                # Yandex
+                if engine in ("yandex", "both") and (image_url or image_path):
+                    page = await context.new_page()
+                    try:
+                        if image_url:
+                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] Opening imageview URL...")
+                            await page.goto(yandex_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                        else:
+                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] Uploading local image (best-effort)...")
+                            await page.goto("https://yandex.com/images/", wait_until="domcontentloaded",
+                                            timeout=int(timeout * 1000))
+                            # selectors drift; keep it best-effort
+                            for sel in [
+                                'button[aria-label*="Search by image"]',
+                                'button[aria-label*="image"]',
+                                'button:has-text("Search by image")',
+                                'button:has-text("Image")',
+                            ]:
+                                try:
+                                    await page.click(sel, timeout=2000)
+                                    break
+                                except Exception:
+                                    pass
+                            file_inputs = await page.query_selector_all('input[type="file"]')
+                            if file_inputs:
+                                await file_inputs[0].set_input_files(image_path)
+                            else:
+                                DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] No file input found (UI changed?).")
+                                page = None
+
+                        if page:
+                            await page.wait_for_timeout(1500)
+                            await _collect_links_from_page(page)
+                            DEBUG_LOGGER.log_message(f"[Crawler][RevImg][Yandex] seeds={len(seeds)}")
+                    except Exception as e:
+                        log.append(f"[Crawler][RevImg][Yandex] error: {e}")
+                    finally:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+
+                # Google Lens
+                if len(seeds) < limit and engine in ("google", "both") and (image_url or image_path):
+                    page = await context.new_page()
+                    try:
+                        if image_url:
+                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Lens] Opening uploadbyurl...")
+                            await page.goto(google_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                        else:
+                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Lens] Uploading local image...")
+                            await page.goto("https://lens.google.com/", wait_until="domcontentloaded",
+                                            timeout=int(timeout * 1000))
+                            inp = await page.query_selector('input[type="file"]')
+                            if not inp:
+                                for sel in ['text=Upload', 'text=Search by image', 'button:has-text("Upload")']:
+                                    try:
+                                        await page.click(sel, timeout=2000)
+                                        break
+                                    except Exception:
+                                        pass
+                                inp = await page.query_selector('input[type="file"]')
+
+                            if inp:
+                                await inp.set_input_files(image_path)
+                            else:
+                                log.append("[Crawler][RevImg][Lens] No file input found (UI changed?).")
+                                page = None
+
+                        if page:
+                            await page.wait_for_timeout(2500)
+                            try:
+                                await page.mouse.wheel(0, 1200)
+                                await page.wait_for_timeout(800)
+                            except Exception:
+                                pass
+
+                            await _collect_links_from_page(page)
+                            DEBUG_LOGGER.log_message(f"[Crawler][RevImg][Lens] seeds={len(seeds)}")
+                    except Exception as e:
+                        log.append(f"[Crawler][RevImg][Lens] error: {e}")
+                    finally:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+
+                await context.close()
+                await browser.close()
+
+        except Exception as e:
+            log.append(f"[Crawler][RevImg] Playwright error: {e}")
+
+        return seeds[:limit]
+
     # ------------------ Search Helpers ------------------
 
     async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
@@ -18120,7 +18721,6 @@ class LinkCrawlerBlock(BaseBlock):
                 for page_idx in range(1, max_pages + 1):
                     if len(urls) >= limit:
                         break
-
                     params = {"q": query, "format": "json", "pageno": str(page_idx)}
                     try:
                         async with session.get(search_url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
@@ -18254,7 +18854,10 @@ class LinkCrawlerBlock(BaseBlock):
         text = re.sub(r"\s+", " ", text).lower()
 
         words = self._TEXT_TOKEN_RE.findall(text)
-        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what", "can"}
+        stops = {
+            "the", "and", "that", "this", "with", "from", "your",
+            "have", "are", "for", "not", "but", "what", "can"
+        }
         filtered = [w for w in words if w not in stops]
 
         counts = Counter(filtered)
@@ -18290,10 +18893,12 @@ class LinkCrawlerBlock(BaseBlock):
         db_path = str(params.get("db_path", "link_corpus.db"))
         seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
 
+        ffmpeg_bin = str(params.get("ffmpeg_bin", "ffmpeg") or "ffmpeg")
+
         DEBUG_LOGGER.log_message(
             f"[Crawler] start | query={query!r} mode={mode} engine={engine} "
             f"max_results={max_results} timeout={http_timeout} use_database={use_database} "
-            f"links_key={links_key!r}"
+            f"ffmpeg_bin={ffmpeg_bin!r} links_key={links_key!r}"
         )
 
         store: LinkCrawlerStore | None = None
@@ -18310,11 +18915,57 @@ class LinkCrawlerBlock(BaseBlock):
 
         # 1) Gather seeds
         seed_urls: List[str] = []
+
+        image_url = str(params.get("image_url", "") or "").strip()
+        image_path = str(params.get("image_path", "") or "").strip()
+        reverse_engine = str(params.get("reverse_engine", "both") or "both").lower().strip()
+        reverse_max_results = int(params.get("reverse_max_results", max_results))
+        reverse_timeout = float(params.get("reverse_timeout", max(20.0, http_timeout)))
+
         if params.get("seeds"):
             raw_seeds = str(params.get("seeds")).split(",")
             seed_urls = [s.strip() for s in raw_seeds if s.strip()]
             log.append(f"[Crawler] Using {len(seed_urls)} explicit seeds.")
             DEBUG_LOGGER.log_message(f"[Crawler] seeds=explicit count={len(seed_urls)}")
+
+        elif image_url or image_path:
+            DEBUG_LOGGER.log_message(
+                f"[Crawler] reverse-image seeds | engine={reverse_engine} "
+                f"image_url={'YES' if bool(image_url) else 'NO'} image_path={'YES' if bool(image_path) else 'NO'} "
+                f"limit={reverse_max_results} timeout={reverse_timeout} ffmpeg_bin={ffmpeg_bin!r}"
+            )
+
+            coerced_url, coerced_path, temp_files = await self._coerce_reverse_image_inputs(
+                image_url=image_url,
+                image_path=image_path,
+                timeout=reverse_timeout,
+                log=log,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+
+            seed_urls = await self._reverse_image_search_seeds(
+                image_url=coerced_url,
+                image_path=coerced_path,
+                engine=reverse_engine,
+                limit=reverse_max_results,
+                timeout=reverse_timeout,
+                log=log
+            )
+
+            # cleanup temp frame(s)
+            if temp_files:
+                try:
+                    import os
+                    for fp in temp_files:
+                        if fp and os.path.exists(fp):
+                            os.remove(fp)
+                except Exception as e:
+                    log.append(f"[Crawler][RevImg] temp cleanup error: {e}")
+
+            if not seed_urls:
+                log.append("[Crawler][RevImg] No seeds found from reverse-image search.")
+                DEBUG_LOGGER.log_message("[Crawler][RevImg] no seeds found")
+
         elif query:
             search_q = self._augment_query_by_mode(query, mode)
             DEBUG_LOGGER.log_message(f"[Crawler] search | engine={engine} mode={mode} q={search_q!r}")
@@ -18325,9 +18976,10 @@ class LinkCrawlerBlock(BaseBlock):
                 seed_urls = await self._search_google_cse(search_q, max_results, log)
             else:
                 seed_urls = await self._search_duckduckgo_html(search_q, max_results, log)
+
         else:
-            log.append("[Crawler] No query or seeds provided.")
-            DEBUG_LOGGER.log_message("[Crawler] no-op: missing query and seeds")
+            log.append("[Crawler] No query, seeds, or image provided.")
+            DEBUG_LOGGER.log_message("[Crawler] no-op: missing query and seeds and image")
             return "No operation.", {}
 
         DEBUG_LOGGER.log_message(f"[Crawler] seeds collected | count={len(seed_urls)}")
@@ -18363,13 +19015,10 @@ class LinkCrawlerBlock(BaseBlock):
         DEBUG_LOGGER.log_message(f"[Crawler] fetch plan | total_seeds={len(seed_urls)} to_fetch={len(seeds_to_fetch)}")
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout)) as session:
-
             sem = asyncio.Semaphore(int(params.get("max_concurrency", 12)))
 
             async def fetch_and_parse(url: str):
-                # ---- per-page crawl message (requested) ----
                 DEBUG_LOGGER.log_message(f"[Crawler][Page] crawling seed={url}")
-
                 async with sem:
                     start = time.time()
                     try:
@@ -18400,7 +19049,6 @@ class LinkCrawlerBlock(BaseBlock):
                             _links, candidates = self._extract_links(html, final_url, mode=mode)
                             lex = self._extract_lexicon(html)
 
-                            # per-page extracted summary
                             DEBUG_LOGGER.log_message(
                                 f"[Crawler][Page] parsed final={final_url} hrefs_total={len(_links)} "
                                 f"candidates_scored={len(candidates)} lexicon_terms={len(lex)}"
@@ -18418,7 +19066,6 @@ class LinkCrawlerBlock(BaseBlock):
 
                     except Exception as e:
                         DEBUG_LOGGER.log_message(f"[Crawler][Page] ERROR seed={url} err={e}")
-                        return
 
             await asyncio.gather(*[fetch_and_parse(u) for u in seeds_to_fetch])
 
@@ -18492,7 +19139,7 @@ class LinkCrawlerBlock(BaseBlock):
             f"suppressed_by_db={suppressed_by_db} links_key={links_key!r}"
         )
 
-        # 4) Reporting (text output)
+        # 4) Reporting
         lines = [
             "### 🕷️ LinkCrawler Report",
             f"_Query: '{query}' | Mode: {mode} | Engine: {engine} | Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)}_",
@@ -18501,6 +19148,7 @@ class LinkCrawlerBlock(BaseBlock):
             f"**New Links Added to Memory:** {len(new_link_objs)}",
             f"**Domains Scanned:** {len(collected_domains)}",
             f"**DB Cache:** {'ON' if use_database else 'OFF'}",
+            f"**ffmpeg_bin:** {ffmpeg_bin}",
         ]
         if use_database:
             lines.append(f"**db_path:** {db_path}")
@@ -18526,6 +19174,7 @@ class LinkCrawlerBlock(BaseBlock):
             "fetched_seed_count": len(seeds_to_fetch),
             "use_database": use_database,
             "db_path": db_path if use_database else None,
+            "ffmpeg_bin": ffmpeg_bin,
             "log": log,
         }
 
@@ -18547,11 +19196,21 @@ class LinkCrawlerBlock(BaseBlock):
             "domains_key": "scraped_domains",
             "lexicon_key": "scraped_lexicon",
 
+            "image_url": "Remote image URL for reverse-image seed discovery (optional)",
+            "image_path": "Local image file path for reverse-image seed discovery (optional)",
+            "reverse_engine": "both",  # "yandex" | "google" | "both"
+            "reverse_max_results": 20,
+            "reverse_timeout": 20.0,
+
+            "ffmpeg_bin": "ffmpeg",
+
             "use_database": False,
             "db_path": "link_corpus.db",
             "seed_ttl_seconds": 21600,
         }
 
+
+# register
 BLOCKS.register("linkcrawler", LinkCrawlerBlock)
 
 # ======================= URLScraperBlock ==================================
