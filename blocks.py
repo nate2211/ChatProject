@@ -9819,8 +9819,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
         # 1. Critical Filters (Immediate penalties)
         negative_hints = {
-            "trailer", "promo", "preview", "teaser", "sample",
-            "intro", "ad_", "advert", "pixel", "tracker", "overlay"
+         "ad_", "advert", "pixel", "tracker", "overlay"
         }
         if any(h in u_lower for h in negative_hints):
             score -= 50
@@ -11653,7 +11652,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
             return sq
         # ------------------ Reverse Image/Video Lookup Logic ------------------ #
-        rev_input_url = str(params.get("reverse_image_url", "")).strip()
+        rev_input_url = str(params.get("reverse_image_url", None)).strip()
         ffmpeg_bin_path = str(params.get("ffmpeg_bin", "")).strip()
 
         # Auto-detect from payload if it looks like a media file OR a local path
@@ -12526,10 +12525,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             except Exception:
                                 pass
 
-                        if not is_video and seed_visual_sig is not None:
-                            # allow visual probing on opaque/signed endpoints
-                            is_video = True
-                            trusted_hit = True  # or set a flag like visual_probe=True
+
                         is_visual_match = False
                         similarity = None
 
@@ -12557,7 +12553,6 @@ class VideoLinkTrackerBlock(BaseBlock):
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
                         trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
-
                         if is_visual_match:
                             asset_score += 100
 
@@ -12578,39 +12573,53 @@ class VideoLinkTrackerBlock(BaseBlock):
                                             continue
                                     else:
                                         continue
+                        else:
+                            if seed_visual_sig is not None:
+                                if similarity is not None and not is_visual_match:
+                                    continue
                         status = "unverified"
                         size = "?"
                         content_type = ""
                         do_head = verify_links or smart_sniff_param
                         trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
+                        # --- REFINED VERIFICATION GATE ---
                         if do_head:
                             try:
                                 h_status, headers = await http.head(canon)
                                 content_type = (headers.get("content-type") or "").lower()
 
-                                if h_status == 200:
-                                    cl = headers.get("content-length")
-                                    if cl:
+                                # 1. Hard Filter: Is it obviously NOT a video? (Junk extensions)
+                                path_low = canon.lower().split('?')[0]
+                                is_junk = any(path_low.endswith(ext) for ext in self.IGNORED_EXTENSIONS)
+
+                                if h_status == 200 and not is_junk:
+                                    if cl := headers.get("content-length"):
                                         size = f"{int(cl) // 1024} KB"
 
-                                    if trusted_hit:
-                                        # NEW: trust network/runtime/db even if CDN uses octet-stream
-                                        status = "200 OK"
-                                    else:
-                                        if (not smart_sniff_param) or (
-                                                any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
-                                                or content_type in self.HLS_CONTENT_TYPES
-                                                or content_type in self.DASH_CONTENT_TYPES
-                                                or canon.lower().endswith(tuple(self.VIDEO_EXTENSIONS))
-                                                or canon.lower().endswith(tuple(self.HLS_SEGMENT_EXTENSIONS))  # NEW
-                                        ):
+                                    # Check if MIME type or Extension matches video patterns
+                                    is_video_mime = any(
+                                        content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
+                                    is_video_ext = any(path_low.endswith(ext) for ext in self.VIDEO_EXTENSIONS)
+
+                                    # 2. Strict Sniffing: If smart_sniff is ON, we only accept video signals
+                                    if smart_sniff_param:
+                                        if is_video_mime or is_video_ext:
                                             status = "200 OK"
                                         else:
-                                            status = "Non-video HEAD"
+                                            status = f"Filtered (Type: {content_type})"
+                                    else:
+                                        # If smart_sniff is OFF, we rely on the sniffer's judgment but still block junk
+                                        status = "200 OK"
                                 else:
-                                    status = f"Dead ({h_status})"
+                                    status = f"Dead/Junk ({h_status})"
+
                             except Exception:
-                                status = "Timeout/Error"
+                                # If HEAD fails, only trust it if it looks like a video URL
+                                if trusted_hit and any(canon.lower().endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                                    status = "200 OK (Sniffed)"
+                                else:
+                                    status = "Timeout/Error"
+
                         if not verify_links or "OK" in status:
                             display_text = (link.get("text", "") or asset_path.rsplit("/", 1)[-1] or "[video asset]")[:100]
                             asset = {
