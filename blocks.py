@@ -12285,16 +12285,39 @@ class VideoLinkTrackerBlock(BaseBlock):
                     # Good for capturing DOM state if Network failed, or getting console logs.
                     if use_runtime_sniff and pw_context:
                         try:
-                            # Use reduced timeout (50%) for secondary checks to save time
                             res_runtime = await self._pw_fetch_runtime_hits(pw_context, page_url, timeout / 2,
                                                                             local_log)
                             if isinstance(res_runtime, tuple):
                                 rt_html, rt_hits = res_runtime
-                                if rt_html and not html: html = rt_html
-                                if rt_hits: local_runtime_hits.extend(rt_hits)
+                                if rt_html and not html:
+                                    html = rt_html
+
+                                if rt_hits:
+                                    local_runtime_hits.extend(rt_hits)
+
+                                    # ✅ Promote runtime URLs into link processing
+                                    for hit in rt_hits:
+                                        u = (hit.get("url") or "").strip()
+                                        if not u:
+                                            continue
+                                        if not _allowed_by_required_sites_check(u):
+                                            continue
+
+                                        # Treat runtime URLs as candidates for asset evaluation
+                                        links_on_page.append({"url": u, "text": "[Runtime]", "tag": "runtime_sniff"})
+
+                                        # Optional: add parent pages for BFS exploration
+                                        try:
+                                            parsed = urlparse(u)
+                                            if parsed.scheme and parsed.netloc and "/" in parsed.path:
+                                                parent = f"{parsed.scheme}://{parsed.netloc}{parsed.path.rsplit('/', 1)[0]}/"
+                                                if _allowed_by_required_sites_check(parent):
+                                                    next_pages.append(parent)
+                                        except Exception:
+                                            pass
+
                         except Exception as e:
                             local_log.append(f"Runtime sniffer failed: {e}")
-
                     # 3. SPECIALIZED SNIFFERS (Sequential Fallbacks)
                     # Run these only if enabled. They reuse the context but won't fight for bandwidth.
 
@@ -12477,14 +12500,22 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if not is_video:
                             is_video = self._is_probable_video_url(canon, asset_path, asset_url_lower)
 
-                        if not is_video and smart_sniff_param:
+                        if (not is_video) and smart_sniff_param:
                             try:
                                 h_status, headers = await http.head(canon)
                                 content_type = (headers.get("content-type") or "").lower()
-                                if any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES):
-                                    is_video = True
-                                if content_type in self.HLS_CONTENT_TYPES or content_type in self.DASH_CONTENT_TYPES:
-                                    is_video = True
+
+                                if h_status == 200:
+                                    if (
+                                            any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
+                                            or content_type in self.HLS_CONTENT_TYPES
+                                            or content_type in self.DASH_CONTENT_TYPES
+                                    ):
+                                        is_video = True
+
+                                    # Runtime links are often opaque; allow some “known good” hints too
+                                    if ("m3u8" in canon.lower()) or ("mpd" in canon.lower()):
+                                        is_video = True
                             except Exception:
                                 pass
 
