@@ -12199,7 +12199,6 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 },
                             )
 
-            pw_needed = use_js or use_network_sniff
             pw_p = pw_browser = pw_context = None
             try:
                 if pw_needed:
@@ -12218,6 +12217,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 # ALWAYS close Camoufox/Playwright if we opened it
                 if pw_needed and (pw_p or pw_browser or pw_context):
                     await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+                pw_p = pw_browser = pw_context = None
             async def _process_page(page_url: str, depth: int, smart_sniff_param: bool) -> Dict[str, Any]:
                 local_log: List[str] = []
                 local_js_links: List[Dict[str, str]] = []
@@ -12442,7 +12442,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         # Rule 2: If it's a Network Sniff hit, TRUST IT.
                         # The sniffer already validated it was media traffic.
-                        elif tag_type == "network_sniff":
+                        elif tag_type in ("network_sniff", "db_link"):
                             is_video = True
 
                         # Rule 3: Otherwise, run the standard heuristics (for <a> tags)
@@ -12474,8 +12474,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if canon in seen_asset_urls:
                             continue
                         seen_asset_urls.add(canon)
-
-                        is_video = self._is_probable_video_url(canon, asset_path, asset_url_lower)
+                        if not is_video:
+                            is_video = self._is_probable_video_url(canon, asset_path, asset_url_lower)
 
                         if not is_video and smart_sniff_param:
                             try:
@@ -12491,15 +12491,16 @@ class VideoLinkTrackerBlock(BaseBlock):
                         if not is_video:
                             continue
                         is_visual_match = False
+                        similarity = None
 
                         if seed_visual_sig is not None:
-                            discovery_frame = None
-                            if self._is_probable_video_url(canon, asset_path, asset_url_lower):
-                                discovery_frame = await self._extract_frame_from_video(
-                                    canon,
-                                    ffmpeg_bin_path,
-                                    local_log
-                                )
+                            # Try frame extraction even if heuristics didn't call it "video".
+                            # Reverse-search often returns extension-less / signed / HLS endpoints.
+                            discovery_frame = await self._extract_frame_from_video(
+                                canon,
+                                ffmpeg_bin_path,
+                                local_log
+                            )
 
                             if discovery_frame:
                                 discovery_sig = self._get_visual_signature(discovery_frame)
@@ -12507,7 +12508,11 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                                 if similarity > 0.75:
                                     is_visual_match = True
-                                    DEBUG_LOGGER.log_message(f"[[VideoLinkTracker][Image] Visual match found! Score: {similarity:.2f} for {canon}")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[VideoLinkTracker][Image] Visual match! score={similarity:.2f} url={canon}"
+                                    )
+                            else:
+                                local_log.append(f"[VideoLinkTracker][Image] Could not extract frame for: {canon}")
 
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
@@ -12522,11 +12527,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 haystack = (link.get("text", "") or "").lower() + " " + asset_url_lower.replace("%20", " ")
                                 if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
                                     if seed_visual_sig is not None:
-                                        if not is_visual_match:
+                                        if similarity is not None and not is_visual_match:
                                             continue
                                     else:
                                         continue
-
                         status = "unverified"
                         size = "?"
                         content_type = ""
