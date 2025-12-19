@@ -12556,8 +12556,15 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
+                        trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
+
                         if is_visual_match:
                             asset_score += 100
+
+                        if trusted_hit:
+                            asset_score = max(asset_score, 0)  # don't allow trusted hits to go negative
+                            asset_score += 25  # optional: push them above borderline noise
+
                         if asset_score < 0:
                             local_log.append(f"Skipped low-score asset ({asset_score}): {canon}")
                             continue
@@ -12580,24 +12587,30 @@ class VideoLinkTrackerBlock(BaseBlock):
                             try:
                                 h_status, headers = await http.head(canon)
                                 content_type = (headers.get("content-type") or "").lower()
+
                                 if h_status == 200:
-                                    if (not smart_sniff_param) or (
-                                        any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
-                                        or content_type in self.HLS_CONTENT_TYPES
-                                        or content_type in self.DASH_CONTENT_TYPES
-                                        or canon.lower().endswith(tuple(self.VIDEO_EXTENSIONS))
-                                    ):
+                                    cl = headers.get("content-length")
+                                    if cl:
+                                        size = f"{int(cl) // 1024} KB"
+
+                                    if trusted_hit:
+                                        # NEW: trust network/runtime/db even if CDN uses octet-stream
                                         status = "200 OK"
-                                        cl = headers.get("content-length")
-                                        if cl:
-                                            size = f"{int(cl) // 1024} KB"
                                     else:
-                                        status = "Non-video HEAD"
+                                        if (not smart_sniff_param) or (
+                                                any(content_type.startswith(pfx) for pfx in self.VIDEO_CONTENT_PREFIXES)
+                                                or content_type in self.HLS_CONTENT_TYPES
+                                                or content_type in self.DASH_CONTENT_TYPES
+                                                or canon.lower().endswith(tuple(self.VIDEO_EXTENSIONS))
+                                                or canon.lower().endswith(tuple(self.HLS_SEGMENT_EXTENSIONS))  # NEW
+                                        ):
+                                            status = "200 OK"
+                                        else:
+                                            status = "Non-video HEAD"
                                 else:
                                     status = f"Dead ({h_status})"
                             except Exception:
                                 status = "Timeout/Error"
-
                         if not verify_links or "OK" in status:
                             display_text = (link.get("text", "") or asset_path.rsplit("/", 1)[-1] or "[video asset]")[:100]
                             asset = {
