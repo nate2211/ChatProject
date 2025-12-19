@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore
+    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore
 from loggers import DEBUG_LOGGER
 
 load_dotenv()
@@ -20487,3 +20487,505 @@ class URLExpanderBlock(BaseBlock):
 
 # Register
 BLOCKS.register("urlexpander", URLExpanderBlock)
+
+
+# ======================= LinkContentCrawlerBlock ============================
+
+@dataclass
+class LinkContentCrawlerBlock(BaseBlock):
+    """
+    LinkContentCrawlerBlock
+    -----------------------
+    Reads one or more Memory keys (memory_sources), extracts URL candidates,
+    then crawls those URLs (HTML only) and extracts **direct content** links:
+
+      - Direct assets (strong):
+          * Video: mp4, webm, mkv, mov, m3u8, mpd, ts, etc.
+          * Audio: mp3, m4a, wav, flac, ogg, aac
+          * Images: jpg, png, webp, gif, avif, svg
+          * Docs: pdf, doc(x), ppt(x), etc.
+
+      - Content pages (medium):
+          * /watch, /player, /embed, /video, /clip, /stream, /download
+
+    Outputs (Memory):
+      - content_links_key: list[dict]  (url objects)
+      - content_urls_key: list[str]    (optional convenience)
+      - per_seed_stats_key: dict
+
+    DB (optional):
+      - suppresses already-emitted content URLs across runs
+      - avoids refetching seed URLs within TTL
+    """
+
+    # ------------------ URL extraction ------------------
+
+    _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
+
+    # ------------------ Content patterns ------------------
+
+    VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m3u8", ".mpd", ".ts")
+    AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac")
+    IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff", ".svg")
+    DOC_EXTS   = (".pdf", ".epub", ".mobi", ".djvu", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf")
+
+    # "content-ish" page routes
+    CONTENT_PATH_TOKENS = (
+        "/watch", "/player", "/embed", "/download", "/stream", "/video", "/clip",
+        "/movie", "/episode", "/season", "/view", "/details",
+    )
+
+    # avoid obvious junk
+    JUNK_HINTS = (
+        "mailto:", "javascript:", "tel:",
+        "/login", "/signin", "/signup", "/register", "/account",
+        "/privacy", "/terms", "/policy", "/contact", "/about", "/dmca",
+        "facebook.com", "twitter.com", "linkedin.com",
+    )
+
+    # Drop these asset types as "crawl outputs" (not content)
+    IGNORED_EXTS = (
+        ".css", ".js", ".json", ".xml", ".map",
+        ".woff", ".woff2", ".ttf", ".eot",
+        ".ico",
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    )
+
+    def _make_store(self, db_path: str):
+        cfg = submanagers.DatabaseConfig(path=db_path)
+        db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
+        store = LinkContentCrawlerStore(db=db)
+        store.ensure_schema()
+        return store
+
+    # ------------------ Utilities ------------------
+
+    def _flatten_memory_urls(self, raw: Any) -> List[str]:
+        """
+        Accepts:
+          - list[str]
+          - list[dict] with url/href/link/page/request_url/final_url fields
+          - str blobs containing URLs
+        """
+        out: List[str] = []
+        seen = set()
+
+        def push(u: str):
+            u = (u or "").strip()
+            if not u:
+                return
+            if u.startswith(("http://", "https://")):
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+                return
+            # scan blob
+            for m in self._URL_RE.finditer(u[:250_000]):
+                uu = m.group(0)
+                if uu and uu not in seen:
+                    seen.add(uu)
+                    out.append(uu)
+
+        def walk(x: Any):
+            if x is None:
+                return
+            if isinstance(x, str):
+                push(x)
+                return
+            if isinstance(x, (int, float)):
+                push(str(x))
+                return
+            if isinstance(x, list):
+                for it in x:
+                    walk(it)
+                return
+            if isinstance(x, dict):
+                for k in ("url", "href", "link", "page", "request_url", "final_url", "source_url"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for k in ("text", "html", "body", "snippet"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for v in x.values():
+                    if isinstance(v, (list, dict)):
+                        walk(v)
+                return
+            push(str(x))
+
+        walk(raw)
+        return out
+
+    def _is_junk(self, u: str) -> bool:
+        low = (u or "").lower()
+        if not low:
+            return True
+        if low.startswith(("#", "javascript:", "mailto:", "tel:")):
+            return True
+        if any(j in low for j in self.JUNK_HINTS):
+            return True
+        return False
+
+    def _ext(self, u: str) -> str:
+        try:
+            path = (u.split("?", 1)[0]).split("#", 1)[0]
+            leaf = path.rsplit("/", 1)[-1]
+            if "." in leaf:
+                return "." + leaf.rsplit(".", 1)[-1].lower()
+        except Exception:
+            pass
+        return ""
+
+    def _classify(self, u: str) -> Tuple[str, int]:
+        """
+        Returns: (kind, score)
+          kind: video|audio|image|doc|page|junk
+        """
+        if self._is_junk(u):
+            return "junk", 0
+
+        low = u.lower()
+        ext = self._ext(low)
+
+        # Hard-ignore obvious non-content assets
+        if ext and ext in self.IGNORED_EXTS:
+            return "junk", 0
+
+        # Direct assets: strongest
+        if ext in self.VIDEO_EXTS or any(low.endswith(x) for x in (".m3u8", ".mpd")):
+            return "video", 60
+        if ext in self.AUDIO_EXTS:
+            return "audio", 55
+        if ext in self.IMAGE_EXTS:
+            return "image", 45
+        if ext in self.DOC_EXTS:
+            return "doc", 40
+
+        # Content-ish pages
+        path = urlparse(u).path.lower() if u else ""
+        if any(tok in path for tok in self.CONTENT_PATH_TOKENS):
+            return "page", 25
+
+        # Otherwise: likely a normal page (low score)
+        return "page", 5
+
+    def _extract_links_from_html(self, html: str, base_url: str) -> List[str]:
+        links: List[str] = []
+        seen = set()
+
+        for m in self._HREF_RE.finditer(html or ""):
+            raw = (m.group(1) or "").strip()
+            if not raw:
+                continue
+            if raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            try:
+                full = urljoin(base_url, raw)
+                pu = urlparse(full)
+                if pu.scheme not in ("http", "https"):
+                    continue
+                # decode "uddg=" style wrapping sometimes seen in HTML
+                if "uddg=" in full:
+                    try:
+                        full = unquote(full.split("uddg=")[1].split("&")[0])
+                    except Exception:
+                        pass
+                if full not in seen:
+                    seen.add(full)
+                    links.append(full)
+            except Exception:
+                continue
+
+        return links
+
+    # ------------------ Execution ------------------
+
+    async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        log: List[str] = []
+
+        memory_sources_raw = str(params.get("memory_sources", "") or "").strip()
+        memory_sources = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+        if not memory_sources:
+            return "No operation.", {"error": "linkcontentcrawler requires params['memory_sources']"}
+
+        # IO / performance
+        timeout = float(params.get("timeout", 10.0))
+        max_seeds = int(params.get("max_seeds", 150))
+        max_concurrency = int(params.get("max_concurrency", 12))
+        max_links_per_seed = int(params.get("max_links_per_seed", 250))
+
+        # emit + scoring knobs
+        min_score = int(params.get("min_score", 20))  # default: only keep content-ish
+        include_pages = bool(params.get("include_pages", True))  # include "page" kind if score >= min_score
+
+        # memory outputs
+        out_key = str(params.get("content_links_key", "content_links")).strip()
+        out_urls_key = str(params.get("content_urls_key", "content_urls")).strip()
+        stats_key = str(params.get("per_seed_stats_key", "content_seed_stats")).strip()
+
+        # DB support
+        use_database = bool(params.get("use_database", False))
+        db_path = str(params.get("db_path", "link_corpus.db"))
+        seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
+
+        DEBUG_LOGGER.log_message(
+            f"[LinkContentCrawler] start | memory_sources={memory_sources} "
+            f"timeout={timeout} max_seeds={max_seeds} max_concurrency={max_concurrency} "
+            f"min_score={min_score} use_database={use_database} out_key={out_key!r}"
+        )
+
+        # Load Memory seeds
+        mem = Memory.load()
+        seed_urls: List[str] = []
+        for k in memory_sources:
+            raw = mem.get(k)
+            seed_urls.extend(self._flatten_memory_urls(raw))
+
+        # Dedup seeds (preserve order)
+        seed_urls = list(dict.fromkeys(seed_urls))
+        if max_seeds and len(seed_urls) > max_seeds:
+            seed_urls = seed_urls[:max_seeds]
+
+        if not seed_urls:
+            return "No seeds found.", {"seed_count": 0, "memory_sources": memory_sources}
+
+        store: Optional[LinkContentCrawlerStore] = None
+        if use_database:
+            try:
+                store = self._make_store(db_path)
+                log.append(f"[LinkContentCrawler][DB] Enabled db_path={db_path} seed_ttl_seconds={seed_ttl_seconds:.0f}")
+            except Exception as e:
+                store = None
+                use_database = False
+                log.append(f"[LinkContentCrawler][DB] Init failed: {e} (continuing without DB)")
+
+        # Plan which seeds to fetch (TTL gating)
+        now_ts = time.time()
+        seeds_to_fetch = seed_urls
+        if store:
+            seeds_to_fetch = [u for u in seed_urls if store.seed_should_fetch(u, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
+            skipped = len(seed_urls) - len(seeds_to_fetch)
+            if skipped:
+                msg = f"[LinkContentCrawler][DB] Skipping {skipped} seed(s) due to TTL."
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+
+        # Crawl HTML pages, extract links, classify and collect
+        import aiohttp
+
+        sem = asyncio.Semaphore(max_concurrency)
+        found_objs: List[Dict[str, Any]] = []
+        found_urls_set = set()
+
+        per_seed_stats: Dict[str, Dict[str, Any]] = {}
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+
+            async def crawl_seed(seed: str):
+                if not seed:
+                    return
+                if self._is_junk(seed):
+                    per_seed_stats[seed] = {"status": "skipped_junk", "out_links": 0, "kept": 0}
+                    return
+
+                async with sem:
+                    t0 = time.time()
+                    try:
+                        DEBUG_LOGGER.log_message(f"[LinkContentCrawler][Seed] fetch={seed}")
+                        async with session.get(seed, allow_redirects=True) as resp:
+                            final_url = str(resp.url)
+                            status = int(resp.status)
+                            ctype = (resp.headers.get("Content-Type", "") or "").lower()
+
+                            if store:
+                                try:
+                                    store.seed_mark_fetched(seed, now_ts=time.time(), status=status)
+                                except Exception:
+                                    pass
+
+                            if status != 200:
+                                per_seed_stats[seed] = {"status": f"http_{status}", "out_links": 0, "kept": 0}
+                                return
+
+                            if "text/html" not in ctype:
+                                # This seed might already be direct content, classify it
+                                kind, score = self._classify(final_url)
+                                kept = 0
+                                if score >= min_score and (include_pages or kind != "page") and kind != "junk":
+                                    if (not store) or (not store.has_emitted(final_url)):
+                                        if final_url not in found_urls_set:
+                                            found_urls_set.add(final_url)
+                                            found_objs.append({
+                                                "url": final_url,
+                                                "source": "linkcontentcrawler_seed_nonhtml",
+                                                "seed": seed,
+                                                "final_url": final_url,
+                                                "kind": kind,
+                                                "score": score,
+                                                "first_seen": time.time(),
+                                            })
+                                            kept += 1
+                                            if store:
+                                                store.mark_emitted(final_url, now_ts=time.time(), source="seed_nonhtml", kind=kind, score=score)
+
+                                per_seed_stats[seed] = {"status": f"non_html({ctype[:40]})", "out_links": 0, "kept": kept}
+                                return
+
+                            html = await resp.text(errors="ignore")
+                            out_links = self._extract_links_from_html(html, final_url)
+                            if max_links_per_seed and len(out_links) > max_links_per_seed:
+                                out_links = out_links[:max_links_per_seed]
+
+                            kept = 0
+                            for u in out_links:
+                                kind, score = self._classify(u)
+                                if kind == "junk":
+                                    continue
+                                if score < min_score:
+                                    continue
+                                if (not include_pages) and kind == "page":
+                                    continue
+
+                                # DB suppress cross-run duplicates
+                                if store and store.has_emitted(u):
+                                    continue
+
+                                if u in found_urls_set:
+                                    continue
+
+                                found_urls_set.add(u)
+                                found_objs.append({
+                                    "url": u,
+                                    "source": "linkcontentcrawler",
+                                    "seed": seed,
+                                    "final_url": final_url,
+                                    "kind": kind,
+                                    "score": score,
+                                    "first_seen": time.time(),
+                                })
+                                kept += 1
+
+                                if store:
+                                    store.mark_emitted(u, now_ts=time.time(), source="crawl", kind=kind, score=score)
+
+                            per_seed_stats[seed] = {
+                                "status": "ok",
+                                "final_url": final_url,
+                                "ms": int((time.time() - t0) * 1000),
+                                "out_links": len(out_links),
+                                "kept": kept,
+                            }
+
+                    except Exception as e:
+                        per_seed_stats[seed] = {"status": "error", "error": str(e)[:200], "out_links": 0, "kept": 0}
+                        DEBUG_LOGGER.log_message(f"[LinkContentCrawler][Seed] ERROR seed={seed} err={e}")
+
+            await asyncio.gather(*[crawl_seed(s) for s in seeds_to_fetch])
+
+        # Merge into Memory (like LinkCrawler)
+        mem2 = Memory.load()
+
+        existing = mem2.get(out_key, [])
+        if not isinstance(existing, list):
+            existing = []
+
+        existing_urls = {
+            str(x.get("url")) for x in existing
+            if isinstance(x, dict) and x.get("url")
+        }
+
+        new_added = 0
+        ts = time.time()
+        for obj in found_objs:
+            u = obj.get("url")
+            if not u:
+                continue
+            if u in existing_urls:
+                continue
+            existing.append(obj)
+            existing_urls.add(u)
+            new_added += 1
+
+        # cap
+        max_memory_items = int(params.get("max_memory_items", 4000))
+        if len(existing) > max_memory_items:
+            existing = existing[-max_memory_items:]
+
+        mem2[out_key] = existing
+        mem2[stats_key] = per_seed_stats
+
+        # optional convenience string list
+        if out_urls_key:
+            mem2[out_urls_key] = [x["url"] for x in existing if isinstance(x, dict) and x.get("url")][-max_memory_items:]
+
+        Memory.save(mem2)
+
+        # Report
+        lines = [
+            "### 🧠 LinkContentCrawler Report",
+            f"_Memory Sources: {', '.join(memory_sources)}_",
+            f"_Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)} | Found: {len(found_objs)} | Added to Memory: {new_added}_",
+            "",
+            f"**min_score:** {min_score} | **include_pages:** {include_pages}",
+            f"**DB Cache:** {'ON' if use_database else 'OFF'}",
+        ]
+        if use_database:
+            lines.append(f"**db_path:** {db_path}")
+            lines.append(f"**seed_ttl_seconds:** {seed_ttl_seconds:.0f}")
+
+        lines.append("")
+        lines.append("**Sample Found Content:**")
+        for o in found_objs[:12]:
+            lines.append(f"- [{o.get('kind')}] score={o.get('score')} {o.get('url')}")
+
+        if log:
+            lines.append("\n**Log:**")
+            lines.extend(log)
+
+        meta = {
+            "seed_count": len(seed_urls),
+            "fetched_seed_count": len(seeds_to_fetch),
+            "found_count": len(found_objs),
+            "new_added": new_added,
+            "content_links_key": out_key,
+            "content_urls_key": out_urls_key,
+            "per_seed_stats_key": stats_key,
+            "use_database": use_database,
+            "db_path": db_path if use_database else None,
+            "seed_ttl_seconds": seed_ttl_seconds,
+            "urls": [o["url"] for o in found_objs],
+            "items": found_objs,
+            "stats": per_seed_stats,
+        }
+
+        return "\n".join(lines), meta
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "memory_sources": "scraped_links",      # comma-separated keys
+            "timeout": 10.0,
+            "max_seeds": 150,
+            "max_concurrency": 12,
+            "max_links_per_seed": 250,
+
+            "min_score": 20,          # 60/55/45/40 direct, 25 content pages, 5 generic pages
+            "include_pages": True,    # include watch/embed/player pages
+
+            "content_links_key": "content_links",
+            "content_urls_key": "content_urls",
+            "per_seed_stats_key": "content_seed_stats",
+            "max_memory_items": 4000,
+
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "seed_ttl_seconds": 21600,
+        }
+
+
+# register
+BLOCKS.register("linkcontentcrawler", LinkContentCrawlerBlock)

@@ -1548,3 +1548,61 @@ class LinkCrawlerStore(BaseStore):
             (seed_url, ts, int(status)),
         )
 
+# ======================================================================
+# Optional DB Store (small, self-contained)
+# ======================================================================
+
+class LinkContentCrawlerStore:
+    """
+    Very small store:
+      - emitted(url): suppress cross-run duplicates
+      - seed fetch TTL: avoid re-fetching the same seed URL too frequently
+    """
+
+    def __init__(self, db):
+        self.db = db
+
+    def ensure_schema(self):
+        self.db.exec("""
+        CREATE TABLE IF NOT EXISTS linkcontent_emitted (
+            url TEXT PRIMARY KEY,
+            first_seen REAL,
+            source TEXT,
+            kind TEXT,
+            score INTEGER
+        )
+        """)
+        self.db.exec("""
+        CREATE TABLE IF NOT EXISTS linkcontent_seed_fetch (
+            url TEXT PRIMARY KEY,
+            last_fetch REAL,
+            last_status INTEGER
+        )
+        """)
+        self.db.exec("CREATE INDEX IF NOT EXISTS idx_lcc_seed_fetch_ts ON linkcontent_seed_fetch(last_fetch)")
+        self.db.commit()
+
+    def has_emitted(self, url: str) -> bool:
+        row = self.db.one("SELECT 1 FROM linkcontent_emitted WHERE url=?", (url,))
+        return bool(row)
+
+    def mark_emitted(self, url: str, *, now_ts: float, source: str, kind: str, score: int):
+        self.db.exec(
+            "INSERT OR REPLACE INTO linkcontent_emitted(url, first_seen, source, kind, score) VALUES(?,?,?,?,?)",
+            (url, float(now_ts), source or "", kind or "", int(score)),
+        )
+        self.db.commit()
+
+    def seed_should_fetch(self, url: str, *, ttl_seconds: float, now_ts: float) -> bool:
+        row = self.db.one("SELECT last_fetch FROM linkcontent_seed_fetch WHERE url=?", (url,))
+        if not row:
+            return True
+        last = float(row[0] or 0.0)
+        return (now_ts - last) >= float(ttl_seconds)
+
+    def seed_mark_fetched(self, url: str, *, now_ts: float, status: int):
+        self.db.exec(
+            "INSERT OR REPLACE INTO linkcontent_seed_fetch(url, last_fetch, last_status) VALUES(?,?,?)",
+            (url, float(now_ts), int(status)),
+        )
+        self.db.commit()
