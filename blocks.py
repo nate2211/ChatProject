@@ -11737,9 +11737,16 @@ class VideoLinkTrackerBlock(BaseBlock):
                     log=log,
                     max_results=max_pages_total
                 )
-
                 for url in rev_seeds:
-                    if global_mode or _allowed_by_required_sites_check(url):
+                    if not (global_mode or _allowed_by_required_sites_check(url)):
+                        continue
+
+                    path = self._clean_path(url)
+                    low = url.lower()
+
+                    if self._is_probable_video_url(url, path, low):
+                        direct_asset_urls.append(url)  # <-- critical
+                    else:
                         candidate_pages.append(url)
 
         # ===================== source=database =====================
@@ -12519,8 +12526,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                             except Exception:
                                 pass
 
-                        if not is_video:
-                            continue
+                        if not is_video and seed_visual_sig is not None:
+                            # allow visual probing on opaque/signed endpoints
+                            is_video = True
+                            trusted_hit = True  # or set a flag like visual_probe=True
                         is_visual_match = False
                         similarity = None
 
