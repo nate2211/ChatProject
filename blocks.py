@@ -12465,7 +12465,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         # Rule 2: If it's a Network Sniff hit, TRUST IT.
                         # The sniffer already validated it was media traffic.
-                        elif tag_type in ("network_sniff", "db_link"):
+                        elif tag_type in ("network_sniff", "db_link", "runtime_sniff"):
                             is_video = True
 
                         # Rule 3: Otherwise, run the standard heuristics (for <a> tags)
@@ -12477,10 +12477,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                         tag = link.get("tag") or ""
                         is_sniff_or_db = (
                                 tag == "network_sniff"
-                                or tag == "db_link"  # <--- Added this
+                                or tag == "runtime_sniff"
+                                or tag == "db_link"
                                 or tag in ("direct_asset", "db_seed", "db_expand", "db_manifest", "synthetic")
                         )
-
                         if not is_sniff_or_db:
                             if not self._allowed_by_required_sites(canon, required_sites, global_mode):
                                 continue
@@ -12566,7 +12566,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         size = "?"
                         content_type = ""
                         do_head = verify_links or smart_sniff_param
-
+                        trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
                         if do_head:
                             try:
                                 h_status, headers = await http.head(canon)
