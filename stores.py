@@ -1606,3 +1606,132 @@ class LinkContentCrawlerStore:
             (url, float(now_ts), int(status)),
         )
         self.db.commit()
+
+# ======================================================================
+# Store (DB-backed) for CDNBlock
+# ======================================================================
+
+class CDNStore:
+    """
+    Stores:
+      - cdn_emitted: suppresses already-emitted CDN urls across runs
+      - cdn_seed_fetch: TTL gating for seed URL fetches
+    """
+
+    DDL: Sequence[str] = (
+        """
+        CREATE TABLE IF NOT EXISTS cdn_emitted (
+            url TEXT PRIMARY KEY,
+            host TEXT,
+            kind TEXT,
+            source_seed TEXT,
+            first_seen REAL,
+            last_seen REAL,
+            score INTEGER
+        );
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS cdn_seed_fetch (
+            seed_url TEXT PRIMARY KEY,
+            last_fetch_ts REAL,
+            status INTEGER
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_cdn_emitted_host ON cdn_emitted(host);",
+    )
+
+    def __init__(self, db):
+        self.db = db
+
+    def ensure_schema(self) -> None:
+        self.db.ensure_schema(self.DDL)
+        # micro-migrations (safe no-ops if already present)
+        try:
+            self.db.ensure_columns("cdn_emitted", {
+                "host": "TEXT",
+                "kind": "TEXT",
+                "source_seed": "TEXT",
+                "first_seen": "REAL",
+                "last_seen": "REAL",
+                "score": "INTEGER",
+            })
+            self.db.ensure_columns("cdn_seed_fetch", {
+                "last_fetch_ts": "REAL",
+                "status": "INTEGER",
+            })
+        except Exception:
+            pass
+
+    # ---------------- TTL gating for seeds ----------------
+
+    def seed_should_fetch(self, seed_url: str, *, ttl_seconds: float, now_ts: float) -> bool:
+        if not seed_url:
+            return False
+        try:
+            row = self.db.fetchone(
+                "SELECT last_fetch_ts FROM cdn_seed_fetch WHERE seed_url=?",
+                [seed_url],
+            )
+            if not row:
+                return True
+            last_ts = float(row["last_fetch_ts"] or 0.0)
+            return (now_ts - last_ts) >= float(ttl_seconds)
+        except Exception:
+            return True
+
+    def seed_mark_fetched(self, seed_url: str, *, now_ts: float, status: int) -> None:
+        if not seed_url:
+            return
+        try:
+            self.db.execute(
+                """
+                INSERT INTO cdn_seed_fetch(seed_url, last_fetch_ts, status)
+                VALUES(?,?,?)
+                ON CONFLICT(seed_url) DO UPDATE SET
+                    last_fetch_ts=excluded.last_fetch_ts,
+                    status=excluded.status
+                """,
+                [seed_url, float(now_ts), int(status)],
+            )
+        except Exception:
+            pass
+
+    # ---------------- emitted suppression ----------------
+
+    def has_emitted(self, url: str) -> bool:
+        if not url:
+            return False
+        try:
+            row = self.db.fetchone("SELECT 1 FROM cdn_emitted WHERE url=? LIMIT 1", [url])
+            return bool(row)
+        except Exception:
+            return False
+
+    def mark_emitted(
+        self,
+        url: str,
+        *,
+        host: str,
+        kind: str,
+        source_seed: str,
+        score: int,
+        now_ts: float,
+    ) -> None:
+        if not url:
+            return
+        try:
+            self.db.execute(
+                """
+                INSERT INTO cdn_emitted(url, host, kind, source_seed, first_seen, last_seen, score)
+                VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(url) DO UPDATE SET
+                    last_seen=excluded.last_seen,
+                    host=excluded.host,
+                    kind=excluded.kind,
+                    source_seed=excluded.source_seed,
+                    score=excluded.score
+                """,
+                [url, host, kind, source_seed, float(now_ts), float(now_ts), int(score)],
+            )
+        except Exception:
+            pass

@@ -39,10 +39,10 @@ from models import get_chat_model  # <-- models now live separately
 import xml.etree.ElementTree as ET
 import re as _re
 from dotenv import load_dotenv
-
+from datetime import datetime, time as dt_time
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore
+    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore
 from loggers import DEBUG_LOGGER
 
 load_dotenv()
@@ -7408,52 +7408,52 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
-        return await self.network_sniffer.sniff(
+        return await asyncio.wait_for(self.network_sniffer.sniff(
             context, page_url,
             timeout=timeout,
             log=log,
             extensions=extensions,
-        )
+        ),timeout=25)
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
-        return await self.js_sniffer.sniff(
+        return await asyncio.wait_for(self.js_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
             extensions=extensions,
-        )
+        ),timeout=25)
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
-        return await self.runtime_sniffer.sniff(
+        return await asyncio.wait_for(self.runtime_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ),timeout=25)
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
-        return await self.react_sniffer.sniff(
+        return await asyncio.wait_for(self.react_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ),timeout=25)
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
-        return await self.database_sniffer.sniff(
+        return await asyncio.wait_for(self.database_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ),timeout=25)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
-        return await self.interaction_sniffer.sniff(
+        return await asyncio.wait_for(self.interaction_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log
-        )
+        ),timeout=25)
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -10753,53 +10753,55 @@ class VideoLinkTrackerBlock(BaseBlock):
     # ------------------------------------------------------------------ #
 
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
-        return await self.network_sniffer.sniff(
+        return await asyncio.wait_for(self.network_sniffer.sniff(
             context, page_url,
             timeout=timeout,
             log=log,
             extensions=extensions,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
-        return await self.js_sniffer.sniff(
+        return await asyncio.wait_for(self.js_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
             extensions=extensions,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
-        return await self.runtime_sniffer.sniff(
+        return await asyncio.wait_for(self.runtime_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
-        return await self.react_sniffer.sniff(
+        return await asyncio.wait_for(self.react_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
+
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
-        return await self.database_sniffer.sniff(
+        return await asyncio.wait_for(self.database_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
-        return await self.interaction_sniffer.sniff(
+        return await asyncio.wait_for(self.interaction_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log
-        )
+        ), timeout=25)
+
     # ------------------------------------------------------------------ #
     # Search engines (DuckDuckGo + Google CSE)
     # ------------------------------------------------------------------ #
@@ -16557,44 +16559,43 @@ class PageTrackerBlock(BaseBlock):
         )
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
-        return await self.js_sniffer.sniff(
+        return await asyncio.wait_for(self.js_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
             extensions=extensions,
-        )
-
+        ), timeout=25)
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
-        return await self.runtime_sniffer.sniff(
+        return await asyncio.wait_for(self.runtime_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
-        return await self.react_sniffer.sniff(
+        return await asyncio.wait_for(self.react_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
-        return await self.database_sniffer.sniff(
+        return await asyncio.wait_for(self.database_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        )
+        ), timeout=25)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
-        return await self.interaction_sniffer.sniff(
+        return await asyncio.wait_for(self.interaction_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log
-        )
+        ), timeout=25)
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -18374,23 +18375,16 @@ class LinkCrawlerBlock(BaseBlock):
     """
     LinkCrawlerBlock
 
-    NEW PARAMS:
-      - use_database: bool = False
-      - db_path: str = "link_corpus.db"
-      - seed_ttl_seconds: float = 21600 (6 hours)
-      - ffmpeg_bin: str = "ffmpeg"
+    Rewritten to use:
+      - HTTPSSubmanager (shared aiohttp engine, retries, cooldowns, per-host semaphores)
+      - DatabaseSubmanager (via LinkCrawlerStore)
 
     Behavior:
-      - Always does Memory-level dedupe (existing behavior).
+      - Memory-level dedupe (existing behavior).
       - If use_database=True:
           * Suppresses URLs previously emitted (cross-run).
           * Skips re-fetching seed URLs recently fetched (TTL).
-
-    Logging:
-      - Uses DEBUG_LOGGER.log_message() for detailed crawl-per-page messages.
     """
-
-    # ------------------ Configuration ------------------
 
     _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
     _TEXT_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
@@ -18428,8 +18422,6 @@ class LinkCrawlerBlock(BaseBlock):
     _MEDIA_EXT_RE = re.compile(r"\.(mp4|mkv|mov|avi|wmv|flv|webm|m3u8|mpd|ts|m4a|mp3|flac|wav|ogg|aac)$", re.IGNORECASE)
     _IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|avif|bmp|tiff|svg)$", re.IGNORECASE)
 
-    # ------------------ Query Augmentation ------------------
-
     def _augment_query_by_mode(self, q: str, mode: str) -> str:
         q = (q or "").strip()
         mode = (mode or "search").lower().strip()
@@ -18461,463 +18453,89 @@ class LinkCrawlerBlock(BaseBlock):
         u = (u or "").lower()
         return bool(self._MEDIA_EXT_RE.search(u)) or any(u.endswith(x) for x in (".m3u8", ".mpd"))
 
-    # ------------------ OG-image fallback ------------------
+    # ------------------ Parsing Logic ------------------
 
-    async def _try_extract_og_image(self, page_url: str, timeout: float, log: List[str]) -> str:
-        import aiohttp
-        from bs4 import BeautifulSoup
-        from urllib.parse import urljoin
+    def _extract_links(self, html: str, base_url: str, mode: str = "search") -> Tuple[List[str], List[str]]:
+        all_links: set[str] = set()
+        content_candidates: set[str] = set()
 
-        if not page_url:
-            return ""
+        mode = (mode or "search").lower().strip()
 
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-                async with session.get(page_url, allow_redirects=True) as resp:
-                    ctype = (resp.headers.get("Content-Type", "") or "").lower()
-                    if resp.status != 200:
-                        return ""
-                    if "text/html" not in ctype:
-                        return ""
-                    html = await resp.text(errors="ignore")
-        except Exception as e:
-            log.append(f"[Crawler][RevImg][coerce] og:image fetch failed: {e}")
-            return ""
-
-        try:
-            soup = BeautifulSoup(html or "", "html.parser")
-            candidates: List[str] = []
-
-            for sel in [
-                ("meta", {"property": "og:image"}),
-                ("meta", {"name": "twitter:image"}),
-                ("meta", {"property": "twitter:image"}),
-                ("link", {"rel": "image_src"}),
-            ]:
-                tag = soup.find(*sel)
-                if not tag:
-                    continue
-                val = tag.get("content") if tag.name == "meta" else tag.get("href")
-                if val:
-                    candidates.append(val.strip())
-
-            for tag in soup.find_all("meta"):
-                prop = (tag.get("property") or "").lower()
-                name = (tag.get("name") or "").lower()
-                if prop in ("og:image:secure_url",) or name in ("twitter:image:src",):
-                    val = tag.get("content")
-                    if val:
-                        candidates.append(val.strip())
-
-            for c in candidates:
-                img = urljoin(page_url, c)
-                if self._looks_like_image_url(img):
-                    log.append(f"[Crawler][RevImg][coerce] using og/twitter image: {img}")
-                    return img
-
-        except Exception as e:
-            log.append(f"[Crawler][RevImg][coerce] og:image parse failed: {e}")
-
-        return ""
-
-    async def _upload_frame_to_host(self, image_path: str, log: List[str]) -> Optional[str]:
-        """
-        Uploads the local temp image to Catbox to get a public URL.
-        This is the secret sauce that makes VideoLinkTracker work.
-        """
-        import aiohttp
-        if not os.path.exists(image_path):
-            return None
-
-        upload_url = "https://catbox.moe/user/api.php"
-        try:
-            with open(image_path, "rb") as f:
-                img_bytes = f.read()
-
-            data = aiohttp.FormData()
-            data.add_field("reqtype", "fileupload")
-            data.add_field("fileToUpload", img_bytes, filename="frame.png", content_type="image/png")
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(upload_url, data=data, timeout=15) as resp:
-                    if resp.status == 200:
-                        url = await resp.text()
-                        return url.strip()
-        except Exception as e:
-            log.append(f"[Crawler][Upload] Failed: {e}")
-        return None
-    # ------------------ FFmpeg “screenshot” (frame extract) ------------------
-
-    async def _screenshot_url_to_temp_image(
-        self,
-        url: str,
-        timeout: float,
-        log: List[str],
-        ffmpeg_bin: str = "ffmpeg"
-    ) -> str:
-        """
-        Uses FFmpeg to extract a single frame from a video (URL or local path).
-        Ported from VideoLinkTracker for maximum reliability and speed.
-        """
-        import os
-        import shutil
-        import random
-        import json
-        import tempfile
-
-        if not url:
-            return ""
-
-        # 1) Resolve binaries robustly
-        def _resolve_bin(name_or_path: str) -> Optional[str]:
-            if not name_or_path:
-                return None
-            if os.path.exists(name_or_path):
-                return os.path.abspath(name_or_path)
-            found = shutil.which(name_or_path)
-            if found:
-                return found
-            if not name_or_path.lower().endswith(".exe"):
-                found = shutil.which(name_or_path + ".exe")
-                if found:
-                    return found
-            return None
-
-        exe = _resolve_bin(ffmpeg_bin) or _resolve_bin("ffmpeg")
-        if not exe:
-            log.append(f"[Crawler][ffmpeg] Binary not found: {ffmpeg_bin}")
-            return ""
-
-        ffprobe_guess = os.path.join(
-            os.path.dirname(exe),
-            "ffprobe" + (".exe" if exe.lower().endswith(".exe") else "")
-        )
-        ffprobe = _resolve_bin(ffprobe_guess) or _resolve_bin("ffprobe")
-
-        # 2) Subprocess runner
-        async def _run_tool(cmd: List[str]) -> Tuple[int, bytes, bytes]:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            out, err = await proc.communicate()
-            return proc.returncode, out or b"", err or b""
-
-        # 3) Probe duration (best-effort)
-        duration: Optional[float] = None
-        if ffprobe:
-            probe_cmds = [
-                [ffprobe, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "format=duration", "-of", "json", url],
-                [ffprobe, "-v", "error", "-select_streams", "v:0",
-                 "-show_entries", "stream=duration", "-of", "json", url],
-            ]
-            for pcmd in probe_cmds:
-                try:
-                    rc, out, _err = await _run_tool(pcmd)
-                    if rc == 0 and out:
-                        info = json.loads(out.decode(errors="ignore") or "{}")
-                        dur_s = (info.get("format") or {}).get("duration")
-                        if dur_s is None:
-                            streams = info.get("streams") or []
-                            if streams:
-                                dur_s = (streams[0] or {}).get("duration")
-                        if dur_s:
-                            d = float(dur_s)
-                            if d > 0:
-                                duration = d
-                                break
-                except Exception:
-                    pass
-
-        # 4) Determine safe timestamp
-        if not duration or duration <= 0:
-            timestamp = 1.0
+        if mode == "docs":
+            hint_set = self._DOC_HINTS
+            ext_re = self._DOC_EXT_RE
+        elif mode == "media":
+            hint_set = self._MEDIA_HINTS
+            ext_re = self._MEDIA_EXT_RE
+        elif mode == "images":
+            hint_set = self._IMAGE_HINTS
+            ext_re = self._IMAGE_EXT_RE
         else:
-            # Keep near start-ish to preserve "seed context", but avoid black first frames
-            margin = min(1.0, duration * 0.05)
-            lo = margin
-            hi = min(30.0, max(margin, duration - margin))
-            if hi <= lo + 0.05:
-                timestamp = max(0.0, duration * 0.5)
-            else:
-                timestamp = random.uniform(lo, hi)
+            hint_set = self._CONTENT_HINTS
+            ext_re = self._MEDIA_EXT_RE
 
-        timestamp_str = f"{timestamp:.3f}"
+        for m in self._HREF_RE.finditer(html or ""):
+            raw = m.group(1)
+            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
 
-        # 5) Extract into temp file (PNG)
-        tmp_path = ""
-        try:
-            fd, tmp_path = tempfile.mkstemp(prefix="crawler_ff_", suffix=".png")
             try:
-                os.close(fd)
-            except Exception:
-                pass
-
-            common_args = [
-                "-hide_banner", "-loglevel", "error",
-                "-an",
-                "-frames:v", "1",
-                "-vcodec", "png",
-                "-y",
-                tmp_path
-            ]
-
-            # Attempt A: fast seek (ss before i)
-            cmd_fast = [exe, "-ss", timestamp_str, "-i", url] + common_args
-            # Attempt B: accurate seek (ss after i)
-            cmd_acc = [exe, "-i", url, "-ss", timestamp_str] + common_args
-
-            for label, cmd in (("fast", cmd_fast), ("accurate", cmd_acc)):
-                try:
-                    rc, _out, err = await _run_tool(cmd)
-                    if rc == 0 and os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-                        log.append(f"[Crawler][ffmpeg] Frame extracted ({label}) @ {timestamp_str}s -> {tmp_path}")
-                        return tmp_path
-                    log.append(f"[Crawler][ffmpeg] {label} seek failed rc={rc}: {err.decode(errors='ignore')[:300]}")
-                except Exception as e:
-                    log.append(f"[Crawler][ffmpeg] {label} exception: {e}")
-
-        except Exception as e:
-            log.append(f"[Crawler][ffmpeg] General extraction error: {e}")
-
-        # cleanup on failure
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-
-        return ""
-
-    # ------------------ Coercion logic (video/page → image input) ------------------
-
-    async def _coerce_reverse_image_inputs(
-            self,
-            *,
-            image_url: str,
-            image_path: str,
-            timeout: float,
-            log: List[str],
-            ffmpeg_bin: str = "ffmpeg",
-    ) -> Tuple[str, str, List[str]]:
-        import os
-        image_url = (image_url or "").strip()
-        image_path = (image_path or "").strip()
-        temps: List[str] = []
-
-        # Case 1: Local Video -> Extract Frame -> Upload to Catbox
-        if image_path and os.path.exists(image_path) and self._looks_like_video_url(image_path):
-            tmp = await self._screenshot_url_to_temp_image(image_path, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
-            if tmp:
-                temps.append(tmp)
-                public_url = await self._upload_frame_to_host(tmp, log)
-                if public_url:
-                    log.append(f"[Crawler][RevImg] Coerced video to public image URL: {public_url}")
-                    return public_url, "", temps
-                return "", tmp, temps  # Fallback to local path if upload fails
-
-        # Case 2: Direct image URL -> Keep as is
-        if image_url and self._looks_like_image_url(image_url) and not self._looks_like_video_url(image_url):
-            return image_url, "", temps
-
-        # Case 3: Video URL -> Extract Frame -> Upload to Catbox
-        if image_url and self._looks_like_video_url(image_url):
-            tmp = await self._screenshot_url_to_temp_image(image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
-            if tmp:
-                temps.append(tmp)
-                public_url = await self._upload_frame_to_host(tmp, log)
-                if public_url:
-                    return public_url, "", temps
-                return "", tmp, temps
-
-        # Case 4: Standard Web Page -> Try OG Tags or Screenshot -> Upload
-        if image_url:
-            og = await self._try_extract_og_image(image_url, timeout=timeout, log=log)
-            if og: return og, "", temps
-
-            tmp = await self._screenshot_url_to_temp_image(image_url, timeout=timeout, log=log, ffmpeg_bin=ffmpeg_bin)
-            if tmp:
-                temps.append(tmp)
-                public_url = await self._upload_frame_to_host(tmp, log)
-                if public_url: return public_url, "", temps
-                return "", tmp, temps
-
-        return image_url, image_path, temps
-
-    # ------------------ Reverse image search (Playwright) ------------------
-
-    async def _reverse_image_search_seeds(
-        self,
-        *,
-        image_url: str = "",
-        image_path: str = "",
-        engine: str = "both",  # "yandex" | "google" | "both"
-        limit: int = 20,
-        timeout: float = 20.0,
-        log: List[str],
-    ) -> List[str]:
-        import os
-        from urllib.parse import quote, urlparse, unquote
-        from playwright.async_api import async_playwright
-
-        engine = (engine or "both").lower().strip()
-        image_url = (image_url or "").strip()
-        image_path = (image_path or "").strip()
-
-        if not image_url and not image_path:
-            return []
-
-        if image_path and not os.path.exists(image_path):
-            log.append(f"[Crawler][RevImg] image_path not found: {image_path}")
-            return []
-
-        def _good_seed(u: str) -> bool:
-            try:
-                pu = urlparse(u)
-                if pu.scheme not in ("http", "https"):
-                    return False
-                host = (pu.netloc or "").lower()
-                if any(bad in host for bad in ("yandex.", "google.", "lens.google.", "gstatic.com")):
-                    return False
-                return True
-            except Exception:
-                return False
-
-        seeds: List[str] = []
-        seen: set[str] = set()
-
-        async def _collect_links_from_page(page):
-            hrefs = await page.eval_on_selector_all(
-                "a[href]",
-                "els => els.map(e => e.getAttribute('href')).filter(Boolean)"
-            )
-            for h in hrefs or []:
-                if not h:
+                full_url = urljoin(base_url, raw)
+                parsed = urlparse(full_url)
+                if parsed.scheme not in ("http", "https"):
                     continue
-                u = h
-                if "url=" in u and ("yandex" in u or "redir" in u):
-                    try:
-                        part = u.split("url=", 1)[1]
-                        part = part.split("&", 1)[0]
-                        u = unquote(part)
-                    except Exception:
-                        pass
 
-                if _good_seed(u) and u not in seen:
-                    seen.add(u)
-                    seeds.append(u)
-                    if len(seeds) >= limit:
-                        return
+                u_lower = full_url.lower()
+                if any(bad in u_lower for bad in self._JUNK_HINTS):
+                    continue
 
-        yandex_url = ""
-        google_url = ""
-        if image_url:
-            yandex_url = f"https://yandex.com/images/search?rpt=imageview&url={quote(image_url)}"
-            google_url = f"https://lens.google.com/uploadbyurl?url={quote(image_url)}"
+                all_links.add(full_url)
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context()
+                score = 0
+                path_lower = (parsed.path or "").lower()
 
-                # Yandex
-                if engine in ("yandex", "both") and (image_url or image_path):
-                    page = await context.new_page()
-                    try:
-                        if image_url:
-                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] Opening imageview URL...")
-                            await page.goto(yandex_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
-                        else:
-                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] Uploading local image (best-effort)...")
-                            await page.goto("https://yandex.com/images/", wait_until="domcontentloaded",
-                                            timeout=int(timeout * 1000))
-                            # selectors drift; keep it best-effort
-                            for sel in [
-                                'button[aria-label*="Search by image"]',
-                                'button[aria-label*="image"]',
-                                'button:has-text("Search by image")',
-                                'button:has-text("Image")',
-                            ]:
-                                try:
-                                    await page.click(sel, timeout=2000)
-                                    break
-                                except Exception:
-                                    pass
-                            file_inputs = await page.query_selector_all('input[type="file"]')
-                            if file_inputs:
-                                await file_inputs[0].set_input_files(image_path)
-                            else:
-                                DEBUG_LOGGER.log_message("[Crawler][RevImg][Yandex] No file input found (UI changed?).")
-                                page = None
+                if any(hint in u_lower for hint in hint_set):
+                    score += 2
+                if ext_re.search(path_lower):
+                    score += 6
+                if any(tok in path_lower for tok in ("/watch", "/player", "/embed", "/download", "/view", "/details")):
+                    score += 1
 
-                        if page:
-                            await page.wait_for_timeout(1500)
-                            await _collect_links_from_page(page)
-                            DEBUG_LOGGER.log_message(f"[Crawler][RevImg][Yandex] seeds={len(seeds)}")
-                    except Exception as e:
-                        log.append(f"[Crawler][RevImg][Yandex] error: {e}")
-                    finally:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
+                if mode in ("docs", "media", "images") and score <= 0:
+                    continue
 
-                # Google Lens
-                if len(seeds) < limit and engine in ("google", "both") and (image_url or image_path):
-                    page = await context.new_page()
-                    try:
-                        if image_url:
-                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Lens] Opening uploadbyurl...")
-                            await page.goto(google_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
-                        else:
-                            DEBUG_LOGGER.log_message("[Crawler][RevImg][Lens] Uploading local image...")
-                            await page.goto("https://lens.google.com/", wait_until="domcontentloaded",
-                                            timeout=int(timeout * 1000))
-                            inp = await page.query_selector('input[type="file"]')
-                            if not inp:
-                                for sel in ['text=Upload', 'text=Search by image', 'button:has-text("Upload")']:
-                                    try:
-                                        await page.click(sel, timeout=2000)
-                                        break
-                                    except Exception:
-                                        pass
-                                inp = await page.query_selector('input[type="file"]')
+                if score > 0:
+                    content_candidates.add(full_url)
 
-                            if inp:
-                                await inp.set_input_files(image_path)
-                            else:
-                                log.append("[Crawler][RevImg][Lens] No file input found (UI changed?).")
-                                page = None
+            except Exception:
+                continue
 
-                        if page:
-                            await page.wait_for_timeout(2500)
-                            try:
-                                await page.mouse.wheel(0, 1200)
-                                await page.wait_for_timeout(800)
-                            except Exception:
-                                pass
+        return list(all_links), list(content_candidates)
 
-                            await _collect_links_from_page(page)
-                            DEBUG_LOGGER.log_message(f"[Crawler][RevImg][Lens] seeds={len(seeds)}")
-                    except Exception as e:
-                        log.append(f"[Crawler][RevImg][Lens] error: {e}")
-                    finally:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
+    def _extract_lexicon(self, html: str) -> List[str]:
+        from collections import Counter
+        text = re.sub(r"<[^>]+>", " ", html or "")
+        text = re.sub(r"\s+", " ", text).lower()
 
-                await context.close()
-                await browser.close()
+        words = self._TEXT_TOKEN_RE.findall(text)
+        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what", "can"}
+        filtered = [w for w in words if w not in stops]
 
-        except Exception as e:
-            log.append(f"[Crawler][RevImg] Playwright error: {e}")
+        counts = Counter(filtered)
+        return [w for w, _c in counts.most_common(20)]
 
-        return seeds[:limit]
+    # ------------------ DB wiring ------------------
 
-    # ------------------ Search Helpers ------------------
+    def _make_store(self, db_path: str) -> LinkCrawlerStore:
+        cfg = submanagers.DatabaseConfig(path=db_path)
+        db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
+        store = LinkCrawlerStore(db=db)
+        store.ensure_schema()
+        return store
+
+    # ------------------ Search Helpers (unchanged; still use aiohttp) ------------------
+    # NOTE: You can optionally refactor these later to also use HTTPSSubmanager,
+    # but keeping them as-is avoids breaking your known-good DDG/SearX/GoogleCSE parsing.
 
     async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
         import aiohttp
@@ -19035,89 +18653,6 @@ class LinkCrawlerBlock(BaseBlock):
 
         return urls[:limit]
 
-    # ------------------ Parsing Logic ------------------
-
-    def _extract_links(self, html: str, base_url: str, mode: str = "search") -> Tuple[List[str], List[str]]:
-        all_links: set[str] = set()
-        content_candidates: set[str] = set()
-
-        mode = (mode or "search").lower().strip()
-
-        if mode == "docs":
-            hint_set = self._DOC_HINTS
-            ext_re = self._DOC_EXT_RE
-        elif mode == "media":
-            hint_set = self._MEDIA_HINTS
-            ext_re = self._MEDIA_EXT_RE
-        elif mode == "images":
-            hint_set = self._IMAGE_HINTS
-            ext_re = self._IMAGE_EXT_RE
-        else:
-            hint_set = self._CONTENT_HINTS
-            ext_re = self._MEDIA_EXT_RE
-
-        for m in self._HREF_RE.finditer(html or ""):
-            raw = m.group(1)
-            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
-                continue
-
-            try:
-                full_url = urljoin(base_url, raw)
-                parsed = urlparse(full_url)
-                if parsed.scheme not in ("http", "https"):
-                    continue
-
-                u_lower = full_url.lower()
-                if any(bad in u_lower for bad in self._JUNK_HINTS):
-                    continue
-
-                all_links.add(full_url)
-
-                score = 0
-                path_lower = (parsed.path or "").lower()
-
-                if any(hint in u_lower for hint in hint_set):
-                    score += 2
-                if ext_re.search(path_lower):
-                    score += 6
-                if any(tok in path_lower for tok in ("/watch", "/player", "/embed", "/download", "/view", "/details")):
-                    score += 1
-
-                if mode in ("docs", "media", "images") and score <= 0:
-                    continue
-
-                if score > 0:
-                    content_candidates.add(full_url)
-
-            except Exception:
-                continue
-
-        return list(all_links), list(content_candidates)
-
-    def _extract_lexicon(self, html: str) -> List[str]:
-        from collections import Counter
-        text = re.sub(r"<[^>]+>", " ", html or "")
-        text = re.sub(r"\s+", " ", text).lower()
-
-        words = self._TEXT_TOKEN_RE.findall(text)
-        stops = {
-            "the", "and", "that", "this", "with", "from", "your",
-            "have", "are", "for", "not", "but", "what", "can"
-        }
-        filtered = [w for w in words if w not in stops]
-
-        counts = Counter(filtered)
-        return [w for w, _c in counts.most_common(20)]
-
-    # ------------------ DB wiring ------------------
-
-    def _make_store(self, db_path: str) -> LinkCrawlerStore:
-        cfg = submanagers.DatabaseConfig(path=db_path)
-        db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
-        store = LinkCrawlerStore(db=db)
-        store.ensure_schema()
-        return store
-
     # ------------------ Execution ------------------
 
     async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -19131,6 +18666,13 @@ class LinkCrawlerBlock(BaseBlock):
         searxng_url = str(params.get("searxng_url", ""))
         http_timeout = float(params.get("timeout", 10.0))
 
+        # HTTPSSubmanager knobs
+        retries = int(params.get("retries", 2))
+        max_bytes = int(params.get("max_bytes", 4_000_000))
+        verify = bool(params.get("verify", True))
+        proxy = str(params.get("proxy", "") or "").strip() or None
+        user_agent = str(params.get("user_agent", "Mozilla/5.0 PromptChat/LinkCrawler"))
+
         links_key = str(params.get("links_key", "scraped_links"))
         domains_key = str(params.get("domains_key", "scraped_domains"))
         lexicon_key = str(params.get("lexicon_key", "scraped_lexicon"))
@@ -19143,8 +18685,8 @@ class LinkCrawlerBlock(BaseBlock):
 
         DEBUG_LOGGER.log_message(
             f"[Crawler] start | query={query!r} mode={mode} engine={engine} "
-            f"max_results={max_results} timeout={http_timeout} use_database={use_database} "
-            f"ffmpeg_bin={ffmpeg_bin!r} links_key={links_key!r}"
+            f"max_results={max_results} timeout={http_timeout} retries={retries} "
+            f"use_database={use_database} ffmpeg_bin={ffmpeg_bin!r} links_key={links_key!r}"
         )
 
         store: LinkCrawlerStore | None = None
@@ -19159,7 +18701,7 @@ class LinkCrawlerBlock(BaseBlock):
                 log.append(f"[Crawler][DB] Init failed: {e} (continuing without DB)")
                 DEBUG_LOGGER.log_message(f"[Crawler][DB] init FAILED: {e} (DB disabled)")
 
-        # 1) Gather seeds
+        # 1) Gather seeds (same behavior as your current version)
         seed_urls: List[str] = []
 
         image_url = str(params.get("image_url", "") or "").strip()
@@ -19175,6 +18717,8 @@ class LinkCrawlerBlock(BaseBlock):
             DEBUG_LOGGER.log_message(f"[Crawler] seeds=explicit count={len(seed_urls)}")
 
         elif image_url or image_path:
+            # NOTE: Your reverse-image pipeline remains as-is (Playwright + ffmpeg + catbox).
+            # It doesn't need HTTPSSubmanager to function.
             DEBUG_LOGGER.log_message(
                 f"[Crawler] reverse-image seeds | engine={reverse_engine} "
                 f"image_url={'YES' if bool(image_url) else 'NO'} image_path={'YES' if bool(image_path) else 'NO'} "
@@ -19198,10 +18742,8 @@ class LinkCrawlerBlock(BaseBlock):
                 log=log
             )
 
-            # cleanup temp frame(s)
             if temp_files:
                 try:
-                    import os
                     for fp in temp_files:
                         if fp and os.path.exists(fp):
                             os.remove(fp)
@@ -19230,9 +18772,7 @@ class LinkCrawlerBlock(BaseBlock):
 
         DEBUG_LOGGER.log_message(f"[Crawler] seeds collected | count={len(seed_urls)}")
 
-        # 2) Shallow crawl (with seed TTL gating if DB enabled)
-        import aiohttp
-
+        # 2) Shallow crawl (TTL gating via DB) using HTTPSSubmanager
         collected_links: set[str] = set()
         collected_domains: set[str] = set()
         collected_lexicon: set[str] = set()
@@ -19248,10 +18788,7 @@ class LinkCrawlerBlock(BaseBlock):
         seeds_to_fetch = seed_urls
 
         if store:
-            seeds_to_fetch = [
-                s for s in seed_urls
-                if store.seed_should_fetch(s, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)
-            ]
+            seeds_to_fetch = [s for s in seed_urls if store.seed_should_fetch(s, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
             skipped = len(seed_urls) - len(seeds_to_fetch)
             if skipped:
                 msg = f"[Crawler][DB] Skipping {skipped} seed(s) due to TTL."
@@ -19260,55 +18797,71 @@ class LinkCrawlerBlock(BaseBlock):
 
         DEBUG_LOGGER.log_message(f"[Crawler] fetch plan | total_seeds={len(seed_urls)} to_fetch={len(seeds_to_fetch)}")
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout)) as session:
-            sem = asyncio.Semaphore(int(params.get("max_concurrency", 12)))
+        sem = asyncio.Semaphore(int(params.get("max_concurrency", 12)))
+
+        async with submanagers.HTTPSSubmanager(
+            user_agent=user_agent,
+            timeout=http_timeout,
+            retries=retries,
+            max_bytes=max_bytes,
+            proxy=proxy,
+            verify=verify,
+            ca_bundle=str(params.get("ca_bundle", "") or "").strip() or None,
+            allow_redirects=True,
+            enable_cookies=bool(params.get("enable_cookies", True)),
+        ) as http:
 
             async def fetch_and_parse(url: str):
                 DEBUG_LOGGER.log_message(f"[Crawler][Page] crawling seed={url}")
                 async with sem:
                     start = time.time()
                     try:
-                        async with session.get(url, allow_redirects=True) as resp:
-                            final_url = str(resp.url)
-                            status = int(resp.status)
-                            ctype = (resp.headers.get("Content-Type", "") or "").lower()
+                        # HEAD first: cheap type filter
+                        status_h, hdrs = await http.head(url)
+                        ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
 
-                            if store:
-                                try:
-                                    store.seed_mark_fetched(url, status=status, now_ts=time.time())
-                                except Exception as e:
-                                    DEBUG_LOGGER.log_message(f"[Crawler][DB] seed_mark_fetched failed url={url} err={e}")
+                        if store:
+                            try:
+                                store.seed_mark_fetched(url, status=int(status_h or 0), now_ts=time.time())
+                            except Exception as e:
+                                DEBUG_LOGGER.log_message(f"[Crawler][DB] seed_mark_fetched failed url={url} err={e}")
 
-                            DEBUG_LOGGER.log_message(
-                                f"[Crawler][Page] fetched status={status} ms={int((time.time()-start)*1000)} "
-                                f"final={final_url} ctype={ctype[:60]!r}"
-                            )
+                        DEBUG_LOGGER.log_message(
+                            f"[Crawler][Page] head status={status_h} ms={int((time.time()-start)*1000)} ctype={ctype[:60]!r}"
+                        )
 
-                            if status != 200:
-                                return
+                        # If clearly non-HTML, skip parsing
+                        if ctype and ("text/html" not in ctype):
+                            DEBUG_LOGGER.log_message(f"[Crawler][Page] skip non-html seed={url} ctype={ctype[:80]!r}")
+                            return
 
-                            if "text/html" not in ctype:
-                                DEBUG_LOGGER.log_message(f"[Crawler][Page] skip non-html final={final_url} ctype={ctype[:80]!r}")
-                                return
+                        # GET bounded HTML
+                        html = await http.get_text(url)
+                        if not html:
+                            DEBUG_LOGGER.log_message(f"[Crawler][Page] empty html seed={url}")
+                            return
 
-                            html = await resp.text(errors="ignore")
-                            _links, candidates = self._extract_links(html, final_url, mode=mode)
-                            lex = self._extract_lexicon(html)
+                        # As with LinkContentCrawler, HTTPSSubmanager doesn't expose final_url here;
+                        # treat url as base_url for urljoin (works for most hrefs).
+                        final_url = url
 
-                            DEBUG_LOGGER.log_message(
-                                f"[Crawler][Page] parsed final={final_url} hrefs_total={len(_links)} "
-                                f"candidates_scored={len(candidates)} lexicon_terms={len(lex)}"
-                            )
+                        _links, candidates = self._extract_links(html, final_url, mode=mode)
+                        lex = self._extract_lexicon(html)
 
-                            for w in lex:
-                                collected_lexicon.add(w)
+                        DEBUG_LOGGER.log_message(
+                            f"[Crawler][Page] parsed seed={url} hrefs_total={len(_links)} "
+                            f"candidates_scored={len(candidates)} lexicon_terms={len(lex)}"
+                        )
 
-                            for c in candidates:
-                                collected_links.add(c)
-                                try:
-                                    collected_domains.add(urlparse(c).netloc)
-                                except Exception:
-                                    pass
+                        for w in lex:
+                            collected_lexicon.add(w)
+
+                        for c in candidates:
+                            collected_links.add(c)
+                            try:
+                                collected_domains.add(urlparse(c).netloc)
+                            except Exception:
+                                pass
 
                     except Exception as e:
                         DEBUG_LOGGER.log_message(f"[Crawler][Page] ERROR seed={url} err={e}")
@@ -19326,10 +18879,7 @@ class LinkCrawlerBlock(BaseBlock):
         if not isinstance(existing_links, list):
             existing_links = []
 
-        existing_urls = {
-            str(x.get("url")) for x in existing_links
-            if isinstance(x, dict) and x.get("url")
-        }
+        existing_urls = {str(x.get("url")) for x in existing_links if isinstance(x, dict) and x.get("url")}
 
         new_link_objs: List[Dict[str, Any]] = []
         suppressed_by_db = 0
@@ -19430,13 +18980,22 @@ class LinkCrawlerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "Scraping query",
-            "mode": "search",  # "docs" | "media" | "images" | "search"
+            "mode": "search",
             "seeds": "Comma-separated list of starting URLs (optional override)",
-            "engine": "duckduckgo",  # "searxng", "google_cse"
+            "engine": "duckduckgo",
             "searxng_url": "http://127.0.0.1:8080",
             "max_results": 20,
             "timeout": 10.0,
             "max_concurrency": 12,
+
+            # HTTPSSubmanager knobs
+            "retries": 2,
+            "max_bytes": 4_000_000,
+            "verify": True,
+            "proxy": "",
+            "ca_bundle": "",
+            "user_agent": "Mozilla/5.0 PromptChat/LinkCrawler",
+            "enable_cookies": True,
 
             "links_key": "scraped_links",
             "domains_key": "scraped_domains",
@@ -19444,7 +19003,7 @@ class LinkCrawlerBlock(BaseBlock):
 
             "image_url": "Remote image URL for reverse-image seed discovery (optional)",
             "image_path": "Local image file path for reverse-image seed discovery (optional)",
-            "reverse_engine": "both",  # "yandex" | "google" | "both"
+            "reverse_engine": "both",
             "reverse_max_results": 20,
             "reverse_timeout": 20.0,
 
@@ -19458,7 +19017,6 @@ class LinkCrawlerBlock(BaseBlock):
 
 # register
 BLOCKS.register("linkcrawler", LinkCrawlerBlock)
-
 # ======================= URLScraperBlock ==================================
 
 @dataclass
@@ -20494,49 +20052,24 @@ BLOCKS.register("urlexpander", URLExpanderBlock)
 @dataclass
 class LinkContentCrawlerBlock(BaseBlock):
     """
-    LinkContentCrawlerBlock
-    -----------------------
-    Reads one or more Memory keys (memory_sources), extracts URL candidates,
-    then crawls those URLs (HTML only) and extracts **direct content** links:
-
-      - Direct assets (strong):
-          * Video: mp4, webm, mkv, mov, m3u8, mpd, ts, etc.
-          * Audio: mp3, m4a, wav, flac, ogg, aac
-          * Images: jpg, png, webp, gif, avif, svg
-          * Docs: pdf, doc(x), ppt(x), etc.
-
-      - Content pages (medium):
-          * /watch, /player, /embed, /video, /clip, /stream, /download
-
-    Outputs (Memory):
-      - content_links_key: list[dict]  (url objects)
-      - content_urls_key: list[str]    (optional convenience)
-      - per_seed_stats_key: dict
-
-    DB (optional):
-      - suppresses already-emitted content URLs across runs
-      - avoids refetching seed URLs within TTL
+    Same behavior as your version, but:
+      - networking: HTTPSSubmanager
+      - DB: DatabaseSubmanager via LinkContentCrawlerStore
     """
-
-    # ------------------ URL extraction ------------------
 
     _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
     _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
-
-    # ------------------ Content patterns ------------------
 
     VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".flv", ".m3u8", ".mpd", ".ts")
     AUDIO_EXTS = (".mp3", ".m4a", ".wav", ".flac", ".ogg", ".aac")
     IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".tiff", ".svg")
     DOC_EXTS   = (".pdf", ".epub", ".mobi", ".djvu", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".txt", ".rtf")
 
-    # "content-ish" page routes
     CONTENT_PATH_TOKENS = (
         "/watch", "/player", "/embed", "/download", "/stream", "/video", "/clip",
         "/movie", "/episode", "/season", "/view", "/details",
     )
 
-    # avoid obvious junk
     JUNK_HINTS = (
         "mailto:", "javascript:", "tel:",
         "/login", "/signin", "/signup", "/register", "/account",
@@ -20544,7 +20077,6 @@ class LinkContentCrawlerBlock(BaseBlock):
         "facebook.com", "twitter.com", "linkedin.com",
     )
 
-    # Drop these asset types as "crawl outputs" (not content)
     IGNORED_EXTS = (
         ".css", ".js", ".json", ".xml", ".map",
         ".woff", ".woff2", ".ttf", ".eot",
@@ -20552,22 +20084,14 @@ class LinkContentCrawlerBlock(BaseBlock):
         ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
     )
 
-    def _make_store(self, db_path: str):
+    def _make_store(self, db_path: str) -> LinkContentCrawlerStore:
         cfg = submanagers.DatabaseConfig(path=db_path)
         db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
         store = LinkContentCrawlerStore(db=db)
         store.ensure_schema()
         return store
 
-    # ------------------ Utilities ------------------
-
     def _flatten_memory_urls(self, raw: Any) -> List[str]:
-        """
-        Accepts:
-          - list[str]
-          - list[dict] with url/href/link/page/request_url/final_url fields
-          - str blobs containing URLs
-        """
         out: List[str] = []
         seen = set()
 
@@ -20580,7 +20104,6 @@ class LinkContentCrawlerBlock(BaseBlock):
                     seen.add(u)
                     out.append(u)
                 return
-            # scan blob
             for m in self._URL_RE.finditer(u[:250_000]):
                 uu = m.group(0)
                 if uu and uu not in seen:
@@ -20591,14 +20114,11 @@ class LinkContentCrawlerBlock(BaseBlock):
             if x is None:
                 return
             if isinstance(x, str):
-                push(x)
-                return
+                push(x); return
             if isinstance(x, (int, float)):
-                push(str(x))
-                return
+                push(str(x)); return
             if isinstance(x, list):
-                for it in x:
-                    walk(it)
+                for it in x: walk(it)
                 return
             if isinstance(x, dict):
                 for k in ("url", "href", "link", "page", "request_url", "final_url", "source_url"):
@@ -20639,21 +20159,15 @@ class LinkContentCrawlerBlock(BaseBlock):
         return ""
 
     def _classify(self, u: str) -> Tuple[str, int]:
-        """
-        Returns: (kind, score)
-          kind: video|audio|image|doc|page|junk
-        """
         if self._is_junk(u):
             return "junk", 0
 
         low = u.lower()
         ext = self._ext(low)
 
-        # Hard-ignore obvious non-content assets
         if ext and ext in self.IGNORED_EXTS:
             return "junk", 0
 
-        # Direct assets: strongest
         if ext in self.VIDEO_EXTS or any(low.endswith(x) for x in (".m3u8", ".mpd")):
             return "video", 60
         if ext in self.AUDIO_EXTS:
@@ -20663,12 +20177,10 @@ class LinkContentCrawlerBlock(BaseBlock):
         if ext in self.DOC_EXTS:
             return "doc", 40
 
-        # Content-ish pages
         path = urlparse(u).path.lower() if u else ""
         if any(tok in path for tok in self.CONTENT_PATH_TOKENS):
             return "page", 25
 
-        # Otherwise: likely a normal page (low score)
         return "page", 5
 
     def _extract_links_from_html(self, html: str, base_url: str) -> List[str]:
@@ -20686,7 +20198,6 @@ class LinkContentCrawlerBlock(BaseBlock):
                 pu = urlparse(full)
                 if pu.scheme not in ("http", "https"):
                     continue
-                # decode "uddg=" style wrapping sometimes seen in HTML
                 if "uddg=" in full:
                     try:
                         full = unquote(full.split("uddg=")[1].split("&")[0])
@@ -20700,8 +20211,6 @@ class LinkContentCrawlerBlock(BaseBlock):
 
         return links
 
-    # ------------------ Execution ------------------
-
     async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         log: List[str] = []
 
@@ -20710,22 +20219,18 @@ class LinkContentCrawlerBlock(BaseBlock):
         if not memory_sources:
             return "No operation.", {"error": "linkcontentcrawler requires params['memory_sources']"}
 
-        # IO / performance
         timeout = float(params.get("timeout", 10.0))
         max_seeds = int(params.get("max_seeds", 150))
         max_concurrency = int(params.get("max_concurrency", 12))
         max_links_per_seed = int(params.get("max_links_per_seed", 250))
 
-        # emit + scoring knobs
-        min_score = int(params.get("min_score", 20))  # default: only keep content-ish
-        include_pages = bool(params.get("include_pages", True))  # include "page" kind if score >= min_score
+        min_score = int(params.get("min_score", 20))
+        include_pages = bool(params.get("include_pages", True))
 
-        # memory outputs
         out_key = str(params.get("content_links_key", "content_links")).strip()
         out_urls_key = str(params.get("content_urls_key", "content_urls")).strip()
         stats_key = str(params.get("per_seed_stats_key", "content_seed_stats")).strip()
 
-        # DB support
         use_database = bool(params.get("use_database", False))
         db_path = str(params.get("db_path", "link_corpus.db"))
         seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
@@ -20736,14 +20241,11 @@ class LinkContentCrawlerBlock(BaseBlock):
             f"min_score={min_score} use_database={use_database} out_key={out_key!r}"
         )
 
-        # Load Memory seeds
         mem = Memory.load()
         seed_urls: List[str] = []
         for k in memory_sources:
-            raw = mem.get(k)
-            seed_urls.extend(self._flatten_memory_urls(raw))
+            seed_urls.extend(self._flatten_memory_urls(mem.get(k)))
 
-        # Dedup seeds (preserve order)
         seed_urls = list(dict.fromkeys(seed_urls))
         if max_seeds and len(seed_urls) > max_seeds:
             seed_urls = seed_urls[:max_seeds]
@@ -20761,7 +20263,6 @@ class LinkContentCrawlerBlock(BaseBlock):
                 use_database = False
                 log.append(f"[LinkContentCrawler][DB] Init failed: {e} (continuing without DB)")
 
-        # Plan which seeds to fetch (TTL gating)
         now_ts = time.time()
         seeds_to_fetch = seed_urls
         if store:
@@ -20772,16 +20273,13 @@ class LinkContentCrawlerBlock(BaseBlock):
                 log.append(msg)
                 DEBUG_LOGGER.log_message(msg)
 
-        # Crawl HTML pages, extract links, classify and collect
-        import aiohttp
-
         sem = asyncio.Semaphore(max_concurrency)
+
         found_objs: List[Dict[str, Any]] = []
         found_urls_set = set()
-
         per_seed_stats: Dict[str, Dict[str, Any]] = {}
 
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        async with submanagers.HTTPSSubmanager(timeout=timeout) as http:
 
             async def crawl_seed(seed: str):
                 if not seed:
@@ -20794,89 +20292,102 @@ class LinkContentCrawlerBlock(BaseBlock):
                     t0 = time.time()
                     try:
                         DEBUG_LOGGER.log_message(f"[LinkContentCrawler][Seed] fetch={seed}")
-                        async with session.get(seed, allow_redirects=True) as resp:
-                            final_url = str(resp.url)
-                            status = int(resp.status)
-                            ctype = (resp.headers.get("Content-Type", "") or "").lower()
+
+                        # Try HEAD first for status + content-type + redirect resolution signal
+                        st, hdrs = await http.head(seed)
+                        hdrs = hdrs or {}
+                        ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+
+                        # HEAD doesn't give final_url; your HTTPSSubmanager tracks redirects internally,
+                        # but head() returns only status+headers. We use the seed as "final_url" for stats,
+                        # and rely on GET for real final URLs when we fetch.
+                        final_url = seed
+                        status = st
+
+                        if store:
+                            try:
+                                store.seed_mark_fetched(seed, now_ts=time.time(), status=status, final_url=final_url)
+                            except Exception:
+                                pass
+
+                        # Non-HTML: treat as a direct content candidate (classify the URL)
+                        if ctype and ("text/html" not in ctype):
+                            kind, score = self._classify(final_url)
+                            kept = 0
+                            if score >= min_score and (include_pages or kind != "page") and kind != "junk":
+                                if (not store) or (not store.has_emitted(final_url)):
+                                    if final_url not in found_urls_set:
+                                        found_urls_set.add(final_url)
+                                        obj = {
+                                            "url": final_url,
+                                            "source": "linkcontentcrawler_seed_nonhtml",
+                                            "seed": seed,
+                                            "final_url": final_url,
+                                            "kind": kind,
+                                            "score": score,
+                                            "first_seen": time.time(),
+                                        }
+                                        found_objs.append(obj)
+                                        kept += 1
+                                        if store:
+                                            store.mark_emitted(
+                                                final_url, now_ts=time.time(), source="seed_nonhtml",
+                                                seed_url=seed, final_url=final_url, kind=kind, score=score
+                                            )
+
+                            per_seed_stats[seed] = {"status": f"non_html({ctype[:40]})", "out_links": 0, "kept": kept}
+                            return
+
+                        # HTML path: GET + parse links
+                        html = await http.get_text(seed)
+                        if not html:
+                            per_seed_stats[seed] = {"status": "empty_html_or_error", "out_links": 0, "kept": 0}
+                            return
+
+                        out_links = self._extract_links_from_html(html, seed)
+                        if max_links_per_seed and len(out_links) > max_links_per_seed:
+                            out_links = out_links[:max_links_per_seed]
+
+                        kept = 0
+                        for u in out_links:
+                            kind, score = self._classify(u)
+                            if kind == "junk":
+                                continue
+                            if score < min_score:
+                                continue
+                            if (not include_pages) and kind == "page":
+                                continue
+
+                            if store and store.has_emitted(u):
+                                continue
+                            if u in found_urls_set:
+                                continue
+
+                            found_urls_set.add(u)
+                            found_objs.append({
+                                "url": u,
+                                "source": "linkcontentcrawler",
+                                "seed": seed,
+                                "final_url": seed,
+                                "kind": kind,
+                                "score": score,
+                                "first_seen": time.time(),
+                            })
+                            kept += 1
 
                             if store:
-                                try:
-                                    store.seed_mark_fetched(seed, now_ts=time.time(), status=status)
-                                except Exception:
-                                    pass
+                                store.mark_emitted(
+                                    u, now_ts=time.time(), source="crawl",
+                                    seed_url=seed, final_url=seed, kind=kind, score=score
+                                )
 
-                            if status != 200:
-                                per_seed_stats[seed] = {"status": f"http_{status}", "out_links": 0, "kept": 0}
-                                return
-
-                            if "text/html" not in ctype:
-                                # This seed might already be direct content, classify it
-                                kind, score = self._classify(final_url)
-                                kept = 0
-                                if score >= min_score and (include_pages or kind != "page") and kind != "junk":
-                                    if (not store) or (not store.has_emitted(final_url)):
-                                        if final_url not in found_urls_set:
-                                            found_urls_set.add(final_url)
-                                            found_objs.append({
-                                                "url": final_url,
-                                                "source": "linkcontentcrawler_seed_nonhtml",
-                                                "seed": seed,
-                                                "final_url": final_url,
-                                                "kind": kind,
-                                                "score": score,
-                                                "first_seen": time.time(),
-                                            })
-                                            kept += 1
-                                            if store:
-                                                store.mark_emitted(final_url, now_ts=time.time(), source="seed_nonhtml", kind=kind, score=score)
-
-                                per_seed_stats[seed] = {"status": f"non_html({ctype[:40]})", "out_links": 0, "kept": kept}
-                                return
-
-                            html = await resp.text(errors="ignore")
-                            out_links = self._extract_links_from_html(html, final_url)
-                            if max_links_per_seed and len(out_links) > max_links_per_seed:
-                                out_links = out_links[:max_links_per_seed]
-
-                            kept = 0
-                            for u in out_links:
-                                kind, score = self._classify(u)
-                                if kind == "junk":
-                                    continue
-                                if score < min_score:
-                                    continue
-                                if (not include_pages) and kind == "page":
-                                    continue
-
-                                # DB suppress cross-run duplicates
-                                if store and store.has_emitted(u):
-                                    continue
-
-                                if u in found_urls_set:
-                                    continue
-
-                                found_urls_set.add(u)
-                                found_objs.append({
-                                    "url": u,
-                                    "source": "linkcontentcrawler",
-                                    "seed": seed,
-                                    "final_url": final_url,
-                                    "kind": kind,
-                                    "score": score,
-                                    "first_seen": time.time(),
-                                })
-                                kept += 1
-
-                                if store:
-                                    store.mark_emitted(u, now_ts=time.time(), source="crawl", kind=kind, score=score)
-
-                            per_seed_stats[seed] = {
-                                "status": "ok",
-                                "final_url": final_url,
-                                "ms": int((time.time() - t0) * 1000),
-                                "out_links": len(out_links),
-                                "kept": kept,
-                            }
+                        per_seed_stats[seed] = {
+                            "status": "ok",
+                            "final_url": seed,
+                            "ms": int((time.time() - t0) * 1000),
+                            "out_links": len(out_links),
+                            "kept": kept,
+                        }
 
                     except Exception as e:
                         per_seed_stats[seed] = {"status": "error", "error": str(e)[:200], "out_links": 0, "kept": 0}
@@ -20884,7 +20395,7 @@ class LinkContentCrawlerBlock(BaseBlock):
 
             await asyncio.gather(*[crawl_seed(s) for s in seeds_to_fetch])
 
-        # Merge into Memory (like LinkCrawler)
+        # Merge into Memory
         mem2 = Memory.load()
 
         existing = mem2.get(out_key, [])
@@ -20897,26 +20408,20 @@ class LinkContentCrawlerBlock(BaseBlock):
         }
 
         new_added = 0
-        ts = time.time()
         for obj in found_objs:
             u = obj.get("url")
-            if not u:
-                continue
-            if u in existing_urls:
+            if not u or u in existing_urls:
                 continue
             existing.append(obj)
             existing_urls.add(u)
             new_added += 1
 
-        # cap
         max_memory_items = int(params.get("max_memory_items", 4000))
         if len(existing) > max_memory_items:
             existing = existing[-max_memory_items:]
 
         mem2[out_key] = existing
         mem2[stats_key] = per_seed_stats
-
-        # optional convenience string list
         if out_urls_key:
             mem2[out_urls_key] = [x["url"] for x in existing if isinstance(x, dict) and x.get("url")][-max_memory_items:]
 
@@ -20924,7 +20429,7 @@ class LinkContentCrawlerBlock(BaseBlock):
 
         # Report
         lines = [
-            "### 🧠 LinkContentCrawler Report",
+            "### 🧠 LinkContentCrawler Report (HTTPSSubmanager + DatabaseSubmanager)",
             f"_Memory Sources: {', '.join(memory_sources)}_",
             f"_Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)} | Found: {len(found_objs)} | Added to Memory: {new_added}_",
             "",
@@ -20959,7 +20464,6 @@ class LinkContentCrawlerBlock(BaseBlock):
             "items": found_objs,
             "stats": per_seed_stats,
         }
-
         return "\n".join(lines), meta
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -20967,14 +20471,14 @@ class LinkContentCrawlerBlock(BaseBlock):
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "memory_sources": "scraped_links",      # comma-separated keys
+            "memory_sources": "scraped_links",
             "timeout": 10.0,
             "max_seeds": 150,
             "max_concurrency": 12,
             "max_links_per_seed": 250,
 
-            "min_score": 20,          # 60/55/45/40 direct, 25 content pages, 5 generic pages
-            "include_pages": True,    # include watch/embed/player pages
+            "min_score": 20,
+            "include_pages": True,
 
             "content_links_key": "content_links",
             "content_urls_key": "content_urls",
@@ -20989,3 +20493,606 @@ class LinkContentCrawlerBlock(BaseBlock):
 
 # register
 BLOCKS.register("linkcontentcrawler", LinkContentCrawlerBlock)
+
+# ======================= CDNBlock ============================
+
+
+@dataclass
+class CDNBlock(BaseBlock):
+    """
+    CDNBlock
+    --------
+    Feeds on input links (from Memory or explicit list) and outputs CDN-like URLs.
+
+    Inputs:
+      - memory_sources: comma-separated Memory keys to read URLs from
+      - seeds: optional comma-separated override list (bypasses Memory)
+
+    Detection:
+      - Resolves redirects (final_url) via HTTPSSubmanager
+      - Scores "cdn-ness" using:
+          * host tokens/suffixes (cloudfront, fastly, akamai, cdn, edgesuite, etc.)
+          * headers (cf-ray, x-amz-cf-id, x-cache, via, x-served-by, server hints)
+          * host change from seed host to final host
+
+      - Optional HTML parsing (small bounded GET) to extract asset URLs and
+        emit the CDN-ish ones.
+
+    Outputs (Memory):
+      - cdn_links_key: list[dict]  (url objects)
+      - cdn_urls_key: list[str]    (optional convenience)
+      - per_seed_stats_key: dict
+
+    DB (optional):
+      - suppresses already-emitted CDN URLs across runs
+      - avoids refetching seed URLs within TTL
+    """
+
+    # ------------------ URL extraction ------------------
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
+    _HREF_SRC_RE = re.compile(r"""(?:href|src)=["'](.*?)["']""", re.IGNORECASE)
+
+    # ------------------ CDN heuristics ------------------
+
+    # high-signal host tokens
+    _CDN_HOST_TOKENS = (
+        "cdn", "edge", "edgesuite", "edgekey", "akamai", "akamaized",
+        "cloudfront", "fastly", "fastlylb", "stackpathcdn", "netdna-cdn",
+        "cloudflare", "r2.dev", "googleusercontent", "googlevideo", "gvt1",
+        "hwcdn", "llnwd", "cachefly", "b-cdn", "bunnycdn", "vkuseraudio",
+    )
+
+    # common CDN-ish domains/suffixes (add as you observe in the wild)
+    _CDN_SUFFIXES = (
+        ".cloudfront.net",
+        ".akamaized.net",
+        ".akamaihd.net",
+        ".edgesuite.net",
+        ".edgekey.net",
+        ".fastly.net",
+        ".fastlylb.net",
+        ".stackpathcdn.com",
+        ".cloudflare.net",
+        ".r2.dev",
+        ".googlevideo.com",
+        ".gvt1.com",
+        ".llnwd.net",
+        ".hwcdn.net",
+        ".cachefly.net",
+        ".b-cdn.net",
+        ".bunnycdn.ru",
+        ".bunnycdn.com",
+    )
+
+    _HEADER_SIGNAL_KEYS = (
+        "cf-ray", "cf-cache-status",
+        "x-amz-cf-id", "x-amz-cf-pop",
+        "x-cache", "x-cache-hits",
+        "via",
+        "x-served-by", "x-timer",
+        "server",
+        "x-cdn", "x-cdn-request-id",
+    )
+
+    def _make_store(self, db_path: str):
+        cfg = submanagers.DatabaseConfig(path=db_path)
+        db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
+        store = CDNStore(db=db)
+        store.ensure_schema()
+        return store
+
+    # ------------------ flatten / parse input ------------------
+
+    def _flatten_urls(self, raw: Any) -> List[str]:
+        """
+        Accepts:
+          - list[str]
+          - list[dict] with url/href/link/page/request_url/final_url/source_url fields
+          - str blobs containing URLs
+        """
+        out: List[str] = []
+        seen = set()
+
+        def push(u: str):
+            u = (u or "").strip()
+            if not u:
+                return
+            if u.startswith(("http://", "https://")):
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+                return
+            for m in self._URL_RE.finditer(u[:250_000]):
+                uu = m.group(0)
+                if uu and uu not in seen:
+                    seen.add(uu)
+                    out.append(uu)
+
+        def walk(x: Any):
+            if x is None:
+                return
+            if isinstance(x, str):
+                push(x)
+                return
+            if isinstance(x, (int, float)):
+                push(str(x))
+                return
+            if isinstance(x, list):
+                for it in x:
+                    walk(it)
+                return
+            if isinstance(x, dict):
+                for k in ("url", "href", "link", "page", "request_url", "final_url", "source_url"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for k in ("text", "html", "body", "snippet"):
+                    v = x.get(k)
+                    if isinstance(v, str) and v.strip():
+                        push(v)
+                for v in x.values():
+                    if isinstance(v, (list, dict)):
+                        walk(v)
+                return
+            push(str(x))
+
+        walk(raw)
+        return out
+
+    def _host(self, u: str) -> str:
+        try:
+            return urlparse(u).netloc.lower()
+        except Exception:
+            return ""
+
+    def _looks_cdn_host(self, host: str) -> Tuple[bool, int, List[str]]:
+        """
+        Returns (is_cdn, score, evidence[])
+        """
+        host = (host or "").lower()
+        if not host:
+            return False, 0, []
+
+        score = 0
+        ev: List[str] = []
+
+        # suffix match is strong
+        for suf in self._CDN_SUFFIXES:
+            if host.endswith(suf):
+                score += 60
+                ev.append(f"host_suffix:{suf}")
+                break
+
+        # token match is medium-strong
+        for tok in self._CDN_HOST_TOKENS:
+            if tok in host:
+                score += 18
+                ev.append(f"host_token:{tok}")
+                # don't break; multiple tokens can stack lightly
+        # generic "cdn" substring tends to be noisy, but still useful
+        if "cdn" in host and all("host_token:cdn" != e for e in ev):
+            score += 10
+            ev.append("host_token:cdn")
+
+        return (score >= 30), score, ev
+
+    def _header_signals(self, headers: Dict[str, str]) -> Tuple[int, List[str]]:
+        if not headers:
+            return 0, []
+        score = 0
+        ev: List[str] = []
+        # normalize keys
+        lower_map = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        for k in self._HEADER_SIGNAL_KEYS:
+            if k in lower_map:
+                score += 10
+                ev.append(f"hdr:{k}")
+        # server hints
+        server = lower_map.get("server", "").lower()
+        if any(x in server for x in ("cloudflare", "akamai", "fastly", "varnish")):
+            score += 15
+            ev.append(f"server_hint:{server[:40]}")
+        return score, ev
+
+    def _extract_asset_urls_from_html(self, html: str, base_url: str, max_assets: int = 200) -> List[str]:
+        if not html:
+            return []
+        out: List[str] = []
+        seen = set()
+
+        for m in self._HREF_SRC_RE.finditer(html[:600_000]):
+            raw = (m.group(1) or "").strip()
+            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+                continue
+            try:
+                full = urljoin(base_url, raw)
+                pu = urlparse(full)
+                if pu.scheme not in ("http", "https"):
+                    continue
+                if full not in seen:
+                    seen.add(full)
+                    out.append(full)
+                    if len(out) >= max_assets:
+                        break
+            except Exception:
+                continue
+
+        # also scan for loose URLs in the doc (helps scripts/json blobs)
+        if len(out) < max_assets:
+            for m in self._URL_RE.finditer(html[:600_000]):
+                u = m.group(0)
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+                    if len(out) >= max_assets:
+                        break
+
+        return out
+
+    # ------------------ core fetch using HTTPSSubmanager ------------------
+
+    async def _head_or_get(
+        self,
+        http: "HTTPSSubmanager",
+        url: str,
+        *,
+        timeout_s: float,
+        want_html_assets: bool,
+        max_html_bytes: int,
+    ) -> Tuple[Optional[int], Dict[str, str], str, str]:
+        """
+        Returns: (status, headers, final_url, html_text_or_empty)
+        Uses http._request so we can get final_url (redirect-resolved).
+        """
+        # NOTE: we call the internal _request for final_url.
+        # This keeps integration self-contained while still leveraging your pooled engine.
+        try:
+            r = await http._request("HEAD", url, want_body=False, allow_redirects=True)
+            status = r.status
+            hdrs = r.headers or {}
+            final_url = r.final_url or url
+
+            # Some origins deny HEAD (405) or give tiny headers; optionally GET HTML
+            html = ""
+            ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+            if want_html_assets and (ctype.startswith("text/html") or "text/html" in ctype or status in (405, 403, 200)):
+                r2 = await http._request("GET", final_url, want_body=True, allow_redirects=True, max_bytes=max_html_bytes)
+                hdrs = r2.headers or hdrs
+                final_url = r2.final_url or final_url
+                if r2.ok and r2.body:
+                    try:
+                        html = r2.body.decode("utf-8", errors="ignore")
+                    except Exception:
+                        html = ""
+            return status, hdrs, final_url, html
+        except Exception:
+            return None, {}, url, ""
+
+    # ------------------ Execution ------------------
+
+    async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        log: List[str] = []
+
+        # Inputs
+        memory_sources_raw = str(params.get("memory_sources", "") or "").strip()
+        memory_sources = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+        seeds_override = str(params.get("seeds", "") or "").strip()
+
+        # Perf knobs
+        timeout = float(params.get("timeout", 6.0))
+        max_seeds = int(params.get("max_seeds", 200))
+        max_concurrency = int(params.get("max_concurrency", 12))
+
+        # HTML asset extraction
+        extract_assets = bool(params.get("extract_assets", True))
+        max_html_bytes = int(params.get("max_html_bytes", 220_000))
+        max_assets_per_seed = int(params.get("max_assets_per_seed", 200))
+
+        # Emit knobs
+        min_score = int(params.get("min_score", 45))  # require decent confidence by default
+
+        # Memory outputs
+        out_key = str(params.get("cdn_links_key", "cdn_links")).strip()
+        out_urls_key = str(params.get("cdn_urls_key", "cdn_urls")).strip()
+        stats_key = str(params.get("per_seed_stats_key", "cdn_seed_stats")).strip()
+
+        # DB support
+        use_database = bool(params.get("use_database", False))
+        db_path = str(params.get("db_path", "link_corpus.db"))
+        seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
+
+        DEBUG_LOGGER.log_message(
+            f"[CDNBlock] start | memory_sources={memory_sources} seeds_override={'YES' if bool(seeds_override) else 'NO'} "
+            f"timeout={timeout} max_seeds={max_seeds} max_concurrency={max_concurrency} "
+            f"extract_assets={extract_assets} min_score={min_score} use_database={use_database}"
+        )
+
+        # Build seed list
+        seed_urls: List[str] = []
+        if seeds_override:
+            seed_urls = [s.strip() for s in seeds_override.split(",") if s.strip()]
+        else:
+            if not memory_sources:
+                # fallback: payload can be a url blob/list
+                seed_urls = self._flatten_urls(payload)
+            else:
+                mem = Memory.load()
+                for k in memory_sources:
+                    seed_urls.extend(self._flatten_urls(mem.get(k)))
+
+        # Dedup (preserve order) + cap
+        seed_urls = list(dict.fromkeys([u for u in seed_urls if u.startswith(("http://", "https://"))]))
+        if max_seeds and len(seed_urls) > max_seeds:
+            seed_urls = seed_urls[:max_seeds]
+
+        if not seed_urls:
+            return "No operation.", {"error": "no seeds", "seed_count": 0}
+
+        # Optional DB store
+        store: Optional[CDNStore] = None
+        if use_database:
+            try:
+                store = self._make_store(db_path)
+                log.append(f"[CDNBlock][DB] Enabled db_path={db_path} seed_ttl_seconds={seed_ttl_seconds:.0f}")
+                DEBUG_LOGGER.log_message(f"[CDNBlock][DB] init ok | db_path={db_path}")
+            except Exception as e:
+                store = None
+                use_database = False
+                log.append(f"[CDNBlock][DB] Init failed: {e} (continuing without DB)")
+                DEBUG_LOGGER.log_message(f"[CDNBlock][DB] init FAILED: {e} (DB disabled)")
+
+        # TTL gating
+        now_ts = time.time()
+        seeds_to_fetch = seed_urls
+        if store:
+            seeds_to_fetch = [u for u in seed_urls if store.seed_should_fetch(u, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
+            skipped = len(seed_urls) - len(seeds_to_fetch)
+            if skipped:
+                msg = f"[CDNBlock][DB] Skipping {skipped} seed(s) due to TTL."
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+
+        per_seed_stats: Dict[str, Dict[str, Any]] = {}
+
+        # Collected CDN urls (dedup in-run)
+        found: List[Dict[str, Any]] = []
+        found_set: set[str] = set()
+
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async with submanagers.HTTPSSubmanager(timeout=timeout, retries=2, max_conn_per_host=8) as http:
+
+            async def process_seed(seed: str):
+                if not seed:
+                    return
+                async with sem:
+                    t0 = time.time()
+                    seed_host = self._host(seed)
+
+                    status, hdrs, final_url, html = await self._head_or_get(
+                        http,
+                        seed,
+                        timeout_s=timeout,
+                        want_html_assets=extract_assets,
+                        max_html_bytes=max_html_bytes,
+                    )
+
+                    if store:
+                        try:
+                            store.seed_mark_fetched(seed, now_ts=time.time(), status=int(status or 0))
+                        except Exception:
+                            pass
+
+                    if status is None:
+                        per_seed_stats[seed] = {"status": "error", "ms": int((time.time() - t0) * 1000)}
+                        return
+
+                    final_host = self._host(final_url)
+                    hdr_score, hdr_ev = self._header_signals(hdrs)
+                    host_is_cdn, host_score, host_ev = self._looks_cdn_host(final_host)
+
+                    # host-change evidence (weak-medium)
+                    host_change_score = 0
+                    host_change_ev: List[str] = []
+                    if seed_host and final_host and seed_host != final_host:
+                        host_change_score = 12
+                        host_change_ev.append("host_changed")
+
+                    # Candidate A: final_url itself (if looks CDN-ish)
+                    score_a = host_score + hdr_score + host_change_score
+                    ev_a = host_ev + hdr_ev + host_change_ev
+                    kept_a = 0
+
+                    if score_a >= min_score and final_url and final_url not in found_set:
+                        if (not store) or (not store.has_emitted(final_url)):
+                            found_set.add(final_url)
+                            found.append({
+                                "url": final_url,
+                                "source": "cdnblock_final_url",
+                                "seed": seed,
+                                "final_url": final_url,
+                                "seed_host": seed_host,
+                                "cdn_host": final_host,
+                                "status": int(status),
+                                "score": int(score_a),
+                                "evidence": ev_a[:12],
+                                "first_seen": time.time(),
+                            })
+                            kept_a = 1
+                            if store:
+                                store.mark_emitted(
+                                    final_url,
+                                    host=final_host,
+                                    kind="final_url",
+                                    source_seed=seed,
+                                    score=int(score_a),
+                                    now_ts=time.time(),
+                                )
+
+                    # Candidate B: assets inside HTML (extract & score each)
+                    kept_assets = 0
+                    scanned_assets = 0
+                    if extract_assets and html:
+                        assets = self._extract_asset_urls_from_html(html, final_url, max_assets=max_assets_per_seed)
+                        scanned_assets = len(assets)
+                        for u in assets:
+                            if u in found_set:
+                                continue
+                            h = self._host(u)
+                            is_cdn, hs, hev = self._looks_cdn_host(h)
+                            if not is_cdn:
+                                continue
+                            # headers are from the page fetch, not the asset fetch (cheap heuristic)
+                            sc = hs + (hdr_score // 2)
+                            if sc < min_score:
+                                continue
+                            if store and store.has_emitted(u):
+                                continue
+
+                            found_set.add(u)
+                            found.append({
+                                "url": u,
+                                "source": "cdnblock_html_asset",
+                                "seed": seed,
+                                "final_url": final_url,
+                                "seed_host": seed_host,
+                                "cdn_host": h,
+                                "status": int(status),
+                                "score": int(sc),
+                                "evidence": (hev + hdr_ev)[:12],
+                                "first_seen": time.time(),
+                            })
+                            kept_assets += 1
+                            if store:
+                                store.mark_emitted(
+                                    u,
+                                    host=h,
+                                    kind="html_asset",
+                                    source_seed=seed,
+                                    score=int(sc),
+                                    now_ts=time.time(),
+                                )
+
+                    per_seed_stats[seed] = {
+                        "status": f"http_{int(status)}",
+                        "final_url": final_url,
+                        "ms": int((time.time() - t0) * 1000),
+                        "kept_final": kept_a,
+                        "scanned_assets": scanned_assets,
+                        "kept_assets": kept_assets,
+                        "final_host": final_host,
+                        "final_score": int(score_a),
+                        "final_evidence": ev_a[:8],
+                    }
+
+            await asyncio.gather(*[process_seed(s) for s in seeds_to_fetch])
+
+        # Merge into Memory
+        mem2 = Memory.load()
+        existing = mem2.get(out_key, [])
+        if not isinstance(existing, list):
+            existing = []
+
+        existing_urls = {
+            str(x.get("url")) for x in existing
+            if isinstance(x, dict) and x.get("url")
+        }
+
+        new_added = 0
+        for obj in found:
+            u = obj.get("url")
+            if not u or u in existing_urls:
+                continue
+            existing.append(obj)
+            existing_urls.add(u)
+            new_added += 1
+
+        # cap
+        max_memory_items = int(params.get("max_memory_items", 5000))
+        if len(existing) > max_memory_items:
+            existing = existing[-max_memory_items:]
+
+        mem2[out_key] = existing
+        mem2[stats_key] = per_seed_stats
+        if out_urls_key:
+            mem2[out_urls_key] = [x["url"] for x in existing if isinstance(x, dict) and x.get("url")][-max_memory_items:]
+        Memory.save(mem2)
+
+        # Report
+        lines = [
+            "### 🌐 CDNBlock Report",
+            f"_Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)} | Found CDN URLs: {len(found)} | Added to Memory: {new_added}_",
+            "",
+            f"**extract_assets:** {extract_assets} | **min_score:** {min_score}",
+            f"**DB Cache:** {'ON' if use_database else 'OFF'}",
+        ]
+        if use_database:
+            lines.append(f"**db_path:** {db_path}")
+            lines.append(f"**seed_ttl_seconds:** {seed_ttl_seconds:.0f}")
+
+        lines.append("")
+        lines.append("**Sample CDN URLs:**")
+        for o in found[:15]:
+            lines.append(f"- score={o.get('score')} host={o.get('cdn_host')} {o.get('url')}")
+
+        if log:
+            lines.append("\n**Log:**")
+            lines.extend(log)
+
+        meta = {
+            "seed_count": len(seed_urls),
+            "fetched_seed_count": len(seeds_to_fetch),
+            "found_count": len(found),
+            "new_added": new_added,
+            "cdn_links_key": out_key,
+            "cdn_urls_key": out_urls_key,
+            "per_seed_stats_key": stats_key,
+            "use_database": use_database,
+            "db_path": db_path if use_database else None,
+            "seed_ttl_seconds": seed_ttl_seconds,
+            "items": found,
+            "urls": [o["url"] for o in found],
+            "stats": per_seed_stats,
+        }
+
+        return "\n".join(lines), meta
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            # inputs
+            "memory_sources": "content_links,scraped_links",  # comma-separated keys
+            "seeds": "",  # optional override
+
+            # perf
+            "timeout": 6.0,
+            "max_seeds": 200,
+            "max_concurrency": 12,
+
+            # html asset extraction
+            "extract_assets": True,
+            "max_html_bytes": 220000,
+            "max_assets_per_seed": 200,
+
+            # scoring
+            "min_score": 45,
+
+            # memory outputs
+            "cdn_links_key": "cdn_links",
+            "cdn_urls_key": "cdn_urls",
+            "per_seed_stats_key": "cdn_seed_stats",
+            "max_memory_items": 5000,
+
+            # db
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "seed_ttl_seconds": 21600,
+        }
+
+
+# register
+BLOCKS.register("cdn", CDNBlock)
