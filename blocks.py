@@ -39,7 +39,7 @@ from models import get_chat_model  # <-- models now live separately
 import xml.etree.ElementTree as ET
 import re as _re
 from dotenv import load_dotenv
-from datetime import datetime, time as dt_time
+
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
     CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore
@@ -18375,12 +18375,12 @@ class LinkCrawlerBlock(BaseBlock):
     """
     LinkCrawlerBlock
 
-    Rewritten to use:
+    Uses:
       - HTTPSSubmanager (shared aiohttp engine, retries, cooldowns, per-host semaphores)
       - DatabaseSubmanager (via LinkCrawlerStore)
 
     Behavior:
-      - Memory-level dedupe (existing behavior).
+      - Memory-level dedupe.
       - If use_database=True:
           * Suppresses URLs previously emitted (cross-run).
           * Skips re-fetching seed URLs recently fetched (TTL).
@@ -18421,6 +18421,20 @@ class LinkCrawlerBlock(BaseBlock):
     _DOC_EXT_RE = re.compile(r"\.(pdf|epub|mobi|djvu|doc|docx|ppt|pptx|xls|xlsx|txt|rtf)$", re.IGNORECASE)
     _MEDIA_EXT_RE = re.compile(r"\.(mp4|mkv|mov|avi|wmv|flv|webm|m3u8|mpd|ts|m4a|mp3|flac|wav|ogg|aac)$", re.IGNORECASE)
     _IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|gif|webp|avif|bmp|tiff|svg)$", re.IGNORECASE)
+
+    # ------------------ time helpers (CRITICAL PATCH) ------------------
+
+    @staticmethod
+    def _now() -> float:
+        import time as _time  # stdlib module, safe even if global `time` is shadowed
+        return _time.time()
+
+    @staticmethod
+    def _ms_since(t0: float) -> int:
+        import time as _time
+        return int((_time.time() - t0) * 1000)
+
+    # ------------------ Query Augmentation ------------------
 
     def _augment_query_by_mode(self, q: str, mode: str) -> str:
         q = (q or "").strip()
@@ -18526,16 +18540,14 @@ class LinkCrawlerBlock(BaseBlock):
 
     # ------------------ DB wiring ------------------
 
-    def _make_store(self, db_path: str) -> LinkCrawlerStore:
+    def _make_store(self, db_path: str) -> "LinkCrawlerStore":
         cfg = submanagers.DatabaseConfig(path=db_path)
         db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
         store = LinkCrawlerStore(db=db)
         store.ensure_schema()
         return store
 
-    # ------------------ Search Helpers (unchanged; still use aiohttp) ------------------
-    # NOTE: You can optionally refactor these later to also use HTTPSSubmanager,
-    # but keeping them as-is avoids breaking your known-good DDG/SearX/GoogleCSE parsing.
+    # ------------------ Search Helpers (unchanged) ------------------
 
     async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
         import aiohttp
@@ -18666,7 +18678,6 @@ class LinkCrawlerBlock(BaseBlock):
         searxng_url = str(params.get("searxng_url", ""))
         http_timeout = float(params.get("timeout", 10.0))
 
-        # HTTPSSubmanager knobs
         retries = int(params.get("retries", 2))
         max_bytes = int(params.get("max_bytes", 4_000_000))
         verify = bool(params.get("verify", True))
@@ -18689,7 +18700,7 @@ class LinkCrawlerBlock(BaseBlock):
             f"use_database={use_database} ffmpeg_bin={ffmpeg_bin!r} links_key={links_key!r}"
         )
 
-        store: LinkCrawlerStore | None = None
+        store: "LinkCrawlerStore | None" = None
         if use_database:
             try:
                 store = self._make_store(db_path)
@@ -18701,7 +18712,7 @@ class LinkCrawlerBlock(BaseBlock):
                 log.append(f"[Crawler][DB] Init failed: {e} (continuing without DB)")
                 DEBUG_LOGGER.log_message(f"[Crawler][DB] init FAILED: {e} (DB disabled)")
 
-        # 1) Gather seeds (same behavior as your current version)
+        # 1) Gather seeds
         seed_urls: List[str] = []
 
         image_url = str(params.get("image_url", "") or "").strip()
@@ -18717,8 +18728,6 @@ class LinkCrawlerBlock(BaseBlock):
             DEBUG_LOGGER.log_message(f"[Crawler] seeds=explicit count={len(seed_urls)}")
 
         elif image_url or image_path:
-            # NOTE: Your reverse-image pipeline remains as-is (Playwright + ffmpeg + catbox).
-            # It doesn't need HTTPSSubmanager to function.
             DEBUG_LOGGER.log_message(
                 f"[Crawler] reverse-image seeds | engine={reverse_engine} "
                 f"image_url={'YES' if bool(image_url) else 'NO'} image_path={'YES' if bool(image_path) else 'NO'} "
@@ -18784,7 +18793,7 @@ class LinkCrawlerBlock(BaseBlock):
             except Exception:
                 pass
 
-        now_ts = time.time()
+        now_ts = self._now()
         seeds_to_fetch = seed_urls
 
         if store:
@@ -18814,37 +18823,31 @@ class LinkCrawlerBlock(BaseBlock):
             async def fetch_and_parse(url: str):
                 DEBUG_LOGGER.log_message(f"[Crawler][Page] crawling seed={url}")
                 async with sem:
-                    start = time.time()
+                    t0 = self._now()
                     try:
-                        # HEAD first: cheap type filter
                         status_h, hdrs = await http.head(url)
                         ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
 
                         if store:
                             try:
-                                store.seed_mark_fetched(url, status=int(status_h or 0), now_ts=time.time())
+                                store.seed_mark_fetched(url, status=int(status_h or 0), now_ts=self._now())
                             except Exception as e:
                                 DEBUG_LOGGER.log_message(f"[Crawler][DB] seed_mark_fetched failed url={url} err={e}")
 
                         DEBUG_LOGGER.log_message(
-                            f"[Crawler][Page] head status={status_h} ms={int((time.time()-start)*1000)} ctype={ctype[:60]!r}"
+                            f"[Crawler][Page] head status={status_h} ms={self._ms_since(t0)} ctype={ctype[:60]!r}"
                         )
 
-                        # If clearly non-HTML, skip parsing
                         if ctype and ("text/html" not in ctype):
                             DEBUG_LOGGER.log_message(f"[Crawler][Page] skip non-html seed={url} ctype={ctype[:80]!r}")
                             return
 
-                        # GET bounded HTML
                         html = await http.get_text(url)
                         if not html:
                             DEBUG_LOGGER.log_message(f"[Crawler][Page] empty html seed={url}")
                             return
 
-                        # As with LinkContentCrawler, HTTPSSubmanager doesn't expose final_url here;
-                        # treat url as base_url for urljoin (works for most hrefs).
-                        final_url = url
-
+                        final_url = url  # safe default; href resolution still works in most cases
                         _links, candidates = self._extract_links(html, final_url, mode=mode)
                         lex = self._extract_lexicon(html)
 
@@ -18874,6 +18877,8 @@ class LinkCrawlerBlock(BaseBlock):
 
         # 3) Write to Memory (dedupe via Memory + optional DB)
         store_obj = Memory.load()
+        if not isinstance(store_obj, dict):
+            store_obj = {}
 
         existing_links = store_obj.get(links_key, [])
         if not isinstance(existing_links, list):
@@ -18883,7 +18888,7 @@ class LinkCrawlerBlock(BaseBlock):
 
         new_link_objs: List[Dict[str, Any]] = []
         suppressed_by_db = 0
-        ts = time.time()
+        ts = self._now()
 
         for u in collected_links:
             if not u:
@@ -19017,6 +19022,8 @@ class LinkCrawlerBlock(BaseBlock):
 
 # register
 BLOCKS.register("linkcrawler", LinkCrawlerBlock)
+
+
 # ======================= URLScraperBlock ==================================
 
 @dataclass
@@ -20496,7 +20503,6 @@ BLOCKS.register("linkcontentcrawler", LinkContentCrawlerBlock)
 
 # ======================= CDNBlock ============================
 
-
 @dataclass
 class CDNBlock(BaseBlock):
     """
@@ -20504,38 +20510,16 @@ class CDNBlock(BaseBlock):
     --------
     Feeds on input links (from Memory or explicit list) and outputs CDN-like URLs.
 
-    Inputs:
-      - memory_sources: comma-separated Memory keys to read URLs from
-      - seeds: optional comma-separated override list (bypasses Memory)
-
-    Detection:
-      - Resolves redirects (final_url) via HTTPSSubmanager
-      - Scores "cdn-ness" using:
-          * host tokens/suffixes (cloudfront, fastly, akamai, cdn, edgesuite, etc.)
-          * headers (cf-ray, x-amz-cf-id, x-cache, via, x-served-by, server hints)
-          * host change from seed host to final host
-
-      - Optional HTML parsing (small bounded GET) to extract asset URLs and
-        emit the CDN-ish ones.
-
-    Outputs (Memory):
-      - cdn_links_key: list[dict]  (url objects)
-      - cdn_urls_key: list[str]    (optional convenience)
-      - per_seed_stats_key: dict
-
-    DB (optional):
-      - suppresses already-emitted CDN URLs across runs
-      - avoids refetching seed URLs within TTL
+    Patch notes:
+      ✅ Always writes cdn_links_key / cdn_urls_key / per_seed_stats_key to Memory,
+        even when there are no seeds or no matches (prevents "no output" confusion).
+      ✅ Adds diagnostics: missing/empty memory_sources keys are logged and included.
+      ✅ Still supports seeds override + payload fallback.
     """
-
-    # ------------------ URL extraction ------------------
 
     _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.IGNORECASE)
     _HREF_SRC_RE = re.compile(r"""(?:href|src)=["'](.*?)["']""", re.IGNORECASE)
 
-    # ------------------ CDN heuristics ------------------
-
-    # high-signal host tokens
     _CDN_HOST_TOKENS = (
         "cdn", "edge", "edgesuite", "edgekey", "akamai", "akamaized",
         "cloudfront", "fastly", "fastlylb", "stackpathcdn", "netdna-cdn",
@@ -20543,7 +20527,6 @@ class CDNBlock(BaseBlock):
         "hwcdn", "llnwd", "cachefly", "b-cdn", "bunnycdn", "vkuseraudio",
     )
 
-    # common CDN-ish domains/suffixes (add as you observe in the wild)
     _CDN_SUFFIXES = (
         ".cloudfront.net",
         ".akamaized.net",
@@ -20585,12 +20568,6 @@ class CDNBlock(BaseBlock):
     # ------------------ flatten / parse input ------------------
 
     def _flatten_urls(self, raw: Any) -> List[str]:
-        """
-        Accepts:
-          - list[str]
-          - list[dict] with url/href/link/page/request_url/final_url/source_url fields
-          - str blobs containing URLs
-        """
         out: List[str] = []
         seen = set()
 
@@ -20598,11 +20575,15 @@ class CDNBlock(BaseBlock):
             u = (u or "").strip()
             if not u:
                 return
+
+            # direct url
             if u.startswith(("http://", "https://")):
                 if u not in seen:
                     seen.add(u)
                     out.append(u)
                 return
+
+            # scan blob for urls
             for m in self._URL_RE.finditer(u[:250_000]):
                 uu = m.group(0)
                 if uu and uu not in seen:
@@ -20635,6 +20616,7 @@ class CDNBlock(BaseBlock):
                     if isinstance(v, (list, dict)):
                         walk(v)
                 return
+
             push(str(x))
 
         walk(raw)
@@ -20647,9 +20629,6 @@ class CDNBlock(BaseBlock):
             return ""
 
     def _looks_cdn_host(self, host: str) -> Tuple[bool, int, List[str]]:
-        """
-        Returns (is_cdn, score, evidence[])
-        """
         host = (host or "").lower()
         if not host:
             return False, 0, []
@@ -20657,20 +20636,17 @@ class CDNBlock(BaseBlock):
         score = 0
         ev: List[str] = []
 
-        # suffix match is strong
         for suf in self._CDN_SUFFIXES:
             if host.endswith(suf):
                 score += 60
                 ev.append(f"host_suffix:{suf}")
                 break
 
-        # token match is medium-strong
         for tok in self._CDN_HOST_TOKENS:
             if tok in host:
                 score += 18
                 ev.append(f"host_token:{tok}")
-                # don't break; multiple tokens can stack lightly
-        # generic "cdn" substring tends to be noisy, but still useful
+
         if "cdn" in host and all("host_token:cdn" != e for e in ev):
             score += 10
             ev.append("host_token:cdn")
@@ -20682,13 +20658,13 @@ class CDNBlock(BaseBlock):
             return 0, []
         score = 0
         ev: List[str] = []
-        # normalize keys
+
         lower_map = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         for k in self._HEADER_SIGNAL_KEYS:
             if k in lower_map:
                 score += 10
                 ev.append(f"hdr:{k}")
-        # server hints
+
         server = lower_map.get("server", "").lower()
         if any(x in server for x in ("cloudflare", "akamai", "fastly", "varnish")):
             score += 15
@@ -20718,7 +20694,6 @@ class CDNBlock(BaseBlock):
             except Exception:
                 continue
 
-        # also scan for loose URLs in the doc (helps scripts/json blobs)
         if len(out) < max_assets:
             for m in self._URL_RE.finditer(html[:600_000]):
                 u = m.group(0)
@@ -20730,33 +20705,23 @@ class CDNBlock(BaseBlock):
 
         return out
 
-    # ------------------ core fetch using HTTPSSubmanager ------------------
-
     async def _head_or_get(
         self,
         http: "HTTPSSubmanager",
         url: str,
         *,
-        timeout_s: float,
         want_html_assets: bool,
         max_html_bytes: int,
     ) -> Tuple[Optional[int], Dict[str, str], str, str]:
-        """
-        Returns: (status, headers, final_url, html_text_or_empty)
-        Uses http._request so we can get final_url (redirect-resolved).
-        """
-        # NOTE: we call the internal _request for final_url.
-        # This keeps integration self-contained while still leveraging your pooled engine.
         try:
             r = await http._request("HEAD", url, want_body=False, allow_redirects=True)
             status = r.status
             hdrs = r.headers or {}
             final_url = r.final_url or url
 
-            # Some origins deny HEAD (405) or give tiny headers; optionally GET HTML
             html = ""
             ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
-            if want_html_assets and (ctype.startswith("text/html") or "text/html" in ctype or status in (405, 403, 200)):
+            if want_html_assets and (("text/html" in ctype) or status in (405, 403, 200)):
                 r2 = await http._request("GET", final_url, want_body=True, allow_redirects=True, max_bytes=max_html_bytes)
                 hdrs = r2.headers or hdrs
                 final_url = r2.final_url or final_url
@@ -20769,15 +20734,51 @@ class CDNBlock(BaseBlock):
         except Exception:
             return None, {}, url, ""
 
+    # ------------------ Memory output initializer (PATCH) ------------------
+
+    def _ensure_memory_outputs(
+        self,
+        *,
+        out_key: str,
+        out_urls_key: str,
+        stats_key: str,
+        per_seed_stats: Dict[str, Any],
+        existing_items: Optional[List[Dict[str, Any]]] = None,
+        max_memory_items: int = 5000,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        mem = Memory.load()
+        if not isinstance(mem, dict):
+            mem = {}
+
+        items = existing_items if isinstance(existing_items, list) else mem.get(out_key, [])
+        if not isinstance(items, list):
+            items = []
+
+        # cap
+        if len(items) > max_memory_items:
+            items = items[-max_memory_items:]
+
+        mem[out_key] = items
+        mem[stats_key] = per_seed_stats or {}
+
+        if out_urls_key:
+            mem[out_urls_key] = [x.get("url") for x in items if isinstance(x, dict) and x.get("url")][-max_memory_items:]
+
+        # Optional extra debug info without breaking schema
+        if diagnostics:
+            mem.setdefault("cdn_debug", {})
+            if isinstance(mem["cdn_debug"], dict):
+                mem["cdn_debug"].update(diagnostics)
+
+        Memory.save(mem)
+
     # ------------------ Execution ------------------
 
     async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        log: List[str] = []
-
         # Inputs
         memory_sources_raw = str(params.get("memory_sources", "") or "").strip()
         memory_sources = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
-
         seeds_override = str(params.get("seeds", "") or "").strip()
 
         # Perf knobs
@@ -20791,12 +20792,13 @@ class CDNBlock(BaseBlock):
         max_assets_per_seed = int(params.get("max_assets_per_seed", 200))
 
         # Emit knobs
-        min_score = int(params.get("min_score", 45))  # require decent confidence by default
+        min_score = int(params.get("min_score", 45))
 
         # Memory outputs
         out_key = str(params.get("cdn_links_key", "cdn_links")).strip()
         out_urls_key = str(params.get("cdn_urls_key", "cdn_urls")).strip()
         stats_key = str(params.get("per_seed_stats_key", "cdn_seed_stats")).strip()
+        max_memory_items = int(params.get("max_memory_items", 5000))
 
         # DB support
         use_database = bool(params.get("use_database", False))
@@ -20809,38 +20811,81 @@ class CDNBlock(BaseBlock):
             f"extract_assets={extract_assets} min_score={min_score} use_database={use_database}"
         )
 
-        # Build seed list
+        # Build seed list + diagnostics (PATCH)
         seed_urls: List[str] = []
+        missing_keys: List[str] = []
+        empty_keys: List[str] = []
+
         if seeds_override:
             seed_urls = [s.strip() for s in seeds_override.split(",") if s.strip()]
         else:
             if not memory_sources:
-                # fallback: payload can be a url blob/list
                 seed_urls = self._flatten_urls(payload)
             else:
                 mem = Memory.load()
+                if not isinstance(mem, dict):
+                    mem = {}
                 for k in memory_sources:
-                    seed_urls.extend(self._flatten_urls(mem.get(k)))
+                    if k not in mem:
+                        missing_keys.append(k)
+                        continue
+                    raw_val = mem.get(k)
+                    flattened = self._flatten_urls(raw_val)
+                    if not flattened:
+                        empty_keys.append(k)
+                    seed_urls.extend(flattened)
 
-        # Dedup (preserve order) + cap
+        # Dedup + cap
         seed_urls = list(dict.fromkeys([u for u in seed_urls if u.startswith(("http://", "https://"))]))
         if max_seeds and len(seed_urls) > max_seeds:
             seed_urls = seed_urls[:max_seeds]
 
+        per_seed_stats: Dict[str, Dict[str, Any]] = {}
+
+        # ✅ PATCH: Always write outputs even if no seeds
         if not seed_urls:
-            return "No operation.", {"error": "no seeds", "seed_count": 0}
+            self._ensure_memory_outputs(
+                out_key=out_key,
+                out_urls_key=out_urls_key,
+                stats_key=stats_key,
+                per_seed_stats=per_seed_stats,
+                existing_items=[],
+                max_memory_items=max_memory_items,
+                diagnostics={
+                    "last_run": time.time(),
+                    "reason": "no_seeds",
+                    "memory_sources": memory_sources,
+                    "missing_keys": missing_keys,
+                    "empty_keys": empty_keys,
+                },
+            )
+            msg = (
+                "### 🌐 CDNBlock Report\n"
+                "_No seeds found; wrote empty outputs to Memory._\n\n"
+                f"- memory_sources={memory_sources}\n"
+                f"- missing_keys={missing_keys}\n"
+                f"- empty_keys={empty_keys}\n"
+            )
+            meta = {
+                "error": "no seeds",
+                "seed_count": 0,
+                "missing_keys": missing_keys,
+                "empty_keys": empty_keys,
+                "cdn_links_key": out_key,
+                "cdn_urls_key": out_urls_key,
+                "per_seed_stats_key": stats_key,
+            }
+            return msg, meta
 
         # Optional DB store
         store: Optional[CDNStore] = None
         if use_database:
             try:
                 store = self._make_store(db_path)
-                log.append(f"[CDNBlock][DB] Enabled db_path={db_path} seed_ttl_seconds={seed_ttl_seconds:.0f}")
                 DEBUG_LOGGER.log_message(f"[CDNBlock][DB] init ok | db_path={db_path}")
             except Exception as e:
                 store = None
                 use_database = False
-                log.append(f"[CDNBlock][DB] Init failed: {e} (continuing without DB)")
                 DEBUG_LOGGER.log_message(f"[CDNBlock][DB] init FAILED: {e} (DB disabled)")
 
         # TTL gating
@@ -20848,25 +20893,14 @@ class CDNBlock(BaseBlock):
         seeds_to_fetch = seed_urls
         if store:
             seeds_to_fetch = [u for u in seed_urls if store.seed_should_fetch(u, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
-            skipped = len(seed_urls) - len(seeds_to_fetch)
-            if skipped:
-                msg = f"[CDNBlock][DB] Skipping {skipped} seed(s) due to TTL."
-                log.append(msg)
-                DEBUG_LOGGER.log_message(msg)
 
-        per_seed_stats: Dict[str, Dict[str, Any]] = {}
-
-        # Collected CDN urls (dedup in-run)
         found: List[Dict[str, Any]] = []
         found_set: set[str] = set()
-
         sem = asyncio.Semaphore(max_concurrency)
 
         async with submanagers.HTTPSSubmanager(timeout=timeout, retries=2, max_conn_per_host=8) as http:
 
             async def process_seed(seed: str):
-                if not seed:
-                    return
                 async with sem:
                     t0 = time.time()
                     seed_host = self._host(seed)
@@ -20874,7 +20908,6 @@ class CDNBlock(BaseBlock):
                     status, hdrs, final_url, html = await self._head_or_get(
                         http,
                         seed,
-                        timeout_s=timeout,
                         want_html_assets=extract_assets,
                         max_html_bytes=max_html_bytes,
                     )
@@ -20893,14 +20926,12 @@ class CDNBlock(BaseBlock):
                     hdr_score, hdr_ev = self._header_signals(hdrs)
                     host_is_cdn, host_score, host_ev = self._looks_cdn_host(final_host)
 
-                    # host-change evidence (weak-medium)
                     host_change_score = 0
                     host_change_ev: List[str] = []
                     if seed_host and final_host and seed_host != final_host:
                         host_change_score = 12
                         host_change_ev.append("host_changed")
 
-                    # Candidate A: final_url itself (if looks CDN-ish)
                     score_a = host_score + hdr_score + host_change_score
                     ev_a = host_ev + hdr_ev + host_change_ev
                     kept_a = 0
@@ -20923,15 +20954,10 @@ class CDNBlock(BaseBlock):
                             kept_a = 1
                             if store:
                                 store.mark_emitted(
-                                    final_url,
-                                    host=final_host,
-                                    kind="final_url",
-                                    source_seed=seed,
-                                    score=int(score_a),
-                                    now_ts=time.time(),
+                                    final_url, host=final_host, kind="final_url",
+                                    source_seed=seed, score=int(score_a), now_ts=time.time()
                                 )
 
-                    # Candidate B: assets inside HTML (extract & score each)
                     kept_assets = 0
                     scanned_assets = 0
                     if extract_assets and html:
@@ -20944,7 +20970,6 @@ class CDNBlock(BaseBlock):
                             is_cdn, hs, hev = self._looks_cdn_host(h)
                             if not is_cdn:
                                 continue
-                            # headers are from the page fetch, not the asset fetch (cheap heuristic)
                             sc = hs + (hdr_score // 2)
                             if sc < min_score:
                                 continue
@@ -20967,12 +20992,8 @@ class CDNBlock(BaseBlock):
                             kept_assets += 1
                             if store:
                                 store.mark_emitted(
-                                    u,
-                                    host=h,
-                                    kind="html_asset",
-                                    source_seed=seed,
-                                    score=int(sc),
-                                    now_ts=time.time(),
+                                    u, host=h, kind="html_asset",
+                                    source_seed=seed, score=int(sc), now_ts=time.time()
                                 )
 
                     per_seed_stats[seed] = {
@@ -20989,17 +21010,16 @@ class CDNBlock(BaseBlock):
 
             await asyncio.gather(*[process_seed(s) for s in seeds_to_fetch])
 
-        # Merge into Memory
-        mem2 = Memory.load()
-        existing = mem2.get(out_key, [])
+        # Merge into Memory (always ensures outputs exist)
+        mem = Memory.load()
+        if not isinstance(mem, dict):
+            mem = {}
+
+        existing = mem.get(out_key, [])
         if not isinstance(existing, list):
             existing = []
 
-        existing_urls = {
-            str(x.get("url")) for x in existing
-            if isinstance(x, dict) and x.get("url")
-        }
-
+        existing_urls = {str(x.get("url")) for x in existing if isinstance(x, dict) and x.get("url")}
         new_added = 0
         for obj in found:
             u = obj.get("url")
@@ -21009,18 +21029,26 @@ class CDNBlock(BaseBlock):
             existing_urls.add(u)
             new_added += 1
 
-        # cap
-        max_memory_items = int(params.get("max_memory_items", 5000))
-        if len(existing) > max_memory_items:
-            existing = existing[-max_memory_items:]
+        # ✅ PATCH: use unified writer (caps + urls list + stats + debug)
+        self._ensure_memory_outputs(
+            out_key=out_key,
+            out_urls_key=out_urls_key,
+            stats_key=stats_key,
+            per_seed_stats=per_seed_stats,
+            existing_items=existing,
+            max_memory_items=max_memory_items,
+            diagnostics={
+                "last_run": time.time(),
+                "memory_sources": memory_sources,
+                "missing_keys": missing_keys,
+                "empty_keys": empty_keys,
+                "seed_count": len(seed_urls),
+                "fetched_seed_count": len(seeds_to_fetch),
+                "found_count": len(found),
+                "new_added": new_added,
+            },
+        )
 
-        mem2[out_key] = existing
-        mem2[stats_key] = per_seed_stats
-        if out_urls_key:
-            mem2[out_urls_key] = [x["url"] for x in existing if isinstance(x, dict) and x.get("url")][-max_memory_items:]
-        Memory.save(mem2)
-
-        # Report
         lines = [
             "### 🌐 CDNBlock Report",
             f"_Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)} | Found CDN URLs: {len(found)} | Added to Memory: {new_added}_",
@@ -21028,18 +21056,16 @@ class CDNBlock(BaseBlock):
             f"**extract_assets:** {extract_assets} | **min_score:** {min_score}",
             f"**DB Cache:** {'ON' if use_database else 'OFF'}",
         ]
-        if use_database:
-            lines.append(f"**db_path:** {db_path}")
-            lines.append(f"**seed_ttl_seconds:** {seed_ttl_seconds:.0f}")
+        if memory_sources:
+            lines.append(f"**memory_sources:** {memory_sources}")
+        if missing_keys or empty_keys:
+            lines.append(f"**missing_keys:** {missing_keys}")
+            lines.append(f"**empty_keys:** {empty_keys}")
 
         lines.append("")
         lines.append("**Sample CDN URLs:**")
         for o in found[:15]:
             lines.append(f"- score={o.get('score')} host={o.get('cdn_host')} {o.get('url')}")
-
-        if log:
-            lines.append("\n**Log:**")
-            lines.extend(log)
 
         meta = {
             "seed_count": len(seed_urls),
@@ -21049,14 +21075,12 @@ class CDNBlock(BaseBlock):
             "cdn_links_key": out_key,
             "cdn_urls_key": out_urls_key,
             "per_seed_stats_key": stats_key,
-            "use_database": use_database,
-            "db_path": db_path if use_database else None,
-            "seed_ttl_seconds": seed_ttl_seconds,
+            "missing_keys": missing_keys,
+            "empty_keys": empty_keys,
             "items": found,
             "urls": [o["url"] for o in found],
             "stats": per_seed_stats,
         }
-
         return "\n".join(lines), meta
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -21064,35 +21088,23 @@ class CDNBlock(BaseBlock):
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            # inputs
-            "memory_sources": "content_links,scraped_links",  # comma-separated keys
-            "seeds": "",  # optional override
-
-            # perf
+            "memory_sources": "content_links,scraped_links",
+            "seeds": "",
             "timeout": 6.0,
             "max_seeds": 200,
             "max_concurrency": 12,
-
-            # html asset extraction
             "extract_assets": True,
             "max_html_bytes": 220000,
             "max_assets_per_seed": 200,
-
-            # scoring
             "min_score": 45,
-
-            # memory outputs
             "cdn_links_key": "cdn_links",
             "cdn_urls_key": "cdn_urls",
             "per_seed_stats_key": "cdn_seed_stats",
             "max_memory_items": 5000,
-
-            # db
             "use_database": False,
             "db_path": "link_corpus.db",
             "seed_ttl_seconds": 21600,
         }
-
 
 # register
 BLOCKS.register("cdn", CDNBlock)

@@ -8,8 +8,9 @@ import re
 import sqlite3
 import ssl
 import threading
+import time
 from dataclasses import dataclass, field
-from datetime import time
+
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
