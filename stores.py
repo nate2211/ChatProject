@@ -5,6 +5,7 @@ import collections
 import random
 import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Callable, ClassVar
 from urllib.parse import urlparse
 import time
@@ -1733,5 +1734,166 @@ class CDNStore:
                 """,
                 [url, host, kind, source_seed, float(now_ts), float(now_ts), int(score)],
             )
+        except Exception:
+            pass
+
+
+# ======================================================================
+# Store (DB-backed) for DirectLinkTracker
+# ======================================================================
+
+class DirectLinkTrackerStore:
+    """
+    SQLite-backed store for DirectLinkTracker.
+
+    Schema matches your LinkTrackerBlock-style tables:
+      - assets(url PK, text, source, size, status, first_seen, last_checked)
+      - pages(url PK, last_scanned)
+    """
+    db_path: str = "link_corpus.db"
+
+    def __post_init__(self) -> None:
+        self._conn: Optional[sqlite3.Connection] = None
+
+    # ---------------------------
+    # lifecycle
+    # ---------------------------
+    def open(self) -> None:
+        if self._conn:
+            return
+        db_path = str(self.db_path or "link_corpus.db")
+        existed = Path(db_path).exists()
+
+        self._conn = sqlite3.connect(db_path)
+        cur = self._conn.cursor()
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assets
+            (
+                url TEXT PRIMARY KEY,
+                text TEXT,
+                source TEXT,
+                size TEXT,
+                status TEXT,
+                first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pages
+            (
+                url TEXT PRIMARY KEY,
+                last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
+        self._conn.commit()
+
+        print(f"[DirectLinkTrackerStore] {'Using existing' if existed else 'Database created'} at {db_path}")
+
+    def close(self) -> None:
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
+
+    def __enter__(self) -> "DirectLinkTrackerStore":
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    @property
+    def conn(self) -> Optional[sqlite3.Connection]:
+        return self._conn
+
+    # ---------------------------
+    # pages
+    # ---------------------------
+    def is_page_scanned(self, url: str) -> bool:
+        if not self._conn:
+            return False
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def mark_page_scanned(self, url: str) -> None:
+        if not self._conn:
+            return
+        try:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT OR REPLACE INTO pages (url, last_scanned) VALUES (?, CURRENT_TIMESTAMP)",
+                (url,),
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+
+    # ---------------------------
+    # assets
+    # ---------------------------
+    def is_asset_url(self, url: str) -> bool:
+        if not self._conn:
+            return False
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT 1 FROM assets WHERE url = ?", (url,))
+            return cur.fetchone() is not None
+        except Exception:
+            return False
+
+    def upsert_asset(self, asset: Dict[str, Any]) -> None:
+        if not self._conn:
+            return
+        u = (asset or {}).get("url", "") or ""
+        if not u:
+            return
+        try:
+            cur = self._conn.cursor()
+            cur.execute("SELECT first_seen FROM assets WHERE url = ?", (u,))
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """
+                    UPDATE assets
+                    SET status=?, last_checked=CURRENT_TIMESTAMP, size=?, source=?, text=?
+                    WHERE url=?
+                    """,
+                    (
+                        asset.get("status", ""),
+                        asset.get("size", ""),
+                        asset.get("source", ""),
+                        asset.get("text", ""),
+                        u,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO assets(url,text,source,size,status,last_checked)
+                    VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        u,
+                        asset.get("text", ""),
+                        asset.get("source", ""),
+                        asset.get("size", ""),
+                        asset.get("status", ""),
+                    ),
+                )
+            self._conn.commit()
         except Exception:
             pass

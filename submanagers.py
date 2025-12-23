@@ -4445,6 +4445,7 @@ class DatabaseSniffer:
             self._log(f"IndexedDB metadata script failed: {e}", log)
             return []
 
+
 # ======================================================================
 # InteractionSniffer (CDP-based Event & Overlay Analysis)
 # ======================================================================

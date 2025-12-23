@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore
+    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore, DirectLinkTrackerStore
 from loggers import DEBUG_LOGGER
 
 load_dotenv()
@@ -13397,24 +13397,18 @@ BLOCKS.register("toronion", TorOnionBlock)
 
 # ======================= DirectLinkTrackerBlock =============================
 
+
 @dataclass
 class DirectLinkTrackerBlock(BaseBlock):
     """
     Expand from direct content links (file hosters / detail pages / folders).
-    NOW accepts a query to guide filtering/ranking.
+    Now uses:
+      - DirectLinkTrackerStore (DB-backed) through DatabaseSubmanager
+      - HTTPSSubmanager for all network I/O (except Playwright sniffers)
 
-    Query sources (priority):
-      1) params["query"]
-      2) payload (if payload is a non-url string)
-      3) empty => no keyword filtering
-
-    With direct expansion enabled, this block will:
-      • start from the direct URL(s)
-      • auto-derive api.get / metadata / parent dirs /f/ / onlyfiles.txt
-      • read onlyfiles.txt for tons of siblings
-      • crawl deeper to pull more file IDs
-      • collect all matching media assets
-      • rank/return the ones most aligned with the query
+    DB usage:
+      - params["use_database"]=True activates store
+      - store is backed by DatabaseSubmanager (shared, thread-safe)
     """
 
     JUNK_FILENAME_KEYWORDS = {
@@ -13432,86 +13426,65 @@ class DirectLinkTrackerBlock(BaseBlock):
     MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
     MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
 
-    # PATCH #4: broaden pillows id patterns + raw hex tokens
     _PILLOWS_ID_RE = re.compile(
         r"(?:/f/|/api/get/|/get/)([a-f0-9]{24,64})|"
         r"\b([a-f0-9]{32})\b",
         re.IGNORECASE
     )
 
-
     def __post_init__(self):
-        self.db_conn: Optional[sqlite3.Connection] = None
-        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
-        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
-    # ------------------------------------------------------------------ #
-    # DB helpers (same schema as LinkTrackerBlock)
-    # ------------------------------------------------------------------ #
-    def _initialize_database(self, db_path: str) -> None:
-        try:
-            if self.db_conn:
-                return
-
-            db_path = str(db_path or "link_corpus.db")
-            existed = Path(db_path).exists()
-
-            self.db_conn = sqlite3.connect(db_path)
-            cur = self.db_conn.cursor()
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assets
-                (
-                    url TEXT PRIMARY KEY,
-                    text TEXT,
-                    source TEXT,
-                    size TEXT,
-                    status TEXT,
-                    first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_checked TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+        self.js_sniffer = submanagers.JSSniffer(
+            submanagers.JSSniffer.Config(enable_auto_scroll=True, max_scroll_steps=40, scroll_step_delay_ms=500)
+        )
+        self.network_sniffer = submanagers.NetworkSniffer(
+            submanagers.NetworkSniffer.Config(enable_auto_scroll=True, max_scroll_steps=40, scroll_step_delay_ms=500)
+        )
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(
+                hook_history_api=True,
+                hook_link_clicks=True,
+                inspect_react_devtools_hook=True,
+                enable_fiber_traversal=True,
+                enable_router_inspection=True,
+                enable_state_url_scan=True
             )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_assets_source ON assets (source)")
-
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pages
-                (
-                    url TEXT PRIMARY KEY,
-                    last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
+        )
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,  # Metadata/Schema only
+                enable_backend_fingerprint=True,
+                enable_html_link_scan=True,
+                enable_backend_link_scan=True,
+                backend_scan_depth=2
             )
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_last_scanned ON pages (last_scanned)")
-            self.db_conn.commit()
-
-            print(f"[DirectLinkTracker] {'Using existing' if existed else 'Database created'} at {db_path}")
-        except Exception as e:
-            print(f"[DirectLinkTracker] Error initializing DB: {e}")
-            if self.db_conn:
-                self.db_conn.close()
-                self.db_conn = None
-
-    def _is_url_in_database(self, url: str) -> bool:
-        if not self.db_conn:
-            return False
+        )
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True
+            )
+        )
+    # ------------------------------------------------------------------ #
+    # small helpers
+    # ------------------------------------------------------------------ #
+    def _looks_nonempty_size(self, cl: Optional[str]) -> bool:
         try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT 1 FROM assets WHERE url = ?", (url,))
-            return cur.fetchone() is not None
+            if not cl:
+                return True
+            return int(cl) > 16 * 1024
         except Exception:
-            return False
+            return True
 
-    def _is_page_scanned(self, url: str) -> bool:
-        if not self.db_conn:
-            return False
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT 1 FROM pages WHERE url = ?", (url,))
-            return cur.fetchone() is not None
-        except Exception:
-            return False
+    def _extract_ids_from_text(self, text: str) -> Set[str]:
+        ids = set()
+        for m in self._PILLOWS_ID_RE.finditer(text or ""):
+            g1, g2 = m.group(1), m.group(2)
+            if g1:
+                ids.add(g1)
+            if g2:
+                ids.add(g2)
+        return ids
 
     def _extract_froste_song_id(self, u: str) -> Optional[str]:
         try:
@@ -13524,181 +13497,48 @@ class DirectLinkTrackerBlock(BaseBlock):
         return None
 
     def _extract_urls_from_index_line(self, line: str) -> List[str]:
-        """
-        Generic: pull any http(s) URL embedded anywhere in a plaintext index line.
-        Handles 'label - url', 'label | url', multiple urls, or bare urls.
-        """
         if not line:
             return []
         urls = self._URL_RE.findall(line)
         cleaned = []
         for u in urls:
-            u = u.strip().rstrip(").,;\"'")  # common trailing junk
+            u = u.strip().rstrip(").,;\"'")
             if u:
                 cleaned.append(u)
         return cleaned
 
     def _label_from_index_line(self, line: str, url: str) -> str:
-        """
-        Try to infer a human-friendly label from the non-url part of the line.
-        """
         line = (line or "").strip()
         if url and url in line:
             line_wo_url = line.replace(url, "").strip()
         else:
             line_wo_url = line
 
-        # common separators
         for sep in [" - ", " | ", "\t", "  "]:
             if sep in line_wo_url:
                 left = line_wo_url.split(sep, 1)[0].strip()
                 if left:
                     return left[:100]
 
-        # fallback to filename from url
         try:
             return url.rsplit("/", 1)[-1][:100]
         except Exception:
             return (line_wo_url or url or "[asset]")[:100]
 
-    def _mark_page_scanned(self, url: str) -> None:
-        if not self.db_conn:
-            return
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute(
-                "INSERT OR REPLACE INTO pages (url, last_scanned) VALUES (?, CURRENT_TIMESTAMP)",
-                (url,),
-            )
-            self.db_conn.commit()
-        except Exception:
-            pass
-
-    def _looks_nonempty_size(self, cl: Optional[str]) -> bool:
-        try:
-            if not cl:
-                return True  # unknown → allow, but will be rechecked
-            return int(cl) > 16 * 1024  # >16KB
-        except Exception:
-            return True
-
-    # PATCH #4: raw-hex aware extraction
-    def _extract_ids_from_text(self, text: str) -> Set[str]:
-        ids = set()
-        for m in self._PILLOWS_ID_RE.finditer(text or ""):
-            g1, g2 = m.group(1), m.group(2)
-            if g1:
-                ids.add(g1)
-            if g2:
-                ids.add(g2)
-        return ids
-
-    def _save_asset_to_database(self, asset: Dict[str, Any]) -> None:
-        if not self.db_conn:
-            return
-        try:
-            cur = self.db_conn.cursor()
-            cur.execute("SELECT first_seen FROM assets WHERE url = ?", (asset.get("url", ""),))
-            row = cur.fetchone()
-            if row:
-                cur.execute(
-                    """
-                    UPDATE assets
-                    SET status=?, last_checked=CURRENT_TIMESTAMP, size=?, source=?
-                    WHERE url=?
-                    """,
-                    (
-                        asset.get("status", ""),
-                        asset.get("size", ""),
-                        asset.get("source", ""),
-                        asset.get("url", ""),
-                    ),
-                )
-            else:
-                cur.execute(
-                    """
-                    INSERT INTO assets(url,text,source,size,status,last_checked)
-                    VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)
-                    """,
-                    (
-                        asset.get("url", ""),
-                        asset.get("text", ""),
-                        asset.get("source", ""),
-                        asset.get("size", ""),
-                        asset.get("status", ""),
-                    ),
-                )
-            self.db_conn.commit()
-        except Exception:
-            pass
-
-    def _extract_urls_from_index_line(self, line: str) -> List[str]:
-        """
-        Generic: pull any http(s) URL embedded anywhere in a plaintext index line.
-        Handles 'label - url', 'label | url', multiple urls, or bare urls.
-        """
-        if not line:
-            return []
-        urls = self._URL_RE.findall(line)
-        cleaned = []
-        for u in urls:
-            u = u.strip().rstrip(").,;\"'")  # common trailing junk
-            if u:
-                cleaned.append(u)
-        return cleaned
-
-    def _label_from_index_line(self, line: str, url: str) -> str:
-        """
-        Try to infer a human-friendly label from the non-url part of the line.
-        """
-        line = (line or "").strip()
-        if url and url in line:
-            line_wo_url = line.replace(url, "").strip()
-        else:
-            line_wo_url = line
-
-        # common separators
-        for sep in [" - ", " | ", "\t", "  "]:
-            if sep in line_wo_url:
-                left = line_wo_url.split(sep, 1)[0].strip()
-                if left:
-                    return left[:100]
-
-        # fallback to filename from url
-        try:
-            return url.rsplit("/", 1)[-1][:100]
-        except Exception:
-            return (line_wo_url or url or "[asset]")[:100]
-    # ------------------------------------------------------------------ #
-    # Query / keyword helpers
-    # ------------------------------------------------------------------ #
     def _extract_keywords_from_query(self, query: str) -> List[str]:
         return [w.strip().lower() for w in (query or "").split() if w.strip()]
 
     def _resolve_query_text(self, payload: Any, params: Dict[str, Any]) -> str:
-        """
-        Priority:
-          params["query"] > payload (if payload is non-url str)
-        """
         q = str(params.get("query", "") or "").strip()
         if q:
             return q
-
         if isinstance(payload, str):
             p = payload.strip()
             if p and not p.startswith("http"):
                 return p
-
         return ""
 
-    # ------------------------------------------------------------------ #
-    # Direct expansion helpers
-    # ------------------------------------------------------------------ #
     def _extract_direct_id(self, u: str) -> Optional[str]:
-        """
-        Pull a likely file id from known direct patterns:
-          /f/<id>  or  /file/<id>
-        """
         try:
             p = urlparse(u)
             parts = [x for x in (p.path or "").split("/") if x]
@@ -13713,13 +13553,10 @@ class DirectLinkTrackerBlock(BaseBlock):
         try:
             p = urlparse(seed_url)
             base = f"{p.scheme}://{p.netloc}"
-
             fid = self._extract_direct_id(seed_url)
 
-            # ✅ ALWAYS keep the seed itself
             out.append(seed_url)
 
-            # parent folder + seed itself
             if fid:
                 out.append(f"{base}/f/")
 
@@ -13741,19 +13578,16 @@ class DirectLinkTrackerBlock(BaseBlock):
                     f"{base}/recent",
                     f"{base}/search",
                 ])
+
             if "music.froste.lol" in p.netloc.lower():
                 sid = self._extract_froste_song_id(seed_url)
-
                 if sid:
-                    # predictable direct assets you already sniffed
                     out.extend([
                         f"{base}/song/{sid}/file",
                         f"{base}/song/{sid}/download",
                     ])
-
-                # likely hubs / listings
                 out.extend([
-                    f"{base}/",  # homepage often lists recent
+                    f"{base}/",
                     f"{base}/recent",
                     f"{base}/songs",
                     f"{base}/search",
@@ -13772,32 +13606,18 @@ class DirectLinkTrackerBlock(BaseBlock):
                 cleaned.append(u)
         return cleaned
 
-    def _looks_like_content_page(self, u: str) -> bool:
-        p = self._clean_path(u)
-        for tok in [
-            "/f/", "/file/", "/folder/", "/view/", "/download/",
-            "/d/", "/details/", "/item/",
-            # NEW froste-ish
-            "/song/", "/album/", "/artist/", "/playlist/"
-        ]:
-            if tok in p:
-                return True
-        if re.search(r"/[a-z0-9]{6,}$", p):
-            return True
-        return False
-
-    def _pillows_id_from_f_url(self, u: str) -> Optional[str]:
+    def _clean_domain(self, u: str) -> str:
         try:
-            p = urlparse(u)
-            parts = [x for x in (p.path or "").split("/") if x]
-            if len(parts) >= 2 and parts[-2] in {"f", "file"}:
-                return parts[-1]
+            return urlparse(u).netloc.lower().split(":")[0]
         except Exception:
-            pass
-        return None
-    # ------------------------------------------------------------------ #
-    # URL / expansion helpers
-    # ------------------------------------------------------------------ #
+            return ""
+
+    def _clean_path(self, u: str) -> str:
+        try:
+            return urlparse(u).path.lower()
+        except Exception:
+            return ""
+
     def _is_mega_link(self, u: str) -> bool:
         try:
             pu = urlparse(u)
@@ -13817,18 +13637,6 @@ class DirectLinkTrackerBlock(BaseBlock):
             return False
         except Exception:
             return False
-
-    def _clean_domain(self, u: str) -> str:
-        try:
-            return urlparse(u).netloc.lower().split(":")[0]
-        except Exception:
-            return ""
-
-    def _clean_path(self, u: str) -> str:
-        try:
-            return urlparse(u).path.lower()
-        except Exception:
-            return ""
 
     def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
         generated = set()
@@ -13862,25 +13670,26 @@ class DirectLinkTrackerBlock(BaseBlock):
 
     def _looks_like_content_page(self, u: str) -> bool:
         p = self._clean_path(u)
-        for tok in ["/f/", "/file/", "/folder/", "/view/", "/download/", "/d/", "/details/", "/item/"]:
+        for tok in [
+            "/f/", "/file/", "/folder/", "/view/", "/download/",
+            "/d/", "/details/", "/item/",
+            "/song/", "/album/", "/artist/", "/playlist/",
+        ]:
             if tok in p:
                 return True
         if re.search(r"/[a-z0-9]{6,}$", p):
             return True
         return False
 
-    async def _try_fetch_metadata(self, session, meta_url: str, timeout: float) -> Dict[str, Any]:
+    def _pillows_id_from_f_url(self, u: str) -> Optional[str]:
         try:
-            async with session.get(meta_url, timeout=aiohttp.ClientTimeout(total=timeout)) as r:
-                if r.status != 200:
-                    return {}
-                ctype = (r.headers.get("Content-Type") or "").lower()
-                txt = await r.text()
-                if "json" in ctype or txt.strip().startswith("{"):
-                    return await r.json()
+            p = urlparse(u)
+            parts = [x for x in (p.path or "").split("/") if x]
+            if len(parts) >= 2 and parts[-2] in {"f", "file"}:
+                return parts[-1]
         except Exception:
             pass
-        return {}
+        return None
 
     def _extract_seed_urls(self, payload: Any, params: Dict[str, Any]) -> List[str]:
         seeds: List[str] = []
@@ -13906,7 +13715,7 @@ class DirectLinkTrackerBlock(BaseBlock):
         return out
 
     # ------------------------------------------------------------------ #
-    # Playwright shared context
+    # Playwright shared context (unchanged)
     # ------------------------------------------------------------------ #
     async def _open_playwright_context(
         self,
@@ -13917,19 +13726,9 @@ class DirectLinkTrackerBlock(BaseBlock):
         blocked_domains: set[str],
         log: List[str],
         *,
-        use_camoufox: bool = False,               # <-- NEW
-        camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
+        use_camoufox: bool = False,
+        camoufox_options: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Open a shared Playwright/Camoufox browser context.
-
-        Returns (p_handle, browser, context) where:
-          - For plain Playwright:
-              p_handle = async_playwright() instance
-          - For Camoufox:
-              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
-        """
-        # ---- small helper for blocked domains ----
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
             for bd in blocked_domains:
@@ -13940,13 +13739,11 @@ class DirectLinkTrackerBlock(BaseBlock):
                     return True
             return False
 
-        # ---- Camoufox path ----
         if use_camoufox:
             if AsyncCamoufox is None:
                 log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
             else:
                 try:
-                    # Default Camoufox launch opts; you can tweak these
                     options = {
                         "headless": True,
                         "block_images": block_resources,
@@ -13957,12 +13754,10 @@ class DirectLinkTrackerBlock(BaseBlock):
                     if camoufox_options:
                         options.update(camoufox_options)
 
-                    # Async context manager: we keep the CM instance as p_handle
                     cf_cm = AsyncCamoufox(**options)
-                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
+                    browser = await cf_cm.__aenter__()
                     context = await browser.new_context(user_agent=ua)
 
-                    # Route blocking is exactly like Playwright Firefox
                     if block_resources or block_domains:
                         async def route_blocker(route, request):
                             rtype = (request.resource_type or "").lower()
@@ -13974,11 +13769,9 @@ class DirectLinkTrackerBlock(BaseBlock):
                             if block_domains and _host_matches_blocked(host):
                                 await route.abort()
                                 return
-
                             if block_resources and rtype in blocked_resource_types:
                                 await route.abort()
                                 return
-
                             await route.continue_()
 
                         await context.route("**/*", route_blocker)
@@ -13989,7 +13782,6 @@ class DirectLinkTrackerBlock(BaseBlock):
                 except Exception as e:
                     log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
 
-        # ---- Standard Playwright (Chromium) path ----
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -14011,11 +13803,9 @@ class DirectLinkTrackerBlock(BaseBlock):
                 if block_domains and _host_matches_blocked(host):
                     await route.abort()
                     return
-
                 if block_resources and rtype in blocked_resource_types:
                     await route.abort()
                     return
-
                 await route.continue_()
 
             await context.route("**/*", route_blocker)
@@ -14024,7 +13814,6 @@ class DirectLinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
-        # Close page context
         try:
             if context:
                 close_ctx = getattr(context, "close", None)
@@ -14036,7 +13825,6 @@ class DirectLinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
-        # Close browser
         try:
             if browser:
                 close_browser = getattr(browser, "close", None)
@@ -14048,29 +13836,21 @@ class DirectLinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
-        # Close handle:
-        #   - Playwright: p.stop()
-        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
                 stop = getattr(p, "stop", None)
-
-                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
-
                 else:
-                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
-
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
@@ -14085,13 +13865,42 @@ class DirectLinkTrackerBlock(BaseBlock):
             context, page_url, timeout=timeout, log=log, extensions=extensions,
         )
 
+    async def _pw_fetch_react_links(self, context, page_url, timeout, log, extensions=None):
+        return await self.react_sniffer.sniff(
+            context, page_url, timeout=timeout, log=log, extensions=extensions,
+        )
+
+    async def _pw_fetch_database_links(self, context, page_url, timeout, log):
+        return await self.database_sniffer.sniff(
+            context, page_url, timeout=timeout, log=log
+        )
+
+    async def _pw_fetch_interaction_links(self, context, page_url, timeout, log):
+        return await self.interaction_sniffer.sniff(
+            context, page_url, timeout=timeout, log=log
+        )
     # ------------------------------------------------------------------ #
-    # Fetch helpers
+    # HTTPS helpers
     # ------------------------------------------------------------------ #
-    async def _fetch_page_html_plain(self, session, page_url: str, timeout: float) -> str:
-        async with session.get(page_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
-            resp.raise_for_status()
-            return await resp.text()
+    async def _http_get_html(self, http: submanagers.HTTPSSubmanager, url: str) -> str:
+        return await http.get_text(url)
+
+    async def _http_head(self, http: submanagers.HTTPSSubmanager, url: str) -> Tuple[Optional[int], Dict[str, str]]:
+        return await http.head(url)
+
+    async def _try_fetch_metadata(self, http: submanagers.HTTPSSubmanager, meta_url: str) -> Dict[str, Any]:
+        try:
+            txt = await http.get_text(meta_url)
+            if not txt:
+                return {}
+            s = txt.strip()
+            if not (s.startswith("{") and s.endswith("}")):
+                # some endpoints return JSON without perfect trimming; still try loads if it starts with {
+                if not s.startswith("{"):
+                    return {}
+            return json.loads(txt)
+        except Exception:
+            return {}
 
     # ------------------------------------------------------------------ #
     # Main execution
@@ -14099,23 +13908,27 @@ class DirectLinkTrackerBlock(BaseBlock):
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         seed_urls = self._extract_seed_urls(payload, params)
         query_text = self._resolve_query_text(payload, params)
-        query_label = query_text or (seed_urls[0] if seed_urls else "<no seeds>")
 
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options") or {}
         if not isinstance(camoufox_options, dict):
             camoufox_options = {}
         camoufox_options.update({"i_know_what_im_doing": True})
-        # DB optional
-        use_database = bool(params.get("use_database", False))
-        db_path = params.get("db_path", "link_corpus.db")
-        if use_database:
-            self._initialize_database(db_path)
 
-        # Config
+        # ---------------- DB (Store + DatabaseSubmanager) ----------------
+        use_database = bool(params.get("use_database", False))
+        db_path = str(params.get("db_path", "link_corpus.db") or "link_corpus.db")
+        db_sm = None
+        store: Optional[DirectLinkTrackerStore] = None
+
+        if use_database:
+            db_sm = submanagers.DatabaseSubmanager(submanagers.DatabaseConfig(path=db_path))
+            store = DirectLinkTrackerStore(db=db_sm)
+            store.ensure_schema()
+
+        # ---------------- Config ----------------
         mode = str(params.get("mode", "docs")).lower()
 
-        # PATCH #2: healthier defaults for heavy hosts (pillows)
         default_pages = 200 if any("pillows.su" in s for s in seed_urls) else (len(seed_urls) or 5)
         max_pages_total = max(1, int(params.get("max_pages_total", default_pages)))
 
@@ -14125,16 +13938,25 @@ class DirectLinkTrackerBlock(BaseBlock):
         timeout = float(params.get("timeout", 6.0))
         verify_links = bool(params.get("verify", True))
 
+        # TLS verify for HTTPSSubmanager (separate from verify_links)
+        tls_verify = bool(params.get("tls_verify", True))
+        ca_bundle = params.get("ca_bundle") or None
+
         use_js = bool(params.get("use_js", False))
         use_network_sniff = bool(params.get("use_network_sniff", False))
         return_all_js_links = bool(params.get("return_all_js_links", False))
         return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_links = bool(params.get("return_react_sniff_links", False))
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_links = bool(params.get("return_database_sniff_links", False))
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_links = bool(params.get("return_interaction_sniff_links", False))
         max_links_per_page = int(params.get("max_links_per_page", 800))
 
         min_term_overlap = max(1, int(params.get("min_term_overlap", 1)))
 
         custom_ext = str(params.get("extensions", "")).split(",")
-
         expand_direct = bool(params.get("expand_direct", True))
         best_n = int(params.get("best_n", 50))
 
@@ -14208,9 +14030,11 @@ class DirectLinkTrackerBlock(BaseBlock):
         visited_pages: set[str] = set()
         all_js_links: List[Dict[str, str]] = []
         all_network_links: List[Dict[str, str]] = []
-
-        # --- Shared Playwright context if needed ---
-        pw_needed = use_js or use_network_sniff
+        all_react_links: List[Dict[str, Any]] = []
+        all_database_links: List[Dict[str, Any]] = []  # [PATCH]
+        all_interaction_links: List[Dict[str, Any]] = []
+        # ---------------- Shared Playwright context if needed ----------------
+        pw_needed = use_js or use_network_sniff or use_react_sniff or use_database_sniff or use_interaction_sniff
         pw_p = pw_browser = pw_context = None
         if pw_needed:
             block_resources = bool(params.get("block_resources", False))
@@ -14235,385 +14059,411 @@ class DirectLinkTrackerBlock(BaseBlock):
             }
             blocked_domains: set[str] = default_blocked_domains.union(user_blocked_domains) if block_domains else set()
 
-            pw_needed = use_js or use_network_sniff
-            pw_p = pw_browser = pw_context = None
             try:
-                if pw_needed:
-                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/DirectLinkTracker"
-                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                        ua=ua_pw,
-                        block_resources=block_resources,
-                        blocked_resource_types=blocked_resource_types,
-                        block_domains=block_domains,
-                        blocked_domains=blocked_domains,
-                        log=log,
-                        use_camoufox=use_camoufox,           # <-- NEW
-                        camoufox_options=camoufox_options,   # <-- NEW
-                    )
-            except:
-                if pw_needed and (pw_p or pw_browser or pw_context):
+                ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/DirectLinkTracker"
+                pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                    ua=ua_pw,
+                    block_resources=block_resources,
+                    blocked_resource_types=blocked_resource_types,
+                    block_domains=block_domains,
+                    blocked_domains=blocked_domains,
+                    log=log,
+                    use_camoufox=use_camoufox,
+                    camoufox_options=camoufox_options,
+                )
+            except Exception:
+                if pw_p or pw_browser or pw_context:
                     await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
 
-        async def _process_page(page_url: str, depth: int) -> Dict[str, Any]:
+        # ---------------- Page processor (uses HTTPSSubmanager) ----------------
+        async def _process_page(http: submanagers.HTTPSSubmanager, page_url: str, depth: int) -> Dict[str, Any]:
             local_log: List[str] = []
             local_assets: List[Dict[str, Any]] = []
             local_js_links: List[Dict[str, str]] = []
             local_network_links: List[Dict[str, str]] = []
+            local_react_links: List[Dict[str, Any]] = []
+            local_database_links: List[Dict[str, Any]] = []
+            local_interaction_links: List[Dict[str, Any]] = []
             next_pages: List[str] = []
 
-            async with aiohttp.ClientSession(
-                headers={"User-Agent": "Mozilla/5.0 PromptChat/DirectLinkTracker"}
-            ) as session:
-                html = ""
-                links_on_page: List[Dict[str, str]] = []
-                sniff_items: List[Dict[str, str]] = []
+            html = ""
+            links_on_page: List[Dict[str, str]] = []
+            sniff_items: List[Dict[str, str]] = []
 
-                try:
-                    # 1) Network sniff
-                    if use_network_sniff and pw_context:
-                        sniff_html, sniff_items, sniff_json = await self._pw_fetch_with_sniff(
-                            pw_context, page_url, timeout, local_log, targets
-                        )
-
-                        html = sniff_html or html
-                        for si in sniff_items:
-                            u = si.get("url")
-                            if not u:
-                                continue
-                            local_network_links.append({
-                                "page": page_url, "url": u,
-                                "text": si.get("text", ""), "tag": si.get("tag", "network_sniff"),
-                                "size": si.get("size", "?")
-                            })
-                            local_js_links.append({
-                                "page": page_url, "url": u,
-                                "text": si.get("text", ""), "tag": si.get("tag", "network_sniff")
-                            })
-
-                    # 2) JS gather
-                    if use_js and pw_context:
-                        js_html, js_links = await self._pw_fetch_js_links(
-                            pw_context, page_url, timeout, local_log
-                        )
-                        if js_html:
-                            html = js_html
-                        links_on_page.extend(js_links)
-                        for jl in js_links:
-                            local_js_links.append({
-                                "page": page_url, "url": jl.get("url", ""),
-                                "text": jl.get("text", ""), "tag": jl.get("tag", "")
-                            })
-
-                    # 3) Plain if needed
-                    if not html:
-                        html = await self._fetch_page_html_plain(session, page_url, timeout)
-
-                    # metadata handling
-                    if page_url.endswith(".json") and "/api/metadata/" in page_url:
-                        meta = await self._try_fetch_metadata(session, page_url, timeout)
-                        if meta:
-                            local_js_links.append({
-                                "page": page_url,
-                                "url": page_url,
-                                "text": f"[metadata] {meta.get('title') or meta.get('name') or ''}".strip(),
-                                "tag": "metadata"
-                            })
-                            harvested_ids = self._extract_ids_from_text(str(meta))
-                            for hid in harvested_ids:
-                                base = page_url.split("/api/metadata/")[0].replace("://api.", "://")
-                                api_base = base.replace("://pillows.su", "://api.pillows.su")
-                                next_pages.append(f"{base}/f/{hid}")
-                                next_pages.append(f"{api_base}/api/get/{hid}")
-
-                    # onlyfiles.txt shortcut (pillows-aware)
-                    if page_url.endswith("onlyfiles.txt"):
-                        try:
-                            for line in (html or "").splitlines():
-                                line = line.strip()
-                                if not line:
-                                    continue
-
-                                urls_in_line = self._extract_urls_from_index_line(line)
-                                if not urls_in_line:
-                                    continue
-
-                                for u2 in urls_in_line:
-                                    if not u2.startswith("http"):
-                                        continue
-                                    if not _allowed_by_required_sites(u2):
-                                        continue
-
-                                    host2 = self._clean_domain(u2)
-                                    path2 = self._clean_path(u2)
-
-                                    label2 = self._label_from_index_line(line, u2)
-                                    # A haystack that actually includes the query-relevant text
-                                    hay2 = f"{label2} {u2} {line} {page_url}"
-
-                                    # If we have keywords, require overlap (but allow small fallback)
-                                    if keywords and not _term_overlap_ok(hay2):
-                                        # keep a tiny fallback so strict queries don't go empty
-                                        if len(next_pages) < 20:
-                                            next_pages.append(u2)
-                                        continue
-
-                                    # --- pillows/pillowcase special: onlyfiles gives /f/<id> pages ---
-                                    if ("pillows.su" in host2 or "pillowcase.su" in host2) and (
-                                            "/f/" in path2 or "/file/" in path2
-                                    ):
-                                        fid2 = self._pillows_id_from_f_url(u2)
-                                        if fid2:
-                                            base = f"{urlparse(u2).scheme}://{urlparse(u2).netloc}"
-                                            api_base = base.replace("://pillows.su", "://api.pillows.su") \
-                                                .replace("://pillowcase.su", "://api.pillows.su")
-
-                                            for ext in targets:
-                                                asset_url = f"{api_base}/api/get/{fid2}{ext}"
-
-                                                # score synthesized asset using query + label + url
-                                                synth_hay = f"{label2} {asset_url} {line} {page_url}"
-                                                score2 = _score_for_keywords(synth_hay)
-
-                                                asset = {
-                                                    "text": label2,
-                                                    "url": asset_url,
-                                                    "source": page_url,
-                                                    "size": "?",
-                                                    "status": "indexed",
-                                                    "tag": "onlyfiles_synth",
-                                                    "score": score2,
-                                                    "onlyfiles": True,
-                                                }
-
-                                                # If keywords exist, enforce min_term_overlap on synth too
-                                                if not keywords or score2 >= min_term_overlap:
-                                                    local_assets.append(asset)
-                                                    if use_database:
-                                                        self._save_asset_to_database(asset)
-                                            continue  # do not crawl /f/ page; already expanded
-
-                                    # --- normal file URL in onlyfiles ---
-                                    if any(path2.endswith(ext) for ext in targets):
-                                        score2 = _score_for_keywords(hay2)
-
-                                        asset = {
-                                            "text": label2,
-                                            "url": u2,
-                                            "source": page_url,
-                                            "size": "?",
-                                            "status": "indexed",
-                                            "tag": "onlyfiles",
-                                            "score": score2,
-                                            "onlyfiles": True,
-                                        }
-
-                                        if not keywords or score2 >= min_term_overlap:
-                                            local_assets.append(asset)
-                                            if use_database:
-                                                self._save_asset_to_database(asset)
-                                    else:
-                                        next_pages.append(u2)
-
-                        except Exception as e:
-                            local_log.append(f"onlyfiles parse error: {e}")
-
-                        return {
-                            "page": page_url,
-                            "assets": local_assets,
-                            "next_pages": next_pages,
-                            "js_links": local_js_links,
-                            "network_links": local_network_links,
-                            "log": local_log
-                        }
-
-                    soup = BeautifulSoup(html or "", "html.parser")
-
-                    title = ""
-                    if soup.title and soup.title.string:
-                        title = soup.title.string.strip()
-
-                    # collect <a> hrefs
-                    link_count = 0
-                    for a in soup.find_all("a", href=True):
-                        links_on_page.append({
-                            "url": a["href"],
-                            "text": a.get_text(strip=True),
-                            "tag": "a",
+            try:
+                # 1) Network sniff (Playwright)
+                if use_network_sniff and pw_context:
+                    sniff_html, sniff_items, sniff_json = await self._pw_fetch_with_sniff(
+                        pw_context, page_url, timeout, local_log, targets
+                    )
+                    html = sniff_html or html
+                    for si in sniff_items:
+                        u = si.get("url")
+                        if not u:
+                            continue
+                        local_network_links.append({
+                            "page": page_url, "url": u,
+                            "text": si.get("text", ""), "tag": si.get("tag", "network_sniff"),
+                            "size": si.get("size", "?")
                         })
-                        link_count += 1
-                        if link_count >= max_links_per_page:
-                            break
+                        local_js_links.append({
+                            "page": page_url, "url": u,
+                            "text": si.get("text", ""), "tag": si.get("tag", "network_sniff")
+                        })
 
-                    # PATCH #1: harvest ids AFTER <a> extraction
-                    harvested_ids = self._extract_ids_from_text(html)
-                    for lk in links_on_page:
-                        harvested_ids |= self._extract_ids_from_text(lk.get("url", ""))
+                # 2) JS gather (Playwright)
+                if use_js and pw_context:
+                    js_html, js_links = await self._pw_fetch_js_links(pw_context, page_url, timeout, local_log)
+                    if js_html:
+                        html = js_html
+                    links_on_page.extend(js_links)
+                    for jl in js_links:
+                        local_js_links.append({
+                            "page": page_url,
+                            "url": jl.get("url", ""),
+                            "text": jl.get("text", ""),
+                            "tag": jl.get("tag", ""),
+                        })
+                if use_react_sniff and pw_context:
+                    r_html, r_hits = await self._pw_fetch_react_links(pw_context, page_url, timeout, local_log)
+                    if r_html and not html:
+                        html = r_html
 
-                    # turn ids into candidate URLs
-                    for hid in harvested_ids:
-                        if "pillows.su" in self._clean_domain(page_url):
-                            base = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+                    for rh in r_hits:
+                        local_react_links.append(rh)
+                        u = rh.get("url")
+                        if u:
+                            # Promote React-found URLs to the main discovery queue
+                            links_on_page.append({
+                                "url": u,
+                                "text": f"[React:{rh.get('kind')}] {rh.get('route', '')}",
+                                "tag": "react_sniff"
+                            })
+                if use_database_sniff and pw_context:
+                    d_html, d_links = await self._pw_fetch_database_links(pw_context, page_url, timeout, local_log)
+                    if d_html and not html:
+                        html = d_html
+
+                    for entry in d_links:
+                        local_database_links.append(entry)
+                        # If entry is a content_link, promote it for file extension verification
+                        if entry.get("kind") == "content_link":
+                            u = entry.get("url")
+                            if u:
+                                links_on_page.append({
+                                    "url": u,
+                                    "text": f"[DB_Link:{entry['meta'].get('source', 'storage')}]",
+                                    "tag": "database_sniff"
+                                })
+                if use_interaction_sniff and pw_context:
+                    # Note: CDP features only trigger if pw_context is Chromium
+                    i_html, i_links = await self._pw_fetch_interaction_links(pw_context, page_url, timeout, local_log)
+                    if i_html and not html:
+                        html = i_html
+
+                    for entry in i_links:
+                        local_interaction_links.append(entry)
+                        # We don't automatically promote interaction nodes to 'links_on_page'
+                        # because they are often nodes (buttons/divs), not URLs.
+                        # However, we log them for barrier analysis.
+                # 3) Plain fetch via HTTPSSubmanager if needed
+                if not html:
+                    html = await self._http_get_html(http, page_url)
+
+                # metadata handling
+                if page_url.endswith(".json") and "/api/metadata/" in page_url:
+                    meta = await self._try_fetch_metadata(http, page_url)
+                    if meta:
+                        local_js_links.append({
+                            "page": page_url,
+                            "url": page_url,
+                            "text": f"[metadata] {meta.get('title') or meta.get('name') or ''}".strip(),
+                            "tag": "metadata"
+                        })
+                        harvested_ids = self._extract_ids_from_text(str(meta))
+                        for hid in harvested_ids:
+                            base = page_url.split("/api/metadata/")[0].replace("://api.", "://")
                             api_base = base.replace("://pillows.su", "://api.pillows.su")
                             next_pages.append(f"{base}/f/{hid}")
                             next_pages.append(f"{api_base}/api/get/{hid}")
-                            next_pages.append(f"{api_base}/api/metadata/{hid}.json")
 
-                    # Scan for assets in links
+                # onlyfiles.txt shortcut
+                if page_url.endswith("onlyfiles.txt"):
+                    try:
+                        for line in (html or "").splitlines():
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            urls_in_line = self._extract_urls_from_index_line(line)
+                            if not urls_in_line:
+                                continue
+
+                            for u2 in urls_in_line:
+                                if not u2.startswith("http"):
+                                    continue
+                                if not _allowed_by_required_sites(u2):
+                                    continue
+
+                                host2 = self._clean_domain(u2)
+                                path2 = self._clean_path(u2)
+
+                                label2 = self._label_from_index_line(line, u2)
+                                hay2 = f"{label2} {u2} {line} {page_url}"
+
+                                if keywords and not _term_overlap_ok(hay2):
+                                    if len(next_pages) < 20:
+                                        next_pages.append(u2)
+                                    continue
+
+                                # pillows onlyfiles -> synthesize api/get + ext
+                                if ("pillows.su" in host2 or "pillowcase.su" in host2) and ("/f/" in path2 or "/file/" in path2):
+                                    fid2 = self._pillows_id_from_f_url(u2)
+                                    if fid2:
+                                        base = f"{urlparse(u2).scheme}://{urlparse(u2).netloc}"
+                                        api_base = base.replace("://pillows.su", "://api.pillows.su") \
+                                                      .replace("://pillowcase.su", "://api.pillows.su")
+
+                                        for ext in targets:
+                                            asset_url = f"{api_base}/api/get/{fid2}{ext}"
+                                            synth_hay = f"{label2} {asset_url} {line} {page_url}"
+                                            score2 = _score_for_keywords(synth_hay)
+
+                                            asset = {
+                                                "text": label2,
+                                                "url": asset_url,
+                                                "source": page_url,
+                                                "size": "?",
+                                                "status": "indexed",
+                                                "tag": "onlyfiles_synth",
+                                                "score": score2,
+                                                "onlyfiles": True,
+                                            }
+
+                                            if (not keywords) or (score2 >= min_term_overlap):
+                                                local_assets.append(asset)
+                                                if store:
+                                                    store.upsert_asset(asset)
+                                        continue
+
+                                # normal file URL in onlyfiles
+                                if any(path2.endswith(ext) for ext in targets):
+                                    score2 = _score_for_keywords(hay2)
+                                    asset = {
+                                        "text": label2,
+                                        "url": u2,
+                                        "source": page_url,
+                                        "size": "?",
+                                        "status": "indexed",
+                                        "tag": "onlyfiles",
+                                        "score": score2,
+                                        "onlyfiles": True,
+                                    }
+                                    if (not keywords) or (score2 >= min_term_overlap):
+                                        local_assets.append(asset)
+                                        if store:
+                                            store.upsert_asset(asset)
+                                else:
+                                    next_pages.append(u2)
+
+                    except Exception as e:
+                        local_log.append(f"onlyfiles parse error: {e}")
+
+                    if store:
+                        try:
+                            store.mark_page_scanned(page_url)
+                        except Exception:
+                            pass
+
+                    return {
+                        "page": page_url,
+                        "assets": local_assets,
+                        "next_pages": next_pages,
+                        "js_links": local_js_links,
+                        "network_links": local_network_links,
+                        "react_links": local_react_links,
+                        "database_links": local_database_links,
+                        "interaction_links": local_interaction_links,
+                        "log": local_log
+                    }
+
+                soup = BeautifulSoup(html or "", "html.parser")
+
+                title = ""
+                if soup.title and soup.title.string:
+                    title = soup.title.string.strip()
+
+                # collect <a> hrefs
+                link_count = 0
+                for a in soup.find_all("a", href=True):
+                    links_on_page.append({
+                        "url": a["href"],
+                        "text": a.get_text(strip=True),
+                        "tag": "a",
+                    })
+                    link_count += 1
+                    if link_count >= max_links_per_page:
+                        break
+
+                # harvest ids after <a>
+                harvested_ids = self._extract_ids_from_text(html)
+                for lk in links_on_page:
+                    harvested_ids |= self._extract_ids_from_text(lk.get("url", ""))
+
+                for hid in harvested_ids:
+                    if "pillows.su" in self._clean_domain(page_url):
+                        base = f"{urlparse(page_url).scheme}://{urlparse(page_url).netloc}"
+                        api_base = base.replace("://pillows.su", "://api.pillows.su")
+                        next_pages.append(f"{base}/f/{hid}")
+                        next_pages.append(f"{api_base}/api/get/{hid}")
+                        next_pages.append(f"{api_base}/api/metadata/{hid}.json")
+
+                # Scan for assets in links
+                for link in links_on_page:
+                    raw = link.get("url", "")
+                    full_url = urljoin(page_url, raw)
+                    if not full_url.startswith("http"):
+                        continue
+                    if not _allowed_by_required_sites(full_url):
+                        continue
+
+                    path = self._clean_path(full_url)
+                    is_mega = self._is_mega_link(full_url)
+
+                    if not is_mega and any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        continue
+                    if not is_mega and not any(path.endswith(ext) for ext in targets):
+                        continue
+
+                    if store and store.is_asset_url(full_url):
+                        continue
+
+                    status = "unverified"
+                    size = "?"
+                    if verify_links and not is_mega:
+                        st, hdrs = await self._http_head(http, full_url)
+                        if st != 200:
+                            continue
+
+                        cl = (hdrs.get("Content-Length") or hdrs.get("content-length"))
+                        ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+
+                        if not self._looks_nonempty_size(cl):
+                            continue
+
+                        if mode == "media" and ("audio" not in ctype and "octet-stream" not in ctype):
+                            continue
+
+                        status = "200 OK"
+                        if cl:
+                            try:
+                                size = f"{int(cl) // 1024} KB"
+                            except Exception:
+                                size = "?"
+
+                    elif is_mega:
+                        status = "MEGA link"
+
+                    text = (link.get("text") or path.rsplit("/", 1)[-1] or "[asset]")[:100]
+                    hay = f"{text} {full_url} {title} {page_url}"
+                    score = _score_for_keywords(hay)
+
+                    asset = {
+                        "text": text,
+                        "url": full_url,
+                        "source": page_url,
+                        "size": size,
+                        "status": status,
+                        "tag": "mega" if is_mega else link.get("tag", "a"),
+                        "score": score,
+                    }
+                    local_assets.append(asset)
+                    if store:
+                        store.upsert_asset(asset)
+
+                # include sniffed items as assets too
+                for item in sniff_items:
+                    u = item.get("url")
+                    if not u or not _allowed_by_required_sites(u):
+                        continue
+                    pth = self._clean_path(u)
+                    if not any(pth.endswith(ext) for ext in targets):
+                        continue
+                    if store and store.is_asset_url(u):
+                        continue
+
+                    status = "sniffed"
+                    size = item.get("size", "?")
+                    if verify_links:
+                        st, _hdrs = await self._http_head(http, u)
+                        if st != 200:
+                            continue
+                        status = "200 OK"
+
+                    hay = f"{item.get('text','')} {u} {title} {page_url}"
+                    score = _score_for_keywords(hay)
+
+                    asset = {
+                        "text": (item.get("text") or u.rsplit("/", 1)[-1] or "[asset]")[:100],
+                        "url": u,
+                        "source": page_url,
+                        "size": size,
+                        "status": status,
+                        "tag": "network_sniff",
+                        "score": score,
+                    }
+                    local_assets.append(asset)
+                    if store:
+                        store.upsert_asset(asset)
+
+                # Next pages
+                if depth < max_depth:
+                    base_host = self._clean_domain(page_url)
                     for link in links_on_page:
                         raw = link.get("url", "")
-                        full_url = urljoin(page_url, raw)
-                        if not full_url.startswith("http"):
+                        nxt = urljoin(page_url, raw)
+                        if not nxt.startswith("http"):
                             continue
-                        if not _allowed_by_required_sites(full_url):
+                        if not _allowed_by_required_sites(nxt):
                             continue
-
-                        path = self._clean_path(full_url)
-                        is_mega = self._is_mega_link(full_url)
-
-                        if not is_mega and any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        if self._clean_domain(nxt) != base_host:
                             continue
-                        if not is_mega and not any(path.endswith(ext) for ext in targets):
+                        if any(self._clean_path(nxt).endswith(ext) for ext in targets):
+                            continue
+                        if not self._looks_like_content_page(nxt):
                             continue
 
-                        if use_database and self._is_url_in_database(full_url):
-                            continue
-
-                        status = "unverified"
-                        size = "?"
-                        if verify_links and not is_mega:
-                            try:
-                                async with session.head(
-                                    full_url,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=3)
-                                ) as h:
-                                    if h.status == 200:
-                                        cl = h.headers.get("Content-Length")
-                                        ctype = (h.headers.get("Content-Type") or "").lower()
-
-                                        if not self._looks_nonempty_size(cl):
-                                            continue  # skip empties
-
-                                        if mode == "media" and ("audio" not in ctype and "octet-stream" not in ctype):
-                                            continue
-
-                                        status = "200 OK"
-                                        if cl:
-                                            size = f"{int(cl) // 1024} KB"
-                                    else:
-                                        continue
-                            except Exception:
-                                continue
-                        elif is_mega:
-                            status = "MEGA link"
-
-                        text = (link.get("text") or path.rsplit("/", 1)[-1] or "[asset]")[:100]
-                        hay = f"{text} {full_url} {title} {page_url}"
-                        score = _score_for_keywords(hay)
-
-                        asset = {
-                            "text": text,
-                            "url": full_url,
-                            "source": page_url,
-                            "size": size,
-                            "status": status,
-                            "tag": "mega" if is_mega else link.get("tag", "a"),
-                            "score": score,
-                        }
-                        local_assets.append(asset)
-                        if use_database:
-                            self._save_asset_to_database(asset)
-
-                    # include sniffed items as assets too
-                    for item in sniff_items:
-                        u = item.get("url")
-                        if not u or not _allowed_by_required_sites(u):
-                            continue
-                        pth = self._clean_path(u)
-                        if not any(pth.endswith(ext) for ext in targets):
-                            continue
-                        if use_database and self._is_url_in_database(u):
-                            continue
-
-                        status = "sniffed"
-                        size = item.get("size", "?")
-                        if verify_links:
-                            try:
-                                async with session.head(
-                                    u,
-                                    allow_redirects=True,
-                                    timeout=aiohttp.ClientTimeout(total=3),
-                                ) as h:
-                                    if h.status != 200:
-                                        continue
-                                    status = "200 OK"
-                            except Exception:
-                                continue
-
-                        hay = f"{item.get('text','')} {u} {title} {page_url}"
-                        score = _score_for_keywords(hay)
-
-                        asset = {
-                            "text": (item.get("text") or u.rsplit("/", 1)[-1] or "[asset]")[:100],
-                            "url": u,
-                            "source": page_url,
-                            "size": size,
-                            "status": status,
-                            "tag": "network_sniff",
-                            "score": score,
-                        }
-                        local_assets.append(asset)
-                        if use_database:
-                            self._save_asset_to_database(asset)
-
-                    # Next pages
-                    if depth < max_depth:
-                        base_host = self._clean_domain(page_url)
-                        for link in links_on_page:
-                            raw = link.get("url", "")
-                            nxt = urljoin(page_url, raw)
-                            if not nxt.startswith("http"):
-                                continue
-                            if not _allowed_by_required_sites(nxt):
-                                continue
-                            if self._clean_domain(nxt) != base_host:
-                                continue
-                            if any(self._clean_path(nxt).endswith(ext) for ext in targets):
-                                continue
-                            if not self._looks_like_content_page(nxt):
-                                continue
-
-                            if keywords:
-                                nxt_hay = (link.get("text", "") + " " + nxt).lower()
-                                if _term_overlap_ok(nxt_hay):
-                                    next_pages.append(nxt)
-                                else:
-                                    if len(next_pages) < 20:
-                                        next_pages.append(nxt)
-                            else:
+                        if keywords:
+                            nxt_hay = (link.get("text", "") + " " + nxt).lower()
+                            if _term_overlap_ok(nxt_hay):
                                 next_pages.append(nxt)
+                            else:
+                                if len(next_pages) < 20:
+                                    next_pages.append(nxt)
+                        else:
+                            next_pages.append(nxt)
 
-                        parent = self._parent_dir_url(page_url)
-                        if parent and parent.startswith("http") and _allowed_by_required_sites(parent):
-                            next_pages.append(parent)
+                    parent = self._parent_dir_url(page_url)
+                    if parent and parent.startswith("http") and _allowed_by_required_sites(parent):
+                        next_pages.append(parent)
 
-                except Exception as e:
-                    local_log.append(f"Error scanning {page_url}: {e}")
+            except Exception as e:
+                local_log.append(f"Error scanning {page_url}: {e}")
 
-                if use_database:
-                    try:
-                        self._mark_page_scanned(page_url)
-                    except Exception:
-                        pass
+            if store:
+                try:
+                    store.mark_page_scanned(page_url)
+                except Exception:
+                    pass
 
-                return {
-                    "page": page_url,
-                    "assets": local_assets,
-                    "next_pages": next_pages,
-                    "js_links": local_js_links,
-                    "network_links": local_network_links,
-                    "log": local_log
-                }
+            return {
+                "page": page_url,
+                "assets": local_assets,
+                "next_pages": next_pages,
+                "js_links": local_js_links,
+                "network_links": local_network_links,
+                "log": local_log
+            }
 
         # ------------------------------------------------------------------ #
         # initial frontier
@@ -14623,13 +14473,11 @@ class DirectLinkTrackerBlock(BaseBlock):
             if not _allowed_by_required_sites(s):
                 continue
             if expand_direct:
-                expanded = self._expand_direct_seed(s) or []  # <-- guard
-                frontier.extend(expanded)
+                frontier.extend(self._expand_direct_seed(s) or [])
             else:
                 frontier.append(s)
 
-        predicted = self._predict_next_in_sequence(frontier)
-        for p in predicted:
+        for p in self._predict_next_in_sequence(frontier):
             if _allowed_by_required_sites(p):
                 frontier.append(p)
 
@@ -14640,50 +14488,81 @@ class DirectLinkTrackerBlock(BaseBlock):
 
         frontier = list(dict.fromkeys(frontier))[:max_pages_total]
 
-        current_depth = 0
-        while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
-            remaining = max_pages_total - len(visited_pages)
-            batch: List[str] = []
-            for u in frontier:
-                if len(batch) >= remaining:
+        # ------------------------------------------------------------------ #
+        # HTTPSSubmanager lifetime (shared pool for the entire run)
+        # ------------------------------------------------------------------ #
+        async with submanagers.HTTPSSubmanager(
+            user_agent="Mozilla/5.0 PromptChat/DirectLinkTracker",
+            timeout=timeout,
+            retries=int(params.get("http_retries", 2)),
+            max_conn_per_host=int(params.get("http_max_conn_per_host", 8)),
+            max_total_conn=int(params.get("http_max_total_conn", 0)),
+            verify=tls_verify,
+            ca_bundle=ca_bundle,
+            max_bytes=int(params.get("http_max_bytes", 4_000_000)),
+            max_html_chars=int(params.get("http_max_html_chars", 600_000)),
+            allow_redirects=bool(params.get("http_allow_redirects", True)),
+            enable_cookies=bool(params.get("http_enable_cookies", True)),
+            proxy=params.get("proxy") or None,
+            proxy_pool=params.get("proxy_pool") or None,
+        ) as http:
+
+            current_depth = 0
+            while frontier and current_depth <= max_depth and len(visited_pages) < max_pages_total:
+                remaining = max_pages_total - len(visited_pages)
+                batch: List[str] = []
+
+                for u in frontier:
+                    if len(batch) >= remaining:
+                        break
+                    if u in visited_pages:
+                        continue
+
+                    if store and store.is_page_scanned(u):
+                        visited_pages.add(u)
+                        log.append(f"Skipping page {u} (already scanned in DB)")
+                        continue
+
+                    batch.append(u)
+
+                if not batch:
                     break
-                if u in visited_pages:
-                    continue
-                if use_database and self._is_page_scanned(u):
-                    visited_pages.add(u)
-                    log.append(f"Skipping page {u} (already scanned in DB)")
-                    continue
-                batch.append(u)
 
-            if not batch:
-                break
+                results = await asyncio.gather(*[_process_page(http, u, current_depth) for u in batch])
+                next_frontier: List[str] = []
 
-            results = await asyncio.gather(*[_process_page(u, current_depth) for u in batch])
-            next_frontier: List[str] = []
+                for res in results:
+                    visited_pages.add(res["page"])
+                    log.extend(res["log"])
+                    all_js_links.extend(res["js_links"])
+                    all_network_links.extend(res["network_links"])
+                    all_react_links.extend(res.get("react_links", []))
+                    all_database_links.extend(res.get("database_links", []))
+                    all_interaction_links.extend(res.get("interaction_links", []))
+                    for a in res["assets"]:
+                        u = a.get("url", "")
+                        if u and u not in seen_asset_urls:
+                            seen_asset_urls.add(u)
+                            found_assets.append(a)
 
-            for res in results:
-                visited_pages.add(res["page"])
-                log.extend(res["log"])
-                all_js_links.extend(res["js_links"])
-                all_network_links.extend(res["network_links"])
+                    for nxt in res["next_pages"]:
+                        if nxt not in visited_pages:
+                            next_frontier.append(nxt)
 
-                for a in res["assets"]:
-                    u = a.get("url", "")
-                    if u and u not in seen_asset_urls:
-                        seen_asset_urls.add(u)
-                        found_assets.append(a)
-
-                for nxt in res["next_pages"]:
-                    if nxt not in visited_pages:
-                        next_frontier.append(nxt)
-
-            current_depth += 1
-            frontier = list(dict.fromkeys(next_frontier))[:max_pages_total]
+                current_depth += 1
+                frontier = list(dict.fromkeys(next_frontier))[:max_pages_total]
 
         if pw_needed:
             await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
 
-        # PATCH #5: re-score onlyfiles assets with better haystack
+        # close DB connection (DatabaseSubmanager) at end of run
+        if db_sm:
+            try:
+                db_sm.close()
+            except Exception:
+                pass
+
+        # re-score onlyfiles assets with better haystack
         if keywords:
             for a in found_assets:
                 if a.get("onlyfiles"):
@@ -14692,12 +14571,10 @@ class DirectLinkTrackerBlock(BaseBlock):
 
             found_assets.sort(key=lambda a: a.get("score", 0), reverse=True)
 
-            # fallback if everything is zero
             if found_assets and found_assets[0].get("score", 0) == 0:
                 log.append("No keyword hits; falling back to unfiltered ordering.")
-                # keep current order (discovery order)
 
-        # PATCH #3: canonical ID dedupe (pillows format variants)
+        # canonical dedupe (pillows format variants)
         def _pillows_canonical_key(u: str) -> str:
             return re.sub(r"\.(mp3|ogg|wav|flac|m4a)$", "", (u or "").lower())
 
@@ -14727,6 +14604,7 @@ class DirectLinkTrackerBlock(BaseBlock):
                 f"min_term_overlap: {min_term_overlap}\n"
                 f"max_depth: {max_depth}\n"
                 f"expand_direct: {expand_direct}\n"
+                f"use_database: {use_database} (db_path={db_path if use_database else 'n/a'})\n"
             )
             lines = [base_text]
 
@@ -14745,7 +14623,33 @@ class DirectLinkTrackerBlock(BaseBlock):
                     lines.append(
                         f"  - *Tag: <{nl.get('tag', 'network_sniff')}> | From page: {host} | Size: {nl.get('size', '?')}*"
                     )
+            if return_react_sniff_links and all_react_links:
+                lines.append("\n### React / SPA Sniffed Hits (debug)\n")
+                for rh in all_react_links[:100]:
+                    kind = rh.get("kind", "nav")
+                    route = rh.get("route") or ""
+                    url = rh.get("url") or ""
+                    lines.append(f"- `{kind}` **{route}** → {url}")
 
+            if return_database_sniff_links and all_database_links:
+                lines.append("\n### Database & Persistence Layer Links (debug)\n")
+                for dbl in all_database_links[:50]:
+                    kind = dbl.get("kind")
+                    meta = dbl.get("meta") or {}
+                    if kind == "content_link":
+                        lines.append(f"- `db_url` ({meta.get('class')}) **{dbl['url']}**")
+                    elif kind == "indexeddb_dump":
+                        lines.append(f"- `storage` **{meta.get('name')}** stores found")
+            if return_interaction_sniff_links and all_interaction_links:
+                lines.append("\n### Interactivity & UI Barriers (debug)\n")
+                for il in all_interaction_links[:50]:
+                    kind = il.get("kind")
+                    meta = il.get("meta") or {}
+                    if kind == "event_listener":
+                        lines.append(f"- `js_event` **{meta.get('nodeName')}** listens for: {meta.get('types')}")
+                    elif kind == "overlay_detected":
+                        lines.append(
+                            f"- `barrier` **{meta.get('tagName')}** covers {meta.get('coverage')} of screen (z-index: {meta.get('zIndex')})")
             return "\n".join(lines), {
                 "count": 0,
                 "seed_urls": seed_urls,
@@ -14756,6 +14660,8 @@ class DirectLinkTrackerBlock(BaseBlock):
                 "js_links": all_js_links,
                 "network_sniff_links": all_network_links,
                 "log": log,
+                "use_database": use_database,
+                "db_path": (db_path if use_database else None),
             }
 
         lines = [f"### DirectLinkTracker Found {len(found_assets)} Assets"]
@@ -14763,7 +14669,8 @@ class DirectLinkTrackerBlock(BaseBlock):
             f"_Mode: {mode} | Query: {query_text or '[none]'} | Seed: {seed_urls[0] if seed_urls else '[none]'} | "
             f"Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
             f"Required Sites: {required_sites or '[none]'} | max_depth: {max_depth} | "
-            f"expand_direct: {expand_direct} | best_n: {best_n}_"
+            f"expand_direct: {expand_direct} | best_n: {best_n} | "
+            f"use_database: {use_database} (db_path={db_path if use_database else 'n/a'})_"
         )
         lines.append("")
 
@@ -14790,7 +14697,33 @@ class DirectLinkTrackerBlock(BaseBlock):
                 lines.append(
                     f"  - *Tag: <{nl.get('tag', 'network_sniff')}> | From page: {host} | Size: {nl.get('size', '?')}*"
                 )
+        if return_react_sniff_links and all_react_links:
+            lines.append("\n### React / SPA Sniffed Hits (debug)\n")
+            for rh in all_react_links[:100]:
+                kind = rh.get("kind", "nav")
+                route = rh.get("route") or ""
+                url = rh.get("url") or ""
+                lines.append(f"- `{kind}` **{route}** → {url}")
+        if return_database_sniff_links and all_database_links:
+            lines.append("\n### Database & Persistence Layer Links (debug)\n")
+            for dbl in all_database_links[:50]:
+                kind = dbl.get("kind")
+                meta = dbl.get("meta") or {}
+                if kind == "content_link":
+                    lines.append(f"- `db_url` ({meta.get('class')}) **{dbl['url']}**")
+                elif kind == "indexeddb_dump":
+                    lines.append(f"- `storage` **{meta.get('name')}** stores found")
+        if return_interaction_sniff_links and all_interaction_links:
 
+            lines.append("\n### Interactivity & UI Barriers (debug)\n")
+            for il in all_interaction_links[:50]:
+                kind = il.get("kind")
+                meta = il.get("meta") or {}
+                if kind == "event_listener":
+                    lines.append(f"- `js_event` **{meta.get('nodeName')}** listens for: {meta.get('types')}")
+                elif kind == "overlay_detected":
+                    lines.append(
+                        f"- `barrier` **{meta.get('tagName')}** covers {meta.get('coverage')} of screen (z-index: {meta.get('zIndex')})")
         return "\n".join(lines), {
             "found": len(found_assets),
             "seed_urls": seed_urls,
@@ -14805,6 +14738,8 @@ class DirectLinkTrackerBlock(BaseBlock):
             "js_links": all_js_links,
             "network_sniff_links": all_network_links,
             "log": log,
+            "use_database": use_database,
+            "db_path": (db_path if use_database else None),
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -14820,27 +14755,51 @@ class DirectLinkTrackerBlock(BaseBlock):
             "url_keywords": "",
             "strict_keywords": False,
             "verify": True,
-            # PATCH #2 defaults now auto-bump on pillows;
-            # still override explicitly if you want:
+            "tls_verify": True,
+            "ca_bundle": None,
+
             "max_depth": 2,
             "max_pages_total": 200,
             "max_links_per_page": 800,
+
             "use_js": False,
             "use_network_sniff": False,
+            "use_react_sniff": False,
+            "use_database_sniff": False,
+            "use_interaction_sniff":False,
+            "return_react_sniff_links":False,
             "return_all_js_links": False,
             "return_network_sniff_links": False,
+            "return_database_sniff_links": False,
+            "return_interaction_sniff_links": False,
+
             "min_term_overlap": 1,
             "site_require": "",
+
             "use_database": False,
             "db_path": "link_corpus.db",
+
             "block_resources": False,
             "blocked_resource_types": "image,stylesheet,font",
             "block_domains": True,
             "blocked_domains": "",
+
             "expand_direct": True,
             "best_n": 50,
+
             "use_camoufox": False,
             "camoufox_options": {},
+
+            # HTTPSSubmanager optional knobs
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_max_total_conn": 0,
+            "http_max_bytes": 4_000_000,
+            "http_max_html_chars": 600_000,
+            "http_allow_redirects": True,
+            "http_enable_cookies": True,
+            "proxy": None,
+            "proxy_pool": None,
         }
 
 
