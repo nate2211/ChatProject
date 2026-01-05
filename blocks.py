@@ -8491,8 +8491,9 @@ class LinkTrackerBlock(BaseBlock):
                             local_log.append(f"Skipping asset {full_url} (already in database)")
                             continue
 
+                        clean_url_for_matching = unquote(full_url).lower()
                         if keywords and not page_has_keywords:
-                            haystack = (link.get("text") or "").lower() + " " + full_url.lower().replace("%20", " ")
+                            haystack = f"{page_title} {link.get('text', '')} {clean_url_for_matching}".lower()
                             if not _term_overlap_ok(haystack):
                                 continue
 
@@ -12713,9 +12714,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 continue
                             if self._is_probable_video_url(full_url, lpath, full_url.lower()):
                                 continue
-
+                            clean_url_for_matching = unquote(full_url).lower()
                             if keywords and not page_has_keywords:
-                                haystack = (link.get("text", "") or "") + " " + full_url
+                                haystack = f"{page_title} {link.get('text', '')} {clean_url_for_matching}".lower()
                                 if not self._term_overlap_ok_check(haystack, keywords, min_term_overlap):
                                     continue
 
@@ -14561,12 +14562,11 @@ class DirectLinkTrackerBlock(BaseBlock):
                 db_sm.close()
             except Exception:
                 pass
-
-        # re-score onlyfiles assets with better haystack
+        clean_url_for_matching = unquote(a.get('url','')).lower()
         if keywords:
             for a in found_assets:
                 if a.get("onlyfiles"):
-                    hay = f"{a.get('text','')} {a.get('url','')} {a.get('source','')}"
+                    hay = f"{a.get('text','')} {clean_url_for_matching } {a.get('source','')}"
                     a["score"] = _score_for_keywords(hay)
 
             found_assets.sort(key=lambda a: a.get("score", 0), reverse=True)
@@ -17669,11 +17669,11 @@ class PageTrackerBlock(BaseBlock):
                             path.endswith(ext) for ext in self.IGNORED_EXTENSIONS
                         ):
                             continue
+                        clean_url_for_matching = unquote(full_url).lower()
 
-                        # Only consider non-asset pages
                         if keywords:
                             haystack = (
-                                (link.get("text") or "") + " " + full_url
+                                (link.get("text") or "") + " " + clean_url_for_matching
                             )
                             if not _term_overlap_ok(haystack):
                                 continue

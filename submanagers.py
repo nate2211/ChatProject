@@ -91,6 +91,17 @@ class NetworkSniffer:
     bytes / non-str object leaks into urlparse/urlunparse/urljoin/urlencode/parse_qsl.
     This version wraps *all* URL plumbing with hard str-normalization.
 
+    Rewrite goals (this patch):
+      1) Salvage is **less noisy** while still effective:
+           - Only salvage URLs that look like they *need* salvage
+           - Score + pick best targets (not “everything”)
+           - Stop probing early once a good variant is found
+           - Quiet logging by default (configurable)
+      2) Salvage is **more programmatic**, not just a static list:
+           - Learn “signature-ish” params by key + value heuristics (entropy/length/base64/hex)
+           - Generate host swap variants via rules (cf-/cdn-/i1..i9)
+           - Generate query simplifications via heuristics
+
     Return:
       (html: str, merged_items: list[dict[str,str]], json_hits: list[dict[str,Any]])
     """
@@ -117,10 +128,7 @@ class NetworkSniffer:
     # ---------------------------- safe string coercion ---------------------------- #
     @staticmethod
     def _to_str(x: Any) -> str:
-        """
-        Coerce possibly-bytes / URL objects / odd objects into str.
-        This prevents urllib/regex from seeing mixed bytes+str and exploding.
-        """
+        """Coerce possibly-bytes / URL objects / odd objects into str."""
         if x is None:
             return ""
         if isinstance(x, str):
@@ -146,7 +154,6 @@ class NetworkSniffer:
 
     @classmethod
     def _safe_urlunparse(cls, parts) -> str:
-        # ensure ALL 6 components are str
         try:
             a, b, c, d, e, f = parts
             return cls.urlunparse((
@@ -154,7 +161,6 @@ class NetworkSniffer:
                 cls._to_str(d), cls._to_str(e), cls._to_str(f),
             ))
         except Exception:
-            # best-effort fallback
             try:
                 return cls._to_str(cls.urlunparse(parts))
             except Exception:
@@ -165,14 +171,12 @@ class NetworkSniffer:
         try:
             return cls.urljoin(cls._to_str(base), cls._to_str(url))
         except Exception:
-            # last resort: concatenate-ish
             b = cls._to_str(base).rstrip("/")
             u = cls._to_str(url).lstrip("/")
             return f"{b}/{u}" if b and u else (b or u)
 
     @classmethod
     def _safe_parse_qsl(cls, query: Any) -> List[Tuple[str, str]]:
-        # parse_qsl can accept str; we force str and force output to str tuples
         out: List[Tuple[str, str]] = []
         try:
             for k, v in cls.parse_qsl(cls._to_str(query), keep_blank_values=True):
@@ -183,7 +187,6 @@ class NetworkSniffer:
 
     @classmethod
     def _safe_urlencode(cls, pairs: List[Tuple[Any, Any]]) -> str:
-        # urlencode explodes if it sees bytes in keys/values sometimes; force str
         try:
             norm = [(cls._to_str(k), cls._to_str(v)) for (k, v) in (pairs or [])]
             return cls.urlencode(norm, doseq=True)
@@ -200,7 +203,7 @@ class NetworkSniffer:
 
     @classmethod
     def _canonicalize_url(cls, url: Any) -> str:
-        """Light canonicalization (force str, scheme/host lower, drop fragments, drop tracking params)."""
+        """Light canonicalization: scheme/host lower, drop fragments, drop tracking params."""
         u = cls._to_str(url).strip()
         if not u:
             return ""
@@ -359,22 +362,43 @@ class NetworkSniffer:
             "referer", "origin", "range", "user-agent", "accept", "accept-language",
         })
 
-        # URL salvage
+        # ---------------- URL salvage (less-noisy + more programmatic) ----------------
         enable_url_salvage: bool = True
-        max_salvage_urls: int = 80
-        max_variants_per_url: int = 12
-        salvage_probe_timeout_ms: int = 7000
+
+        # target selection (less noisy)
+        salvage_max_targets_total: int = 30          # was 80: pick fewer, better
+        salvage_max_targets_per_host: int = 8        # avoid hammering one CDN
+        salvage_only_if_mediaish: bool = True
+        salvage_only_if_suspect: bool = True         # new: require “needs salvage” signal
+        salvage_suspect_statuses: Set[int] = field(default_factory=lambda: {401, 403, 404, 410, 416, 429})
+        salvage_min_score_to_probe: float = 2.0      # new: score threshold
+        salvage_score_bonus_if_signed: float = 2.0
+        salvage_score_bonus_if_mediaish: float = 1.0
+        salvage_score_bonus_if_segmenty: float = 0.5
+
+        # probing
+        salvage_probe_timeout_ms: int = 6500
         salvage_probe_concurrency: int = 6
         salvage_range_bytes: int = 8192
-        salvage_only_if_mediaish: bool = True
-        salvage_record_non_200: bool = True
 
+        # output/logging
+        salvage_log_level: str = "ok"  # "none" | "ok" | "all"
+        salvage_record_non_200: bool = False  # default quieter
+        salvage_emit_only_ok_variants_in_bundle: bool = True
+
+        # variant generation caps
+        salvage_max_variants_per_url: int = 10
+        salvage_max_query_simplify_variants: int = 4
+        salvage_max_host_swap_variants: int = 6
+
+        # signature-ish detection seeds (still useful, but not the only guide)
         salvage_strip_query_keys_substrings: Set[str] = field(default_factory=lambda: {
-            "token", "expires", "sig", "signature", "policy", "key-pair-id",
+            "token", "expires", "exp", "sig", "signature", "policy", "key-pair-id",
             "x-amz-", "x-goog-", "x-ms-", "hdnts", "acl", "hmac",
             "cdn_hash", "hash", "auth", "authorization", "session",
         })
 
+        # optional static origin swaps (kept), but we also do programmatic swaps
         salvage_origin_swaps: Dict[str, Set[str]] = field(default_factory=lambda: {
             "cf-hls-media.sndcdn.com": {"cf-media.sndcdn.com", "hls-media.sndcdn.com"},
             "media.sndcdn.com": {"cf-media.sndcdn.com"},
@@ -386,20 +410,12 @@ class NetworkSniffer:
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
 
-        # tolerate missing DEBUG_LOGGER global
-        try:
-            fallback = getattr(__builtins__, "DEBUG_LOGGER", None)  # rarely present; harmless
-            _ = fallback
-        except Exception:
-            pass
-
         if logger is not None:
             self.logger = logger
         else:
-            # use DEBUG_LOGGER if caller environment has it, else fallback
             self.logger = globals().get("DEBUG_LOGGER", None) or self._FallbackLogger()
 
-        self._log("[NetworkSniffer] Initialized (evidence + salvage) [hard str-safe]", None)
+        self._log("[NetworkSniffer] Initialized (evidence + salvage) [hard str-safe + programmatic salvage]", None)
 
         # SoundCloud nudges (optional)
         try:
@@ -681,15 +697,9 @@ class NetworkSniffer:
         }
 
     # ============================== URL salvage ============================== #
-    def _has_signaturey_params(self, url: str) -> bool:
-        try:
-            p = self._safe_urlparse(url)
-            q = self._to_str(p.query).lower()
-            if not q:
-                return False
-            return any(sub in q for sub in self.cfg.salvage_strip_query_keys_substrings)
-        except Exception:
-            return False
+    _B64URL_RE = re.compile(r"^[A-Za-z0-9\-_]+={0,2}$")
+    _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+    _JWT_LIKE_RE = re.compile(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$")
 
     def _is_mediaish_url(self, url: str) -> bool:
         try:
@@ -707,51 +717,241 @@ class NetworkSniffer:
         except Exception:
             return False
 
-    def _strip_signature_params_variant(self, url: str) -> Optional[str]:
+    def _signaturey_key(self, k: str) -> bool:
+        kl = (k or "").lower()
+        if not kl:
+            return False
+        if any(sub in kl for sub in (self.cfg.salvage_strip_query_keys_substrings or set())):
+            return True
+        # extra heuristics (programmatic)
+        if kl in ("sig", "signature", "token", "auth", "authorization", "expires", "exp", "policy"):
+            return True
+        if kl.startswith(("x-amz-", "x-goog-", "x-ms-")):
+            return True
+        return False
+
+    def _signaturey_value(self, v: str) -> bool:
+        vv = (v or "").strip()
+        if not vv:
+            return False
+        # timestamps and epoch-like values often live next to signatures
+        if vv.isdigit() and len(vv) in (10, 13):
+            return True
+        # long/high-entropy-ish
+        if len(vv) >= 48:
+            if self._JWT_LIKE_RE.match(vv):
+                return True
+            if self._B64URL_RE.match(vv):
+                return True
+            if self._HEX_RE.match(vv) and len(vv) >= 32:
+                return True
+        return False
+
+    def _has_signaturey_params(self, url: str) -> bool:
         try:
             p = self._safe_urlparse(url)
             if not p.query:
-                return None
-            kept: List[Tuple[str, str]] = []
+                return False
             for k, v in self._safe_parse_qsl(p.query):
-                kl = self._to_str(k).lower()
-                if any(sub in kl for sub in self.cfg.salvage_strip_query_keys_substrings):
-                    continue
-                kept.append((self._to_str(k), self._to_str(v)))
-            new_q = self._safe_urlencode(kept)
-            return self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, ""))
+                if self._signaturey_key(self._to_str(k)) or self._signaturey_value(self._to_str(v)):
+                    return True
+            return False
         except Exception:
-            return None
+            return False
 
-    def _path_only_variant(self, url: str) -> Optional[str]:
+    def _build_query_variants(self, url: str) -> List[Tuple[str, str]]:
+        """
+        Programmatic query simplification variants:
+          - drop signature-ish keys
+          - drop signature-ish values (even if key is unknown)
+          - drop ALL query (path-only)
+          - drop “obviously noisy” keys by length/entropy
+        """
+        out: List[Tuple[str, str]] = []
         try:
             p = self._safe_urlparse(url)
             if not p.scheme or not p.netloc:
-                return None
-            return self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
-        except Exception:
-            return None
+                return out
 
-    def _origin_swap_variants(self, url: str) -> List[str]:
-        out: List[str] = []
+            pairs = self._safe_parse_qsl(p.query)
+            if not pairs:
+                # still allow path-only variant via caller
+                return out
+
+            # 1) drop signature-ish keys/values
+            kept1: List[Tuple[str, str]] = []
+            dropped_any = False
+            for k, v in pairs:
+                ks = self._to_str(k)
+                vs = self._to_str(v)
+                if self._signaturey_key(ks) or self._signaturey_value(vs):
+                    dropped_any = True
+                    continue
+                kept1.append((ks, vs))
+            if dropped_any:
+                q1 = self._safe_urlencode(kept1)
+                u1 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, q1, ""))
+                out.append((u1, "query_drop_signature"))
+
+            # 2) keep only “short/simple” params (often id= / itag= / range=)
+            kept2: List[Tuple[str, str]] = []
+            for k, v in pairs:
+                ks = self._to_str(k)
+                vs = self._to_str(v)
+                if len(ks) <= 16 and len(vs) <= 64 and not self._signaturey_key(ks) and not self._signaturey_value(vs):
+                    kept2.append((ks, vs))
+            if kept2 and kept2 != pairs:
+                q2 = self._safe_urlencode(kept2)
+                u2 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, q2, ""))
+                out.append((u2, "query_keep_simple"))
+
+            # 3) drop query entirely (path-only)
+            u3 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
+            out.append((u3, "path_only"))
+
+        except Exception:
+            pass
+
+        # dedupe + cap
+        seen: Set[str] = set()
+        uniq: List[Tuple[str, str]] = []
+        for u, k in out:
+            cu = self._canonicalize_url(u)
+            if not cu or cu in seen:
+                continue
+            seen.add(cu)
+            uniq.append((cu, k))
+            if len(uniq) >= int(self.cfg.salvage_max_query_simplify_variants):
+                break
+        return uniq
+
+    def _programmatic_host_swaps(self, host: str) -> Set[str]:
+        """
+        Generate host alternatives via rules, not just config lists:
+          - toggle common CDN prefixes: cf- , cdn. , media. , img. (conservative)
+          - i1..i9 numeric subdomain bump
+        """
+        h = (host or "").strip().lower()
+        if not h:
+            return set()
+
+        out: Set[str] = set()
+
+        # numeric subdomain i1 -> i2..i5
+        m = self.re.match(r"^(i)(\d+)\.(.+)$", h)
+        if m:
+            base = m.group(1)
+            n = int(m.group(2))
+            rest = m.group(3)
+            for nn in range(max(1, n - 1), min(9, n + 4) + 1):
+                if nn != n:
+                    out.add(f"{base}{nn}.{rest}")
+
+        # cf- prefix toggle
+        if h.startswith("cf-"):
+            out.add(h[len("cf-"):])
+        else:
+            out.add("cf-" + h)
+
+        # cdn. toggle
+        if h.startswith("cdn."):
+            out.add(h[len("cdn."):])
+        else:
+            out.add("cdn." + h)
+
+        return {x for x in out if x and x != h}
+
+    def _origin_swap_variants(self, url: str) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
         try:
             p = self._safe_urlparse(url)
             host = self._to_str(p.netloc).lower()
-            alts = self.cfg.salvage_origin_swaps.get(host) or set()
-            for ah in alts:
-                ahs = self._to_str(ah).strip()
-                if not ahs:
-                    continue
-                out.append(self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)))
+            if not host:
+                return out
+
+            # 1) configured swaps (kept)
+            for ah in (self.cfg.salvage_origin_swaps.get(host) or set()):
+                ahs = self._to_str(ah).strip().lower()
+                if ahs and ahs != host:
+                    out.append((self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)), "origin_swap_static"))
+
+            # 2) programmatic swaps
+            for ahs in self._programmatic_host_swaps(host):
+                out.append((self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)), "origin_swap_rule"))
+
         except Exception:
             pass
-        return out
+
+        # dedupe + cap
+        seen: Set[str] = set()
+        uniq: List[Tuple[str, str]] = []
+        for u, k in out:
+            cu = self._canonicalize_url(u)
+            if not cu or cu in seen:
+                continue
+            seen.add(cu)
+            uniq.append((cu, k))
+            if len(uniq) >= int(self.cfg.salvage_max_host_swap_variants):
+                break
+        return uniq
+
+    def _salvage_score(self, url: str, *, status: Optional[int], kind: Optional[str]) -> float:
+        u = self._to_str(url)
+        ul = u.lower()
+        score = 0.0
+
+        if self._is_mediaish_url(u):
+            score += float(self.cfg.salvage_score_bonus_if_mediaish)
+
+        if kind in ("video", "audio"):
+            score += 0.5
+
+        if any(x in ul for x in ("seg", "segment", "chunk", "frag", "m4s", "bytestream", "range")):
+            score += float(self.cfg.salvage_score_bonus_if_segmenty)
+
+        if self._has_signaturey_params(u):
+            score += float(self.cfg.salvage_score_bonus_if_signed)
+
+        if status is not None:
+            if status in self.cfg.salvage_suspect_statuses:
+                score += 2.0
+            elif 500 <= status <= 599:
+                score += 0.5
+
+        return score
+
+    def _salvage_should_target(self, url: str, *, status: Optional[int], kind: Optional[str]) -> bool:
+        if not self.cfg.enable_url_salvage:
+            return False
+        if not self._host_allowed(url):
+            return False
+        if self.cfg.salvage_only_if_mediaish and (not self._is_mediaish_url(url)) and (not self._has_signaturey_params(url)):
+            return False
+        if self.cfg.salvage_only_if_suspect:
+            suspect = False
+            if status is not None and status in self.cfg.salvage_suspect_statuses:
+                suspect = True
+            if self._has_signaturey_params(url):
+                suspect = True
+            if not suspect:
+                return False
+        score = self._salvage_score(url, status=status, kind=kind)
+        return score >= float(self.cfg.salvage_min_score_to_probe)
+
+    def _salvage_log(self, msg: str, log: Optional[List[str]], *, level: str):
+        lvl = (self.cfg.salvage_log_level or "ok").lower()
+        if lvl == "none":
+            return
+        if lvl == "ok" and level != "ok":
+            return
+        self._log(msg, log)
 
     async def _probe_url(self, api_ctx, url: str, req_headers: Dict[str, str], *, timeout_ms: int) -> Dict[str, Any]:
         """
-        Best-effort probe:
-          1) HEAD (if supported)
-          2) Range GET small bytes
+        Probe:
+          - Try Range GET first (more reliable than HEAD on many CDNs)
+          - Fall back to HEAD (some endpoints prefer it)
+          - Stop once we have ok (200/206) with media-ish content-type (or any 200/206 if unknown)
         """
         url = self._to_str(url)
         result = {
@@ -771,100 +971,145 @@ class NetworkSniffer:
 
         h = {self._to_str(k): self._to_str(v) for k, v in (req_headers or {}).items() if k and v}
 
+        # ensure Range header for GET
+        h_get = dict(h)
+        if "range" not in {k.lower() for k in h_get.keys()}:
+            h_get["Range"] = f"bytes=0-{max(0, int(self.cfg.salvage_range_bytes) - 1)}"
+
+        async def accept_ok(status: Optional[int], ctype: Optional[str]) -> bool:
+            if status not in (200, 206):
+                return False
+            ct = (ctype or "").lower()
+            if ct.startswith(("video/", "audio/", "image/")):
+                return True
+            if "mpegurl" in ct or "dash" in ct or "application/octet-stream" in ct:
+                return True
+            # if we can't tell, still accept 200/206 (some CDNs omit type)
+            return True
+
+        # 1) GET Range
         try:
-            resp = await api_ctx.head(url, headers=h, timeout=timeout_ms)
-            result["method"] = "HEAD"
+            resp = await api_ctx.get(url, headers=h_get, timeout=timeout_ms)
+            result["method"] = "GET"
             result["status"] = getattr(resp, "status", None)
             result["final_url"] = self._to_str(getattr(resp, "url", None) or url)
             rh = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp, "headers", None) or {}).items()}
             result["content_type"] = rh.get("content-type")
             result["content_length"] = rh.get("content-length")
-            if result["status"] in (200, 206):
-                ct = (result["content_type"] or "").lower()
-                if ct.startswith(("video/", "audio/", "image/")) or ("mpegurl" in ct) or ("dash" in ct):
-                    result["ok"] = True
-        except Exception as e:
-            result["error"] = f"head_failed:{e}"
-
-        try:
-            h2 = dict(h)
-            if "range" not in {k.lower() for k in h2.keys()}:
-                h2["Range"] = f"bytes=0-{max(0, int(self.cfg.salvage_range_bytes) - 1)}"
-            resp2 = await api_ctx.get(url, headers=h2, timeout=timeout_ms)
-            result["method"] = (result["method"] + "+GET") if result["method"] else "GET"
-            st = getattr(resp2, "status", None)
-            result["status"] = st if st is not None else result["status"]
-            result["final_url"] = self._to_str(getattr(resp2, "url", None) or result["final_url"])
-            rh2 = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp2, "headers", None) or {}).items()}
-            result["content_type"] = result["content_type"] or rh2.get("content-type")
-            result["content_length"] = result["content_length"] or rh2.get("content-length")
 
             b = None
             try:
-                b = await resp2.body()
+                b = await resp.body()
             except Exception:
                 b = None
             if b:
                 result["hash_prefix_sha256"] = self.hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
 
-            if result["status"] in (200, 206):
+            if await accept_ok(result["status"], result["content_type"]):
                 result["ok"] = True
+                return result
+
+        except Exception as e:
+            result["error"] = f"get_failed:{e}"
+
+        # 2) HEAD fallback
+        try:
+            resp2 = await api_ctx.head(url, headers=h, timeout=timeout_ms)
+            result["method"] = (result["method"] + "+HEAD") if result["method"] else "HEAD"
+            result["status"] = getattr(resp2, "status", None) or result["status"]
+            result["final_url"] = self._to_str(getattr(resp2, "url", None) or result["final_url"])
+            rh2 = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp2, "headers", None) or {}).items()}
+            result["content_type"] = result["content_type"] or rh2.get("content-type")
+            result["content_length"] = result["content_length"] or rh2.get("content-length")
+
+            if await accept_ok(result["status"], result["content_type"]):
+                result["ok"] = True
+
         except Exception as e:
             result["error"] = (result["error"] + "|") if result["error"] else ""
-            result["error"] += f"get_failed:{e}"
+            result["error"] += f"head_failed:{e}"
 
         return result
 
-    async def _salvage_one(self, api_ctx, observed_url: str, req_headers_subset: Dict[str, str], *, log: Optional[List[str]]) -> Dict[str, Any]:
+    async def _salvage_one(self, api_ctx, observed_url: str, req_headers_subset: Dict[str, str], *,
+                          log: Optional[List[str]], observed_status: Optional[int], observed_kind: Optional[str]) -> Dict[str, Any]:
         observed = self._canonicalize_url(observed_url)
         if not observed:
             return {"observed_url": self._to_str(observed_url), "variants": [], "ok_variants": []}
 
+        # build variants programmatically
         variants: List[Tuple[str, str]] = []
 
-        if self._has_signaturey_params(observed):
-            v = self._strip_signature_params_variant(observed)
-            if v and v != observed:
-                variants.append((v, "token_stripped"))
+        # A) query simplifications (signature drop, keep-simple, path-only)
+        variants.extend(self._build_query_variants(observed))
 
-        v2 = self._path_only_variant(observed)
-        if v2 and v2 != observed:
-            variants.append((v2, "path_only"))
+        # B) host swaps (static + rule-based)
+        variants.extend(self._origin_swap_variants(observed))
 
-        for u0 in [observed] + [u for (u, _) in variants]:
-            for su in self._origin_swap_variants(u0):
-                if su and su != observed:
-                    variants.append((su, "origin_swap"))
+        # C) host swaps of query variants (limited)
+        #    (useful when cdn host differs but query already simplified)
+        for (u, k) in list(variants)[:3]:
+            for (u2, k2) in self._origin_swap_variants(u):
+                variants.append((u2, f"{k}+{k2}"))
 
+        # de-dupe + cap
         seen: Set[str] = {observed}
         uniq: List[Tuple[str, str]] = []
         for u, k in variants:
             cu = self._canonicalize_url(u)
             if not cu or cu in seen:
                 continue
+            if not self._host_allowed(cu):
+                continue
             seen.add(cu)
             uniq.append((cu, k))
-            if len(uniq) >= int(self.cfg.max_variants_per_url):
+            if len(uniq) >= int(self.cfg.salvage_max_variants_per_url):
                 break
 
         out_variants: List[Dict[str, Any]] = []
         ok_variants: List[Dict[str, Any]] = []
+
         tmo = int(self.cfg.salvage_probe_timeout_ms)
 
-        for (u, kind) in uniq:
-            if not self._host_allowed(u):
-                continue
+        # Probe order: try the “most likely” first
+        def variant_rank(vk: str) -> int:
+            vk = (vk or "").lower()
+            if "query_drop_signature" in vk:
+                return 0
+            if "query_keep_simple" in vk:
+                return 1
+            if "path_only" in vk:
+                return 2
+            if "origin_swap" in vk:
+                return 3
+            return 9
+
+        uniq.sort(key=lambda t: variant_rank(t[1]))
+
+        # Less noisy: stop early once we find a good variant
+        for (u, vkind) in uniq:
             pr = await self._probe_url(api_ctx, u, req_headers_subset, timeout_ms=tmo)
-            pr["variant_kind"] = kind
+            pr["variant_kind"] = vkind
             out_variants.append(pr)
+
             if pr.get("ok"):
                 ok_variants.append(pr)
-                self._log(f"[NetworkSniffer] Salvage OK: {observed} -> {u} ({pr.get('status')})", log)
+                self._salvage_log(
+                    f"[NetworkSniffer] Salvage OK ({observed_status}/{observed_kind}): {observed} -> {u} ({pr.get('status')})",
+                    log, level="ok"
+                )
+                # early stop: 1 good result is usually enough
+                break
             else:
                 if self.cfg.salvage_record_non_200:
-                    self._log(f"[NetworkSniffer] Salvage miss: {observed} -> {u} ({pr.get('status')})", log)
+                    self._salvage_log(
+                        f"[NetworkSniffer] Salvage miss: {observed} -> {u} ({pr.get('status')})",
+                        log, level="all"
+                    )
 
-        return {"observed_url": observed, "variants": out_variants, "ok_variants": ok_variants}
+        # optionally emit only ok variants to keep the bundle clean
+        variants_emit = ok_variants if self.cfg.salvage_emit_only_ok_variants_in_bundle else out_variants
+        return {"observed_url": observed, "variants": variants_emit, "ok_variants": ok_variants}
 
     # ============================== forensics ============================== #
     def _pick_headers_subset(self, headers_lc: Dict[str, str], allow: Set[str]) -> Dict[str, str]:
@@ -880,7 +1125,6 @@ class NetworkSniffer:
         try:
             if post_data is None:
                 return {"size": 0, "sha256": None}
-            b = None
             if isinstance(post_data, str):
                 b = post_data.encode("utf-8", "ignore")
             elif isinstance(post_data, (bytes, bytearray, memoryview)):
@@ -891,7 +1135,8 @@ class NetworkSniffer:
         except Exception:
             return {"size": None, "sha256": None}
 
-    async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *, timeout_ms: int, prefix_bytes: int) -> Optional[str]:
+    async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
+                                         timeout_ms: int, prefix_bytes: int) -> Optional[str]:
         if api_ctx is None:
             return None
         try:
@@ -940,8 +1185,10 @@ class NetworkSniffer:
         forensics: List[Dict[str, Any]] = []
         seen_forensics: Set[str] = set()
 
-        salvage_targets: List[str] = []
-        salvage_seen: Set[str] = set()
+        # new: salvage target table (url -> info), scored + per-host limited
+        salvage_info: Dict[str, Dict[str, Any]] = {}
+        salvage_host_counts: Dict[str, int] = {}
+
         salvage_bundles: List[Dict[str, Any]] = []
 
         html: str = ""
@@ -1213,29 +1460,26 @@ class NetworkSniffer:
                     if self.cfg.prefer_master_manifests:
                         manifests_to_expand.sort(key=lambda t: (0 if "master" in self._to_str(t[2]).lower() else 1))
 
-                if len(found_items) >= max_items:
-                    return
+                if len(found_items) < max_items:
+                    # content-disposition filename hint
+                    cd = self._to_str(headers.get("content-disposition") or "")
+                    filename = None
+                    if cd:
+                        m = self.re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, self.re.I)
+                        if m:
+                            filename = self._to_str(m.group(1))
 
-                # content-disposition filename hint
-                cd = self._to_str(headers.get("content-disposition") or "")
-                filename = None
-                if cd:
-                    m = self.re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, self.re.I)
-                    if m:
-                        filename = self._to_str(m.group(1))
-
-                item: Dict[str, Any] = {
-                    "url": canonical_url,
-                    "text": f"[Network {kind.capitalize()}]",
-                    "tag": "network_sniff",
-                    "kind": kind,
-                    "content_type": ctype or "?",
-                    "size": headers.get("content-length", "?"),
-                }
-                if filename:
-                    item["text"] = f"[Network {kind.capitalize()}] {filename}"
-
-                found_items.append(item)
+                    item: Dict[str, Any] = {
+                        "url": canonical_url,
+                        "text": f"[Network {kind.capitalize()}]",
+                        "tag": "network_sniff",
+                        "kind": kind,
+                        "content_type": ctype or "?",
+                        "size": headers.get("content-length", "?"),
+                    }
+                    if filename:
+                        item["text"] = f"[Network {kind.capitalize()}] {filename}"
+                    found_items.append(item)
 
                 # forensics bundle
                 if self.cfg.enable_forensics and len(forensics) < int(self.cfg.max_forensics_events):
@@ -1275,17 +1519,34 @@ class NetworkSniffer:
                         seen_forensics.add(k)
                         forensics.append(bundle)
 
-                # salvage targets
+                # salvage targets (LESS NOISY + SCORED)
                 if self.cfg.enable_url_salvage:
-                    if len(salvage_targets) < int(self.cfg.max_salvage_urls):
-                        if (not self.cfg.salvage_only_if_mediaish) or self._is_mediaish_url(canonical_url) or self._has_signaturey_params(canonical_url):
-                            if canonical_url not in salvage_seen:
-                                salvage_seen.add(canonical_url)
-                                salvage_targets.append(canonical_url)
+                    status = getattr(response, "status", None)
+                    if self._salvage_should_target(canonical_url, status=status, kind=kind):
+                        host = self._to_str(self._safe_urlparse(canonical_url).netloc).lower()
+                        if host:
+                            cnt = salvage_host_counts.get(host, 0)
+                            if cnt >= int(self.cfg.salvage_max_targets_per_host):
+                                return
+                        score = self._salvage_score(canonical_url, status=status, kind=kind)
+
+                        # keep best score per URL
+                        prev = salvage_info.get(canonical_url)
+                        if (prev is None) or (float(prev.get("score", 0.0)) < score):
+                            salvage_info[canonical_url] = {
+                                "url": canonical_url,
+                                "score": score,
+                                "status": status,
+                                "kind": kind,
+                            }
+                            if host:
+                                salvage_host_counts[host] = salvage_host_counts.get(host, 0) + 1
 
             except Exception as e:
-                # IMPORTANT: stringify everything in log to avoid *another* mixed-type crash
-                self._log(f"[NetworkSniffer][handle_response] Error processing {self._to_str(getattr(response,'url',None))}: {self._to_str(e)}", log)
+                self._log(
+                    f"[NetworkSniffer][handle_response] Error processing {self._to_str(getattr(response,'url',None))}: {self._to_str(e)}",
+                    log
+                )
 
         page.on("response", handle_response)
 
@@ -1362,19 +1623,32 @@ class NetworkSniffer:
 
                 await self.asyncio.gather(*[guard_hash(b) for b in forensics])
 
-            # salvage stage
-            if self.cfg.enable_url_salvage and api_ctx is not None and salvage_targets:
+            # salvage stage (SCORED + TOP-N)
+            if self.cfg.enable_url_salvage and api_ctx is not None and salvage_info:
+                # select top targets
+                targets = list(salvage_info.values())
+                targets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
+                targets = targets[: int(self.cfg.salvage_max_targets_total)]
+
                 sem = self.asyncio.Semaphore(int(self.cfg.salvage_probe_concurrency))
 
                 def req_hdrs_for(u: str) -> Dict[str, str]:
                     ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
                     return ev.get("headers_subset") or {}
 
-                async def salvage_guard(u: str):
+                async def salvage_guard(info: Dict[str, Any]):
                     async with sem:
-                        return await self._salvage_one(api_ctx, u, req_hdrs_for(u), log=log)
+                        u = self._to_str(info.get("url"))
+                        return await self._salvage_one(
+                            api_ctx,
+                            u,
+                            req_hdrs_for(u),
+                            log=log,
+                            observed_status=info.get("status"),
+                            observed_kind=info.get("kind"),
+                        )
 
-                salvage_bundles = await self.asyncio.gather(*[salvage_guard(u) for u in salvage_targets])
+                salvage_bundles = await self.asyncio.gather(*[salvage_guard(i) for i in targets])
 
             # emit bundles
             if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
@@ -1389,12 +1663,22 @@ class NetworkSniffer:
                 })
 
             if self.cfg.enable_url_salvage and salvage_bundles and len(json_hits) < max_json:
+                # keep bundle clean by removing empty salvage results
+                clean = []
+                for b in salvage_bundles:
+                    if not isinstance(b, dict):
+                        continue
+                    if b.get("ok_variants"):
+                        clean.append(b)
+                    elif not self.cfg.salvage_emit_only_ok_variants_in_bundle and b.get("variants"):
+                        clean.append(b)
+
                 json_hits.append({
                     "url": canonical_page_url,
                     "json": {"salvage_bundle": {
                         "source_page": canonical_page_url,
-                        "count": len(salvage_bundles),
-                        "items": salvage_bundles[: int(self.cfg.max_salvage_urls)],
+                        "count": len(clean),
+                        "items": clean,
                     }},
                     "source_page": canonical_page_url,
                 })
@@ -1427,7 +1711,6 @@ class NetworkSniffer:
         self._log(summary, log)
 
         return html, merged_items, json_hits
-
 
 # ======================================================================
 # JSSniffer
