@@ -9,8 +9,8 @@ import sqlite3
 import ssl
 import threading
 import time
-from dataclasses import dataclass, field
-
+from dataclasses import dataclass, field, fields
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable
 from urllib.parse import urlparse, urljoin, parse_qsl, urlencode, urlunparse
@@ -83,65 +83,176 @@ def _canonicalize_url(u: str) -> str:
 
 class NetworkSniffer:
     """
-    Advanced Playwright network sniffer for VIDEO + AUDIO + IMAGES.
+    Advanced Playwright network sniffer for VIDEO + AUDIO + IMAGES
+    + Evidence collection
+    + URL salvage (token stripping / path-only / origin swapping + probing)
 
-    Adds (existing):
-      - blob:/MediaSource recovery (records blob media placeholders)
-      - HLS/DASH manifest expansion into derived segment links
-      - Robust URL canonicalization for all captured URLs.
-      - Granular logging for filtering decisions.
-      - SAFE JSON sniffing (size + URL pattern gated).
-      - Auto-scroll support to trigger lazy-loaded media/content.
-      - Configurable goto_wait_until (e.g. 'commit' for Camoufox).
-      - GraphQL POST sniffing: extracts operationName, variable keys, and
-        detects introspection queries on /graphql.
+    FIX: "Cannot mix str and non-str arguments" (urllib.parse) happens when *any*
+    bytes / non-str object leaks into urlparse/urlunparse/urljoin/urlencode/parse_qsl.
+    This version wraps *all* URL plumbing with hard str-normalization.
 
-    NEW (more advanced):
-      - Redirect chain tracking (request.redirected_from / response.status + Location)
-      - Response header URL mining (Location, Link, Content-Location, Refresh)
-      - Content-Disposition filename sniff (useful for media downloads)
-      - Byte-range / segment heuristics (accepts "video-ish" even w/out extensions)
-      - Better manifest parsing (HLS supports relative + absolute, MPD namespace-safe)
-      - Manifest prioritization & safe size limits for manifest reads
-      - Optional allow/deny host filters
-      - Optional capture of request/response timing metadata (when available)
+    Return:
+      (html: str, merged_items: list[dict[str,str]], json_hits: list[dict[str,Any]])
     """
 
+    # ---------------------------- minimal internal deps ---------------------------- #
+    from dataclasses import dataclass, field
+    from typing import Any, Dict, List, Optional, Set, Tuple
+    import asyncio, json, re, hashlib, time
+    from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin
+
+    try:
+        import xml.etree.ElementTree as ET
+    except Exception:  # pragma: no cover
+        ET = None
+
+    # ---------------------------- fallback logger ---------------------------- #
+    class _FallbackLogger:
+        def log_message(self, msg: str) -> None:
+            try:
+                print(msg)
+            except Exception:
+                pass
+
+    # ---------------------------- safe string coercion ---------------------------- #
+    @staticmethod
+    def _to_str(x: Any) -> str:
+        """
+        Coerce possibly-bytes / URL objects / odd objects into str.
+        This prevents urllib/regex from seeing mixed bytes+str and exploding.
+        """
+        if x is None:
+            return ""
+        if isinstance(x, str):
+            return x
+        if isinstance(x, (bytes, bytearray, memoryview)):
+            b = bytes(x)
+            try:
+                return b.decode("utf-8", "ignore")
+            except Exception:
+                try:
+                    return b.decode("latin-1", "ignore")
+                except Exception:
+                    return ""
+        try:
+            return str(x)
+        except Exception:
+            return ""
+
+    # ---------------------------- "safe urllib" wrappers ---------------------------- #
+    @classmethod
+    def _safe_urlparse(cls, url: Any):
+        return cls.urlparse(cls._to_str(url))
+
+    @classmethod
+    def _safe_urlunparse(cls, parts) -> str:
+        # ensure ALL 6 components are str
+        try:
+            a, b, c, d, e, f = parts
+            return cls.urlunparse((
+                cls._to_str(a), cls._to_str(b), cls._to_str(c),
+                cls._to_str(d), cls._to_str(e), cls._to_str(f),
+            ))
+        except Exception:
+            # best-effort fallback
+            try:
+                return cls._to_str(cls.urlunparse(parts))
+            except Exception:
+                return ""
+
+    @classmethod
+    def _safe_urljoin(cls, base: Any, url: Any) -> str:
+        try:
+            return cls.urljoin(cls._to_str(base), cls._to_str(url))
+        except Exception:
+            # last resort: concatenate-ish
+            b = cls._to_str(base).rstrip("/")
+            u = cls._to_str(url).lstrip("/")
+            return f"{b}/{u}" if b and u else (b or u)
+
+    @classmethod
+    def _safe_parse_qsl(cls, query: Any) -> List[Tuple[str, str]]:
+        # parse_qsl can accept str; we force str and force output to str tuples
+        out: List[Tuple[str, str]] = []
+        try:
+            for k, v in cls.parse_qsl(cls._to_str(query), keep_blank_values=True):
+                out.append((cls._to_str(k), cls._to_str(v)))
+        except Exception:
+            pass
+        return out
+
+    @classmethod
+    def _safe_urlencode(cls, pairs: List[Tuple[Any, Any]]) -> str:
+        # urlencode explodes if it sees bytes in keys/values sometimes; force str
+        try:
+            norm = [(cls._to_str(k), cls._to_str(v)) for (k, v) in (pairs or [])]
+            return cls.urlencode(norm, doseq=True)
+        except Exception:
+            return ""
+
+    # ---------------------------- canonicalize ---------------------------- #
+    _TRACKING_KEYS = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_name", "utm_reader", "utm_viz_id",
+        "gclid", "dclid", "gbraid", "wbraid", "fbclid", "msclkid", "ttclid", "twclid", "yclid",
+        "mc_cid", "mc_eid",
+    }
+
+    @classmethod
+    def _canonicalize_url(cls, url: Any) -> str:
+        """Light canonicalization (force str, scheme/host lower, drop fragments, drop tracking params)."""
+        u = cls._to_str(url).strip()
+        if not u:
+            return ""
+        try:
+            p = cls._safe_urlparse(u)
+            scheme = cls._to_str(p.scheme).lower()
+            netloc = cls._to_str(p.netloc).lower()
+            path = cls._to_str(p.path)
+            params = cls._to_str(p.params)
+
+            kept: List[Tuple[str, str]] = []
+            for k, v in cls._safe_parse_qsl(p.query):
+                if cls._to_str(k).lower() in cls._TRACKING_KEYS:
+                    continue
+                kept.append((cls._to_str(k), cls._to_str(v)))
+
+            query = cls._safe_urlencode(kept)
+            return cls._safe_urlunparse((scheme, netloc, path, params, query, ""))  # drop fragment
+        except Exception:
+            return u
+
+    # ---------------------------- config ---------------------------- #
     @dataclass
     class Config:
         timeout: float = 8.0
         max_items: int = 250
-        max_json_hits: int = 100
+        max_json_hits: int = 150
 
-        # how many derived items to add per manifest
         max_derived_per_manifest: int = 200
-        # max manifests to expand per page
         max_manifests_to_expand: int = 10
 
-        # If True, store sniff items even without size/ctype
         accept_unknown_streams: bool = True
 
-        # ------------------ auto-scroll options ------------------ #
+        # auto-scroll
         enable_auto_scroll: bool = True
         max_scroll_steps: int = 20
         scroll_step_delay_ms: int = 400
         scroll_back_to_top: bool = False
 
-        # How Playwright waits in page.goto; for Camoufox you can set "commit"
         goto_wait_until: str = "domcontentloaded"
 
-        # ------------------ allow/deny host filters ------------------ #
+        # host filters
         enable_host_allowlist: bool = False
         host_allow_substrings: Set[str] = field(default_factory=set)
 
         enable_host_denylist: bool = False
         host_deny_substrings: Set[str] = field(default_factory=set)
 
-        # ------------------ extension sets ------------------ #
+        # extensions
         video_extensions: Set[str] = field(default_factory=lambda: {
             ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv",
-            ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv",
-            ".m4s"  # dash segments
+            ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv", ".m4s"
         })
         audio_extensions: Set[str] = field(default_factory=lambda: {
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav",
@@ -151,17 +262,14 @@ class NetworkSniffer:
             ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
             ".avif", ".heic", ".heif", ".tiff"
         })
-
         junk_extensions: Set[str] = field(default_factory=lambda: {
-            ".js", ".css", ".json", ".html", ".woff", ".woff2",
-            ".ttf", ".map", ".vtt", ".srt"
+            ".js", ".css", ".json", ".html", ".woff", ".woff2", ".ttf", ".map", ".vtt", ".srt"
         })
 
-        # ------------------ content-type sets ------------------ #
+        # content-types
         video_prefixes: Set[str] = field(default_factory=lambda: {"video/"})
         audio_prefixes: Set[str] = field(default_factory=lambda: {"audio/"})
         image_prefixes: Set[str] = field(default_factory=lambda: {"image/"})
-
         hls_types: Set[str] = field(default_factory=lambda: {
             "application/x-mpegurl", "application/vnd.apple.mpegurl"
         })
@@ -169,14 +277,10 @@ class NetworkSniffer:
             "application/dash+xml", "application/vnd.mpeg.dash.mpd", "application/xml", "text/xml"
         })
 
-        deny_content_substrings: Set[str] = field(default_factory=lambda: {
-            "javascript", "css", "font/"
-        })
-        deny_resource_types: Set[str] = field(default_factory=lambda: {
-            "stylesheet", "font", "manifest", "other"
-        })
+        deny_content_substrings: Set[str] = field(default_factory=lambda: {"javascript", "css", "font/"})
+        deny_resource_types: Set[str] = field(default_factory=lambda: {"stylesheet", "font", "manifest", "other"})
 
-        # ------------------ stream hint sets ------------------ #
+        # stream hints
         video_stream_hints: Set[str] = field(default_factory=lambda: {
             ".m3u8", "manifest.mpd", "master.m3u8", "chunklist.m3u8",
             "videoplayback", "dash", "hls", "stream", "cdn",
@@ -187,7 +291,7 @@ class NetworkSniffer:
             ".flac", ".ogg", ".opus", "weba"
         })
 
-        # ------------------ ad/tracker sets ------------------ #
+        # ad/tracker
         ad_host_substrings: Set[str] = field(default_factory=lambda: {
             "doubleclick", "googlesyndication", "adservice", "adserver",
             "adsystem", "adnxs", "tracking", "analytics", "metrics",
@@ -198,9 +302,8 @@ class NetworkSniffer:
             "/click/", "/impression", "/pixel", "/sponsor/", "/advert/"
         })
 
-        # ------------------ JSON sniff config ------------------ #
+        # JSON sniff
         enable_json_sniff: bool = True
-
         json_url_hints: Set[str] = field(default_factory=lambda: {
             "player", "manifest", "api", "metadata", "m3u8", "mpd",
             "playlist", "video", "audio", "graphql"
@@ -208,92 +311,142 @@ class NetworkSniffer:
         json_content_types: Set[str] = field(default_factory=lambda: {
             "application/json", "text/json", "application/problem+json"
         })
-
-        # HARD gate: only sniff JSON when BOTH:
-        #  - Content-Length <= json_body_max_kb, AND
-        #  - URL matches one of json_url_patterns.
         json_body_max_kb: int = 256
         json_url_patterns: Set[str] = field(default_factory=lambda: {
             "/api/player", "/player_api", "/player/",
-            "/manifest", "/playlist", "/video/", "/audio/",
-            "/graphql"
+            "/manifest", "/playlist", "/video/", "/audio/", "/graphql"
         })
 
-        # ------------------ GraphQL sniff config ------------------ #
+        # GraphQL sniff
         enable_graphql_sniff: bool = True
         graphql_endpoint_keywords: Set[str] = field(default_factory=lambda: {"/graphql"})
-        graphql_max_body_kb: int = 256  # size gate for request body
+        graphql_max_body_kb: int = 256
 
-        # ------------------ NEW: header mining ------------------ #
+        # header mining
         enable_header_url_mining: bool = True
         max_header_url_events: int = 250
         header_url_keys: Set[str] = field(default_factory=lambda: {
             "location", "link", "content-location", "refresh"
         })
 
-        # ------------------ NEW: redirect chain tracking ------------------ #
+        # redirect tracking
         enable_redirect_tracking: bool = True
         max_redirect_events: int = 200
 
-        # ------------------ NEW: manifest safety ------------------ #
-        max_manifest_bytes: int = 512 * 1024  # cap manifest text read
+        # manifest safety
+        max_manifest_bytes: int = 512 * 1024
         prefer_master_manifests: bool = True
 
-        # ------------------ NEW: segment heuristics ------------------ #
+        # segment heuristics
         enable_segment_heuristics: bool = True
-        min_segment_bytes: int = 64 * 1024      # ignore tiny
-        max_segment_bytes: int = 50 * 1024 * 1024  # ignore huge "download everything" unless clearly media
+        min_segment_bytes: int = 64 * 1024
+        max_segment_bytes: int = 50 * 1024 * 1024
         accept_range_requests_as_media: bool = True
 
-        # ------------------ NEW: attach timing ------------------ #
-        enable_timing_meta: bool = True  # best effort (Playwright varies)
+        # forensics
+        enable_forensics: bool = True
+        max_forensics_events: int = 250
+        forensics_body_prefix_bytes: int = 8192
+        forensics_hash_via_probe: bool = True
+        forensics_probe_timeout_ms: int = 6000
+        forensics_include_headers_subset: Set[str] = field(default_factory=lambda: {
+            "content-type", "content-length", "content-range", "accept-ranges",
+            "etag", "last-modified", "cache-control", "expires",
+            "server", "via", "x-cache", "cf-cache-status", "age",
+            "location", "content-disposition",
+        })
+        forensics_include_request_headers_subset: Set[str] = field(default_factory=lambda: {
+            "referer", "origin", "range", "user-agent", "accept", "accept-language",
+        })
 
+        # URL salvage
+        enable_url_salvage: bool = True
+        max_salvage_urls: int = 80
+        max_variants_per_url: int = 12
+        salvage_probe_timeout_ms: int = 7000
+        salvage_probe_concurrency: int = 6
+        salvage_range_bytes: int = 8192
+        salvage_only_if_mediaish: bool = True
+        salvage_record_non_200: bool = True
+
+        salvage_strip_query_keys_substrings: Set[str] = field(default_factory=lambda: {
+            "token", "expires", "sig", "signature", "policy", "key-pair-id",
+            "x-amz-", "x-goog-", "x-ms-", "hdnts", "acl", "hmac",
+            "cdn_hash", "hash", "auth", "authorization", "session",
+        })
+
+        salvage_origin_swaps: Dict[str, Set[str]] = field(default_factory=lambda: {
+            "cf-hls-media.sndcdn.com": {"cf-media.sndcdn.com", "hls-media.sndcdn.com"},
+            "media.sndcdn.com": {"cf-media.sndcdn.com"},
+            "i1.sndcdn.com": {"i2.sndcdn.com", "i3.sndcdn.com", "i4.sndcdn.com"},
+            "lh3.googleusercontent.com": {"lh4.googleusercontent.com", "lh5.googleusercontent.com", "lh6.googleusercontent.com"},
+        })
+
+    # ---------------------------- init ---------------------------- #
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
-        self.logger = logger or DEBUG_LOGGER
-        self._log("[NetworkSniffer] NetworkSniffer initialized (advanced)", None)
 
-        self.cfg.video_stream_hints.add("cf-hls-media.sndcdn.com")
-        self.cfg.audio_stream_hints.add(".m3u8")
-
-    # ------------------------------ logging helper ------------------------------ #
-
-    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+        # tolerate missing DEBUG_LOGGER global
         try:
-            if log_list is not None:
-                log_list.append(msg)
-            if self.logger is not None:
-                self.logger.log_message(msg)
+            fallback = getattr(__builtins__, "DEBUG_LOGGER", None)  # rarely present; harmless
+            _ = fallback
         except Exception:
             pass
 
-    # ------------------------------ helpers ------------------------------ #
+        if logger is not None:
+            self.logger = logger
+        else:
+            # use DEBUG_LOGGER if caller environment has it, else fallback
+            self.logger = globals().get("DEBUG_LOGGER", None) or self._FallbackLogger()
 
-    def _extract_urls_from_text(self, s: str) -> List[str]:
+        self._log("[NetworkSniffer] Initialized (evidence + salvage) [hard str-safe]", None)
+
+        # SoundCloud nudges (optional)
+        try:
+            self.cfg.video_stream_hints.add("cf-hls-media.sndcdn.com")
+            self.cfg.audio_stream_hints.add(".m3u8")
+        except Exception:
+            pass
+
+    # ---------------------------- logging ---------------------------- #
+    def _log(self, msg: Any, log_list: Optional[List[str]]) -> None:
+        s = self._to_str(msg)
+        try:
+            if log_list is not None:
+                log_list.append(s)
+            if self.logger is not None:
+                self.logger.log_message(s)
+        except Exception:
+            pass
+
+    # ---------------------------- helpers ---------------------------- #
+    def _extract_urls_from_text(self, s: Any) -> List[str]:
+        s = self._to_str(s)
         if not s:
             return []
-        rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+        rx = self.re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", self.re.IGNORECASE)
         out: List[str] = []
         seen: Set[str] = set()
         for u in rx.findall(s):
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
+            uu = self._to_str(u)
+            if uu and uu not in seen:
+                seen.add(uu)
+                out.append(uu)
         return out
 
-    def _host_allowed(self, url: str) -> bool:
+    def _host_allowed(self, url: Any) -> bool:
         try:
-            p = urlparse(url)
-            host = (p.netloc or "").lower()
+            p = self._safe_urlparse(url)
+            host = self._to_str(p.netloc).lower()
         except Exception:
             return True
 
         if self.cfg.enable_host_denylist and self.cfg.host_deny_substrings:
-            if any(x.lower() in host for x in self.cfg.host_deny_substrings):
+            if any(self._to_str(x).lower() in host for x in self.cfg.host_deny_substrings):
                 return False
 
         if self.cfg.enable_host_allowlist and self.cfg.host_allow_substrings:
-            return any(x.lower() in host for x in self.cfg.host_allow_substrings)
+            return any(self._to_str(x).lower() in host for x in self.cfg.host_allow_substrings)
 
         return True
 
@@ -353,25 +506,17 @@ class NetworkSniffer:
     def _should_sniff_json(self, url_lower: str, ctype: str, content_length: Optional[int]) -> bool:
         if not self.cfg.enable_json_sniff:
             return False
-
         ct = (ctype or "").lower()
-        # allow "json-ish" content-types + common metadata endpoints
         if not (any(jt in ct for jt in self.cfg.json_content_types) or "/metadata/" in url_lower):
             return False
-
         if not any(h in url_lower for h in self.cfg.json_url_hints):
             return False
-
         if content_length is None:
             return False
-
-        max_bytes = int(self.cfg.json_body_max_kb) * 1024
-        if content_length > max_bytes:
+        if content_length > int(self.cfg.json_body_max_kb) * 1024:
             return False
-
         if not self._matches_json_pattern(url_lower):
             return False
-
         return True
 
     def _looks_like_graphql_endpoint(self, url_lower: str) -> bool:
@@ -380,8 +525,8 @@ class NetworkSniffer:
     def _is_allowed_by_extensions(self, url: str, extensions: Optional[Set[str]], kind: Optional[str]) -> bool:
         if not extensions:
             return True
-        parsed = urlparse(url)
-        path = (parsed.path or "").lower()
+        parsed = self._safe_urlparse(url)
+        path = self._to_str(parsed.path).lower()
         if any(path.endswith(ext.lower()) for ext in extensions):
             return True
         if self.cfg.accept_unknown_streams and kind in ("video", "audio"):
@@ -389,7 +534,7 @@ class NetworkSniffer:
         return False
 
     def _is_manifest(self, url: str, ctype: str) -> Optional[str]:
-        ul = url.lower()
+        ul = (url or "").lower()
         ct = (ctype or "").lower()
         if ul.endswith(".m3u8") or ct in self.cfg.hls_types:
             return "hls"
@@ -398,27 +543,19 @@ class NetworkSniffer:
         return None
 
     def _looks_like_segment(self, url_lower: str, ctype: str, content_length: Optional[int], headers: Dict[str, str]) -> Optional[str]:
-        """
-        Best-effort segment classification for streams with no extensions.
-        Returns "video"/"audio"/None.
-        """
         if not self.cfg.enable_segment_heuristics:
             return None
 
         ct = (ctype or "").lower()
-        # obvious types win
         k = self._classify_by_content_type(ct)
         if k in ("video", "audio"):
             return k
 
-        # range requests often used for mp4 fragments
         if self.cfg.accept_range_requests_as_media:
-            # response headers can include content-range; request includes range
             cr = (headers.get("content-range") or "").lower()
             if cr.startswith("bytes "):
-                return "video"  # conservative default
+                return "video"
 
-        # size sanity
         if content_length is None:
             return None
         if content_length < int(self.cfg.min_segment_bytes):
@@ -426,69 +563,65 @@ class NetworkSniffer:
         if content_length > int(self.cfg.max_segment_bytes) and not any(x in url_lower for x in (".m3u8", ".mpd")):
             return None
 
-        # url hints / typical segment naming
         if any(h in url_lower for h in ("seg", "segment", "chunk", "frag", "m4s", "/range/", "bytestream")):
             return "video"
 
         return None
 
-    # ------------------ manifest parsing (stronger) ------------------ #
-
+    # ------------------ manifest parsing ------------------ #
     _HLS_LINE_RE = re.compile(r"^(?!#)(.+)$", re.MULTILINE)
 
-    def _parse_hls_manifest(self, manifest_text: str, base_url: str) -> List[str]:
+    def _parse_hls_manifest(self, manifest_text: Any, base_url: str) -> List[str]:
+        txt = self._to_str(manifest_text)
         out: List[str] = []
         seen: Set[str] = set()
-
-        for m in self._HLS_LINE_RE.finditer(manifest_text or ""):
+        for m in self._HLS_LINE_RE.finditer(txt or ""):
             line = (m.group(1) or "").strip()
             if not line:
                 continue
-            # allow relative or absolute
-            u = _canonicalize_url(urljoin(base_url, line))
-            if u and u not in seen:
-                seen.add(u)
-                out.append(u)
-
+            full = self._canonicalize_url(self._safe_urljoin(base_url, line))
+            if full and full not in seen:
+                seen.add(full)
+                out.append(full)
         return out
 
-    def _parse_mpd_manifest(self, manifest_text: str, base_url: str) -> List[str]:
+    def _parse_mpd_manifest(self, manifest_text: Any, base_url: str) -> List[str]:
+        txt = self._to_str(manifest_text)
         out: List[str] = []
         seen: Set[str] = set()
 
-        # namespace-safe XML parse
-        try:
-            root = ET.fromstring(manifest_text)
-            for el in root.iter():
-                for attr_name in ("media", "initialization", "sourceURL", "href"):
-                    u = el.attrib.get(attr_name)
-                    if not u:
-                        continue
-                    full = _canonicalize_url(urljoin(base_url, u.strip()))
-                    if full and full not in seen:
-                        seen.add(full)
-                        out.append(full)
-        except Exception:
-            pass
+        if self.ET is not None:
+            try:
+                root = self.ET.fromstring(txt)
+                for el in root.iter():
+                    for attr_name in ("media", "initialization", "sourceURL", "href"):
+                        u = el.attrib.get(attr_name)
+                        if not u:
+                            continue
+                        full = self._canonicalize_url(self._safe_urljoin(base_url, self._to_str(u).strip()))
+                        if full and full not in seen:
+                            seen.add(full)
+                            out.append(full)
+            except Exception:
+                pass
 
-        # fallback regex
         if not out:
-            rx = re.compile(r'(?:media|initialization|sourceURL|href)\s*=\s*["\']([^"\']+)["\']', re.I)
-            for m in rx.finditer(manifest_text or ""):
+            rx = self.re.compile(r'(?:media|initialization|sourceURL|href)\s*=\s*["\']([^"\']+)["\']', self.re.I)
+            for m in rx.finditer(txt or ""):
                 u = (m.group(1) or "").strip()
                 if not u:
                     continue
-                full = _canonicalize_url(urljoin(base_url, u))
+                full = self._canonicalize_url(self._safe_urljoin(base_url, u))
                 if full and full not in seen:
                     seen.add(full)
                     out.append(full)
 
         return out
 
-    async def _expand_manifest(self, response: Response, manifest_kind: str, url: str, log: Optional[List[str]]) -> List[str]:
+    async def _expand_manifest(self, response, manifest_kind: str, url: str, log: Optional[List[str]]) -> List[str]:
         try:
-            # Playwright doesn't expose a "max bytes" read directly; this is best-effort
             txt = await response.text()
+            txt = self._to_str(txt)
             if txt and len(txt) > int(self.cfg.max_manifest_bytes):
                 txt = txt[: int(self.cfg.max_manifest_bytes)]
         except Exception as e:
@@ -499,15 +632,13 @@ class NetworkSniffer:
         self._log(f"[NetworkSniffer] Expanded {manifest_kind} manifest: {url} -> {len(derived)} derived", log)
         return derived
 
-    # ------------------ auto-scroll implementation ------------------ #
-
-    async def _auto_scroll(self, page: "Page", tmo: float, log: Optional[List[str]]) -> None:
+    # ------------------ auto-scroll ------------------ #
+    async def _auto_scroll(self, page, tmo: float, log: Optional[List[str]]) -> None:
         if not self.cfg.enable_auto_scroll:
             return
         try:
             max_steps = max(1, int(self.cfg.max_scroll_steps))
             step_delay = max(50, int(self.cfg.scroll_step_delay_ms))
-
             max_total_ms = int(tmo * 1000 * 0.8)
             used_ms = 0
 
@@ -532,52 +663,269 @@ class NetworkSniffer:
                 last_height = new_height
 
             if self.cfg.scroll_back_to_top:
-                try:
-                    await page.evaluate("() => window.scrollTo(0, 0);")
-                    self._log("[NetworkSniffer] Auto-scroll: scrolled back to top.", log)
-                except Exception as e:
-                    self._log(f"[NetworkSniffer] Auto-scroll: failed to scroll back to top: {e}", log)
+                await page.evaluate("() => window.scrollTo(0, 0);")
+                self._log("[NetworkSniffer] Auto-scroll: scrolled back to top.", log)
 
         except Exception as e:
             self._log(f"[NetworkSniffer] Auto-scroll error: {e}", log)
 
     # ------------------ output normalization ------------------ #
-
     def _normalize_item(self, it: Dict[str, Any]) -> Dict[str, str]:
         return {
-            "url": str(it.get("url") or ""),
-            "text": str(it.get("text") or ""),
-            "tag": str(it.get("tag") or "network_sniff"),
-            "kind": str(it.get("kind") or "unknown"),
-            "content_type": str(it.get("content_type") or "?"),
-            "size": str(it.get("size") or "?"),
+            "url": self._to_str(it.get("url")),
+            "text": self._to_str(it.get("text")),
+            "tag": self._to_str(it.get("tag") or "network_sniff"),
+            "kind": self._to_str(it.get("kind") or "unknown"),
+            "content_type": self._to_str(it.get("content_type") or "?"),
+            "size": self._to_str(it.get("size") or "?"),
         }
 
-    # ------------------------------ public ------------------------------ #
+    # ============================== URL salvage ============================== #
+    def _has_signaturey_params(self, url: str) -> bool:
+        try:
+            p = self._safe_urlparse(url)
+            q = self._to_str(p.query).lower()
+            if not q:
+                return False
+            return any(sub in q for sub in self.cfg.salvage_strip_query_keys_substrings)
+        except Exception:
+            return False
 
+    def _is_mediaish_url(self, url: str) -> bool:
+        try:
+            u = self._to_str(url)
+            ul = u.lower()
+            p = self._safe_urlparse(u)
+            path = self._to_str(p.path).lower()
+            if self._classify_by_extension(path):
+                return True
+            if any(h in ul for h in self.cfg.video_stream_hints) or any(h in ul for h in self.cfg.audio_stream_hints):
+                return True
+            if any(x in ul for x in ("seg", "segment", "chunk", "frag", "m4s", "bytestream", "videoplayback", "hls", "dash")):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _strip_signature_params_variant(self, url: str) -> Optional[str]:
+        try:
+            p = self._safe_urlparse(url)
+            if not p.query:
+                return None
+            kept: List[Tuple[str, str]] = []
+            for k, v in self._safe_parse_qsl(p.query):
+                kl = self._to_str(k).lower()
+                if any(sub in kl for sub in self.cfg.salvage_strip_query_keys_substrings):
+                    continue
+                kept.append((self._to_str(k), self._to_str(v)))
+            new_q = self._safe_urlencode(kept)
+            return self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, ""))
+        except Exception:
+            return None
+
+    def _path_only_variant(self, url: str) -> Optional[str]:
+        try:
+            p = self._safe_urlparse(url)
+            if not p.scheme or not p.netloc:
+                return None
+            return self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
+        except Exception:
+            return None
+
+    def _origin_swap_variants(self, url: str) -> List[str]:
+        out: List[str] = []
+        try:
+            p = self._safe_urlparse(url)
+            host = self._to_str(p.netloc).lower()
+            alts = self.cfg.salvage_origin_swaps.get(host) or set()
+            for ah in alts:
+                ahs = self._to_str(ah).strip()
+                if not ahs:
+                    continue
+                out.append(self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)))
+        except Exception:
+            pass
+        return out
+
+    async def _probe_url(self, api_ctx, url: str, req_headers: Dict[str, str], *, timeout_ms: int) -> Dict[str, Any]:
+        """
+        Best-effort probe:
+          1) HEAD (if supported)
+          2) Range GET small bytes
+        """
+        url = self._to_str(url)
+        result = {
+            "url": url,
+            "ok": False,
+            "status": None,
+            "final_url": url,
+            "content_type": None,
+            "content_length": None,
+            "hash_prefix_sha256": None,
+            "method": None,
+            "error": "",
+        }
+        if api_ctx is None:
+            result["error"] = "no_api_request_context"
+            return result
+
+        h = {self._to_str(k): self._to_str(v) for k, v in (req_headers or {}).items() if k and v}
+
+        try:
+            resp = await api_ctx.head(url, headers=h, timeout=timeout_ms)
+            result["method"] = "HEAD"
+            result["status"] = getattr(resp, "status", None)
+            result["final_url"] = self._to_str(getattr(resp, "url", None) or url)
+            rh = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp, "headers", None) or {}).items()}
+            result["content_type"] = rh.get("content-type")
+            result["content_length"] = rh.get("content-length")
+            if result["status"] in (200, 206):
+                ct = (result["content_type"] or "").lower()
+                if ct.startswith(("video/", "audio/", "image/")) or ("mpegurl" in ct) or ("dash" in ct):
+                    result["ok"] = True
+        except Exception as e:
+            result["error"] = f"head_failed:{e}"
+
+        try:
+            h2 = dict(h)
+            if "range" not in {k.lower() for k in h2.keys()}:
+                h2["Range"] = f"bytes=0-{max(0, int(self.cfg.salvage_range_bytes) - 1)}"
+            resp2 = await api_ctx.get(url, headers=h2, timeout=timeout_ms)
+            result["method"] = (result["method"] + "+GET") if result["method"] else "GET"
+            st = getattr(resp2, "status", None)
+            result["status"] = st if st is not None else result["status"]
+            result["final_url"] = self._to_str(getattr(resp2, "url", None) or result["final_url"])
+            rh2 = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp2, "headers", None) or {}).items()}
+            result["content_type"] = result["content_type"] or rh2.get("content-type")
+            result["content_length"] = result["content_length"] or rh2.get("content-length")
+
+            b = None
+            try:
+                b = await resp2.body()
+            except Exception:
+                b = None
+            if b:
+                result["hash_prefix_sha256"] = self.hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
+
+            if result["status"] in (200, 206):
+                result["ok"] = True
+        except Exception as e:
+            result["error"] = (result["error"] + "|") if result["error"] else ""
+            result["error"] += f"get_failed:{e}"
+
+        return result
+
+    async def _salvage_one(self, api_ctx, observed_url: str, req_headers_subset: Dict[str, str], *, log: Optional[List[str]]) -> Dict[str, Any]:
+        observed = self._canonicalize_url(observed_url)
+        if not observed:
+            return {"observed_url": self._to_str(observed_url), "variants": [], "ok_variants": []}
+
+        variants: List[Tuple[str, str]] = []
+
+        if self._has_signaturey_params(observed):
+            v = self._strip_signature_params_variant(observed)
+            if v and v != observed:
+                variants.append((v, "token_stripped"))
+
+        v2 = self._path_only_variant(observed)
+        if v2 and v2 != observed:
+            variants.append((v2, "path_only"))
+
+        for u0 in [observed] + [u for (u, _) in variants]:
+            for su in self._origin_swap_variants(u0):
+                if su and su != observed:
+                    variants.append((su, "origin_swap"))
+
+        seen: Set[str] = {observed}
+        uniq: List[Tuple[str, str]] = []
+        for u, k in variants:
+            cu = self._canonicalize_url(u)
+            if not cu or cu in seen:
+                continue
+            seen.add(cu)
+            uniq.append((cu, k))
+            if len(uniq) >= int(self.cfg.max_variants_per_url):
+                break
+
+        out_variants: List[Dict[str, Any]] = []
+        ok_variants: List[Dict[str, Any]] = []
+        tmo = int(self.cfg.salvage_probe_timeout_ms)
+
+        for (u, kind) in uniq:
+            if not self._host_allowed(u):
+                continue
+            pr = await self._probe_url(api_ctx, u, req_headers_subset, timeout_ms=tmo)
+            pr["variant_kind"] = kind
+            out_variants.append(pr)
+            if pr.get("ok"):
+                ok_variants.append(pr)
+                self._log(f"[NetworkSniffer] Salvage OK: {observed} -> {u} ({pr.get('status')})", log)
+            else:
+                if self.cfg.salvage_record_non_200:
+                    self._log(f"[NetworkSniffer] Salvage miss: {observed} -> {u} ({pr.get('status')})", log)
+
+        return {"observed_url": observed, "variants": out_variants, "ok_variants": ok_variants}
+
+    # ============================== forensics ============================== #
+    def _pick_headers_subset(self, headers_lc: Dict[str, str], allow: Set[str]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        for k in (allow or set()):
+            kk = self._to_str(k).lower()
+            v = headers_lc.get(kk)
+            if v:
+                out[kk] = self._to_str(v)
+        return out
+
+    def _hash_post_data(self, post_data: Any, max_bytes: int = 4096) -> Dict[str, Any]:
+        try:
+            if post_data is None:
+                return {"size": 0, "sha256": None}
+            b = None
+            if isinstance(post_data, str):
+                b = post_data.encode("utf-8", "ignore")
+            elif isinstance(post_data, (bytes, bytearray, memoryview)):
+                b = bytes(post_data)
+            else:
+                b = self._to_str(post_data).encode("utf-8", "ignore")
+            return {"size": len(b), "sha256": self.hashlib.sha256(b[:max_bytes]).hexdigest()}
+        except Exception:
+            return {"size": None, "sha256": None}
+
+    async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *, timeout_ms: int, prefix_bytes: int) -> Optional[str]:
+        if api_ctx is None:
+            return None
+        try:
+            h = {self._to_str(k): self._to_str(v) for k, v in (req_headers_subset or {}).items() if k and v}
+            h2 = dict(h)
+            h2["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
+            resp = await api_ctx.get(self._to_str(url), headers=h2, timeout=timeout_ms)
+            b = await resp.body()
+            if not b:
+                return None
+            return self.hashlib.sha256(b[:prefix_bytes]).hexdigest()
+        except Exception:
+            return None
+
+    # ============================== sniff ============================== #
     async def sniff(
         self,
-        context: BrowserContext,
+        context,
         page_url: str,
         *,
         timeout: Optional[float] = None,
         log: Optional[List[str]] = None,
         extensions: Optional[Set[str]] = None,
-    ) -> Tuple[str, List[Dict[str, str]], List[Dict[str, Any]]]:
-
+    ):
         if context is None:
             self._log("[NetworkSniffer] No Playwright context; skipping sniff.", log)
             return "", [], []
-        if Page is None:
-            self._log("[NetworkSniffer] Playwright classes not found; skipping sniff.", log)
-            return "", [], []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
-        canonical_page_url = _canonicalize_url(page_url)
+        canonical_page_url = self._canonicalize_url(page_url)
 
         found_items: List[Dict[str, Any]] = []
-        json_hits: List[Dict[str, Any]] = []
         derived_items: List[Dict[str, Any]] = []
+        json_hits: List[Dict[str, Any]] = []
 
         seen_network: Set[str] = set()
         seen_derived: Set[str] = set()
@@ -585,315 +933,374 @@ class NetworkSniffer:
         blob_placeholders: List[Dict[str, Any]] = []
         req_types: Dict[str, str] = {}
 
-        # NEW: redirect tracking
+        request_evidence: Dict[str, Dict[str, Any]] = {}
         redirect_events: List[Dict[str, Any]] = []
         seen_redirect: Set[str] = set()
 
+        forensics: List[Dict[str, Any]] = []
+        seen_forensics: Set[str] = set()
+
+        salvage_targets: List[str] = []
+        salvage_seen: Set[str] = set()
+        salvage_bundles: List[Dict[str, Any]] = []
+
         html: str = ""
 
-        page: Page = await context.new_page()
+        page = await context.new_page()
         wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
 
+        api_ctx = None
         try:
-            max_items = int(self.cfg.max_items)
-            max_json = int(self.cfg.max_json_hits)
-            max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
-            max_manifests = int(self.cfg.max_manifests_to_expand)
+            api_ctx = getattr(context, "request", None) or getattr(page, "request", None)
+        except Exception:
+            api_ctx = None
 
-            manifests_to_expand: List[Tuple[Response, str, str]] = []
+        max_items = int(self.cfg.max_items)
+        max_json = int(self.cfg.max_json_hits)
+        max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
+        max_manifests = int(self.cfg.max_manifests_to_expand)
 
-            self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
+        manifests_to_expand: List[Tuple[Any, str, str]] = []
 
-            # -------- request handler (GraphQL + redirect chain) -------- #
+        self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
 
-            def handle_request(req: Request):
-                try:
-                    req_types[req.url] = req.resource_type
-                except Exception:
-                    pass
+        # ---------------- request handler ---------------- #
+        def handle_request(req):
+            try:
+                rurl = self._to_str(getattr(req, "url", None))
+                req_types[rurl] = self._to_str(getattr(req, "resource_type", None))
+            except Exception:
+                pass
 
-                # Redirect chain (request-side): capture redirected_from pointers
-                try:
-                    if self.cfg.enable_redirect_tracking:
-                        prev = getattr(req, "redirected_from", None)
-                        if prev:
-                            # best-effort: prev may be Request
-                            prev_url = getattr(prev, "url", None) or ""
-                            cur_url = req.url or ""
-                            key = f"{prev_url} -> {cur_url}"
-                            if prev_url and cur_url and key not in seen_redirect:
-                                seen_redirect.add(key)
-                                redirect_events.append({"from": prev_url, "to": cur_url})
-                except Exception:
-                    pass
+            # request-side redirect chain
+            try:
+                if self.cfg.enable_redirect_tracking:
+                    prev = getattr(req, "redirected_from", None)
+                    if prev:
+                        prev_url = self._to_str(getattr(prev, "url", None))
+                        cur_url = self._to_str(getattr(req, "url", None))
+                        key = f"{prev_url} -> {cur_url}"
+                        if prev_url and cur_url and key not in seen_redirect:
+                            seen_redirect.add(key)
+                            redirect_events.append({"from": prev_url, "to": cur_url})
+            except Exception:
+                pass
 
-                # GraphQL sniff: POST to /graphql with small JSON body
-                try:
-                    if (self.cfg.enable_graphql_sniff and req.method and req.method.upper() == "POST"):
-                        url_lower = (req.url or "").lower()
-                        if self._looks_like_graphql_endpoint(url_lower):
-                            body = req.post_data or ""
-                            if isinstance(body, bytes):
-                                body = body.decode("utf-8", "ignore")
-                            if not body:
-                                return
-                            max_bytes = int(self.cfg.graphql_max_body_kb) * 1024
-                            if len(body) > max_bytes:
-                                return
+            # request evidence
+            try:
+                if self.cfg.enable_forensics:
+                    url = self._to_str(getattr(req, "url", None))
+                    if url and url not in request_evidence:
+                        try:
+                            rh_raw = getattr(req, "headers", None) or {}
+                            rh_lc = {self._to_str(k).lower(): self._to_str(v) for k, v in rh_raw.items()}
+                        except Exception:
+                            rh_lc = {}
+                        req_hdr_subset = self._pick_headers_subset(rh_lc, self.cfg.forensics_include_request_headers_subset)
 
-                            try:
-                                gql_payload = json.loads(body)
-                            except Exception:
-                                return
+                        post_data = getattr(req, "post_data", None)
+                        post_hash = self._hash_post_data(post_data, max_bytes=4096)
 
-                            payloads = gql_payload if isinstance(gql_payload, list) else [gql_payload]
-                            for pay in payloads:
-                                if not isinstance(pay, dict):
-                                    continue
-                                op_name = pay.get("operationName")
-                                vars_obj = pay.get("variables")
-                                query = pay.get("query") or ""
-                                is_introspection = (
-                                    isinstance(query, str) and ("__schema" in query or "__type" in query)
-                                )
-                                var_keys = list(vars_obj.keys()) if isinstance(vars_obj, dict) else None
+                        frame_url = None
+                        try:
+                            fr = getattr(req, "frame", None)
+                            if fr is not None:
+                                frame_url = self._to_str(getattr(fr, "url", None))
+                        except Exception:
+                            frame_url = None
 
-                                if len(json_hits) >= max_json:
-                                    break
+                        request_evidence[url] = {
+                            "method": self._to_str(getattr(req, "method", None)),
+                            "resource_type": self._to_str(getattr(req, "resource_type", None)),
+                            "frame_url": frame_url,
+                            "headers_subset": req_hdr_subset,
+                            "post_data_hash": post_hash,
+                        }
+            except Exception:
+                pass
 
-                                json_hits.append({
-                                    "url": req.url,
-                                    "json": {
-                                        "graphql": True,
-                                        "operationName": op_name,
-                                        "variable_keys": var_keys,
-                                        "is_introspection": is_introspection,
-                                        "query_preview": query[:2048] if isinstance(query, str) else None,
-                                    },
-                                    "source_page": canonical_page_url,
-                                })
-                                self._log(
-                                    f"[NetworkSniffer] GraphQL request captured: {req.url} op={op_name} introspection={is_introspection}",
-                                    log,
-                                )
-                except Exception as e:
-                    self._log(f"[NetworkSniffer] handle_request GraphQL sniff error: {e}", log)
+            # GraphQL sniff
+            try:
+                if self.cfg.enable_graphql_sniff and self._to_str(getattr(req, "method", "")).upper() == "POST":
+                    url_lower = self._to_str(getattr(req, "url", None)).lower()
+                    if self._looks_like_graphql_endpoint(url_lower):
+                        body = self._to_str(getattr(req, "post_data", None) or "")
+                        if not body:
+                            return
+                        if len(body) > int(self.cfg.graphql_max_body_kb) * 1024:
+                            return
 
-            page.on("request", handle_request)
+                        try:
+                            gql_payload = self.json.loads(body)
+                        except Exception:
+                            return
 
-            # -------- header mining helper -------- #
+                        payloads = gql_payload if isinstance(gql_payload, list) else [gql_payload]
+                        for pay in payloads:
+                            if not isinstance(pay, dict):
+                                continue
+                            op_name = pay.get("operationName")
+                            vars_obj = pay.get("variables")
+                            query = pay.get("query") or ""
+                            is_introspection = isinstance(query, str) and ("__schema" in query or "__type" in query)
+                            var_keys = list(vars_obj.keys()) if isinstance(vars_obj, dict) else None
 
-            def mine_headers(url: str, headers: Dict[str, str]):
-                if not self.cfg.enable_header_url_mining:
-                    return
-                if len(json_hits) >= max_json:
-                    return
-                # limited budget (separate from max_json, but we store into json_hits)
-                cap = int(self.cfg.max_header_url_events)
-                if cap <= 0:
-                    return
-
-                try:
-                    for k in (self.cfg.header_url_keys or set()):
-                        v = headers.get(k)
-                        if not v:
-                            continue
-                        for u in self._extract_urls_from_text(v)[:50]:
                             if len(json_hits) >= max_json:
-                                return
+                                break
+
                             json_hits.append({
-                                "url": url,
-                                "json": {"header_url": u, "header_key": k},
+                                "url": self._to_str(getattr(req, "url", None)),
+                                "json": {
+                                    "graphql": True,
+                                    "operationName": op_name,
+                                    "variable_keys": var_keys,
+                                    "is_introspection": is_introspection,
+                                    "query_preview": query[:2048] if isinstance(query, str) else None,
+                                },
                                 "source_page": canonical_page_url,
                             })
+            except Exception as e:
+                self._log(f"[NetworkSniffer] handle_request GraphQL sniff error: {e}", log)
+
+        page.on("request", handle_request)
+
+        # ---------------- header mining ---------------- #
+        def mine_headers(url: str, headers_lc: Dict[str, str]):
+            if not self.cfg.enable_header_url_mining:
+                return
+            if len(json_hits) >= max_json:
+                return
+            if int(self.cfg.max_header_url_events) <= 0:
+                return
+            try:
+                for k in (self.cfg.header_url_keys or set()):
+                    kk = self._to_str(k).lower()
+                    v = headers_lc.get(kk)
+                    if not v:
+                        continue
+                    for u in self._extract_urls_from_text(v)[:50]:
+                        if len(json_hits) >= max_json:
+                            return
+                        json_hits.append({
+                            "url": url,
+                            "json": {"header_url": u, "header_key": kk},
+                            "source_page": canonical_page_url,
+                        })
+            except Exception:
+                pass
+
+        async def handle_json(resp, url: str):
+            if len(json_hits) >= max_json:
+                return
+            try:
+                data = await resp.json()
+                json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
+            except Exception as e:
+                self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
+
+        # ---------------- response handler ---------------- #
+        def handle_response(response):
+            try:
+                raw_url = self._to_str(getattr(response, "url", None))
+                canonical_url = self._canonicalize_url(raw_url)
+
+                if not canonical_url or canonical_url in seen_network:
+                    return
+                if not self._host_allowed(canonical_url):
+                    return
+
+                is_blob = canonical_url.startswith("blob:")
+                resource_type = self._to_str(req_types.get(raw_url, ""))
+
+                if not is_blob:
+                    p = self._safe_urlparse(canonical_url)
+                    path = self._to_str(p.path or "/").lower()
+                    netloc = self._to_str(p.netloc or "")
+                    if self._is_junk_by_extension(path):
+                        return
+                    if self._looks_like_ad(netloc, path):
+                        return
+
+                seen_network.add(canonical_url)
+
+                # normalize headers to {lower:str -> str}
+                try:
+                    hdr_raw = getattr(response, "headers", None) or {}
+                    headers = {self._to_str(k).lower(): self._to_str(v) for (k, v) in hdr_raw.items()}
+                except Exception:
+                    headers = {}
+
+                ctype = (headers.get("content-type") or "").lower()
+                url_lower = canonical_url.lower()
+
+                # header URL mining
+                mine_headers(canonical_url, headers)
+
+                # response redirect info
+                try:
+                    if self.cfg.enable_redirect_tracking:
+                        loc = self._to_str(headers.get("location"))
+                        if loc:
+                            key = f"{canonical_url} -> {loc}"
+                            if key not in seen_redirect and len(redirect_events) < int(self.cfg.max_redirect_events):
+                                seen_redirect.add(key)
+                                redirect_events.append({"from": canonical_url, "to": loc, "status": getattr(response, "status", None)})
                 except Exception:
                     pass
 
-            # -------- JSON response helper (existing) -------- #
+                # content-length parse
+                cl_header = self._to_str(headers.get("content-length") or "")
+                content_length: Optional[int] = None
+                try:
+                    if cl_header.isdigit():
+                        content_length = int(cl_header)
+                except Exception:
+                    content_length = None
 
-            async def handle_json(resp: Response, url: str):
-                if len(json_hits) >= max_json:
+                if (not is_blob) and ctype and self._deny_by_content_type(ctype):
                     return
-                try:
-                    data = await resp.json()
-                    json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
-                except Exception as e:
-                    self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
+                if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
+                    return
 
-            # -------- response handler (advanced) -------- #
+                # SAFE JSON sniff
+                if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
+                    self.asyncio.create_task(handle_json(response, canonical_url))
+                    return
 
-            def handle_response(response: Response):
-                try:
-                    url = response.url
-                    canonical_url = _canonicalize_url(url)
-
-                    if not canonical_url or canonical_url in seen_network:
-                        return
-                    if not self._host_allowed(canonical_url):
-                        return
-
-                    is_blob = canonical_url.startswith("blob:")
-                    resource_type = req_types.get(url, "")
-
-                    if not is_blob:
-                        parsed = urlparse(canonical_url)
-                        path = (parsed.path or "/").lower()
-                        netloc = parsed.netloc or ""
-                        url_lower = canonical_url.lower()
-
-                        if self._is_junk_by_extension(path):
-                            self._log(f"[NetworkSniffer] Skipped junk ext: {canonical_url}", log)
-                            return
-                        if self._looks_like_ad(netloc, path):
-                            self._log(f"[NetworkSniffer] Skipped ad: {canonical_url}", log)
-                            return
-
-                    seen_network.add(canonical_url)
-
-                    headers = {k.lower(): v for (k, v) in (response.headers or {}).items()}
-                    ctype = (headers.get("content-type") or "").lower()
-                    url_lower = canonical_url.lower()
-
-                    # NEW: mine headers for URLs
-                    mine_headers(canonical_url, headers)
-
-                    # response redirect info
-                    try:
-                        if self.cfg.enable_redirect_tracking:
-                            loc = headers.get("location")
-                            if loc:
-                                key = f"{canonical_url} -> {loc}"
-                                if key not in seen_redirect and len(redirect_events) < int(self.cfg.max_redirect_events):
-                                    seen_redirect.add(key)
-                                    redirect_events.append({"from": canonical_url, "to": loc, "status": response.status})
-                    except Exception:
-                        pass
-
-                    cl_header = headers.get("content-length") or ""
-                    content_length: Optional[int] = None
-                    try:
-                        if cl_header and cl_header.isdigit():
-                            content_length = int(cl_header)
-                    except Exception:
-                        content_length = None
-
-                    if (not is_blob) and ctype and self._deny_by_content_type(ctype):
-                        self._log(f"[NetworkSniffer] Skipped denied ctype: {canonical_url} ({ctype})", log)
-                        return
-                    if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
-                        self._log(f"[NetworkSniffer] Skipped denied rtype: {canonical_url} ({resource_type})", log)
-                        return
-
-                    # ---- SAFE JSON sniff (response-side) ----
-                    if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
-                        asyncio.create_task(handle_json(response, canonical_url))
-                        return
-
-                    # ---- Blob media handling ----
-                    if is_blob:
-                        if resource_type == "media":
-                            blob_placeholders.append({
+                # blob media placeholder
+                if is_blob:
+                    if resource_type == "media":
+                        blob_placeholders.append({
+                            "url": canonical_url,
+                            "text": "[Network Video Blob]",
+                            "tag": "network_sniff",
+                            "kind": "video",
+                            "content_type": ctype or "?",
+                            "size": headers.get("content-length", "?"),
+                        })
+                        if len(json_hits) < max_json:
+                            json_hits.append({
                                 "url": canonical_url,
-                                "text": "[Network Video Blob]",
-                                "tag": "network_sniff",
-                                "kind": "video",
-                                "content_type": ctype or "?",
-                                "size": headers.get("content-length", "?"),
+                                "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
+                                "source_page": canonical_page_url
                             })
-                            if len(json_hits) < max_json:
-                                json_hits.append({
-                                    "url": canonical_url,
-                                    "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
-                                    "source_page": canonical_page_url
-                                })
-                            self._log(f"[NetworkSniffer] Detected blob media: {canonical_url}", log)
-                        return
-
-                    parsed = urlparse(canonical_url)
-                    path = (parsed.path or "/").lower()
-
-                    kind = (
-                        self._classify_by_extension(path)
-                        or (self._classify_by_content_type(ctype) if ctype else None)
-                        or self._classify_by_stream_hint(url_lower)
-                    )
-
-                    # NEW: segment heuristics if still unknown
-                    if not kind:
-                        seg_kind = self._looks_like_segment(url_lower, ctype, content_length, headers)
-                        if seg_kind:
-                            kind = seg_kind
-
-                    if not kind:
-                        self._log(f"[NetworkSniffer] Skipped unknown kind: {canonical_url}", log)
-                        return
-
-                    if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
-                        self._log(f"[NetworkSniffer] Skipped by extensions: {canonical_url} (kind={kind})", log)
-                        return
-
-                    # manifest detection/prioritization
-                    mkind = self._is_manifest(canonical_url, ctype)
-                    if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
-                        if self.cfg.prefer_master_manifests:
-                            # prioritize likely master playlists (rough heuristic)
-                            score = 0
-                            ul = canonical_url.lower()
-                            if "master" in ul:
-                                score += 3
-                            if "chunklist" in ul:
-                                score -= 1
-                            manifests_to_expand.append((response, mkind, canonical_url))
-                            manifests_to_expand.sort(key=lambda t: (0 if "master" in t[2].lower() else 1))
-                        else:
-                            manifests_to_expand.append((response, mkind, canonical_url))
-
-                        self._log(f"[NetworkSniffer] Identified manifest: {canonical_url} (kind={mkind})", log)
-
-                    if len(found_items) >= max_items:
-                        return
-
-                    # NEW: Content-Disposition filename hint
-                    cd = headers.get("content-disposition") or ""
-                    filename = None
-                    if cd:
-                        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, re.I)
-                        if m:
-                            filename = m.group(1)
-
-                    item: Dict[str, Any] = {
-                        "url": canonical_url,
-                        "text": f"[Network {kind.capitalize()}]",
-                        "tag": "network_sniff",
-                        "kind": kind,
-                        "content_type": ctype or "?",
-                        "size": headers.get("content-length", "?"),
-                    }
-                    if filename:
-                        item["text"] = f"[Network {kind.capitalize()}] {filename}"
-
-                    found_items.append(item)
-                    self._log(f"[NetworkSniffer] Added item: {canonical_url} (kind={kind})", log)
-
-                except Exception as e:
-                    self._log(f"[NetworkSniffer][handle_response] Error processing {response.url}: {e}", log)
                     return
 
-            page.on("response", handle_response)
+                p = self._safe_urlparse(canonical_url)
+                path = self._to_str(p.path or "/").lower()
 
+                kind = (
+                    self._classify_by_extension(path)
+                    or (self._classify_by_content_type(ctype) if ctype else None)
+                    or self._classify_by_stream_hint(url_lower)
+                )
+
+                if not kind:
+                    seg_kind = self._looks_like_segment(url_lower, ctype, content_length, headers)
+                    if seg_kind:
+                        kind = seg_kind
+
+                if not kind:
+                    return
+
+                if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
+                    return
+
+                # manifest tracking
+                mkind = self._is_manifest(canonical_url, ctype)
+                if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
+                    manifests_to_expand.append((response, mkind, canonical_url))
+                    if self.cfg.prefer_master_manifests:
+                        manifests_to_expand.sort(key=lambda t: (0 if "master" in self._to_str(t[2]).lower() else 1))
+
+                if len(found_items) >= max_items:
+                    return
+
+                # content-disposition filename hint
+                cd = self._to_str(headers.get("content-disposition") or "")
+                filename = None
+                if cd:
+                    m = self.re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, self.re.I)
+                    if m:
+                        filename = self._to_str(m.group(1))
+
+                item: Dict[str, Any] = {
+                    "url": canonical_url,
+                    "text": f"[Network {kind.capitalize()}]",
+                    "tag": "network_sniff",
+                    "kind": kind,
+                    "content_type": ctype or "?",
+                    "size": headers.get("content-length", "?"),
+                }
+                if filename:
+                    item["text"] = f"[Network {kind.capitalize()}] {filename}"
+
+                found_items.append(item)
+
+                # forensics bundle
+                if self.cfg.enable_forensics and len(forensics) < int(self.cfg.max_forensics_events):
+                    req_ev = request_evidence.get(raw_url) or request_evidence.get(canonical_url) or {}
+                    req_hdr_subset = (req_ev.get("headers_subset") or {})
+                    resp_hdr_subset = self._pick_headers_subset(headers, self.cfg.forensics_include_headers_subset)
+
+                    timing = None
+                    try:
+                        rreq = getattr(response, "request", None)
+                        if rreq is not None:
+                            timing = getattr(rreq, "timing", None)
+                            if callable(timing):
+                                timing = timing()
+                    except Exception:
+                        timing = None
+
+                    bundle = {
+                        "url": canonical_url,
+                        "final_url": canonical_url,
+                        "status": getattr(response, "status", None),
+                        "content_type": headers.get("content-type"),
+                        "content_length": headers.get("content-length"),
+                        "discovered_at": self.time.time(),
+                        "source_page": canonical_page_url,
+                        "initiator_frame": req_ev.get("frame_url"),
+                        "resource_type": req_ev.get("resource_type") or resource_type,
+                        "request_method": req_ev.get("method"),
+                        "request_headers_subset": req_hdr_subset,
+                        "request_post_data_hash": req_ev.get("post_data_hash"),
+                        "response_headers_subset": resp_hdr_subset,
+                        "timing": timing,
+                        "sha256_body_prefix": None,
+                    }
+                    k = f"{bundle.get('url')}|{bundle.get('status')}|{bundle.get('content_type')}|{bundle.get('content_length')}"
+                    if k not in seen_forensics:
+                        seen_forensics.add(k)
+                        forensics.append(bundle)
+
+                # salvage targets
+                if self.cfg.enable_url_salvage:
+                    if len(salvage_targets) < int(self.cfg.max_salvage_urls):
+                        if (not self.cfg.salvage_only_if_mediaish) or self._is_mediaish_url(canonical_url) or self._has_signaturey_params(canonical_url):
+                            if canonical_url not in salvage_seen:
+                                salvage_seen.add(canonical_url)
+                                salvage_targets.append(canonical_url)
+
+            except Exception as e:
+                # IMPORTANT: stringify everything in log to avoid *another* mixed-type crash
+                self._log(f"[NetworkSniffer][handle_response] Error processing {self._to_str(getattr(response,'url',None))}: {self._to_str(e)}", log)
+
+        page.on("response", handle_response)
+
+        # ---------------- run page ---------------- #
+        try:
             sniff_goto_timeout = max(15000, int(tmo * 1000))
             try:
                 await page.goto(canonical_page_url, wait_until=wait_mode, timeout=sniff_goto_timeout)
             except Exception as e:
                 self._log(f"[NetworkSniffer] goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
 
-            # ---- Auto-scroll to trigger more network activity ----
             await self._auto_scroll(page, tmo, log)
-
-            # Final small wait (<= 20% of tmo)
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
-            # NEW: emit redirect events (kept in json_hits so downstream sees them)
+            # redirect chain
             if self.cfg.enable_redirect_tracking and redirect_events and len(json_hits) < max_json:
                 json_hits.append({
                     "url": canonical_page_url,
@@ -901,15 +1308,12 @@ class NetworkSniffer:
                     "source_page": canonical_page_url,
                 })
 
-            # ---- Expand manifests ----
+            # manifest expansion
             if manifests_to_expand:
-                self._log(f"[NetworkSniffer] Expanding {len(manifests_to_expand)} manifests...", log)
-
-                async def expand_one(resp: Response, mkind: str, murl: str):
+                async def expand_one(resp, mkind: str, murl: str):
                     derived_urls = await self._expand_manifest(resp, mkind, murl, log)
                     if not derived_urls:
                         return
-
                     for u in derived_urls[:max_derived_per_manifest]:
                         if not u:
                             continue
@@ -917,14 +1321,10 @@ class NetworkSniffer:
                             continue
                         if not self._host_allowed(u):
                             continue
-
                         seen_derived.add(u)
-
-                        dk = self._classify_by_extension(urlparse(u).path or "") or "video"
+                        dk = self._classify_by_extension(self._to_str(self._safe_urlparse(u).path)) or "video"
                         if not self._is_allowed_by_extensions(u, extensions, dk):
-                            self._log(f"[NetworkSniffer] Derived skipped by extensions: {u} (kind={dk})", log)
                             continue
-
                         derived_items.append({
                             "url": u,
                             "text": f"[Network {dk.capitalize()} Segment]",
@@ -933,8 +1333,6 @@ class NetworkSniffer:
                             "content_type": mkind,
                             "size": "?",
                         })
-                        self._log(f"[NetworkSniffer] Added derived item: {u} (kind={dk})", log)
-
                         if len(json_hits) < max_json:
                             json_hits.append({
                                 "url": u,
@@ -942,13 +1340,64 @@ class NetworkSniffer:
                                 "source_page": canonical_page_url
                             })
 
-                # expand in parallel
-                await asyncio.gather(*[
+                await self.asyncio.gather(*[
                     expand_one(resp, mkind, murl)
                     for (resp, mkind, murl) in manifests_to_expand
                 ])
 
-                self._log(f"[NetworkSniffer] Finished manifest expansion. Total derived: {len(derived_items)}", log)
+            # forensics hash fill
+            if self.cfg.enable_forensics and self.cfg.forensics_hash_via_probe and api_ctx is not None and forensics:
+                sem = self.asyncio.Semaphore(8)
+
+                async def guard_hash(bundle: Dict[str, Any]):
+                    async with sem:
+                        hp = await self._hash_body_prefix_via_probe(
+                            api_ctx,
+                            bundle["url"],
+                            bundle.get("request_headers_subset") or {},
+                            timeout_ms=int(self.cfg.forensics_probe_timeout_ms),
+                            prefix_bytes=int(self.cfg.forensics_body_prefix_bytes),
+                        )
+                        bundle["sha256_body_prefix"] = hp
+
+                await self.asyncio.gather(*[guard_hash(b) for b in forensics])
+
+            # salvage stage
+            if self.cfg.enable_url_salvage and api_ctx is not None and salvage_targets:
+                sem = self.asyncio.Semaphore(int(self.cfg.salvage_probe_concurrency))
+
+                def req_hdrs_for(u: str) -> Dict[str, str]:
+                    ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
+                    return ev.get("headers_subset") or {}
+
+                async def salvage_guard(u: str):
+                    async with sem:
+                        return await self._salvage_one(api_ctx, u, req_hdrs_for(u), log=log)
+
+                salvage_bundles = await self.asyncio.gather(*[salvage_guard(u) for u in salvage_targets])
+
+            # emit bundles
+            if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
+                json_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"forensics_bundle": {
+                        "source_page": canonical_page_url,
+                        "count": len(forensics),
+                        "items": forensics[: int(self.cfg.max_forensics_events)],
+                    }},
+                    "source_page": canonical_page_url,
+                })
+
+            if self.cfg.enable_url_salvage and salvage_bundles and len(json_hits) < max_json:
+                json_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"salvage_bundle": {
+                        "source_page": canonical_page_url,
+                        "count": len(salvage_bundles),
+                        "items": salvage_bundles[: int(self.cfg.max_salvage_urls)],
+                    }},
+                    "source_page": canonical_page_url,
+                })
 
             try:
                 html = await page.content()
@@ -958,23 +1407,21 @@ class NetworkSniffer:
 
         except Exception as e:
             self._log(f"[NetworkSniffer] Unexpected error during sniff for {canonical_page_url}: {e}", log)
+
         finally:
             try:
-                try:
-                    await asyncio.wait_for(page.close(), timeout=3.0)
-                except asyncio.TimeoutError:
-                    self._log("[NetworkSniffer] page.close() timed out; ignoring.", log)
-            except Exception as e:
-                self._log(f"[NetworkSniffer] Failed to close page: {e}", log)
+                await self.asyncio.wait_for(page.close(), timeout=3.0)
+            except Exception:
+                pass
 
-            merged_items_any = found_items + derived_items + blob_placeholders
-
+        merged_items_any = found_items + derived_items + blob_placeholders
         merged_items = [self._normalize_item(it) for it in merged_items_any if it.get("url")]
 
         summary = (
             f"[NetworkSniffer] Finished sniff for {canonical_page_url}: "
             f"media={len(found_items)} derived={len(derived_items)} "
             f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
+            f"forensics={len(forensics)} salvage={len(salvage_bundles)} "
             f"(Total output: {len(merged_items)})"
         )
         self._log(summary, log)
@@ -988,23 +1435,28 @@ class NetworkSniffer:
 
 class JSSniffer:
     """
-    Shared-context Playwright JS DOM link sniffer.
+    Shared-context Playwright JS + DOM + SPA-state link sniffer.
 
     Output schema:
       link = {url, text, tag}
 
-    Anti-freeze changes:
-      - Bounded DOM/Shadow traversal (no querySelectorAll("*"))
-      - Bounded script scanning (count + max chars)
-      - Bounded webpack scanning (count + max chars)
-      - Hard timeouts around evaluate/content
-      - Output capped in browser-side code (max_items_soft_limit)
+    NEW "long-lost content" additions:
+      - performance entries mining (resource timing URLs)
+      - <link rel=preload/prefetch/modulepreload> + meta/content mining
+      - srcset parsing + background-image/style url() extraction
+      - JSON-LD + script[type=application/json] + common SPA blobs (__NEXT_DATA__, __NUXT__, etc.)
+      - localStorage/sessionStorage URL mining (bounded)
+      - optional global JSON scan from known window keys (bounded)
+      - stronger URL unescaping (\\u0026, \\/, \\u003a, etc.)
     """
 
+    # ------------------------------------------------------------------ #
+    # Config
+    # ------------------------------------------------------------------ #
     @dataclass
     class Config:
         timeout: float = 8.0
-        max_links: int = 500
+        max_links: int = 700
         wait_after_goto_ms: int = 500
         include_shadow_dom: bool = True
 
@@ -1020,16 +1472,16 @@ class JSSniffer:
         # ------------------ anti-freeze budgets ------------------ #
         evaluate_timeout_s: float = 6.0          # hard timeout for page.evaluate
         content_timeout_s: float = 4.0           # hard timeout for page.content
-        max_items_soft_limit: int = 1400         # browser-side cap before returning to Python
+        max_items_soft_limit: int = 1800         # browser-side cap before returning to Python
 
         # Shadow DOM traversal caps
         shadow_host_soft_limit: int = 400        # how many potential shadow hosts to inspect
-        max_dom_nodes_scanned: int = 12000       # global cap for scanned elements
+        max_dom_nodes_scanned: int = 14000       # global cap for scanned elements
 
         # Script scanning caps
         enable_script_scan: bool = True
-        script_soft_limit: int = 80              # number of <script> tags to inspect
-        max_script_chars: int = 60_000           # truncate per-script text
+        script_soft_limit: int = 90              # number of <script> tags to inspect
+        max_script_chars: int = 80_000           # truncate per-script text
 
         # Optional click simulation
         enable_click_simulation: bool = False
@@ -1042,24 +1494,53 @@ class JSSniffer:
 
         # ------------------ Webpack module scan ------------------ #
         enable_webpack_scan: bool = True
-        webpack_module_soft_limit: int = 250     # smaller default to avoid freezing
-        max_webpack_fn_chars: int = 80_000       # truncate function.toString()
+        webpack_module_soft_limit: int = 250
+        max_webpack_fn_chars: int = 90_000
         webpack_url_regex: str = r"(https?:\/\/[^\s'\"`]+|\/api\/[a-zA-Z0-9_\/\-\?\=&]+)"
         webpack_api_hints: Set[str] = field(default_factory=lambda: {
             "/api/", "/graphql", "/auth", "/login", "/logout", "/stream",
             ".m3u8", ".mpd", "/cdn/", "/v1/", "/v2/"
         })
 
+        # ------------------ "long lost content" scans ------------------ #
+        enable_perf_entries: bool = True
+        max_perf_entries: int = 700
+
+        enable_meta_scan: bool = True  # meta content, canonical, og:, twitter:
+        enable_link_rel_scan: bool = True  # preload/prefetch/modulepreload/alternate
+
+        enable_srcset_scan: bool = True
+        enable_css_url_scan: bool = True   # style tags + inline style url(...)
+        max_style_chars: int = 90_000
+
+        enable_storage_scan: bool = True
+        max_storage_keys: int = 120
+        max_storage_chars: int = 120_000
+
+        enable_spa_state_scan: bool = True
+        max_spa_json_chars: int = 140_000
+        spa_state_keys: List[str] = field(default_factory=lambda: [
+            "__NEXT_DATA__", "__NUXT__", "__NUXT_DATA__", "__APOLLO_STATE__",
+            "__INITIAL_STATE__", "__PRELOADED_STATE__", "__SSR_STATE__",
+            "REDUX_STATE", "INITIAL_REDUX_STATE",
+        ])
+
+        # optional: try scanning a few known global objects (bounded stringify)
+        enable_global_json_scan: bool = False
+        global_json_keys: List[str] = field(default_factory=lambda: [
+            "webpackChunk", "__VUE_DEVTOOLS_GLOBAL_HOOK__", "requirejs",
+        ])
+        max_global_json_chars: int = 80_000
+
+        # selectors for direct URL-bearing elements
         selectors: List[str] = field(default_factory=lambda: [
             "a[href]",
-            "video[src]",
-            "video source[src]",
-            "source[src]",
-            "audio[src]",
-            "audio source[src]",
-            "img[src]",
-            "iframe[src]",
-            "embed[src]",
+            "video[src]", "video source[src]", "source[src]",
+            "audio[src]", "audio source[src]",
+            "img[src]", "img[srcset]",
+            "iframe[src]", "embed[src]",
+            "link[href]",  # rel scans filter in JS
+            "meta[content]",
         ])
 
         junk_prefixes: Set[str] = field(default_factory=lambda: {
@@ -1080,10 +1561,10 @@ class JSSniffer:
         })
 
         data_url_keys: Set[str] = field(default_factory=lambda: {
-            "data-href", "data-url", "data-src", "data-video", "data-video-url",
+            "data-href", "data-url", "data-src", "data-srcset",
+            "data-video", "data-video-url", "data-poster",
             "data-file", "data-stream", "data-mp4", "data-m3u8", "data-mpd",
-            "data-audio", "data-audio-url", "data-image", "data-poster",
-            "data-media-url"
+            "data-audio", "data-audio-url", "data-image", "data-media-url"
         })
 
         onclick_url_regexes: List[str] = field(default_factory=lambda: [
@@ -1143,18 +1624,14 @@ class JSSniffer:
             return "image"
         return None
 
-    def _is_allowed_by_extensions(
-        self,
-        url: str,
-        extensions: Optional[Set[str]],
-        kind: Optional[str]
-    ) -> bool:
+    def _is_allowed_by_extensions(self, url: str, extensions: Optional[Set[str]], kind: Optional[str]) -> bool:
         if not extensions:
             return True
         parsed = urlparse(url)
         p = (parsed.path or "").lower()
         if any(p.endswith(ext.lower()) for ext in extensions):
             return True
+        # keep video/audio even if extension filter is narrow (your prior behavior)
         if kind in ("video", "audio"):
             return True
         return False
@@ -1162,11 +1639,18 @@ class JSSniffer:
     def _normalize_link(self, url: str, text: str, tag: str) -> Dict[str, str]:
         return {"url": url, "text": text or "", "tag": tag or "a"}
 
-    def _fix_escaped_ampersands(self, url: str) -> str:
+    def _fix_common_escapes(self, url: str) -> str:
+        """
+        JS-heavy apps love escaping:
+          \\u0026, %5Cu0026, \\/, \\u003a, \\u002f, etc.
+        We keep it conservative (no heavy unescape libs).
+        """
         if not url:
             return url
         try:
             url = url.replace("\\u0026", "&")
+            url = url.replace("\\u003a", ":").replace("\\u002f", "/")
+            url = url.replace("\\/", "/")
         except Exception:
             pass
         try:
@@ -1239,14 +1723,12 @@ class JSSniffer:
 
         page: "Page" = await context.new_page()
 
-        # Playwright per-page defaults (helps avoid long hangs in operations that honor PW timeouts)
         try:
             page.set_default_timeout(int(max(1.0, tmo) * 1000))
             page.set_default_navigation_timeout(int(max(5.0, tmo) * 1000))
         except Exception:
             pass
 
-        # Optional resource blocking (speed)
         if self.cfg.block_resource_types:
             try:
                 async def _route_handler(route):
@@ -1257,7 +1739,6 @@ class JSSniffer:
                     except Exception:
                         pass
                     return await route.continue_()
-
                 await page.route("**/*", _route_handler)
             except Exception as e:
                 self._log(f"Resource blocking setup failed: {e}", log)
@@ -1271,7 +1752,6 @@ class JSSniffer:
         self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
 
         try:
-            # --- 1) Navigation: timeout is NON-FATAL --- #
             try:
                 await page.goto(canonical_page_url, wait_until=wait_mode, timeout=js_timeout_ms)
             except Exception as e:
@@ -1280,21 +1760,17 @@ class JSSniffer:
             if wait_after_ms > 0:
                 await page.wait_for_timeout(wait_after_ms)
 
-            # ---- Auto-scroll to trigger lazy-loaded elements ----
             await self._auto_scroll(page, tmo, log)
 
-            # Small extra delay after scroll (<= 10% of tmo, but at least 200ms)
             extra_wait = max(200, int(tmo * 1000 * 0.1))
             await page.wait_for_timeout(extra_wait)
 
-            # --- 2) DOM snapshot (bounded by timeout) --- #
             try:
                 html = await asyncio.wait_for(page.content(), timeout=self.cfg.content_timeout_s)
             except Exception as e:
                 self._log(f"page.content() skipped/timeout: {e}", log)
                 html = ""
 
-            # --- 3) Evaluate (bounded by timeout) --- #
             eval_args = {
                 "selectors": selector_js,
                 "includeShadow": bool(self.cfg.include_shadow_dom),
@@ -1302,7 +1778,6 @@ class JSSniffer:
                 "onclickRegexes": [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes],
                 "redirectHints": list(self.cfg.redirect_hints),
                 "scriptJsonHints": list(self.cfg.script_json_hints),
-
                 "baseUrl": canonical_page_url,
 
                 "maxItems": int(self.cfg.max_items_soft_limit),
@@ -1318,13 +1793,36 @@ class JSSniffer:
                 "maxWebpackFnChars": int(self.cfg.max_webpack_fn_chars),
                 "webpackUrlRegex": self.cfg.webpack_url_regex,
                 "webpackApiHints": list(self.cfg.webpack_api_hints),
+
+                # long-lost content toggles/budgets
+                "enablePerf": bool(self.cfg.enable_perf_entries),
+                "maxPerf": int(self.cfg.max_perf_entries),
+
+                "enableMeta": bool(self.cfg.enable_meta_scan),
+                "enableRelLinks": bool(self.cfg.enable_link_rel_scan),
+
+                "enableSrcset": bool(self.cfg.enable_srcset_scan),
+                "enableCssUrls": bool(self.cfg.enable_css_url_scan),
+                "maxStyleChars": int(self.cfg.max_style_chars),
+
+                "enableStorage": bool(self.cfg.enable_storage_scan),
+                "maxStorageKeys": int(self.cfg.max_storage_keys),
+                "maxStorageChars": int(self.cfg.max_storage_chars),
+
+                "enableSpa": bool(self.cfg.enable_spa_state_scan),
+                "maxSpaChars": int(self.cfg.max_spa_json_chars),
+                "spaKeys": list(self.cfg.spa_state_keys),
+
+                "enableGlobalJson": bool(self.cfg.enable_global_json_scan),
+                "globalKeys": list(self.cfg.global_json_keys),
+                "maxGlobalChars": int(self.cfg.max_global_json_chars),
             }
 
             raw_payload = {}
             try:
                 raw_payload = await asyncio.wait_for(
                     page.evaluate(
-                        """
+                        r"""
                         (args) => {
                           const {
                             selectors, includeShadow,
@@ -1332,7 +1830,14 @@ class JSSniffer:
                             baseUrl,
                             maxItems, maxDomNodes, shadowHostLimit,
                             enableScriptScan, scriptLimit, maxScriptChars,
-                            enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints
+                            enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints,
+
+                            enablePerf, maxPerf,
+                            enableMeta, enableRelLinks,
+                            enableSrcset, enableCssUrls, maxStyleChars,
+                            enableStorage, maxStorageKeys, maxStorageChars,
+                            enableSpa, maxSpaChars, spaKeys,
+                            enableGlobalJson, globalKeys, maxGlobalChars,
                           } = args;
 
                           const out = [];
@@ -1340,8 +1845,11 @@ class JSSniffer:
 
                           function normalizeUrlRaw(u) {
                             if (!u) return "";
+                            try { u = String(u); } catch { return ""; }
                             try { u = u.replace(/\\u0026/gi, "&"); } catch {}
                             try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
+                            try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
+                            try { u = u.replace(/\\\//g, "/"); } catch {}
                             return u;
                           }
 
@@ -1356,7 +1864,7 @@ class JSSniffer:
                           }
 
                           function push(el, url, tag, reason=null) {
-                            if (out.length >= maxItems) return false; // soft cap
+                            if (out.length >= maxItems) return false;
                             url = absUrl(url);
                             if (!url ||
                                 url.startsWith("blob:") ||
@@ -1366,6 +1874,7 @@ class JSSniffer:
                               return true;
                             }
                             seen.add(url);
+
                             let text = "";
                             try { text = (el && (el.innerText || el.textContent || el.title) || "").trim(); } catch {}
                             const item = { url, text, tag };
@@ -1374,16 +1883,45 @@ class JSSniffer:
                             return true;
                           }
 
+                          function pushAny(el, s, tag, reason) {
+                            if (!s) return true;
+                            const txt = normalizeUrlRaw(s);
+                            if (!txt) return true;
+
+                            // find URL-ish tokens in text
+                            const rx = /((https?:)?\/\/[^\s'"`<>]{6,}|\/[^\s'"`<>]{6,})/ig;
+                            let m;
+                            rx.lastIndex = 0;
+                            while ((m = rx.exec(txt)) !== null) {
+                              const cand = m[1];
+                              if (!cand) continue;
+                              if (!push(el, cand, tag, reason)) return false;
+                              if (out.length >= maxItems) return false;
+                            }
+                            return true;
+                          }
+
+                          function parseSrcsetValue(v) {
+                            // "url1 1x, url2 2x" / "url 640w"
+                            const parts = String(v || "").split(",");
+                            const urls = [];
+                            for (const p of parts) {
+                              const u = (p || "").trim().split(/\s+/)[0];
+                              if (u) urls.push(u);
+                            }
+                            return urls;
+                          }
+
                           function sniffDataAttrs(el) {
                             for (const k of dataKeys) {
                               const v = el.getAttribute?.(k);
-                              if (v) { if (!push(el, v, el.tagName.toLowerCase(), "data-attr")) return false; }
+                              if (v) { if (!push(el, v, (el.tagName||"").toLowerCase(), "data-attr")) return false; }
                             }
                             for (const attr of (el.attributes || [])) {
                               const n = (attr.name || "").toLowerCase();
                               const v = attr.value;
-                              if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://"))) {
-                                if (!push(el, v, el.tagName.toLowerCase(), "data-generic")) return false;
+                              if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://") || v.startsWith("/"))) {
+                                if (!pushAny(el, v, (el.tagName||"").toLowerCase(), "data-generic")) return false;
                               }
                             }
                             return true;
@@ -1398,7 +1936,7 @@ class JSSniffer:
                                 const r = new RegExp(rx, "ig");
                                 let m;
                                 while ((m = r.exec(oc)) !== null) {
-                                  if (m[1]) { if (!push(el, m[1], el.tagName.toLowerCase(), "onclick")) return false; }
+                                  if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), "onclick")) return false; }
                                 }
                               } catch {}
                             }
@@ -1406,11 +1944,11 @@ class JSSniffer:
                             const ocl = oc.toLowerCase();
                             for (const h of redirectHints) {
                               if (ocl.includes(h)) {
-                                const urlMatch = ocl.match(/(https?:)?\\/\\/[^\\s'"]+/);
+                                const urlMatch = ocl.match(/(https?:)?\/\/[^\s'"]+/);
                                 if (urlMatch) {
-                                  if (!push(el, urlMatch[0], el.tagName.toLowerCase(), "redirect-hint-url")) return false;
+                                  if (!push(el, urlMatch[0], (el.tagName||"").toLowerCase(), "redirect-hint-url")) return false;
                                 } else {
-                                  if (!push(el, oc, el.tagName.toLowerCase(), "redirect-hint")) return false;
+                                  if (!pushAny(el, oc, (el.tagName||"").toLowerCase(), "redirect-hint")) return false;
                                 }
                                 break;
                               }
@@ -1428,15 +1966,36 @@ class JSSniffer:
                                   const r = new RegExp(rx, "ig");
                                   let m;
                                   while ((m = r.exec(v)) !== null) {
-                                    if (m[1]) { if (!push(el, m[1], el.tagName.toLowerCase(), `inline-listener-${k}`)) return false; }
+                                    if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), `inline-listener-${k}`)) return false; }
                                   }
                                 } catch {}
                               }
+                              if (!pushAny(el, v, (el.tagName||"").toLowerCase(), `inline-listener-text-${k}`)) return false;
                             }
                             return true;
                           }
 
-                          // ---- bounded DOM scan (NO querySelectorAll("*")) ----
+                          function sniffStyleUrls(el) {
+                            if (!enableCssUrls) return true;
+
+                            // inline style attr
+                            try {
+                              const st = el.getAttribute?.("style") || "";
+                              if (st) { if (!pushAny(el, st, (el.tagName||"").toLowerCase(), "style-attr")) return false; }
+                            } catch {}
+
+                            // computed background-image (cheap-ish, but bounded by DOM scan caps)
+                            try {
+                              const cs = window.getComputedStyle?.(el);
+                              const bg = cs && cs.getPropertyValue && cs.getPropertyValue("background-image");
+                              if (bg && bg.includes("url(")) {
+                                if (!pushAny(el, bg, (el.tagName||"").toLowerCase(), "style-bg")) return false;
+                              }
+                            } catch {}
+                            return true;
+                          }
+
+                          // ---- bounded DOM scan (NO querySelectorAll("*") everywhere) ----
                           function scanRoot(root) {
                             let scanned = 0;
                             try {
@@ -1445,19 +2004,43 @@ class JSSniffer:
                                 scanned++;
                                 if (scanned > maxDomNodes) break;
 
+                                const tag = (el.tagName || "a").toLowerCase();
+
+                                // direct URLs
                                 const url = el.href || el.currentSrc || el.src ||
                                             el.getAttribute?.("href") || el.getAttribute?.("src") || "";
-                                if (!push(el, url, (el.tagName || "a").toLowerCase(), "dom")) return;
+                                if (!push(el, url, tag, "dom")) return;
+
+                                // srcset
+                                if (enableSrcset) {
+                                  try {
+                                    const ss = el.getAttribute?.("srcset") || "";
+                                    if (ss) {
+                                      for (const u of parseSrcsetValue(ss)) {
+                                        if (!push(el, u, tag, "srcset")) return;
+                                      }
+                                    }
+                                  } catch {}
+                                }
+
+                                // video poster
+                                try {
+                                  const poster = el.getAttribute?.("poster") || "";
+                                  if (poster) { if (!push(el, poster, tag, "poster")) return; }
+                                } catch {}
+
                                 if (!sniffDataAttrs(el)) return;
                                 if (!sniffOnclick(el)) return;
                                 if (!sniffInlineListeners(el)) return;
+                                if (!sniffStyleUrls(el)) return;
+
+                                if (out.length >= maxItems) return;
                               }
                             } catch {}
                           }
 
                           function scanShadowRootsBounded() {
                             if (!includeShadow) return;
-                            // only consider a bounded number of candidates
                             let hosts = [];
                             try {
                               hosts = Array.from(document.querySelectorAll("[id],[class],*")).slice(0, shadowHostLimit);
@@ -1474,26 +2057,87 @@ class JSSniffer:
                             }
                           }
 
+                          function scanMetaAndRelLinks() {
+                            if (!enableMeta && !enableRelLinks) return;
+                            const host = document.head || document.documentElement || document.body || document;
+
+                            if (enableRelLinks) {
+                              try {
+                                const rels = new Set(["preload","prefetch","modulepreload","dns-prefetch","preconnect","alternate","canonical"]);
+                                const links = Array.from(document.querySelectorAll("link[href]")).slice(0, 500);
+                                for (const l of links) {
+                                  if (out.length >= maxItems) return;
+                                  const rel = String(l.getAttribute("rel") || "").toLowerCase().trim();
+                                  if (!rel) continue;
+                                  // rel can be space-separated
+                                  const relParts = rel.split(/\s+/);
+                                  if (!relParts.some(r => rels.has(r))) continue;
+                                  const href = l.getAttribute("href") || "";
+                                  if (!push(l, href, "link", `link-rel-${rel}`)) return;
+                                }
+                              } catch {}
+                            }
+
+                            if (enableMeta) {
+                              try {
+                                const metas = Array.from(document.querySelectorAll("meta[content]")).slice(0, 600);
+                                for (const m of metas) {
+                                  if (out.length >= maxItems) return;
+                                  const content = m.getAttribute("content") || "";
+                                  const name = (m.getAttribute("name") || m.getAttribute("property") || "").toLowerCase();
+                                  // prefer url-ish meta keys, but still mine content for URLs
+                                  if (name.includes("url") || name.startsWith("og:") || name.startsWith("twitter:") || name.includes("image")) {
+                                    if (!pushAny(m, content, "meta", `meta-${name || "content"}`)) return;
+                                  } else if (content.includes("http") || content.includes("://") || content.startsWith("/")) {
+                                    if (!pushAny(m, content, "meta", "meta-content")) return;
+                                  }
+                                }
+                              } catch {}
+                            }
+                          }
+
+                          function scanCssTextBounded() {
+                            if (!enableCssUrls) return;
+                            let styleText = "";
+                            try {
+                              const styles = Array.from(document.querySelectorAll("style")).slice(0, 40);
+                              for (const s of styles) {
+                                if (out.length >= maxItems) return;
+                                let t = "";
+                                try { t = (s.textContent || "").trim(); } catch {}
+                                if (!t) continue;
+                                styleText += "\n" + t;
+                                if (styleText.length >= maxStyleChars) break;
+                              }
+                            } catch {}
+                            if (!styleText) return;
+                            if (styleText.length > maxStyleChars) styleText = styleText.slice(0, maxStyleChars);
+                            // mine url(...) and raw url-like tokens
+                            pushAny(document, styleText, "style", "style-tag");
+                          }
+
                           function scanScriptsBounded() {
                             if (!enableScriptScan) return;
                             let scripts = [];
                             try { scripts = Array.from(document.querySelectorAll("script")).slice(0, scriptLimit); } catch {}
                             for (const s of scripts) {
                               if (out.length >= maxItems) return;
+
+                              // prioritize JSON-ish script types too
+                              const type = String(s.getAttribute("type") || "").toLowerCase();
+                              const isJsonType = type.includes("json") || type.includes("ld+json");
+
                               let txt = "";
                               try { txt = (s.textContent || "").trim(); } catch {}
                               if (!txt) continue;
                               if (txt.length > maxScriptChars) txt = txt.slice(0, maxScriptChars);
 
                               // raw URL-ish tokens
-                              try {
-                                const urls = txt.match(/(https?:)?\\/\\/[^\\s'"]{6,}/ig) || [];
-                                for (const u of urls) { if (!push(s, u, "script", "script-raw-url")) return; }
-                              } catch {}
+                              pushAny(s, txt, "script", "script-text");
 
-                              // best-effort JSON parse for inline JSON blobs
+                              // JSON parse for JSON-ish blobs
                               const head = txt.slice(0, 1);
-                              if (head === "{" || head === "[") {
+                              if (isJsonType || head === "{" || head === "[") {
                                 try {
                                   const data = JSON.parse(txt);
                                   const stack = [data];
@@ -1513,7 +2157,7 @@ class JSSniffer:
                                       const kl = String(k || "").toLowerCase();
                                       if (typeof v === "string") {
                                         const low = v.toLowerCase();
-                                        if (low.includes("http") || low.includes("m3u8") || low.includes("mpd")) {
+                                        if (low.includes("http") || low.includes("m3u8") || low.includes("mpd") || low.startsWith("/")) {
                                           if (!push(s, v, "script", "script-json-string")) return;
                                         }
                                         if (scriptJsonHints.some(h => kl.includes(h))) {
@@ -1526,6 +2170,102 @@ class JSSniffer:
                                   }
                                 } catch {}
                               }
+                            }
+                          }
+
+                          function scanPerfEntries() {
+                            if (!enablePerf) return;
+                            try {
+                              const entries = performance.getEntriesByType?.("resource") || [];
+                              const sliced = entries.slice(0, Math.max(1, maxPerf));
+                              for (const e of sliced) {
+                                if (out.length >= maxItems) return;
+                                const n = e && e.name;
+                                if (!n) continue;
+                                if (!push(document, n, "perf", "performance-resource")) return;
+                              }
+                            } catch {}
+                          }
+
+                          function scanStorage() {
+                            if (!enableStorage) return;
+
+                            function dumpStorage(st, tag) {
+                              try {
+                                if (!st) return true;
+                                const n = Math.min(st.length || 0, Math.max(1, maxStorageKeys));
+                                let acc = "";
+                                for (let i = 0; i < n; i++) {
+                                  if (out.length >= maxItems) return false;
+                                  const k = st.key(i);
+                                  if (!k) continue;
+                                  const v = st.getItem(k) || "";
+                                  // mine key + value
+                                  acc += "\n" + k + "\n" + v;
+                                  if (acc.length >= maxStorageChars) break;
+                                }
+                                if (acc) {
+                                  if (acc.length > maxStorageChars) acc = acc.slice(0, maxStorageChars);
+                                  return pushAny(document, acc, tag, `${tag}-dump`);
+                                }
+                              } catch {}
+                              return true;
+                            }
+
+                            if (!dumpStorage(window.localStorage, "localStorage")) return;
+                            if (!dumpStorage(window.sessionStorage, "sessionStorage")) return;
+                          }
+
+                          function scanSpaState() {
+                            if (!enableSpa) return;
+
+                            // 1) known window keys
+                            for (const k of spaKeys || []) {
+                              if (out.length >= maxItems) return;
+                              try {
+                                const v = window[k];
+                                if (!v) continue;
+                                let s = "";
+                                try { s = JSON.stringify(v); } catch { s = String(v); }
+                                if (!s) continue;
+                                if (s.length > maxSpaChars) s = s.slice(0, maxSpaChars);
+                                if (!pushAny(document, s, "spa", `spa-${k}`)) return;
+                              } catch {}
+                            }
+
+                            // 2) common embedded JSON nodes
+                            try {
+                              const nodes = [];
+                              // next.js often uses this id; nuxt has __NUXT__ script sometimes
+                              const n1 = document.querySelector("script#__NEXT_DATA__");
+                              if (n1) nodes.push(n1);
+                              const n2 = document.querySelector("script[type='application/ld+json']");
+                              if (n2) nodes.push(n2);
+
+                              for (const n of nodes.slice(0, 6)) {
+                                if (out.length >= maxItems) return;
+                                let txt = "";
+                                try { txt = (n.textContent || "").trim(); } catch {}
+                                if (!txt) continue;
+                                if (txt.length > maxSpaChars) txt = txt.slice(0, maxSpaChars);
+                                if (!pushAny(n, txt, "spa", "spa-embedded-script")) return;
+                              }
+                            } catch {}
+                          }
+
+                          function scanGlobalJson() {
+                            if (!enableGlobalJson) return;
+                            for (const k of globalKeys || []) {
+                              if (out.length >= maxItems) return;
+                              try {
+                                const v = window[k];
+                                if (!v) continue;
+                                let s = "";
+                                try { s = JSON.stringify(v); } catch { s = String(v); }
+                                if (!s) continue;
+                                if (s.length > maxGlobalChars) s = s.slice(0, maxGlobalChars);
+                                if (!pushAny(document, s, "global", `global-${k}`)) return;
+                              } catch {}
                             }
                           }
 
@@ -1580,10 +2320,16 @@ class JSSniffer:
                             }
                           }
 
-                          // Execute
+                          // Execute (ordered from “cheap + high signal” → “heavier”)
                           scanRoot(document);
                           scanShadowRootsBounded();
+                          scanMetaAndRelLinks();
+                          scanPerfEntries();
+                          scanCssTextBounded();
+                          scanStorage();
+                          scanSpaState();
                           scanScriptsBounded();
+                          scanGlobalJson();
                           scanWebpackModulesBounded();
 
                           return { items: out, capped: out.length >= maxItems };
@@ -1598,9 +2344,9 @@ class JSSniffer:
                 raw_payload = {}
 
             raw_links = raw_payload.get("items") or []
-            self._log(f"Raw links from DOM/scripts/webpack: {len(raw_links)}", log)
+            self._log(f"Raw links from DOM/scripts/webpack/perf/storage/spa: {len(raw_links)}", log)
 
-            # Optional click simulation (unchanged-ish, but still bounded)
+            # Optional click simulation (still bounded)
             if self.cfg.enable_click_simulation:
                 self._log("Starting click simulation…", log)
                 try:
@@ -1627,14 +2373,16 @@ class JSSniffer:
 
                             click_raw = await asyncio.wait_for(
                                 page.evaluate(
-                                    """
+                                    r"""
                                     (baseUrl) => {
                                       const out = [];
                                       const seen = new Set();
                                       function normalizeUrlRaw(u) {
                                         if (!u) return "";
+                                        try { u = String(u); } catch { return ""; }
                                         try { u = u.replace(/\\u0026/gi, "&"); } catch {}
-                                        try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
+                                        try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
+                                        try { u = u.replace(/\\\//g, "/"); } catch {}
                                         return u;
                                       }
                                       function absUrl(u) {
@@ -1642,13 +2390,13 @@ class JSSniffer:
                                         try { u = normalizeUrlRaw(String(u).trim()); return new URL(u, baseUrl).href; }
                                         catch { return String(u).trim(); }
                                       }
-                                      document.querySelectorAll("a[href], video[src], audio[src], img[src], source[src]").forEach(el => {
+                                      document.querySelectorAll("a[href], video[src], audio[src], img[src], source[src], link[href]").forEach(el => {
                                         const url = absUrl(el.href || el.currentSrc || el.src || el.getAttribute("href") || el.getAttribute("src"));
                                         if (!url || seen.has(url)) return;
                                         seen.add(url);
                                         out.push({url, tag: (el.tagName || "a").toLowerCase()});
                                       });
-                                      return out.slice(0, 400);
+                                      return out.slice(0, 500);
                                     }
                                     """,
                                     canonical_page_url,
@@ -1680,8 +2428,7 @@ class JSSniffer:
                 if not url:
                     continue
 
-                # your patch: safety net
-                url = self._fix_escaped_ampersands(url)
+                url = self._fix_common_escapes(url)
 
                 canonical_url_py = _canonicalize_url(url)
                 if canonical_url_py in seen_urls_in_js:
@@ -1706,7 +2453,7 @@ class JSSniffer:
         except Exception as e:
             self._log(f"Overall error on {canonical_page_url}: {e}", log)
 
-        # --- Robust page close: NEVER let close() hang the whole sniffer --- #
+        # Robust close
         try:
             try:
                 await asyncio.wait_for(page.close(), timeout=3.0)
@@ -3904,27 +4651,51 @@ class ReactSniffer:
 
 class DatabaseSniffer:
     """
-    Playwright-based sniffer for Data Persistence + Safe Link Extraction (ADVANCED).
+    Playwright-based sniffer for Data Persistence + Safe Link Extraction (ADVANCED / HARDENED).
 
     SAFE GUARANTEES:
       - Does NOT extract IndexedDB records (metadata only).
-      - Does NOT return full backend configs; only (a) shallow fingerprints, (b) URL strings.
+      - Does NOT return full backend configs; only shallow fingerprints + URL strings.
       - Does NOT store arbitrary HTML; only returns html snapshot + hits (URLs + metadata).
 
-    Adds:
-      - URL extraction: absolute + ws/wss + schemeless + href/src relatives
-      - Canonicalization via _canonicalize_url() (expected to exist in your module)
-      - Network capture (request/response URLs + Location/Link headers)
-      - URL classification (api/media/asset/data/page)
-      - Backend global scan caps to prevent heavy traversal
+    Improvements:
+      - High-ROI URL harvesting:
+          * attribute whitelist beyond href/src (srcset, poster, data-src, data-href, etc.)
+          * <source>/<track> scanning
+          * CSS url(...) extraction from <style> + style=""
+          * meta (og:video, twitter:player, etc.) URL capture
+          * JSON-LD (application/ld+json) URL extraction with caps + seen-set
+          * JS string-literal URL extraction from inline scripts with byte caps + yielding
+      - Hardened against hangs:
+          * circular protection and caps for JSON traversal
+          * incremental harvesting (no giant concatenated buffers)
+          * yields to event loop during heavy parse
     """
 
-    # --- URL patterns (link-only) ---
+    # --- basic URL patterns (link-only) ---
     _ABS_URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
     _SCHEMELESS_RE = re.compile(r"(?<!:)\b//[^\s\"'<>]+", re.IGNORECASE)  # //cdn.example.com/x
-    _ATTR_REL_RE = re.compile(r"""(?:href|src)\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+
+    # CSS url(...) – handles url(x) url('x') url("x")
+    _CSS_URL_RE = re.compile(r"url\(\s*(?:['\"])?([^'\"\)\s]+)(?:['\"])?\s*\)", re.IGNORECASE)
+
+    # JS string literal URL-ish extraction (kept conservative)
+    # - catches "https://..." 'wss://...' "//cdn..." "/api/v1" "./x" "../x"
+    _JS_LIT_RE = re.compile(
+        r"""(?:
+            (?P<abs>(?:https?|wss?)://[^"'\\\s<>{}\[\]]+)
+          | (?P<schemeless>//[^"'\\\s<>{}\[\]]+)
+          | (?P<rel>
+                (?:/|\./|\.\./)[^"'\\\s<>{}\[\]]+
+            )
+        )""",
+        re.IGNORECASE | re.VERBOSE,
+    )
 
     _ALLOWED_SCHEMES = {"http", "https", "ws", "wss"}
+
+    # Attribute/value grabbing (we still parse with Playwright DOM, but keep regex fallback)
+    _ATTR_PAIR_RE = re.compile(r"""([a-zA-Z0-9_\-:]+)\s*=\s*["']([^"']+)["']""")
 
     # ------------------------------------------------------------------ #
     # Config
@@ -3933,31 +4704,36 @@ class DatabaseSniffer:
     class Config:
         timeout: float = 10.0
 
-        # --- IndexedDB Extraction (metadata only) ---
-        enable_indexeddb_dump: bool = True
+        # --- Backwards compatible toggles (your pipeline expects these) ---
+        enable_html_link_scan: bool = True              # legacy name
+        enable_backend_link_scan: bool = True           # legacy name
+        enable_network_capture: bool = True             # legacy name
+        enable_backend_fingerprint: bool = True         # legacy name
+        enable_indexeddb_dump: bool = True              # legacy name
+
+        # --- New harvesting toggles (fine-grained) ---
+        enable_dom_attribute_scan: bool = True
+        enable_dom_style_scan: bool = True
+        enable_dom_meta_scan: bool = True
+        enable_jsonld_scan: bool = True
+        enable_inline_script_string_scan: bool = True
+
+        # --- IndexedDB metadata only ---
         max_idb_databases: int = 5
         max_idb_stores: int = 5
-        max_idb_records_per_store: int = 20  # backwards compat; unused
 
-        # --- Backend Inference ---
-        enable_backend_fingerprint: bool = True
+        # --- Backend fingerprint ---
         known_globals: Set[str] = field(default_factory=lambda: {
             "firebase", "_firebaseApp", "Supabase", "supabaseClient",
             "__FIREBASE_DEFAULTS__", "mongo", "Realm", "couchdb",
         })
 
-        # --- Link extraction toggles ---
-        enable_html_link_scan: bool = True
-        enable_backend_link_scan: bool = True
-
-        # --- Network capture (URLs only) ---
-        enable_network_capture: bool = True
+        # --- Network capture caps (URL-only) ---
         max_network_urls: int = 400
 
         # --- Classification / filtering ---
         classify_links: bool = True
-        # Optional: if non-empty, only include these classes in content_link hits.
-        allow_classes: Set[str] = field(default_factory=set)
+        allow_classes: Set[str] = field(default_factory=set)  # if non-empty, filter emitted links by class
 
         # --- Backend global scan caps (avoid expensive traversals) ---
         backend_scan_max_urls: int = 200
@@ -3965,13 +4741,54 @@ class DatabaseSniffer:
         backend_scan_max_array_items: int = 50
         backend_scan_depth: int = 2
 
+        # --- DOM harvesting caps (avoid giant pages) ---
+        max_dom_nodes: int = 4000
+        max_attr_pairs: int = 12000
+
+        # Only scan these attributes (high ROI)
+        attr_whitelist: Set[str] = field(default_factory=lambda: {
+            "href", "src", "srcset", "poster",
+            "data-src", "data-href", "data-url", "data-srcset",
+            "content", "value",  # meta/content + some forms
+        })
+
+        # --- CSS scanning caps ---
+        max_style_tag_bytes: int = 400_000     # across all <style> tags
+        max_inline_style_bytes: int = 200_000  # across all style="" attrs
+
+        # --- JSON-LD caps ---
+        max_jsonld_blocks: int = 30
+        max_jsonld_bytes_per_block: int = 200_000
+        json_scan_max_urls: int = 300
+        json_scan_max_depth: int = 6
+        json_scan_max_keys_per_obj: int = 100
+        json_scan_max_array_items: int = 200
+
+        # --- Inline script literal URL scan caps ---
+        max_inline_script_blocks: int = 40
+        max_inline_script_bytes_per_block: int = 200_000
+        js_literal_max_urls: int = 400
+
+        # --- Yielding / responsiveness ---
+        yield_every_n_urls: int = 200
+
+        @classmethod
+        def from_kwargs(cls, **kwargs) -> "DatabaseSniffer.Config":
+            """
+            Backward/forward-compatible constructor:
+            - ignores unknown keys instead of crashing your pipeline
+            """
+            allowed = {f.name for f in fields(cls)}
+            filtered = {k: v for k, v in kwargs.items() if k in allowed}
+            return cls(**filtered)
+
     # ------------------------------------------------------------------ #
     # Lifecycle
     # ------------------------------------------------------------------ #
     def __init__(self, config: Optional["DatabaseSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
-        self._log("DatabaseSniffer Initialized (advanced link-only mode)", None)
+        self._log("DatabaseSniffer Initialized (hardened advanced link-only mode)", None)
 
     # ------------------------------------------------------------------ #
     # Logging helper
@@ -4014,7 +4831,7 @@ class DatabaseSniffer:
 
         # canonicalize (your global helper)
         try:
-            return _canonicalize_url(raw)  # noqa: F821 (expected provided by your module)
+            return _canonicalize_url(raw)  # noqa: F821
         except Exception:
             return raw
 
@@ -4036,34 +4853,9 @@ class DatabaseSniffer:
         return "page"
 
     # ------------------------------------------------------------------ #
-    # Link extraction helpers
+    # Core add-hit helper
     # ------------------------------------------------------------------ #
-    def _extract_links_from_text(self, base_url: str, text: str) -> List[str]:
-        if not text:
-            return []
-
-        cands: List[str] = []
-        cands += self._ABS_URL_RE.findall(text)
-        cands += self._SCHEMELESS_RE.findall(text)
-
-        # HTML attributes (relative or absolute)
-        for m in self._ATTR_REL_RE.findall(text):
-            cands.append(m)
-
-        seen = set()
-        out: List[str] = []
-        for raw in cands:
-            u = self._normalize_candidate(base_url, raw)
-            if not u:
-                continue
-            if not self._is_allowed_scheme(u):
-                continue
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-        return out
-
-    def _add_link_hits(
+    async def _add_link_hits_async(
         self,
         page_url: str,
         urls: List[str],
@@ -4076,36 +4868,220 @@ class DatabaseSniffer:
 
         # Optional filtering by class
         if self.cfg.classify_links and self.cfg.allow_classes:
-            keep: List[str] = []
-            for u in urls:
-                if self._classify_url(u) in self.cfg.allow_classes:
-                    keep.append(u)
-            urls = keep
-
-        if not urls:
-            return
+            urls = [u for u in urls if self._classify_url(u) in self.cfg.allow_classes]
+            if not urls:
+                return
 
         self._log(f"Link scan ({source}) found {len(urls)} URLs", log)
 
+        n = 0
         for u in urls:
             meta: Dict[str, Any] = {"url": u, "source": source}
             if self.cfg.classify_links:
                 meta["class"] = self._classify_url(u)
 
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": u,
-                    "tag": "db_sniff",
-                    "kind": "content_link",
-                    "meta": meta,
-                }
-            )
+            hits.append({
+                "page": page_url,
+                "url": u,
+                "tag": "db_sniff",
+                "kind": "content_link",
+                "meta": meta,
+            })
+
+            n += 1
+            if self.cfg.yield_every_n_urls and (n % self.cfg.yield_every_n_urls == 0):
+                await asyncio.sleep(0)
+
+    # ------------------------------------------------------------------ #
+    # Text extraction primitives (safe)
+    # ------------------------------------------------------------------ #
+    def _extract_urls_from_text(self, base_url: str, text: str) -> List[str]:
+        if not text:
+            return []
+        cands: List[str] = []
+        cands += self._ABS_URL_RE.findall(text)
+        cands += self._SCHEMELESS_RE.findall(text)
+
+        seen: Set[str] = set()
+        out: List[str] = []
+        for raw in cands:
+            u = self._normalize_candidate(base_url, raw)
+            if not u:
+                continue
+            if not self._is_allowed_scheme(u):
+                continue
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_css_urls(self, base_url: str, css_text: str) -> List[str]:
+        if not css_text:
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw in self._CSS_URL_RE.findall(css_text):
+            u = self._normalize_candidate(base_url, raw)
+            if not u or not self._is_allowed_scheme(u):
+                continue
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_srcset_urls(self, base_url: str, srcset: str) -> List[str]:
+        """
+        srcset format: "url1 1x, url2 2x" or "url 480w, url 800w"
+        We'll split commas, take first token in each chunk.
+        """
+        if not srcset:
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+        for part in srcset.split(","):
+            token = (part or "").strip().split()
+            if not token:
+                continue
+            raw = token[0].strip()
+            u = self._normalize_candidate(base_url, raw)
+            if not u or not self._is_allowed_scheme(u):
+                continue
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_js_string_literals(self, base_url: str, script_text: str, *, max_urls: int) -> List[str]:
+        """
+        Conservative scanning of inline JS for URL-ish string literals and relative endpoints.
+        Uses caps to prevent runaway.
+        """
+        if not script_text:
+            return []
+        seen: Set[str] = set()
+        out: List[str] = []
+        for m in self._JS_LIT_RE.finditer(script_text):
+            raw = m.group(0)
+            u = self._normalize_candidate(base_url, raw)
+            if not u or not self._is_allowed_scheme(u):
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            out.append(u)
+            if len(out) >= max_urls:
+                break
+        return out
+
+    def _extract_urls_from_json_value(
+        self,
+        base_url: str,
+        val: Any,
+        *,
+        seen_ids: Set[int],
+        out: List[str],
+        max_urls: int,
+        max_depth: int,
+        max_keys: int,
+        max_arr: int,
+        depth: int = 0,
+    ) -> None:
+        """
+        JSON traversal hardened:
+          - seen_ids prevents circular loops
+          - depth/keys/array caps
+          - extracts URL strings only (absolute/ws/schemeless/relative)
+        """
+        if len(out) >= max_urls:
+            return
+        if depth > max_depth:
+            return
+        if val is None:
+            return
+
+        # Circular protection for containers
+        if isinstance(val, (dict, list)):
+            vid = id(val)
+            if vid in seen_ids:
+                return
+            seen_ids.add(vid)
+
+        if isinstance(val, str):
+            # Pull any URLs inside the string
+            for u in self._extract_urls_from_text(base_url, val):
+                if len(out) >= max_urls:
+                    break
+                if u not in out:
+                    out.append(u)
+
+            # Also consider relative endpoints embedded as plain strings
+            # (e.g., "/api/v1/foo")
+            if len(out) < max_urls and val.startswith(("/", "./", "../")):
+                u = self._normalize_candidate(base_url, val)
+                if u and self._is_allowed_scheme(u) and u not in out:
+                    out.append(u)
+            return
+
+        if isinstance(val, list):
+            for item in val[:max_arr]:
+                self._extract_urls_from_json_value(
+                    base_url, item,
+                    seen_ids=seen_ids, out=out,
+                    max_urls=max_urls, max_depth=max_depth,
+                    max_keys=max_keys, max_arr=max_arr,
+                    depth=depth + 1,
+                )
+                if len(out) >= max_urls:
+                    return
+            return
+
+        if isinstance(val, dict):
+            # scan keys + values
+            for k in list(val.keys())[:max_keys]:
+                if len(out) >= max_urls:
+                    return
+                try:
+                    self._extract_urls_from_json_value(
+                        base_url, val.get(k),
+                        seen_ids=seen_ids, out=out,
+                        max_urls=max_urls, max_depth=max_depth,
+                        max_keys=max_keys, max_arr=max_arr,
+                        depth=depth + 1,
+                    )
+                except Exception:
+                    continue
+
+    def _extract_urls_from_json_text(self, base_url: str, json_text: str) -> List[str]:
+        if not json_text:
+            return []
+        json_text = json_text.strip()
+        if not json_text:
+            return []
+
+        try:
+            data = json.loads(json_text)
+        except Exception:
+            # Sometimes JSON-LD has multiple objects without array; try a lightweight salvage:
+            # If it fails, just do string URL extraction.
+            return self._extract_urls_from_text(base_url, json_text)
+
+        out: List[str] = []
+        self._extract_urls_from_json_value(
+            base_url,
+            data,
+            seen_ids=set(),
+            out=out,
+            max_urls=int(self.cfg.json_scan_max_urls),
+            max_depth=int(self.cfg.json_scan_max_depth),
+            max_keys=int(self.cfg.json_scan_max_keys_per_obj),
+            max_arr=int(self.cfg.json_scan_max_array_items),
+        )
+        return out
 
     # ------------------------------------------------------------------ #
     # Network capture (URLs only)
     # ------------------------------------------------------------------ #
-    def _add_urls(self, bucket: Set[str], base_url: str, raw: str) -> None:
+    def _add_url_to_bucket(self, bucket: Set[str], base_url: str, raw: str) -> None:
         u = self._normalize_candidate(base_url, raw)
         if u and self._is_allowed_scheme(u):
             bucket.add(u)
@@ -4113,26 +5089,268 @@ class DatabaseSniffer:
     async def _attach_network_collectors(self, page, page_url: str, net_urls: Set[str], log):
         def on_request(req):
             try:
-                self._add_urls(net_urls, page_url, req.url)
+                self._add_url_to_bucket(net_urls, page_url, req.url)
             except Exception:
                 pass
 
         def on_response(resp):
             try:
-                self._add_urls(net_urls, page_url, resp.url)
-
-                # Mine key headers (still URL-only)
+                self._add_url_to_bucket(net_urls, page_url, resp.url)
                 hdrs = getattr(resp, "headers", None) or {}
                 for k in ("location", "link"):
                     v = hdrs.get(k)
                     if v:
-                        for u in self._extract_links_from_text(page_url, v):
+                        for u in self._extract_urls_from_text(page_url, v):
                             net_urls.add(u)
             except Exception:
                 pass
 
         page.on("request", on_request)
         page.on("response", on_response)
+
+    # ------------------------------------------------------------------ #
+    # DOM harvesting (advanced high ROI)
+    # ------------------------------------------------------------------ #
+    async def _dom_harvest_urls(self, page, page_url: str, log: Optional[List[str]]) -> Dict[str, List[str]]:
+        """
+        Uses Playwright page.evaluate to harvest:
+          - whitelisted attribute values (href/src/srcset/poster/data-src/etc.)
+          - inline style text (style="")
+          - <style> tag contents
+          - meta content for OG/twitter/etc.
+          - JSON-LD blocks
+          - inline script blocks (string literal extraction)
+        Returns dict of buckets.
+        """
+        buckets: Dict[str, List[str]] = {
+            "dom_attrs": [],
+            "dom_srcset": [],
+            "dom_css": [],
+            "dom_meta": [],
+            "jsonld": [],
+            "inline_js": [],
+        }
+
+        # Pull DOM info in one go to reduce round-trips
+        # Caps are applied inside JS to avoid huge payloads.
+        js = r"""
+        (cfg) => {
+          const out = {
+            attrs: [],
+            srcsets: [],
+            inlineStyles: [],
+            styleTags: [],
+            metaContents: [],
+            jsonldBlocks: [],
+            inlineScripts: [],
+          };
+
+          const MAX_NODES = cfg.maxNodes || 4000;
+          const MAX_ATTRS = cfg.maxAttrs || 12000;
+          const attrWhite = new Set(cfg.attrWhitelist || []);
+          const maxStyleTagBytes = cfg.maxStyleTagBytes || 400000;
+          const maxInlineStyleBytes = cfg.maxInlineStyleBytes || 200000;
+          const maxJsonLdBlocks = cfg.maxJsonLdBlocks || 30;
+          const maxJsonLdBytes = cfg.maxJsonLdBytes || 200000;
+          const maxInlineScripts = cfg.maxInlineScripts || 40;
+          const maxInlineScriptBytes = cfg.maxInlineScriptBytes || 200000;
+
+          // --- element attribute scan ---
+          let scannedNodes = 0;
+          let scannedAttrs = 0;
+
+          const els = Array.from(document.querySelectorAll('*'));
+          for (const el of els) {
+            scannedNodes++;
+            if (scannedNodes > MAX_NODES) break;
+
+            // srcset special
+            const ss = el.getAttribute && el.getAttribute('srcset');
+            if (ss) out.srcsets.push(ss);
+
+            // inline style
+            const st = el.getAttribute && el.getAttribute('style');
+            if (st && out.inlineStyles.join('').length < maxInlineStyleBytes) out.inlineStyles.push(st);
+
+            if (!el.attributes) continue;
+            for (let i = 0; i < el.attributes.length; i++) {
+              scannedAttrs++;
+              if (scannedAttrs > MAX_ATTRS) break;
+              const a = el.attributes[i];
+              const name = (a.name || '').toLowerCase();
+              if (!attrWhite.has(name)) continue;
+              const v = a.value;
+              if (typeof v === 'string' && v) out.attrs.push([name, v]);
+            }
+            if (scannedAttrs > MAX_ATTRS) break;
+          }
+
+          // --- style tags ---
+          if (cfg.enableStyleTags) {
+            const styles = Array.from(document.querySelectorAll('style'));
+            let bytes = 0;
+            for (const s of styles) {
+              const t = s.textContent || '';
+              if (!t) continue;
+              const take = t.slice(0, Math.max(0, maxStyleTagBytes - bytes));
+              if (!take) break;
+              out.styleTags.push(take);
+              bytes += take.length;
+              if (bytes >= maxStyleTagBytes) break;
+            }
+          }
+
+          // --- meta tags: OG/twitter/etc. use content attr ---
+          if (cfg.enableMeta) {
+            const metas = Array.from(document.querySelectorAll('meta'));
+            for (const m of metas) {
+              const prop = (m.getAttribute('property') || m.getAttribute('name') || '').toLowerCase();
+              const content = m.getAttribute('content') || '';
+              if (!content) continue;
+              // keep high ROI meta names/properties
+              if (
+                prop.startsWith('og:') ||
+                prop.startsWith('twitter:') ||
+                prop.includes('video') ||
+                prop.includes('player') ||
+                prop.includes('stream') ||
+                prop.includes('image')
+              ) {
+                out.metaContents.push(content);
+              }
+            }
+          }
+
+          // --- JSON-LD blocks ---
+          if (cfg.enableJsonLd) {
+            const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+            let n = 0;
+            for (const sc of scripts) {
+              if (n >= maxJsonLdBlocks) break;
+              const t = (sc.textContent || '').trim();
+              if (!t) continue;
+              out.jsonldBlocks.push(t.slice(0, maxJsonLdBytes));
+              n++;
+            }
+          }
+
+          // --- inline scripts (string literals scan is done in python, but we pull text here) ---
+          if (cfg.enableInlineScripts) {
+            const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+            let n = 0;
+            for (const sc of scripts) {
+              if (n >= maxInlineScripts) break;
+              const t = (sc.textContent || '');
+              if (!t) continue;
+              out.inlineScripts.push(t.slice(0, maxInlineScriptBytes));
+              n++;
+            }
+          }
+
+          return out;
+        }
+        """
+
+        cfg = {
+            "maxNodes": int(self.cfg.max_dom_nodes),
+            "maxAttrs": int(self.cfg.max_attr_pairs),
+            "attrWhitelist": sorted([a.lower() for a in (self.cfg.attr_whitelist or set())]),
+            "enableStyleTags": bool(self.cfg.enable_dom_style_scan),
+            "enableMeta": bool(self.cfg.enable_dom_meta_scan),
+            "enableJsonLd": bool(self.cfg.enable_jsonld_scan),
+            "enableInlineScripts": bool(self.cfg.enable_inline_script_string_scan),
+            "maxStyleTagBytes": int(self.cfg.max_style_tag_bytes),
+            "maxInlineStyleBytes": int(self.cfg.max_inline_style_bytes),
+            "maxJsonLdBlocks": int(self.cfg.max_jsonld_blocks),
+            "maxJsonLdBytes": int(self.cfg.max_jsonld_bytes_per_block),
+            "maxInlineScripts": int(self.cfg.max_inline_script_blocks),
+            "maxInlineScriptBytes": int(self.cfg.max_inline_script_bytes_per_block),
+        }
+
+        payload = None
+        try:
+            payload = await page.evaluate(js, cfg)
+        except Exception as e:
+            self._log(f"DOM harvest evaluate failed: {e}", log)
+            return buckets
+
+        # --- Attributes
+        if self.cfg.enable_dom_attribute_scan and payload:
+            attrs = payload.get("attrs") or []
+            collected: List[str] = []
+            collected_srcset: List[str] = []
+
+            for name, val in attrs:
+                nlow = (name or "").lower()
+                if not isinstance(val, str) or not val.strip():
+                    continue
+
+                if nlow == "srcset":
+                    collected_srcset.extend(self._extract_srcset_urls(page_url, val))
+                else:
+                    collected.extend(self._extract_urls_from_text(page_url, val))
+                    # also allow relative endpoints in these attrs
+                    if val.startswith(("/", "./", "../")):
+                        u = self._normalize_candidate(page_url, val)
+                        if u and self._is_allowed_scheme(u):
+                            collected.append(u)
+
+            # Handle also explicit srcset list harvested separately
+            for ss in (payload.get("srcsets") or []):
+                if isinstance(ss, str):
+                    collected_srcset.extend(self._extract_srcset_urls(page_url, ss))
+
+            buckets["dom_attrs"] = list(dict.fromkeys(collected))
+            buckets["dom_srcset"] = list(dict.fromkeys(collected_srcset))
+
+        # --- Inline styles + <style> tags
+        if self.cfg.enable_dom_style_scan and payload:
+            css_urls: List[str] = []
+            for st in (payload.get("inlineStyles") or []):
+                if isinstance(st, str):
+                    css_urls.extend(self._extract_css_urls(page_url, st))
+            for sty in (payload.get("styleTags") or []):
+                if isinstance(sty, str):
+                    css_urls.extend(self._extract_css_urls(page_url, sty))
+            buckets["dom_css"] = list(dict.fromkeys(css_urls))
+
+        # --- Meta tags
+        if self.cfg.enable_dom_meta_scan and payload:
+            meta_urls: List[str] = []
+            for c in (payload.get("metaContents") or []):
+                if isinstance(c, str):
+                    meta_urls.extend(self._extract_urls_from_text(page_url, c))
+                    if c.startswith(("/", "./", "../")):
+                        u = self._normalize_candidate(page_url, c)
+                        if u and self._is_allowed_scheme(u):
+                            meta_urls.append(u)
+            buckets["dom_meta"] = list(dict.fromkeys(meta_urls))
+
+        # --- JSON-LD
+        if self.cfg.enable_jsonld_scan and payload:
+            jl_urls: List[str] = []
+            for block in (payload.get("jsonldBlocks") or []):
+                if isinstance(block, str) and block:
+                    jl_urls.extend(self._extract_urls_from_json_text(page_url, block))
+                    if len(jl_urls) >= int(self.cfg.json_scan_max_urls):
+                        break
+            buckets["jsonld"] = list(dict.fromkeys(jl_urls))[: int(self.cfg.json_scan_max_urls)]
+
+        # --- Inline scripts string literal scan (incremental + yield)
+        if self.cfg.enable_inline_script_string_scan and payload:
+            js_urls: List[str] = []
+            for block in (payload.get("inlineScripts") or []):
+                if not isinstance(block, str) or not block:
+                    continue
+                js_urls.extend(self._extract_js_string_literals(page_url, block, max_urls=int(self.cfg.js_literal_max_urls)))
+                if len(js_urls) >= int(self.cfg.js_literal_max_urls):
+                    break
+                # yield occasionally so Playwright can progress
+                if len(js_urls) and (len(js_urls) % int(self.cfg.yield_every_n_urls or 200) == 0):
+                    await asyncio.sleep(0)
+            buckets["inline_js"] = list(dict.fromkeys(js_urls))[: int(self.cfg.js_literal_max_urls)]
+
+        return buckets
 
     # ------------------------------------------------------------------ #
     # Public API (matches other sniffers)
@@ -4167,7 +5385,7 @@ class DatabaseSniffer:
 
             # Navigate
             await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(800)
 
             # --- Backend fingerprint (window globals) ---
             backend_urls: List[str] = []
@@ -4196,18 +5414,15 @@ class DatabaseSniffer:
                         """,
                         list(self.cfg.known_globals),
                     )
-
                     for fp in fingerprints or []:
                         if isinstance(fp, dict):
-                            hits.append(
-                                {
-                                    "page": page_url,
-                                    "url": page_url,
-                                    "tag": "db_sniff",
-                                    "kind": "db_config_detected",
-                                    "meta": fp,
-                                }
-                            )
+                            hits.append({
+                                "page": page_url,
+                                "url": page_url,
+                                "tag": "db_sniff",
+                                "kind": "db_config_detected",
+                                "meta": fp,
+                            })
                 except Exception as e:
                     self._log(f"Backend fingerprint error on {page_url}: {e}", log)
 
@@ -4230,10 +5445,7 @@ class DatabaseSniffer:
 
                               const addUrl = (u) => {
                                 if (!u || seen.has(u)) return;
-                                if (isUrl(u)) {
-                                  seen.add(u);
-                                  urls.push(u);
-                                }
+                                if (isUrl(u)) { seen.add(u); urls.push(u); }
                               };
 
                               const scanValue = (v, depth) => {
@@ -4243,7 +5455,10 @@ class DatabaseSniffer:
                                 if (typeof v === 'string') { addUrl(v); return; }
 
                                 if (Array.isArray(v)) {
-                                  for (const item of v.slice(0, MAX_ARR)) scanValue(item, depth - 1);
+                                  for (const item of v.slice(0, MAX_ARR)) {
+                                    scanValue(item, depth - 1);
+                                    if (urls.length >= MAX_URLS) return;
+                                  }
                                   return;
                                 }
 
@@ -4252,7 +5467,7 @@ class DatabaseSniffer:
                                   try { keys = Object.keys(v).slice(0, MAX_KEYS); } catch (e) { return; }
                                   for (const k of keys) {
                                     try { scanValue(v[k], depth - 1); } catch (e) {}
-                                    if (urls.length >= MAX_URLS) break;
+                                    if (urls.length >= MAX_URLS) return;
                                   }
                                 }
                               };
@@ -4295,15 +5510,13 @@ class DatabaseSniffer:
                 try:
                     idb_data = await self._dump_indexeddb(page, log)
                     for db in idb_data:
-                        hits.append(
-                            {
-                                "page": page_url,
-                                "url": page_url,
-                                "tag": "db_sniff",
-                                "kind": "indexeddb_dump",
-                                "meta": db,
-                            }
-                        )
+                        hits.append({
+                            "page": page_url,
+                            "url": page_url,
+                            "tag": "db_sniff",
+                            "kind": "indexeddb_dump",
+                            "meta": db,
+                        })
                 except Exception as e:
                     self._log(f"IndexedDB dump error on {page_url}: {e}", log)
 
@@ -4313,20 +5526,30 @@ class DatabaseSniffer:
             except Exception as e:
                 self._log(f"Error getting HTML for {page_url}: {e}", log)
 
-            # --- Link-only extraction from HTML ---
+            # --- Advanced DOM harvesting (HIGH ROI) ---
+            dom_buckets = {}
+            if self.cfg.enable_html_link_scan:
+                dom_buckets = await self._dom_harvest_urls(page, page_url, log)
+
+            # --- Emit hits ---
+            # 1) legacy “html scan” fallback: still worth keeping
             if self.cfg.enable_html_link_scan and html:
-                html_links = self._extract_links_from_text(page_url, html)
-                self._add_link_hits(page_url, html_links, hits, source="html", log=log)
+                html_links = self._extract_urls_from_text(page_url, html)
+                await self._add_link_hits_async(page_url, html_links, hits, source="html_regex", log=log)
 
-            # --- Link-only extraction from backend globals ---
+            # 2) advanced DOM buckets (attributes/srcset/css/meta/jsonld/inline_js)
+            for k, urls in (dom_buckets or {}).items():
+                if urls:
+                    await self._add_link_hits_async(page_url, urls, hits, source=k, log=log)
+
+            # 3) backend globals
             if backend_urls:
-                self._add_link_hits(page_url, backend_urls, hits, source="backend_globals", log=log)
+                await self._add_link_hits_async(page_url, backend_urls, hits, source="backend_globals", log=log)
 
-            # --- Network URLs flush ---
+            # 4) network URLs flush
             if self.cfg.enable_network_capture and net_urls:
                 urls = list(net_urls)[: int(self.cfg.max_network_urls)]
-                self._add_link_hits(page_url, urls, hits, source="network", log=log)
-
+                await self._add_link_hits_async(page_url, urls, hits, source="network", log=log)
 
         except Exception as e:
             self._log(f"Fatal error during DB sniff on {page_url}: {e}", log)
@@ -4444,7 +5667,6 @@ class DatabaseSniffer:
         except Exception as e:
             self._log(f"IndexedDB metadata script failed: {e}", log)
             return []
-
 
 # ======================================================================
 # InteractionSniffer (CDP-based Event & Overlay Analysis)
