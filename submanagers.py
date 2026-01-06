@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import collections  # For collections.Counter
 import hashlib
+import math
 import os
 import re
 import sqlite3
 import ssl
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field, fields
 from html.parser import HTMLParser
 from pathlib import Path
@@ -7207,25 +7209,32 @@ class _HTTPResult:
 
 class HTTPSSubmanager:
     """
-    Industrial-grade shared HTTPS engine (aiohttp-only).
-
-    Goals:
-      - Keep integration simple: callers just use get_text/get_bytes/head.
-      - Add resiliency, rate-limit friendliness, proxy rotation, and browser mimicry.
-      - Fix response lifetime: never return a closed aiohttp response object.
-
-    Features:
-      - Single pooled ClientSession + TCPConnector
-      - DNS cache + keepalive + happy eyeballs
-      - Per-host concurrency semaphores
-      - Per-host cooldown (429/503 aware) + Retry-After support
-      - Retry with exponential backoff + jitter (status + network exception aware)
-      - Proxy rotation per-attempt (pool)
-      - Browser-like headers + adaptive referer/origin per host
-      - Safe bounded reads (max_bytes) with streaming accumulation
-      - TLS controls: verify on/off + custom CA bundle
-      - Cookie jar enabled (helps doc portals / soft WAFs)
+    Industrial-grade shared HTTPS engine (aiohttp-only), with:
+      - Freeze prevention: strict timeouts, redirect caps, early-exit for heavy MIME.
+      - Secure Gateway: magic-byte verification, entropy heuristics, decompression bomb guard.
+      - Optional domain reputation filter (local heuristics / denylist).
     """
+
+    # --- Magic byte signatures (first bytes) ---
+    _MAGIC_EXE = (b"MZ",)  # Windows PE
+    _MAGIC_PDF = (b"%PDF",)
+    _MAGIC_PNG = (b"\x89PNG\r\n\x1a\n",)
+    _MAGIC_JPG = (b"\xff\xd8\xff",)
+    _MAGIC_GIF = (b"GIF87a", b"GIF89a")
+    _MAGIC_ZIP = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+
+    # quick “script-like” / “text-like” types
+    _TEXTLIKE_MIME_HINTS = (
+        "text/",
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/x-javascript",
+        "application/ecmascript",
+        "application/x-ecmascript",
+        "application/xhtml+xml",
+        "application/x-www-form-urlencoded",
+    )
 
     def __init__(
         self,
@@ -7235,18 +7244,50 @@ class HTTPSSubmanager:
         backoff_base: float = 0.35,
         backoff_cap: float = 8.0,
         max_conn_per_host: int = 8,
-        max_total_conn: int = 0,  # 0 => aiohttp default (unbounded by connector limit) - set if you want
+        max_total_conn: int = 0,
         proxy: Optional[str] = None,
         proxy_pool: Optional[list] = None,
         verify: bool = True,
         ca_bundle: Optional[str] = None,
 
         # safety / “don’t melt”
-        max_bytes: int = 4_000_000,     # bound for get_text/get_bytes (4MB)
-        max_html_chars: int = 600_000,  # bound for decoded text
+        max_bytes: int = 4_000_000,
+        max_html_chars: int = 600_000,
         respect_retry_after: bool = True,
         enable_cookies: bool = True,
         allow_redirects: bool = True,
+
+        # ------------------ Freeze prevention ------------------
+        max_redirects: int = 5,                # hard cap
+        total_timeout_s: float = 15.0,         # DNS+connect+first byte+body, etc.
+        connect_timeout_s: float = 5.0,
+        sock_read_timeout_s: float = 7.0,      # overall socket-read budget
+        chunk_timeout_s: float = 5.0,          # “silence” timeout between chunks
+        chunk_size: int = 64 * 1024,
+
+        # MIME early exit
+        heavy_mime_hints: Tuple[str, ...] = ("video/", "audio/", "application/octet-stream"),
+        heavy_snippet_cap: int = 1_000_000,    # if max_bytes > this and MIME is heavy => bail
+
+        # ------------------ Secure Gateway ------------------
+        enable_magic_byte_verification: bool = True,
+        magic_pe_kill_mime_allow: Tuple[str, ...] = ("application/x-msdownload", "application/octet-stream"),
+        magic_pe_kill_ext_block: Tuple[str, ...] = (".js", ".mjs", ".css", ".json", ".xml", ".txt", ".html", ".htm"),
+        enable_entropy_filter: bool = True,
+        entropy_sample_bytes: int = 64_000,    # only sample first N bytes of text
+        entropy_threshold: float = 7.25,       # near 8 => very “random”
+        min_printable_ratio: float = 0.75,     # text should mostly be printable
+        enable_decompression_bomb_guard: bool = True,
+        decompress_ratio_limit: float = 120.0, # uncompressed_bytes / compressed_bytes
+        decompress_hard_cap_bytes: int = 12_000_000,  # absolute decoded cap during decompress
+
+        # ------------------ Domain reputation (optional) ------------------
+        enable_domain_reputation_filter: bool = False,
+        domain_denylist: Optional[Tuple[str, ...]] = None,
+        parked_domain_hints: Tuple[str, ...] = (
+            "sedoparking", "parkingcrew", "bodis", "domainparking", "namebright",
+            "dan.com", "hugedomains", "afternic", "parking", "buythisdomain"
+        ),
     ):
         self.ua = user_agent
         self.timeout = float(timeout)
@@ -7268,22 +7309,45 @@ class HTTPSSubmanager:
         self.respect_retry_after = bool(respect_retry_after)
         self.allow_redirects = bool(allow_redirects)
 
+        # freeze prevention
+        self.max_redirects = int(max_redirects)
+        self.total_timeout_s = float(total_timeout_s)
+        self.connect_timeout_s = float(connect_timeout_s)
+        self.sock_read_timeout_s = float(sock_read_timeout_s)
+        self.chunk_timeout_s = float(chunk_timeout_s)
+        self.chunk_size = int(chunk_size)
+
+        self.heavy_mime_hints = tuple(str(x).lower() for x in heavy_mime_hints)
+        self.heavy_snippet_cap = int(heavy_snippet_cap)
+
+        # secure gateway
+        self.enable_magic_byte_verification = bool(enable_magic_byte_verification)
+        self.magic_pe_kill_mime_allow = tuple(str(x).lower() for x in magic_pe_kill_mime_allow)
+        self.magic_pe_kill_ext_block = tuple(str(x).lower() for x in magic_pe_kill_ext_block)
+
+        self.enable_entropy_filter = bool(enable_entropy_filter)
+        self.entropy_sample_bytes = int(entropy_sample_bytes)
+        self.entropy_threshold = float(entropy_threshold)
+        self.min_printable_ratio = float(min_printable_ratio)
+
+        self.enable_decompression_bomb_guard = bool(enable_decompression_bomb_guard)
+        self.decompress_ratio_limit = float(decompress_ratio_limit)
+        self.decompress_hard_cap_bytes = int(decompress_hard_cap_bytes)
+
+        # domain reputation
+        self.enable_domain_reputation_filter = bool(enable_domain_reputation_filter)
+        self.domain_denylist = tuple(d.lower() for d in (domain_denylist or ()))
+        self.parked_domain_hints = tuple(x.lower() for x in parked_domain_hints)
+
         self.enable_cookies = bool(enable_cookies)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
 
-        # Per-host concurrency (fairness)
         self._host_sem: Dict[str, asyncio.Semaphore] = {}
-
-        # Per-host cooldown timestamp (rate-limit friendliness)
         self._host_cooldown_until: Dict[str, float] = {}
-
-        # Per-host last successful URL (for referer/origin mimicry)
         self._host_last_ok_url: Dict[str, str] = {}
-
-        # tiny lock to avoid stampedes updating cooldown
         self._cooldown_lock = asyncio.Lock()
 
     # ------------------------------------------------------------- #
@@ -7292,7 +7356,6 @@ class HTTPSSubmanager:
     async def __aenter__(self):
         self._ssl_context = self._build_ssl_context()
 
-        # DNS caching and connection pooling
         self._connector = aiohttp.TCPConnector(
             ssl=self._ssl_context,
             limit=(self.max_total_conn if self.max_total_conn > 0 else 0),
@@ -7304,16 +7367,16 @@ class HTTPSSubmanager:
         )
 
         jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
-
-        # Base headers: browser-ish defaults
         base_headers = self._base_browser_headers()
 
+        # IMPORTANT:
+        # auto_decompress=False lets us enforce decompression ratio/caps ourselves.
         self._session = aiohttp.ClientSession(
             connector=self._connector,
             cookie_jar=jar,
             headers=base_headers,
-            auto_decompress=True,
-            trust_env=True,  # respects env proxies if present
+            auto_decompress=False,
+            trust_env=True,
         )
         return self
 
@@ -7327,20 +7390,14 @@ class HTTPSSubmanager:
         self._host_cooldown_until.clear()
         self._host_last_ok_url.clear()
 
-
     # ------------------------------------------------------------- #
     # SSL / TLS helpers
     # ------------------------------------------------------------- #
     def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
-        # If verify ON and no custom CA, let aiohttp use system defaults.
         if self.verify and not self.ca_bundle:
             return None
-
         if self.verify:
-            # Verify ON with explicit CA bundle (or default context)
             return ssl.create_default_context(cafile=self.ca_bundle if self.ca_bundle else None)
-
-        # verify OFF (dangerous but sometimes necessary behind MITM proxies)
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -7355,9 +7412,15 @@ class HTTPSSubmanager:
         except Exception:
             return ""
 
+    def _path(self, url: str) -> str:
+        try:
+            return urlparse(url).path or ""
+        except Exception:
+            return ""
+
     def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
-        if not host: host = "_"
-        # No need for a complex lock, just use dict.setdefault
+        if not host:
+            host = "_"
         return self._host_sem.setdefault(host, asyncio.Semaphore(self.max_conn_per_host))
 
     async def _respect_host_cooldown(self, host: str):
@@ -7387,12 +7450,11 @@ class HTTPSSubmanager:
         return None
 
     def _base_browser_headers(self) -> Dict[str, str]:
-        # Note: aiohttp does gzip/deflate by default; brotli would require extra dependency.
         return {
             "User-Agent": self.ua,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "DNT": "1",
@@ -7406,69 +7468,267 @@ class HTTPSSubmanager:
         host = self._host(url)
         last_ok = self._host_last_ok_url.get(host, "")
         h: Dict[str, str] = {}
-
-        # If we’ve successfully hit this host before, mimic navigation flow.
         if last_ok:
             h["Referer"] = last_ok
-            # If same host, Sec-Fetch-Site becomes same-origin-ish
             h["Sec-Fetch-Site"] = "same-origin"
-
-        # Slight variability to avoid being “too static”
         if random.random() < 0.10:
             h["Accept-Language"] = "en-US,en;q=0.8"
-
         return h
 
     # ------------------------------------------------------------- #
     # Retry policy
     # ------------------------------------------------------------- #
     def _is_retryable_status(self, status: int) -> bool:
-        # Typical transient statuses
-        if status in (408, 425, 429, 500, 502, 503, 504):
-            return True
-        return False
+        return status in (408, 425, 429, 500, 502, 503, 504)
 
     def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
-        # If server provides Retry-After and we respect it, honor up to cap
         if server_hint is not None and server_hint > 0:
             return min(self.backoff_cap, float(server_hint))
-
-        # Exponential backoff + jitter
         base = self.backoff_base * (2 ** attempt)
         jitter = random.uniform(0.0, base * 0.25)
         return min(self.backoff_cap, base + jitter)
 
     def _parse_retry_after(self, hdrs: Dict[str, str]) -> Optional[float]:
-        if not hdrs:
-            return None
-        ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+        ra = (hdrs.get("Retry-After") or hdrs.get("retry-after") or "").strip()
         if not ra:
             return None
-        ra = str(ra).strip()
-        # Retry-After can be seconds or HTTP date; we handle seconds only (fast + common)
         try:
             return float(ra)
         except Exception:
             return None
 
     # ------------------------------------------------------------- #
-    # Safe bounded read
+    # Domain reputation filter (optional)
     # ------------------------------------------------------------- #
-    async def _read_bounded(self, resp: aiohttp.ClientResponse, max_bytes: int) -> bytes:
-        buf = bytearray()
-        try:
-            async for chunk in resp.content.iter_chunked(64 * 1024):
-                if not chunk:
-                    break
-                buf.extend(chunk)
-                if len(buf) >= max_bytes:
-                    break
-        except Exception:
-            pass
-        return bytes(buf)
+    def _is_toxic_domain(self, host: str) -> bool:
+        if not host:
+            return False
+        h = host.lower()
+
+        # explicit denylist (exact or suffix match)
+        for d in self.domain_denylist:
+            if h == d or h.endswith("." + d):
+                return True
+
+        # cheap “parked” / “toxic” heuristics
+        for hint in self.parked_domain_hints:
+            if hint in h:
+                return True
+
+        # extremely short / weird netlocs can be junk in bulk crawls
+        if len(h) <= 3 and "." not in h:
+            return True
+
+        return False
 
     # ------------------------------------------------------------- #
-    # Core request (never returns a closed aiohttp response)
+    # Secure Gateway helpers
+    # ------------------------------------------------------------- #
+    def _content_type(self, hdrs: Dict[str, str]) -> str:
+        return (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+
+    def _content_encoding(self, hdrs: Dict[str, str]) -> str:
+        return (hdrs.get("Content-Encoding") or hdrs.get("content-encoding") or "").lower()
+
+    def _looks_textlike(self, ctype: str) -> bool:
+        if not ctype:
+            return False
+        return any(h in ctype for h in self._TEXTLIKE_MIME_HINTS)
+
+    def _should_early_exit_heavy(self, ctype: str, max_bytes: int) -> bool:
+        if not ctype:
+            return False
+        if any(h in ctype for h in self.heavy_mime_hints) and max_bytes > self.heavy_snippet_cap:
+            return True
+        return False
+
+    def _starts_with_any(self, data: bytes, sigs: Tuple[bytes, ...]) -> bool:
+        for s in sigs:
+            if data.startswith(s):
+                return True
+        return False
+
+    def _magic_byte_violation(self, url: str, ctype: str, first: bytes) -> bool:
+        """
+        If a response is effectively a PE (MZ) but it "looks like" text/script,
+        kill it early. This is deliberately conservative to avoid false positives.
+        """
+        if not first or len(first) < 2:
+            return False
+        if not self._starts_with_any(first, self._MAGIC_EXE):
+            return False
+
+        path = self._path(url).lower()
+
+        # If file extension suggests text/script or page-like content -> suspicious
+        if any(path.endswith(ext) for ext in self.magic_pe_kill_ext_block):
+            return True
+
+        # If content-type says textlike -> suspicious
+        if self._looks_textlike(ctype):
+            return True
+
+        # If content-type is not in the small “allowed” list -> suspicious
+        if ctype and not any(a in ctype for a in self.magic_pe_kill_mime_allow):
+            return True
+
+        return False
+
+    def _shannon_entropy(self, data: bytes) -> float:
+        """
+        Shannon entropy in bits/byte on the given byte sample.
+        """
+        if not data:
+            return 0.0
+        # frequency
+        counts = [0] * 256
+        for b in data:
+            counts[b] += 1
+        n = float(len(data))
+        ent = 0.0
+        for c in counts:
+            if c:
+                p = c / n
+                ent -= p * math.log2(p)
+        return ent
+
+    def _printable_ratio(self, data: bytes) -> float:
+        if not data:
+            return 1.0
+        printable = 0
+        for b in data:
+            # allow common whitespace + ASCII printable
+            if b in (9, 10, 13) or 32 <= b <= 126:
+                printable += 1
+        return printable / max(1, len(data))
+
+    # ------------------------------------------------------------- #
+    # Read + Decompress (bounded, timeouted, guarded)
+    # ------------------------------------------------------------- #
+    async def _read_bounded_secure(self, resp: aiohttp.ClientResponse, url: str, max_bytes: int) -> Tuple[bytes, str]:
+        """
+        Returns (body_bytes, error_string). error_string non-empty => treat as blocked/error.
+        Notes:
+          - Reads compressed bytes from the socket (auto_decompress=False).
+          - If encoding gzip/deflate -> incremental decompress with ratio + cap checks.
+          - Enforces per-chunk “silence” timeout to prevent slowloris/zombies.
+          - Does magic-byte check on the *decompressed* first bytes (best signal).
+          - Does entropy heuristic on text-like content (first N bytes).
+        """
+        hdrs = dict(resp.headers) if resp.headers else {}
+        ctype = self._content_type(hdrs)
+        enc = self._content_encoding(hdrs)
+
+        # MIME-type early exit for heavy blobs
+        if self._should_early_exit_heavy(ctype, max_bytes):
+            return b"", "early_exit_heavy_mime"
+
+        # incremental decompressor (gzip/deflate only; br is left as raw)
+        decompressor = None
+        if self.enable_decompression_bomb_guard:
+            if "gzip" in enc:
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)  # gzip wrapper
+            elif "deflate" in enc:
+                decompressor = zlib.decompressobj()
+
+        compressed_read = 0
+        out = bytearray()
+        first_probe_done = False
+        entropy_probe = bytearray()
+
+        it = resp.content.iter_chunked(self.chunk_size).__aiter__()
+
+        while True:
+            try:
+                chunk = await asyncio.wait_for(it.__anext__(), timeout=self.chunk_timeout_s)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                # chunk silence timeout: return what we have (do NOT freeze caller)
+                break
+            except Exception:
+                break
+
+            if not chunk:
+                break
+
+            compressed_read += len(chunk)
+
+            # Decompress if we can; otherwise treat as plain bytes stream.
+            produced = chunk
+            if decompressor is not None:
+                try:
+                    produced = decompressor.decompress(chunk, self.decompress_hard_cap_bytes)
+                except Exception:
+                    return bytes(out), "decompress_error"
+
+                # ratio guard (only meaningful if we have some compressed bytes)
+                if compressed_read > 0:
+                    ratio = (len(out) + len(produced)) / max(1, compressed_read)
+                    if ratio > self.decompress_ratio_limit:
+                        return bytes(out), "decompression_ratio_blocked"
+
+                if (len(out) + len(produced)) > self.decompress_hard_cap_bytes:
+                    return bytes(out), "decompression_hard_cap_blocked"
+
+            # magic-byte verification on the first produced bytes
+            if self.enable_magic_byte_verification and not first_probe_done:
+                probe = produced[:16]
+                first_probe_done = True
+                if self._magic_byte_violation(url, ctype, probe):
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return b"", "magic_byte_blocked"
+
+            out.extend(produced)
+
+            # entropy probe (only for text-like)
+            if self.enable_entropy_filter and self._looks_textlike(ctype) and len(entropy_probe) < self.entropy_sample_bytes:
+                take = produced[: max(0, self.entropy_sample_bytes - len(entropy_probe))]
+                entropy_probe.extend(take)
+
+            # bounded output read (caller budget)
+            if len(out) >= max_bytes:
+                try:
+                    resp.close()  # early close to avoid lingering
+                except Exception:
+                    pass
+                out = out[:max_bytes]
+                break
+
+        # flush decompressor
+        if decompressor is not None:
+            try:
+                tail = decompressor.flush()
+                if tail:
+                    # enforce guards on flush too
+                    if compressed_read > 0:
+                        ratio = (len(out) + len(tail)) / max(1, compressed_read)
+                        if ratio > self.decompress_ratio_limit:
+                            return bytes(out), "decompression_ratio_blocked"
+                    if (len(out) + len(tail)) > self.decompress_hard_cap_bytes:
+                        return bytes(out), "decompression_hard_cap_blocked"
+
+                    out.extend(tail)
+                    if len(out) > max_bytes:
+                        out = out[:max_bytes]
+            except Exception:
+                # ignore flush failures
+                pass
+
+        # entropy check (cheap heuristic; block only if strongly suspicious)
+        if self.enable_entropy_filter and self._looks_textlike(ctype) and entropy_probe:
+            ent = self._shannon_entropy(bytes(entropy_probe))
+            pr = self._printable_ratio(bytes(entropy_probe))
+            if ent >= self.entropy_threshold and pr < self.min_printable_ratio:
+                return bytes(out), f"entropy_blocked(ent={ent:.2f},printable={pr:.2f})"
+
+        return bytes(out), ""
+
+    # ------------------------------------------------------------- #
+    # Core request
     # ------------------------------------------------------------- #
     async def _request(
         self,
@@ -7488,24 +7748,35 @@ class HTTPSSubmanager:
         max_bytes = self.max_bytes if max_bytes is None else int(max_bytes)
 
         host = self._host(url)
+
+        # optional reputation filter
+        if self.enable_domain_reputation_filter and self._is_toxic_domain(host):
+            return _HTTPResult(False, None, {}, url, b"", error="domain_reputation_blocked")
+
         sem = self._get_host_semaphore(host)
 
         for attempt in range(self.retries + 1):
             await self._respect_host_cooldown(host)
 
             proxy = self._choose_proxy()
-            req_headers = {}
+            req_headers: Dict[str, str] = {}
             req_headers.update(self._per_request_headers(url))
             if headers:
                 req_headers.update(headers)
 
             try:
                 async with sem:
-                    timeout = ClientTimeout(total=self.timeout)
+                    timeout = ClientTimeout(
+                        total=self.total_timeout_s,
+                        connect=self.connect_timeout_s,
+                        sock_read=self.sock_read_timeout_s,
+                    )
+
                     async with self._session.request(
                         method,
                         url,
                         allow_redirects=allow_redirects,
+                        max_redirects=self.max_redirects,
                         proxy=proxy,
                         timeout=timeout,
                         headers=req_headers,
@@ -7515,28 +7786,32 @@ class HTTPSSubmanager:
                         status = int(resp.status)
                         hdrs = dict(resp.headers) if resp.headers else {}
 
-                        # Rate-limit friendliness: set cooldown when server says so
+                        # cooldown on 429/503 with Retry-After
                         if self.respect_retry_after and status in (429, 503):
                             ra = self._parse_retry_after(hdrs)
                             if ra:
                                 await self._set_host_cooldown(host, ra)
 
                         body = b""
-                        if want_body:
-                            body = await self._read_bounded(resp, max_bytes=max_bytes)
+                        err = ""
 
-                        # Track last-ok url for referer mimicry
-                        if status and 200 <= status < 300:
+                        if want_body:
+                            body, err = await self._read_bounded_secure(resp, url=final_url, max_bytes=max_bytes)
+                            if err:
+                                return _HTTPResult(False, status, hdrs, final_url, b"", error=err)
+
+                        # last-ok for referer mimicry
+                        if 200 <= status < 300:
                             self._host_last_ok_url[host] = final_url
 
-                        # Retryable HTTP statuses
-                        if status and self._is_retryable_status(status) and attempt < self.retries:
+                        # retryable statuses
+                        if self._is_retryable_status(status) and attempt < self.retries:
                             server_hint = self._parse_retry_after(hdrs) if self.respect_retry_after else None
                             await asyncio.sleep(self._retry_delay(attempt, server_hint=server_hint))
                             continue
 
                         return _HTTPResult(
-                            ok=(status is not None and 200 <= status < 300),
+                            ok=(200 <= status < 300),
                             status=status,
                             headers=hdrs,
                             final_url=final_url,
@@ -7544,56 +7819,47 @@ class HTTPSSubmanager:
                             error="",
                         )
 
-            except (aiohttp.ClientConnectorError,
-                    aiohttp.ClientOSError,
-                    aiohttp.ServerDisconnectedError,
-                    aiohttp.ClientPayloadError,
-                    asyncio.TimeoutError,
-                    ssl.SSLError) as e:
-                # Transient-ish network/TLS errors: retry
+            except aiohttp.TooManyRedirects:
+                return _HTTPResult(False, None, {}, url, b"", error="too_many_redirects")
+            except (
+                aiohttp.ClientConnectorError,
+                aiohttp.ClientOSError,
+                aiohttp.ServerDisconnectedError,
+                aiohttp.ClientPayloadError,
+                asyncio.TimeoutError,
+                ssl.SSLError,
+            ) as e:
                 if attempt >= self.retries:
                     return _HTTPResult(False, None, {}, url, b"", error=str(e))
                 await asyncio.sleep(self._retry_delay(attempt))
                 continue
             except Exception as e:
-                # Unknown: usually not worth hammering
                 return _HTTPResult(False, None, {}, url, b"", error=str(e))
 
         return _HTTPResult(False, None, {}, url, b"", error="exhausted_retries")
 
     # ------------------------------------------------------------- #
-    # Public helpers (same API as your current version)
+    # Public helpers
     # ------------------------------------------------------------- #
     async def get_text(self, url: str) -> str:
-        """
-        GET url and return decoded text ("" on non-2xx or error).
-        """
         r = await self._request("GET", url, want_body=True)
         if not r.ok or not r.body:
             return ""
         try:
-            # Let aiohttp do charset detection? We only have bytes now, so do a safe decode.
             txt = r.body.decode("utf-8", errors="ignore")
         except Exception:
             return ""
-
         if len(txt) > self.max_html_chars:
             txt = txt[: self.max_html_chars]
         return txt
 
     async def get_bytes(self, url: str) -> bytes:
-        """
-        GET url and return raw bytes (b"" on non-2xx or error).
-        """
         r = await self._request("GET", url, want_body=True)
         if not r.ok:
             return b""
         return r.body or b""
 
     async def head(self, url: str) -> Tuple[Optional[int], Dict[str, str]]:
-        """
-        HEAD url and return (status, headers).
-        """
         r = await self._request("HEAD", url, want_body=False, allow_redirects=True)
         if r.status is None:
             return None, {}
