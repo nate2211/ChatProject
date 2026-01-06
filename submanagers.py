@@ -407,7 +407,7 @@ class NetworkSniffer:
         })
 
     # ---------------------------- init ---------------------------- #
-    def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None):
+    def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None, http=None):
         self.cfg = config or self.Config()
 
         if logger is not None:
@@ -417,6 +417,7 @@ class NetworkSniffer:
 
         self._log("[NetworkSniffer] Initialized (evidence + salvage) [hard str-safe + programmatic salvage]", None)
 
+        self.http= http
         # SoundCloud nudges (optional)
         try:
             self.cfg.video_stream_hints.add("cf-hls-media.sndcdn.com")
@@ -948,86 +949,66 @@ class NetworkSniffer:
 
     async def _probe_url(self, api_ctx, url: str, req_headers: Dict[str, str], *, timeout_ms: int) -> Dict[str, Any]:
         """
-        Probe:
-          - Try Range GET first (more reliable than HEAD on many CDNs)
-          - Fall back to HEAD (some endpoints prefer it)
-          - Stop once we have ok (200/206) with media-ish content-type (or any 200/206 if unknown)
+        HYBRID PROBE: Uses industrial engine if available, else falls back to Playwright api_ctx.
         """
         url = self._to_str(url)
         result = {
-            "url": url,
-            "ok": False,
-            "status": None,
-            "final_url": url,
-            "content_type": None,
-            "content_length": None,
-            "hash_prefix_sha256": None,
-            "method": None,
-            "error": "",
+            "url": url, "ok": False, "status": None, "final_url": url,
+            "content_type": None, "content_length": None, "hash_prefix_sha256": None,
+            "method": None, "error": "",
         }
+
+        # --- Path A: HTTPSSubmanager (High Resiliency) ---
+        if self.http:
+            try:
+                # 1. HEAD request for metadata
+                status, hdrs = await self.http.head(url)
+                result.update({
+                    "method": "ENGINE_GET",
+                    "status": status,
+                    "content_type": hdrs.get("Content-Type") or hdrs.get("content-type"),
+                    "content_length": hdrs.get("Content-Length") or hdrs.get("content-length")
+                })
+
+                # 2. Bounded GET for hashing
+                body = await self.http.get_bytes(url)
+                if body:
+                    result["hash_prefix_sha256"] = hashlib.sha256(body[:int(self.cfg.salvage_range_bytes)]).hexdigest()
+
+                # Check success
+                if status and 200 <= status < 300:
+                    result["ok"] = True
+                return result
+            except Exception as e:
+                self._log(f"[NetworkSniffer] Engine probe failed, trying fallback: {e}", None)
+                # If engine fails, we don't return yet; we try Path B fallback
+
+        # --- Path B: Playwright Fallback (Original Logic) ---
         if api_ctx is None:
-            result["error"] = "no_api_request_context"
+            result["error"] = "no_context_or_engine"
             return result
 
         h = {self._to_str(k): self._to_str(v) for k, v in (req_headers or {}).items() if k and v}
-
-        # ensure Range header for GET
         h_get = dict(h)
         if "range" not in {k.lower() for k in h_get.keys()}:
             h_get["Range"] = f"bytes=0-{max(0, int(self.cfg.salvage_range_bytes) - 1)}"
 
-        async def accept_ok(status: Optional[int], ctype: Optional[str]) -> bool:
-            if status not in (200, 206):
-                return False
-            ct = (ctype or "").lower()
-            if ct.startswith(("video/", "audio/", "image/")):
-                return True
-            if "mpegurl" in ct or "dash" in ct or "application/octet-stream" in ct:
-                return True
-            # if we can't tell, still accept 200/206 (some CDNs omit type)
-            return True
-
-        # 1) GET Range
         try:
             resp = await api_ctx.get(url, headers=h_get, timeout=timeout_ms)
-            result["method"] = "GET"
+            result["method"] = "PW_GET"
             result["status"] = getattr(resp, "status", None)
-            result["final_url"] = self._to_str(getattr(resp, "url", None) or url)
-            rh = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp, "headers", None) or {}).items()}
+            rh = {k.lower(): v for k, v in (getattr(resp, "headers", None) or {}).items()}
             result["content_type"] = rh.get("content-type")
             result["content_length"] = rh.get("content-length")
 
-            b = None
-            try:
-                b = await resp.body()
-            except Exception:
-                b = None
+            b = await resp.body()
             if b:
-                result["hash_prefix_sha256"] = self.hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
+                result["hash_prefix_sha256"] = hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
 
-            if await accept_ok(result["status"], result["content_type"]):
+            if result["status"] in (200, 206):
                 result["ok"] = True
-                return result
-
         except Exception as e:
-            result["error"] = f"get_failed:{e}"
-
-        # 2) HEAD fallback
-        try:
-            resp2 = await api_ctx.head(url, headers=h, timeout=timeout_ms)
-            result["method"] = (result["method"] + "+HEAD") if result["method"] else "HEAD"
-            result["status"] = getattr(resp2, "status", None) or result["status"]
-            result["final_url"] = self._to_str(getattr(resp2, "url", None) or result["final_url"])
-            rh2 = {self._to_str(k).lower(): self._to_str(v) for (k, v) in (getattr(resp2, "headers", None) or {}).items()}
-            result["content_type"] = result["content_type"] or rh2.get("content-type")
-            result["content_length"] = result["content_length"] or rh2.get("content-length")
-
-            if await accept_ok(result["status"], result["content_type"]):
-                result["ok"] = True
-
-        except Exception as e:
-            result["error"] = (result["error"] + "|") if result["error"] else ""
-            result["error"] += f"head_failed:{e}"
+            result["error"] = f"pw_fallback_failed:{e}"
 
         return result
 
@@ -1136,19 +1117,27 @@ class NetworkSniffer:
             return {"size": None, "sha256": None}
 
     async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
-                                         timeout_ms: int, prefix_bytes: int) -> Optional[str]:
-        if api_ctx is None:
-            return None
+                                          timeout_ms: int, prefix_bytes: int) -> Optional[str]:
+        """
+        HYBRID HASHING: Uses engine if available, else Playwright context.
+        """
+        # Engine path
+        if self.http:
+            try:
+                b = await self.http.get_bytes(self._to_str(url))
+                return hashlib.sha256(b[:prefix_bytes]).hexdigest() if b else None
+            except:
+                pass  # fall through to PW
+
+        # Original PW path
+        if api_ctx is None: return None
         try:
             h = {self._to_str(k): self._to_str(v) for k, v in (req_headers_subset or {}).items() if k and v}
-            h2 = dict(h)
-            h2["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
-            resp = await api_ctx.get(self._to_str(url), headers=h2, timeout=timeout_ms)
+            h["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
+            resp = await api_ctx.get(self._to_str(url), headers=h, timeout=timeout_ms)
             b = await resp.body()
-            if not b:
-                return None
-            return self.hashlib.sha256(b[:prefix_bytes]).hexdigest()
-        except Exception:
+            return hashlib.sha256(b[:prefix_bytes]).hexdigest() if b else None
+        except:
             return None
 
     # ============================== sniff ============================== #
@@ -7337,6 +7326,7 @@ class HTTPSSubmanager:
         self._host_sem.clear()
         self._host_cooldown_until.clear()
         self._host_last_ok_url.clear()
+
 
     # ------------------------------------------------------------- #
     # SSL / TLS helpers

@@ -8209,7 +8209,7 @@ class LinkTrackerBlock(BaseBlock):
                 local_database_hits: List[Dict[str, Any]] = []
                 local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
-
+                self.network_sniffer.http = http
                 try:
                     links_on_page: List[Dict[str, str]] = []
                     html = ""
@@ -12237,6 +12237,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_database_hits: List[Dict[str, Any]] = []
                 local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
+                self.network_sniffer.http = http
                 DEBUG_LOGGER.log_message(f"[BFS] processing page: {page_url} (depth={depth})")
                 try:
                     links_on_page: List[Dict[str, str]] = []
@@ -17324,7 +17325,7 @@ class PageTrackerBlock(BaseBlock):
                 local_database_hits: List[Dict[str, Any]] = []
                 local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
-
+                self.network_sniffer.http = http
                 try:
                     links_on_page: List[Dict[str, str]] = []
                     html = ""
@@ -18343,6 +18344,13 @@ class LinkCrawlerBlock(BaseBlock):
       - If use_database=True:
           * Suppresses URLs previously emitted (cross-run).
           * Skips re-fetching seed URLs recently fetched (TTL).
+
+    Reverse-image seed discovery (NEW):
+      - Provide either:
+          params["image_url"]  (best), OR
+          params["image_path"] (fallback; filename-based discovery)
+      - Produces seed URLs via SearXNG JSON (preferred) or DDG HTML (fallback),
+        then continues the existing shallow crawl logic.
     """
 
     _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
@@ -18385,7 +18393,7 @@ class LinkCrawlerBlock(BaseBlock):
 
     @staticmethod
     def _now() -> float:
-        import time as _time  # stdlib module, safe even if global `time` is shadowed
+        import time as _time
         return _time.time()
 
     @staticmethod
@@ -18491,7 +18499,10 @@ class LinkCrawlerBlock(BaseBlock):
         text = re.sub(r"\s+", " ", text).lower()
 
         words = self._TEXT_TOKEN_RE.findall(text)
-        stops = {"the", "and", "that", "this", "with", "from", "your", "have", "are", "for", "not", "but", "what", "can"}
+        stops = {
+            "the", "and", "that", "this", "with", "from", "your", "have", "are",
+            "for", "not", "but", "what", "can"
+        }
         filtered = [w for w in words if w not in stops]
 
         counts = Counter(filtered)
@@ -18506,7 +18517,235 @@ class LinkCrawlerBlock(BaseBlock):
         store.ensure_schema()
         return store
 
-    # ------------------ Search Helpers (unchanged) ------------------
+    # ------------------ Reverse-image helpers (NEW) ------------------
+
+    async def _coerce_reverse_image_inputs(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        timeout: float,
+        log: List[str],
+        ffmpeg_bin: str = "ffmpeg",
+    ) -> Tuple[str, str, List[str]]:
+        """
+        Coerce reverse-image inputs into either:
+          - a usable remote URL (image_url), OR
+          - a usable local image path (image_path)
+        Handles:
+          - local video -> extract first frame via ffmpeg
+          - remote non-image -> download to temp, then extract if video-like
+        """
+        import tempfile
+        import subprocess
+        from urllib.parse import urlparse
+
+        temp_files: List[str] = []
+
+        image_url = (image_url or "").strip()
+        image_path = (image_path or "").strip()
+
+        IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".avif", ".svg")
+        VID_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".flv", ".m4v", ".gif")
+
+        def _is_http_url(u: str) -> bool:
+            try:
+                p = urlparse(u)
+                return p.scheme in ("http", "https") and bool(p.netloc)
+            except Exception:
+                return False
+
+        def _looks_like_image_file(path: str) -> bool:
+            return (path or "").lower().endswith(IMG_EXTS)
+
+        def _looks_like_video_file(path: str) -> bool:
+            low = (path or "").lower()
+            return low.endswith(VID_EXTS) or any(x in low for x in (".m3u8", ".mpd"))
+
+        def _looks_like_image_url(u: str) -> bool:
+            low = (u or "").lower()
+            return low.endswith(IMG_EXTS) or bool(self._IMAGE_EXT_RE.search(low))
+
+        async def _download_to_temp(url: str) -> str:
+            import aiohttp
+
+            parsed = urlparse(url)
+            base = os.path.basename(parsed.path or "")
+            ext = os.path.splitext(base)[1].lower()
+            if not ext or len(ext) > 8:
+                ext = ".bin"
+
+            fd, outp = tempfile.mkstemp(prefix="revimg_", suffix=ext)
+            os.close(fd)
+            temp_files.append(outp)
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        headers={"User-Agent": "Mozilla/5.0 PromptChat/LinkCrawler"},
+                    ) as resp:
+                        resp.raise_for_status()
+                        with open(outp, "wb") as f:
+                            while True:
+                                chunk = await resp.content.read(1024 * 64)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+            except Exception as e:
+                log.append(f"[Crawler][RevImg] download failed url={url!r}: {e}")
+                return ""
+
+            return outp
+
+        def _ffmpeg_extract_first_frame(src_path: str) -> str:
+            fd, outp = tempfile.mkstemp(prefix="revimg_frame_", suffix=".png")
+            os.close(fd)
+            temp_files.append(outp)
+
+            cmd = [ffmpeg_bin, "-y", "-i", src_path, "-frames:v", "1", outp]
+            try:
+                p = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=max(5, int(timeout)),
+                    check=False,
+                )
+                if p.returncode != 0 or not os.path.exists(outp) or os.path.getsize(outp) <= 0:
+                    err = (p.stderr or b"")[:800].decode("utf-8", "ignore")
+                    log.append(f"[Crawler][RevImg] ffmpeg extract failed rc={p.returncode} err={err}")
+                    return ""
+            except Exception as e:
+                log.append(f"[Crawler][RevImg] ffmpeg error: {e}")
+                return ""
+
+            return outp
+
+        # 1) Prefer local path if valid
+        if image_path:
+            if not os.path.exists(image_path):
+                log.append(f"[Crawler][RevImg] image_path does not exist: {image_path}")
+                image_path = ""
+            else:
+                if _looks_like_image_file(image_path):
+                    return "", image_path, temp_files
+                if _looks_like_video_file(image_path):
+                    frame = _ffmpeg_extract_first_frame(image_path)
+                    if frame:
+                        log.append(f"[Crawler][RevImg] extracted frame -> {frame}")
+                        return "", frame, temp_files
+                # Last resort: assume image anyway
+                return "", image_path, temp_files
+
+        # 2) URL input
+        if image_url and _is_http_url(image_url):
+            # If it already looks like an image URL, keep it
+            if _looks_like_image_url(image_url):
+                return image_url, "", temp_files
+
+            # Otherwise download and try to coerce into an image
+            tmp = await _download_to_temp(image_url)
+            if not tmp:
+                return image_url, "", temp_files
+
+            if _looks_like_image_file(tmp):
+                return "", tmp, temp_files
+
+            frame = _ffmpeg_extract_first_frame(tmp)
+            if frame:
+                return "", frame, temp_files
+
+            return "", tmp, temp_files
+
+        return "", "", temp_files
+
+    async def _reverse_image_search_seeds(
+            self,
+            *,
+            image_url: str,
+            image_path: str,
+            engine: str,
+            limit: int,
+            timeout: float,
+            log: List[str],
+            searxng_url: str,
+    ) -> List[str]:
+        """
+        Enhanced reverse-image discovery.
+        1. If image_path is provided, uploads to Catbox.moe to get a public URL.
+        2. Builds targeted footprint queries for Yandex, Google, and Bing.
+        3. Fetches seeds via SearXNG.
+        """
+        import aiohttp
+        engine = (engine or "both").lower().strip()
+        limit = max(1, int(limit or 10))
+
+        # 1. Catbox Upload (if local path exists)
+        if image_path and os.path.exists(image_path) and not image_url:
+            log.append(f"[Crawler][RevImg] Uploading {os.path.basename(image_path)} to Catbox...")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field("reqtype", "fileupload")
+                    # Anonymous upload (no userhash required)
+                    with open(image_path, "rb") as f:
+                        data.add_field("fileToUpload", f, filename=os.path.basename(image_path))
+                        async with session.post("https://catbox.moe/user/api.php", data=data, timeout=timeout) as resp:
+                            if resp.status == 200:
+                                image_url = (await resp.text()).strip()
+                                log.append(f"[Crawler][RevImg] Catbox URL: {image_url}")
+                            else:
+                                log.append(f"[Crawler][RevImg] Catbox upload failed: {resp.status}")
+            except Exception as e:
+                log.append(f"[Crawler][RevImg] Catbox error: {e}")
+
+        queries: List[str] = []
+
+        # 2. Targeted Footprint Queries
+        if image_url:
+            # Footprint: Search for the URL itself across big visual engines
+            queries.append(f'"{image_url}"')
+            queries.append(f'site:yandex.com "{image_url}"')
+            queries.append(f'site:bing.com "{image_url}"')
+            queries.append(f'site:google.com "{image_url}"')
+            # Visual mirrors
+            queries.append(f'"{image_url}" (source OR original OR mirror)')
+
+        # Fallback Filename logic (still useful for Yandex/Bing indexing)
+        if image_path:
+            fn = os.path.basename(image_path)
+            queries.append(f'"{fn}"')
+            stem = os.path.splitext(fn)[0]
+            if stem and len(stem) > 4:
+                queries.append(f'"{stem}" source')
+
+        if not queries:
+            log.append("[Crawler][RevImg] No usable seeds after coercion.")
+            return []
+
+        # 3. Multi-Engine Harvest via SearXNG
+        seeds: List[str] = []
+        seen: Set[str] = set()
+        per_query = max(15, limit * 2)
+
+        for q in queries:
+            found = await self._search_searxng_json(searxng_url, q, per_query, timeout, log)
+            for u in found:
+                u = (u or "").strip()
+                # Filter engine noise
+                if not u or u in seen or any(
+                        x in u.lower() for x in ("google.com/search", "bing.com/images", "yandex.ru/images")):
+                    continue
+                seen.add(u)
+                seeds.append(u)
+                if len(seeds) >= limit: break
+            if len(seeds) >= limit: break
+
+        log.append(f"[Crawler][RevImg] Seeds discovered: {len(seeds)}")
+        return seeds[:limit]
+    # ------------------ Search Helpers ------------------
 
     async def _search_duckduckgo_html(self, query: str, limit: int, log: List[str]) -> List[str]:
         import aiohttp
@@ -18543,13 +18782,14 @@ class LinkCrawlerBlock(BaseBlock):
         return urls[:limit]
 
     async def _search_searxng_json(self, base_url: str, query: str, limit: int, timeout: float, log: List[str]) -> List[str]:
-        import aiohttp, json
+        import aiohttp
+        import json
+
         urls: List[str] = []
-        if not base_url:
-            base_url = "http://127.0.0.1:8080"
+        base_url = (base_url or "").strip() or "http://127.0.0.1:8080"
 
         search_url = base_url.rstrip("/") + "/search"
-        max_pages = min(5, (limit // 10) + 1)
+        max_pages = min(6, (limit // 10) + 1)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -18558,7 +18798,11 @@ class LinkCrawlerBlock(BaseBlock):
                         break
                     params = {"q": query, "format": "json", "pageno": str(page_idx)}
                     try:
-                        async with session.get(search_url, params=params, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                        async with session.get(
+                            search_url,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=timeout)
+                        ) as resp:
                             if resp.status == 403:
                                 log.append(f"[Crawler][SearXNG] HTTP 403 on page {page_idx}. Stopping.")
                                 break
@@ -18582,14 +18826,14 @@ class LinkCrawlerBlock(BaseBlock):
                         log.append(f"[Crawler][SearXNG] Request error page {page_idx}: {req_err}")
                         break
 
-            log.append(f"[Crawler][SearXNG] Found {len(urls)} results.")
+            log.append(f"[Crawler][SearXNG] Found {len(urls)} results for query={query!r}.")
         except Exception as e:
             log.append(f"[Crawler][SearXNG] General Error: {e}")
 
         return urls[:limit]
 
     async def _search_google_cse(self, query: str, limit: int, log: List[str]) -> List[str]:
-        import aiohttp, os
+        import aiohttp
         cx = os.environ.get("GOOGLE_CSE_ID")
         key = os.environ.get("GOOGLE_API_KEY")
         if not cx or not key:
@@ -18630,11 +18874,11 @@ class LinkCrawlerBlock(BaseBlock):
         log: List[str] = []
 
         query = str(params.get("query", "") or str(payload or "")).strip()
-        engine = str(params.get("engine", "duckduckgo")).lower()
+        engine = str(params.get("engine", "duckduckgo")).lower().strip()
         mode = str(params.get("mode", "search") or "search").lower().strip()
 
         max_results = int(params.get("max_results", 20))
-        searxng_url = str(params.get("searxng_url", ""))
+        searxng_url = str(params.get("searxng_url", "") or "").strip()
         http_timeout = float(params.get("timeout", 10.0))
 
         retries = int(params.get("retries", 2))
@@ -18659,7 +18903,7 @@ class LinkCrawlerBlock(BaseBlock):
             f"use_database={use_database} ffmpeg_bin={ffmpeg_bin!r} links_key={links_key!r}"
         )
 
-        store: "LinkCrawlerStore | None" = None
+        store: Optional["LinkCrawlerStore"] = None
         if use_database:
             try:
                 store = self._make_store(db_path)
@@ -18701,13 +18945,18 @@ class LinkCrawlerBlock(BaseBlock):
                 ffmpeg_bin=ffmpeg_bin,
             )
 
+            if not coerced_url and not coerced_path:
+                log.append("[Crawler][RevImg] Could not coerce image_url/image_path into usable input.")
+                return "No operation.", {"error": "reverse_image_input_invalid", "log": log}
+
             seed_urls = await self._reverse_image_search_seeds(
                 image_url=coerced_url,
                 image_path=coerced_path,
                 engine=reverse_engine,
                 limit=reverse_max_results,
                 timeout=reverse_timeout,
-                log=log
+                log=log,
+                searxng_url=searxng_url,
             )
 
             if temp_files:
@@ -18736,16 +18985,18 @@ class LinkCrawlerBlock(BaseBlock):
         else:
             log.append("[Crawler] No query, seeds, or image provided.")
             DEBUG_LOGGER.log_message("[Crawler] no-op: missing query and seeds and image")
-            return "No operation.", {}
+            return "No operation.", {"log": log}
 
         DEBUG_LOGGER.log_message(f"[Crawler] seeds collected | count={len(seed_urls)}")
 
         # 2) Shallow crawl (TTL gating via DB) using HTTPSSubmanager
-        collected_links: set[str] = set()
-        collected_domains: set[str] = set()
-        collected_lexicon: set[str] = set()
+        collected_links: Set[str] = set()
+        collected_domains: Set[str] = set()
+        collected_lexicon: Set[str] = set()
 
         for s in seed_urls:
+            if not s:
+                continue
             collected_links.add(s)
             try:
                 collected_domains.add(urlparse(s).netloc)
@@ -18756,12 +19007,19 @@ class LinkCrawlerBlock(BaseBlock):
         seeds_to_fetch = seed_urls
 
         if store:
-            seeds_to_fetch = [s for s in seed_urls if store.seed_should_fetch(s, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
-            skipped = len(seed_urls) - len(seeds_to_fetch)
-            if skipped:
-                msg = f"[Crawler][DB] Skipping {skipped} seed(s) due to TTL."
-                log.append(msg)
-                DEBUG_LOGGER.log_message(msg)
+            try:
+                seeds_to_fetch = [
+                    s for s in seed_urls
+                    if store.seed_should_fetch(s, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)
+                ]
+                skipped = len(seed_urls) - len(seeds_to_fetch)
+                if skipped:
+                    msg = f"[Crawler][DB] Skipping {skipped} seed(s) due to TTL."
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+            except Exception as e:
+                log.append(f"[Crawler][DB] TTL gating failed: {e} (continuing without gating)")
+                seeds_to_fetch = seed_urls
 
         DEBUG_LOGGER.log_message(f"[Crawler] fetch plan | total_seeds={len(seed_urls)} to_fetch={len(seeds_to_fetch)}")
 
@@ -18806,7 +19064,7 @@ class LinkCrawlerBlock(BaseBlock):
                             DEBUG_LOGGER.log_message(f"[Crawler][Page] empty html seed={url}")
                             return
 
-                        final_url = url  # safe default; href resolution still works in most cases
+                        final_url = url  # safe default
                         _links, candidates = self._extract_links(html, final_url, mode=mode)
                         lex = self._extract_lexicon(html)
 
@@ -18853,13 +19111,21 @@ class LinkCrawlerBlock(BaseBlock):
             if not u:
                 continue
 
-            if store and store.has_emitted(u):
-                suppressed_by_db += 1
-                continue
+            if store:
+                try:
+                    if store.has_emitted(u):
+                        suppressed_by_db += 1
+                        continue
+                except Exception:
+                    # if DB read fails, don’t kill the run
+                    pass
 
             if u in existing_urls:
                 if store:
-                    store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+                    try:
+                        store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+                    except Exception:
+                        pass
                 continue
 
             new_link_objs.append({
@@ -18871,7 +19137,10 @@ class LinkCrawlerBlock(BaseBlock):
             })
 
             if store:
-                store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+                try:
+                    store.mark_emitted(u, mode=mode, query=query, now_ts=ts)
+                except Exception:
+                    pass
 
         combined_links = existing_links + new_link_objs
         if len(combined_links) > 2000:
@@ -18944,9 +19213,9 @@ class LinkCrawlerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "Scraping query",
-            "mode": "search",
+            "mode": "search / docs / media / images",
             "seeds": "Comma-separated list of starting URLs (optional override)",
-            "engine": "duckduckgo",
+            "engine": "duckduckgo / searxng / google_cse",
             "searxng_url": "http://127.0.0.1:8080",
             "max_results": 20,
             "timeout": 10.0,
@@ -18965,14 +19234,16 @@ class LinkCrawlerBlock(BaseBlock):
             "domains_key": "scraped_domains",
             "lexicon_key": "scraped_lexicon",
 
-            "image_url": "Remote image URL for reverse-image seed discovery (optional)",
-            "image_path": "Local image file path for reverse-image seed discovery (optional)",
-            "reverse_engine": "both",
+            # Reverse-image (seed discovery)
+            "image_url": "Remote image URL for reverse-image seed discovery (best)",
+            "image_path": "Local file path for reverse-image seed discovery (fallback; filename/stem)",
+            "reverse_engine": "both / google / bing (affects query augmentation only)",
             "reverse_max_results": 20,
             "reverse_timeout": 20.0,
 
             "ffmpeg_bin": "ffmpeg",
 
+            # DB
             "use_database": False,
             "db_path": "link_corpus.db",
             "seed_ttl_seconds": 21600,
