@@ -83,27 +83,9 @@ def _canonicalize_url(u: str) -> str:
 # NetworkSniffer
 # ======================================================================
 
+
 class NetworkSniffer:
     """
-    Advanced Playwright network sniffer for VIDEO + AUDIO + IMAGES
-    + Evidence collection
-    + URL salvage (token stripping / path-only / origin swapping + probing)
-
-    FIX: "Cannot mix str and non-str arguments" (urllib.parse) happens when *any*
-    bytes / non-str object leaks into urlparse/urlunparse/urljoin/urlencode/parse_qsl.
-    This version wraps *all* URL plumbing with hard str-normalization.
-
-    Rewrite goals (this patch):
-      1) Salvage is **less noisy** while still effective:
-           - Only salvage URLs that look like they *need* salvage
-           - Score + pick best targets (not “everything”)
-           - Stop probing early once a good variant is found
-           - Quiet logging by default (configurable)
-      2) Salvage is **more programmatic**, not just a static list:
-           - Learn “signature-ish” params by key + value heuristics (entropy/length/base64/hex)
-           - Generate host swap variants via rules (cf-/cdn-/i1..i9)
-           - Generate query simplifications via heuristics
-
     Return:
       (html: str, merged_items: list[dict[str,str]], json_hits: list[dict[str,Any]])
     """
@@ -130,7 +112,6 @@ class NetworkSniffer:
     # ---------------------------- safe string coercion ---------------------------- #
     @staticmethod
     def _to_str(x: Any) -> str:
-        """Coerce possibly-bytes / URL objects / odd objects into str."""
         if x is None:
             return ""
         if isinstance(x, str):
@@ -178,7 +159,7 @@ class NetworkSniffer:
             return f"{b}/{u}" if b and u else (b or u)
 
     @classmethod
-    def _safe_parse_qsl(cls, query: Any) -> List[Tuple[str, str]]:
+    def _safe_parse_qsl(cls, query: Any) -> "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]":
         out: List[Tuple[str, str]] = []
         try:
             for k, v in cls.parse_qsl(cls._to_str(query), keep_blank_values=True):
@@ -188,7 +169,7 @@ class NetworkSniffer:
         return out
 
     @classmethod
-    def _safe_urlencode(cls, pairs: List[Tuple[Any, Any]]) -> str:
+    def _safe_urlencode(cls, pairs: "NetworkSniffer.List[NetworkSniffer.Tuple[Any, Any]]") -> str:
         try:
             norm = [(cls._to_str(k), cls._to_str(v)) for (k, v) in (pairs or [])]
             return cls.urlencode(norm, doseq=True)
@@ -205,7 +186,6 @@ class NetworkSniffer:
 
     @classmethod
     def _canonicalize_url(cls, url: Any) -> str:
-        """Light canonicalization: scheme/host lower, drop fragments, drop tracking params."""
         u = cls._to_str(url).strip()
         if not u:
             return ""
@@ -239,7 +219,6 @@ class NetworkSniffer:
 
         accept_unknown_streams: bool = True
 
-        # auto-scroll
         enable_auto_scroll: bool = True
         max_scroll_steps: int = 20
         scroll_step_delay_ms: int = 400
@@ -247,14 +226,12 @@ class NetworkSniffer:
 
         goto_wait_until: str = "domcontentloaded"
 
-        # host filters
         enable_host_allowlist: bool = False
         host_allow_substrings: Set[str] = field(default_factory=set)
 
         enable_host_denylist: bool = False
         host_deny_substrings: Set[str] = field(default_factory=set)
 
-        # extensions
         video_extensions: Set[str] = field(default_factory=lambda: {
             ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv",
             ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv", ".m4s"
@@ -271,7 +248,6 @@ class NetworkSniffer:
             ".js", ".css", ".json", ".html", ".woff", ".woff2", ".ttf", ".map", ".vtt", ".srt"
         })
 
-        # content-types
         video_prefixes: Set[str] = field(default_factory=lambda: {"video/"})
         audio_prefixes: Set[str] = field(default_factory=lambda: {"audio/"})
         image_prefixes: Set[str] = field(default_factory=lambda: {"image/"})
@@ -285,7 +261,6 @@ class NetworkSniffer:
         deny_content_substrings: Set[str] = field(default_factory=lambda: {"javascript", "css", "font/"})
         deny_resource_types: Set[str] = field(default_factory=lambda: {"stylesheet", "font", "manifest", "other"})
 
-        # stream hints
         video_stream_hints: Set[str] = field(default_factory=lambda: {
             ".m3u8", "manifest.mpd", "master.m3u8", "chunklist.m3u8",
             "videoplayback", "dash", "hls", "stream", "cdn",
@@ -296,7 +271,6 @@ class NetworkSniffer:
             ".flac", ".ogg", ".opus", "weba"
         })
 
-        # ad/tracker
         ad_host_substrings: Set[str] = field(default_factory=lambda: {
             "doubleclick", "googlesyndication", "adservice", "adserver",
             "adsystem", "adnxs", "tracking", "analytics", "metrics",
@@ -307,7 +281,6 @@ class NetworkSniffer:
             "/click/", "/impression", "/pixel", "/sponsor/", "/advert/"
         })
 
-        # JSON sniff
         enable_json_sniff: bool = True
         json_url_hints: Set[str] = field(default_factory=lambda: {
             "player", "manifest", "api", "metadata", "m3u8", "mpd",
@@ -322,33 +295,27 @@ class NetworkSniffer:
             "/manifest", "/playlist", "/video/", "/audio/", "/graphql"
         })
 
-        # GraphQL sniff
         enable_graphql_sniff: bool = True
         graphql_endpoint_keywords: Set[str] = field(default_factory=lambda: {"/graphql"})
         graphql_max_body_kb: int = 256
 
-        # header mining
         enable_header_url_mining: bool = True
         max_header_url_events: int = 250
         header_url_keys: Set[str] = field(default_factory=lambda: {
             "location", "link", "content-location", "refresh"
         })
 
-        # redirect tracking
         enable_redirect_tracking: bool = True
         max_redirect_events: int = 200
 
-        # manifest safety
         max_manifest_bytes: int = 512 * 1024
         prefer_master_manifests: bool = True
 
-        # segment heuristics
         enable_segment_heuristics: bool = True
         min_segment_bytes: int = 64 * 1024
         max_segment_bytes: int = 50 * 1024 * 1024
         accept_range_requests_as_media: bool = True
 
-        # forensics
         enable_forensics: bool = True
         max_forensics_events: int = 250
         forensics_body_prefix_bytes: int = 8192
@@ -364,43 +331,31 @@ class NetworkSniffer:
             "referer", "origin", "range", "user-agent", "accept", "accept-language",
         })
 
-        # ---------------- URL salvage (less-noisy + more programmatic) ----------------
+        # ---------------- URL salvage ----------------
         enable_url_salvage: bool = True
-
-        # target selection (less noisy)
-        salvage_max_targets_total: int = 30          # was 80: pick fewer, better
-        salvage_max_targets_per_host: int = 8        # avoid hammering one CDN
+        salvage_max_targets_total: int = 30
+        salvage_max_targets_per_host: int = 8
         salvage_only_if_mediaish: bool = True
-        salvage_only_if_suspect: bool = True         # new: require “needs salvage” signal
+        salvage_only_if_suspect: bool = True
         salvage_suspect_statuses: Set[int] = field(default_factory=lambda: {401, 403, 404, 410, 416, 429})
-        salvage_min_score_to_probe: float = 2.0      # new: score threshold
+        salvage_min_score_to_probe: float = 2.0
         salvage_score_bonus_if_signed: float = 2.0
         salvage_score_bonus_if_mediaish: float = 1.0
         salvage_score_bonus_if_segmenty: float = 0.5
-
-        # probing
         salvage_probe_timeout_ms: int = 6500
         salvage_probe_concurrency: int = 6
         salvage_range_bytes: int = 8192
-
-        # output/logging
         salvage_log_level: str = "ok"  # "none" | "ok" | "all"
-        salvage_record_non_200: bool = False  # default quieter
+        salvage_record_non_200: bool = False
         salvage_emit_only_ok_variants_in_bundle: bool = True
-
-        # variant generation caps
         salvage_max_variants_per_url: int = 10
         salvage_max_query_simplify_variants: int = 4
         salvage_max_host_swap_variants: int = 6
-
-        # signature-ish detection seeds (still useful, but not the only guide)
         salvage_strip_query_keys_substrings: Set[str] = field(default_factory=lambda: {
             "token", "expires", "exp", "sig", "signature", "policy", "key-pair-id",
             "x-amz-", "x-goog-", "x-ms-", "hdnts", "acl", "hmac",
             "cdn_hash", "hash", "auth", "authorization", "session",
         })
-
-        # optional static origin swaps (kept), but we also do programmatic swaps
         salvage_origin_swaps: Dict[str, Set[str]] = field(default_factory=lambda: {
             "cf-hls-media.sndcdn.com": {"cf-media.sndcdn.com", "hls-media.sndcdn.com"},
             "media.sndcdn.com": {"cf-media.sndcdn.com"},
@@ -408,19 +363,45 @@ class NetworkSniffer:
             "lh3.googleusercontent.com": {"lh4.googleusercontent.com", "lh5.googleusercontent.com", "lh6.googleusercontent.com"},
         })
 
+        # ---------------- MSE sniff ----------------
+        enable_mse_sniff: bool = True
+        mse_max_events: int = 250
+        mse_flush_interval_ms: int = 250
+        mse_max_url_len: int = 2048
+        mse_prefix_hex_bytes: int = 32
+        mse_capture_fetch: bool = True
+        mse_capture_xhr: bool = True
+        mse_capture_media_src_assign: bool = True
+        mse_emit_each_event_json: bool = False
+        mse_mediaish_url_hints: Set[str] = field(default_factory=lambda: {
+            ".m4s", ".mp4", ".ts", ".aac", ".m3u8", ".mpd", "dash", "hls", "segment", "seg", "chunk", "frag", "bytestream"
+        })
+
+        # ---------------- NEW: Binary Signature Sniffing ----------------
+        enable_binary_signature_sniff: bool = True
+        binary_sniff_only_if_unknown_kind: bool = True  # if False, may “upgrade” unknown/odd ctype too
+        binary_sniff_prefix_bytes: int = 4096
+        binary_sniff_timeout_ms: int = 6000
+        binary_sniff_concurrency: int = 8
+        binary_sniff_max_tasks: int = 80
+
+        # when URLs look like scripts / no-ext / weird ext but might serve media
+        binary_suspect_extensions: Set[str] = field(default_factory=lambda: {
+            ".php", ".bin", ".cgi", ".asp", ".aspx", ".jsp", ".do", ".action"
+        })
+        binary_suspect_content_types: Set[str] = field(default_factory=lambda: {
+            "application/octet-stream", "binary/octet-stream", "application/download", "application/x-download"
+        })
+        binary_sniff_url_hints: Set[str] = field(default_factory=lambda: {
+            "download", "media", "stream", "video", "audio", "file", "blob", "segment", "chunk"
+        })
+
     # ---------------------------- init ---------------------------- #
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None, http=None):
         self.cfg = config or self.Config()
-
-        if logger is not None:
-            self.logger = logger
-        else:
-            self.logger = globals().get("DEBUG_LOGGER", None) or self._FallbackLogger()
-
-        self._log("[NetworkSniffer] Initialized (evidence + salvage) [hard str-safe + programmatic salvage]", None)
-
-        self.http= http
-        # SoundCloud nudges (optional)
+        self.logger = logger if logger is not None else (globals().get("DEBUG_LOGGER", None) or self._FallbackLogger())
+        self.http = http  # optional HTTPSSubmanager-like engine
+        self._log("[NetworkSniffer] Initialized (evidence + salvage + MSE + binary-signature) [hard str-safe]", None)
         try:
             self.cfg.video_stream_hints.add("cf-hls-media.sndcdn.com")
             self.cfg.audio_stream_hints.add(".m3u8")
@@ -463,10 +444,8 @@ class NetworkSniffer:
         if self.cfg.enable_host_denylist and self.cfg.host_deny_substrings:
             if any(self._to_str(x).lower() in host for x in self.cfg.host_deny_substrings):
                 return False
-
         if self.cfg.enable_host_allowlist and self.cfg.host_allow_substrings:
             return any(self._to_str(x).lower() in host for x in self.cfg.host_allow_substrings)
-
         return True
 
     def _looks_like_ad(self, netloc: str, path: str) -> bool:
@@ -634,7 +613,6 @@ class NetworkSniffer:
                 if full and full not in seen:
                     seen.add(full)
                     out.append(full)
-
         return out
 
     async def _expand_manifest(self, response, manifest_kind: str, url: str, log: Optional[List[str]]) -> List[str]:
@@ -646,7 +624,6 @@ class NetworkSniffer:
         except Exception as e:
             self._log(f"[NetworkSniffer] Manifest read failed: {url} ({e})", log)
             return []
-
         derived = self._parse_hls_manifest(txt, url) if manifest_kind == "hls" else self._parse_mpd_manifest(txt, url)
         self._log(f"[NetworkSniffer] Expanded {manifest_kind} manifest: {url} -> {len(derived)} derived", log)
         return derived
@@ -684,7 +661,6 @@ class NetworkSniffer:
             if self.cfg.scroll_back_to_top:
                 await page.evaluate("() => window.scrollTo(0, 0);")
                 self._log("[NetworkSniffer] Auto-scroll: scrolled back to top.", log)
-
         except Exception as e:
             self._log(f"[NetworkSniffer] Auto-scroll error: {e}", log)
 
@@ -726,7 +702,6 @@ class NetworkSniffer:
             return False
         if any(sub in kl for sub in (self.cfg.salvage_strip_query_keys_substrings or set())):
             return True
-        # extra heuristics (programmatic)
         if kl in ("sig", "signature", "token", "auth", "authorization", "expires", "exp", "policy"):
             return True
         if kl.startswith(("x-amz-", "x-goog-", "x-ms-")):
@@ -737,10 +712,8 @@ class NetworkSniffer:
         vv = (v or "").strip()
         if not vv:
             return False
-        # timestamps and epoch-like values often live next to signatures
         if vv.isdigit() and len(vv) in (10, 13):
             return True
-        # long/high-entropy-ish
         if len(vv) >= 48:
             if self._JWT_LIKE_RE.match(vv):
                 return True
@@ -763,13 +736,6 @@ class NetworkSniffer:
             return False
 
     def _build_query_variants(self, url: str) -> List[Tuple[str, str]]:
-        """
-        Programmatic query simplification variants:
-          - drop signature-ish keys
-          - drop signature-ish values (even if key is unknown)
-          - drop ALL query (path-only)
-          - drop “obviously noisy” keys by length/entropy
-        """
         out: List[Tuple[str, str]] = []
         try:
             p = self._safe_urlparse(url)
@@ -778,10 +744,8 @@ class NetworkSniffer:
 
             pairs = self._safe_parse_qsl(p.query)
             if not pairs:
-                # still allow path-only variant via caller
                 return out
 
-            # 1) drop signature-ish keys/values
             kept1: List[Tuple[str, str]] = []
             dropped_any = False
             for k, v in pairs:
@@ -796,7 +760,6 @@ class NetworkSniffer:
                 u1 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, q1, ""))
                 out.append((u1, "query_drop_signature"))
 
-            # 2) keep only “short/simple” params (often id= / itag= / range=)
             kept2: List[Tuple[str, str]] = []
             for k, v in pairs:
                 ks = self._to_str(k)
@@ -808,14 +771,11 @@ class NetworkSniffer:
                 u2 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, q2, ""))
                 out.append((u2, "query_keep_simple"))
 
-            # 3) drop query entirely (path-only)
             u3 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, "", ""))
             out.append((u3, "path_only"))
-
         except Exception:
             pass
 
-        # dedupe + cap
         seen: Set[str] = set()
         uniq: List[Tuple[str, str]] = []
         for u, k in out:
@@ -829,18 +789,12 @@ class NetworkSniffer:
         return uniq
 
     def _programmatic_host_swaps(self, host: str) -> Set[str]:
-        """
-        Generate host alternatives via rules, not just config lists:
-          - toggle common CDN prefixes: cf- , cdn. , media. , img. (conservative)
-          - i1..i9 numeric subdomain bump
-        """
         h = (host or "").strip().lower()
         if not h:
             return set()
 
         out: Set[str] = set()
 
-        # numeric subdomain i1 -> i2..i5
         m = self.re.match(r"^(i)(\d+)\.(.+)$", h)
         if m:
             base = m.group(1)
@@ -850,13 +804,11 @@ class NetworkSniffer:
                 if nn != n:
                     out.add(f"{base}{nn}.{rest}")
 
-        # cf- prefix toggle
         if h.startswith("cf-"):
             out.add(h[len("cf-"):])
         else:
             out.add("cf-" + h)
 
-        # cdn. toggle
         if h.startswith("cdn."):
             out.add(h[len("cdn."):])
         else:
@@ -872,20 +824,16 @@ class NetworkSniffer:
             if not host:
                 return out
 
-            # 1) configured swaps (kept)
             for ah in (self.cfg.salvage_origin_swaps.get(host) or set()):
                 ahs = self._to_str(ah).strip().lower()
                 if ahs and ahs != host:
                     out.append((self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)), "origin_swap_static"))
 
-            # 2) programmatic swaps
             for ahs in self._programmatic_host_swaps(host):
                 out.append((self._safe_urlunparse((p.scheme, ahs, p.path, p.params, p.query, p.fragment)), "origin_swap_rule"))
-
         except Exception:
             pass
 
-        # dedupe + cap
         seen: Set[str] = set()
         uniq: List[Tuple[str, str]] = []
         for u, k in out:
@@ -905,13 +853,10 @@ class NetworkSniffer:
 
         if self._is_mediaish_url(u):
             score += float(self.cfg.salvage_score_bonus_if_mediaish)
-
         if kind in ("video", "audio"):
             score += 0.5
-
         if any(x in ul for x in ("seg", "segment", "chunk", "frag", "m4s", "bytestream", "range")):
             score += float(self.cfg.salvage_score_bonus_if_segmenty)
-
         if self._has_signaturey_params(u):
             score += float(self.cfg.salvage_score_bonus_if_signed)
 
@@ -920,7 +865,6 @@ class NetworkSniffer:
                 score += 2.0
             elif 500 <= status <= 599:
                 score += 0.5
-
         return score
 
     def _salvage_should_target(self, url: str, *, status: Optional[int], kind: Optional[str]) -> bool:
@@ -950,9 +894,6 @@ class NetworkSniffer:
         self._log(msg, log)
 
     async def _probe_url(self, api_ctx, url: str, req_headers: Dict[str, str], *, timeout_ms: int) -> Dict[str, Any]:
-        """
-        HYBRID PROBE: Uses industrial engine if available, else falls back to Playwright api_ctx.
-        """
         url = self._to_str(url)
         result = {
             "url": url, "ok": False, "status": None, "final_url": url,
@@ -960,32 +901,26 @@ class NetworkSniffer:
             "method": None, "error": "",
         }
 
-        # --- Path A: HTTPSSubmanager (High Resiliency) ---
+        # --- Engine path ---
         if self.http:
             try:
-                # 1. HEAD request for metadata
                 status, hdrs = await self.http.head(url)
                 result.update({
-                    "method": "ENGINE_GET",
+                    "method": "ENGINE_HEAD+PREFIX_GET",
                     "status": status,
                     "content_type": hdrs.get("Content-Type") or hdrs.get("content-type"),
                     "content_length": hdrs.get("Content-Length") or hdrs.get("content-length")
                 })
-
-                # 2. Bounded GET for hashing
-                body = await self.http.get_bytes(url)
-                if body:
-                    result["hash_prefix_sha256"] = hashlib.sha256(body[:int(self.cfg.salvage_range_bytes)]).hexdigest()
-
-                # Check success
+                prefix = await self.http.get_prefix(url, size=int(self.cfg.salvage_range_bytes), timeout_ms=timeout_ms)
+                if prefix:
+                    result["hash_prefix_sha256"] = self.hashlib.sha256(prefix).hexdigest()
                 if status and 200 <= status < 300:
                     result["ok"] = True
                 return result
             except Exception as e:
                 self._log(f"[NetworkSniffer] Engine probe failed, trying fallback: {e}", None)
-                # If engine fails, we don't return yet; we try Path B fallback
 
-        # --- Path B: Playwright Fallback (Original Logic) ---
+        # --- Playwright fallback ---
         if api_ctx is None:
             result["error"] = "no_context_or_engine"
             return result
@@ -1005,8 +940,7 @@ class NetworkSniffer:
 
             b = await resp.body()
             if b:
-                result["hash_prefix_sha256"] = hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
-
+                result["hash_prefix_sha256"] = self.hashlib.sha256(b[: int(self.cfg.salvage_range_bytes)]).hexdigest()
             if result["status"] in (200, 206):
                 result["ok"] = True
         except Exception as e:
@@ -1020,22 +954,14 @@ class NetworkSniffer:
         if not observed:
             return {"observed_url": self._to_str(observed_url), "variants": [], "ok_variants": []}
 
-        # build variants programmatically
         variants: List[Tuple[str, str]] = []
-
-        # A) query simplifications (signature drop, keep-simple, path-only)
         variants.extend(self._build_query_variants(observed))
-
-        # B) host swaps (static + rule-based)
         variants.extend(self._origin_swap_variants(observed))
 
-        # C) host swaps of query variants (limited)
-        #    (useful when cdn host differs but query already simplified)
         for (u, k) in list(variants)[:3]:
             for (u2, k2) in self._origin_swap_variants(u):
                 variants.append((u2, f"{k}+{k2}"))
 
-        # de-dupe + cap
         seen: Set[str] = {observed}
         uniq: List[Tuple[str, str]] = []
         for u, k in variants:
@@ -1051,10 +977,8 @@ class NetworkSniffer:
 
         out_variants: List[Dict[str, Any]] = []
         ok_variants: List[Dict[str, Any]] = []
-
         tmo = int(self.cfg.salvage_probe_timeout_ms)
 
-        # Probe order: try the “most likely” first
         def variant_rank(vk: str) -> int:
             vk = (vk or "").lower()
             if "query_drop_signature" in vk:
@@ -1069,7 +993,6 @@ class NetworkSniffer:
 
         uniq.sort(key=lambda t: variant_rank(t[1]))
 
-        # Less noisy: stop early once we find a good variant
         for (u, vkind) in uniq:
             pr = await self._probe_url(api_ctx, u, req_headers_subset, timeout_ms=tmo)
             pr["variant_kind"] = vkind
@@ -1081,7 +1004,6 @@ class NetworkSniffer:
                     f"[NetworkSniffer] Salvage OK ({observed_status}/{observed_kind}): {observed} -> {u} ({pr.get('status')})",
                     log, level="ok"
                 )
-                # early stop: 1 good result is usually enough
                 break
             else:
                 if self.cfg.salvage_record_non_200:
@@ -1090,7 +1012,6 @@ class NetworkSniffer:
                         log, level="all"
                     )
 
-        # optionally emit only ok variants to keep the bundle clean
         variants_emit = ok_variants if self.cfg.salvage_emit_only_ok_variants_in_bundle else out_variants
         return {"observed_url": observed, "variants": variants_emit, "ok_variants": ok_variants}
 
@@ -1120,27 +1041,442 @@ class NetworkSniffer:
 
     async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
                                           timeout_ms: int, prefix_bytes: int) -> Optional[str]:
-        """
-        HYBRID HASHING: Uses engine if available, else Playwright context.
-        """
-        # Engine path
         if self.http:
             try:
-                b = await self.http.get_bytes(self._to_str(url))
-                return hashlib.sha256(b[:prefix_bytes]).hexdigest() if b else None
-            except:
-                pass  # fall through to PW
+                prefix = await self.http.get_prefix(self._to_str(url), size=int(prefix_bytes), timeout_ms=timeout_ms)
+                return self.hashlib.sha256(prefix).hexdigest() if prefix else None
+            except Exception:
+                pass
 
-        # Original PW path
-        if api_ctx is None: return None
+        if api_ctx is None:
+            return None
         try:
             h = {self._to_str(k): self._to_str(v) for k, v in (req_headers_subset or {}).items() if k and v}
             h["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
             resp = await api_ctx.get(self._to_str(url), headers=h, timeout=timeout_ms)
             b = await resp.body()
-            return hashlib.sha256(b[:prefix_bytes]).hexdigest() if b else None
-        except:
+            return self.hashlib.sha256(b[:prefix_bytes]).hexdigest() if b else None
+        except Exception:
             return None
+
+    # ============================== NEW: Binary Signature Sniffing ============================== #
+    def _ext_of(self, url: str) -> str:
+        try:
+            p = self._safe_urlparse(url)
+            path = self._to_str(p.path).lower()
+            i = path.rfind(".")
+            if i == -1:
+                return ""
+            ext = path[i:]
+            if len(ext) > 10:
+                return ""
+            return ext
+        except Exception:
+            return ""
+
+    def _is_binary_suspect(self, url: str, *, ctype: str, resource_type: str, content_length: Optional[int]) -> bool:
+        if not self.cfg.enable_binary_signature_sniff:
+            return False
+        if not self._host_allowed(url):
+            return False
+        if url.startswith("blob:"):
+            return False
+
+        ul = (url or "").lower()
+        ext = self._ext_of(url)
+
+        # “classic” hiding places (.php/.bin/etc) OR no extension
+        suspect_ext = (ext in (self.cfg.binary_suspect_extensions or set())) or (ext == "")
+        hinty_url = any(h in ul for h in (self.cfg.binary_sniff_url_hints or set()))
+
+        ct = (ctype or "").lower().split(";")[0].strip()
+        suspect_ct = ct in (self.cfg.binary_suspect_content_types or set())
+
+        # avoid probing tiny responses unless url is very suspect
+        if content_length is not None and content_length < 2048 and not (suspect_ext and hinty_url):
+            return False
+
+        # skip obvious non-media text/html pages unless it looks like a media endpoint
+        if "text/html" in ct and not hinty_url:
+            return False
+
+        # skip styles/fonts/etc by resource type filters already, but keep an extra guard
+        if self._deny_by_resource_type(resource_type):
+            return False
+
+        return bool(suspect_ext or suspect_ct or hinty_url)
+
+    async def _get_prefix_bytes(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
+                               timeout_ms: int, prefix_bytes: int) -> Optional[bytes]:
+        url = self._to_str(url)
+        if self.http:
+            try:
+                b = await self.http.get_prefix(url, size=int(prefix_bytes), timeout_ms=timeout_ms)
+                return bytes(b) if b else None
+            except Exception:
+                pass
+
+        if api_ctx is None:
+            return None
+        try:
+            h = {self._to_str(k): self._to_str(v) for k, v in (req_headers_subset or {}).items() if k and v}
+            # force range to avoid huge downloads
+            h["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
+            resp = await api_ctx.get(url, headers=h, timeout=timeout_ms)
+            b = await resp.body()
+            return bytes(b) if b else None
+        except Exception:
+            return None
+
+    def _guess_kind_from_magic(self, b: Optional[bytes]) -> Tuple[Optional[str], Optional[str], str]:
+        """
+        Returns (kind, content_type_hint, detail)
+        kind: video|audio|image|None
+        """
+        if not b:
+            return None, None, "no_bytes"
+
+        bb = bytes(b[: max(64, min(len(b), 4096))])
+
+        # images
+        if bb.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image", "image/png", "magic:png"
+        if bb[:3] == b"\xFF\xD8\xFF":
+            return "image", "image/jpeg", "magic:jpg"
+        if bb.startswith(b"GIF87a") or bb.startswith(b"GIF89a"):
+            return "image", "image/gif", "magic:gif"
+        if bb.startswith(b"RIFF") and b"WEBP" in bb[8:16]:
+            return "image", "image/webp", "magic:webp"
+
+        # containers / video
+        # MP4 / fMP4: size(4) + 'ftyp' (4) or early 'moof'
+        if len(bb) >= 12 and bb[4:8] == b"ftyp":
+            return "video", "video/mp4", "magic:mp4_ftyp"
+        if b"moof" in bb[:64] or b"mdat" in bb[:64]:
+            return "video", "video/mp4", "magic:mp4_moof_mdat"
+        # MPEG-TS: sync byte 0x47 at packet boundary (often first byte)
+        if bb and bb[0] == 0x47:
+            return "video", "video/mp2t", "magic:mpegts"
+        # WebM/Matroska: EBML header
+        if bb.startswith(b"\x1A\x45\xDF\xA3"):
+            return "video", "video/webm", "magic:ebml_webm"
+
+        # audio
+        if bb.startswith(b"ID3"):
+            return "audio", "audio/mpeg", "magic:mp3_id3"
+        # MP3 frame sync (very rough)
+        if len(bb) >= 2 and bb[0] == 0xFF and (bb[1] & 0xE0) == 0xE0:
+            return "audio", "audio/mpeg", "magic:mp3_framesync"
+        # AAC ADTS sync (0xFFF1 or 0xFFF9)
+        if len(bb) >= 2 and bb[0] == 0xFF and (bb[1] & 0xF6) == 0xF0:
+            return "audio", "audio/aac", "magic:aac_adts"
+        if bb.startswith(b"OggS"):
+            return "audio", "audio/ogg", "magic:ogg"
+        if bb.startswith(b"fLaC"):
+            return "audio", "audio/flac", "magic:flac"
+        if bb.startswith(b"RIFF") and b"WAVE" in bb[8:16]:
+            return "audio", "audio/wav", "magic:wav"
+
+        return None, None, "magic:unknown"
+
+    # ============================== MSE sniff ============================== #
+    def _mse_init_script(self, cfg: Dict[str, Any]) -> str:
+        safe_cfg = {
+            "maxQueue": int(cfg.get("maxQueue", 2000)),
+            "maxUrlLen": int(cfg.get("maxUrlLen", 2048)),
+            "prefixHexBytes": int(cfg.get("prefixHexBytes", 32)),
+            "flushIntervalMs": int(cfg.get("flushIntervalMs", 250)),
+            "captureFetch": bool(cfg.get("captureFetch", True)),
+            "captureXHR": bool(cfg.get("captureXHR", True)),
+            "captureMediaSrcAssign": bool(cfg.get("captureMediaSrcAssign", True)),
+            "mediaishHints": list(cfg.get("mediaishHints", [])),
+        }
+        cfg_json = self.json.dumps(safe_cfg)
+        return f"""
+(() => {{
+  try {{
+    const NS = (window.__NS_MSE = window.__NS_MSE || {{}});
+    if (NS.__installed) return;
+    NS.__installed = true;
+
+    const DEFAULTS = {{
+      maxQueue: 2000,
+      maxUrlLen: 2048,
+      prefixHexBytes: 32,
+      flushIntervalMs: 250,
+      captureFetch: true,
+      captureXHR: true,
+      captureMediaSrcAssign: true,
+      mediaishHints: [
+        ".m4s",".mp4",".ts",".aac",".m3u8",".mpd","dash","hls","segment","seg","chunk","frag","bytestream"
+      ]
+    }};
+
+    const EMBEDDED = {cfg_json};
+    NS.cfg = Object.assign(DEFAULTS, (NS.cfg || {{}}), (EMBEDDED || {{}}));
+    NS.q = NS.q || [];
+    NS.stats = NS.stats || {{dropped:0, pushed:0, flushed:0, errs:0}};
+
+    function nowMs(){{ return Date.now(); }}
+    function trunc(s, n){{ s = (s == null ? "" : String(s)); return s.length > n ? s.slice(0, n) : s; }}
+    function safeUrl(u){{ return trunc(u, NS.cfg.maxUrlLen); }}
+
+    function isMediaishUrl(u){{
+      try {{
+        const s = String(u || "").toLowerCase();
+        for (const h of (NS.cfg.mediaishHints||[])) {{ if (s.includes(h)) return true; }}
+        return false;
+      }} catch(e) {{ return false; }}
+    }}
+
+    function hexPrefixFromU8(u8, maxBytes){{
+      try {{
+        const n = Math.min(u8.byteLength || 0, maxBytes|0);
+        let out = "";
+        for (let i=0;i<n;i++) {{
+          const b = u8[i] & 0xFF;
+          out += (b<16 ? "0" : "") + b.toString(16);
+        }}
+        return out;
+      }} catch(e) {{ return ""; }}
+    }}
+
+    function pushEvt(evt){{
+      try {{
+        if (!evt || typeof evt !== "object") return;
+        evt.ts = evt.ts || nowMs();
+        if (evt.url) evt.url = safeUrl(evt.url);
+        if (NS.q.length >= (NS.cfg.maxQueue|0)) {{
+          NS.q.shift();
+          NS.stats.dropped++;
+        }}
+        NS.q.push(evt);
+        NS.stats.pushed++;
+      }} catch(e) {{
+        NS.stats.errs++;
+      }}
+    }}
+
+    function flush(){{
+      try {{
+        const fn = window.__ns_mse_push;
+        if (typeof fn !== "function") return;
+        if (!NS.q.length) return;
+        const batch = NS.q.splice(0, 100);
+        NS.stats.flushed += batch.length;
+        fn(batch);
+      }} catch(e) {{
+        NS.stats.errs++;
+      }}
+    }}
+
+    setInterval(flush, Math.max(50, NS.cfg.flushIntervalMs|0));
+
+    const MS = window.MediaSource;
+    if (MS && MS.prototype) {{
+      const origAddSB = MS.prototype.addSourceBuffer;
+      if (typeof origAddSB === "function") {{
+        MS.prototype.addSourceBuffer = function(mime){{
+          const msId = (this.__ns_ms_id = this.__ns_ms_id || ("ms_" + Math.random().toString(16).slice(2)));
+          pushEvt({{event:"mse_addSourceBuffer", ms_id: msId, mime: trunc(mime, 200)}});
+          const sb = origAddSB.apply(this, arguments);
+
+          try {{
+            if (sb && !sb.__ns_wrapped) {{
+              sb.__ns_wrapped = true;
+              sb.__ns_mime = trunc(mime, 200);
+              const origAppend = sb.appendBuffer;
+
+              if (typeof origAppend === "function") {{
+                sb.appendBuffer = function(buf){{
+                  try {{
+                    const u8 = buf instanceof ArrayBuffer ? new Uint8Array(buf) :
+                              (ArrayBuffer.isView(buf) ? new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength) : null);
+                    const byteLen = u8 ? (u8.byteLength||0) : (buf && buf.byteLength ? buf.byteLength : null);
+                    const hex = u8 ? hexPrefixFromU8(u8, NS.cfg.prefixHexBytes|0) : "";
+                    pushEvt({{
+                      event:"mse_appendBuffer",
+                      ms_id: msId,
+                      mime: sb.__ns_mime || "",
+                      byteLength: byteLen,
+                      prefix_hex: hex
+                    }});
+                  }} catch(e) {{}}
+                  return origAppend.apply(this, arguments);
+                }};
+              }}
+            }}
+          }} catch(e) {{}}
+
+          return sb;
+        }};
+      }}
+    }}
+
+    try {{
+      const origCreate = URL.createObjectURL;
+      if (typeof origCreate === "function") {{
+        URL.createObjectURL = function(obj){{
+          const out = origCreate.apply(this, arguments);
+          try {{
+            if (obj && window.MediaSource && obj instanceof window.MediaSource) {{
+              const msId = (obj.__ns_ms_id = obj.__ns_ms_id || ("ms_" + Math.random().toString(16).slice(2)));
+              pushEvt({{event:"mse_createObjectURL", ms_id: msId, blob_url: safeUrl(out)}});
+            }}
+          }} catch(e) {{}}
+          return out;
+        }};
+      }}
+    }} catch(e) {{}}
+
+    if (NS.cfg.captureMediaSrcAssign) {{
+      try {{
+        const proto = HTMLMediaElement && HTMLMediaElement.prototype;
+        if (proto) {{
+          const desc = Object.getOwnPropertyDescriptor(proto, "src");
+          if (desc && desc.set) {{
+            Object.defineProperty(proto, "src", {{
+              get: desc.get,
+              set: function(v){{
+                try {{
+                  const s = String(v||"");
+                  if (s.startsWith("blob:")) {{
+                    pushEvt({{event:"media_src_set", tag:"prop", blob_url: safeUrl(s)}});
+                  }}
+                }} catch(e) {{}}
+                return desc.set.call(this, v);
+              }}
+            }});
+          }}
+
+          const origSetAttr = Element.prototype.setAttribute;
+          Element.prototype.setAttribute = function(k, v){{
+            try {{
+              if (this && (this instanceof HTMLMediaElement) && String(k||"").toLowerCase() === "src") {{
+                const s = String(v||"");
+                if (s.startsWith("blob:")) pushEvt({{event:"media_src_set", tag:"attr", blob_url: safeUrl(s)}});
+              }}
+            }} catch(e) {{}}
+            return origSetAttr.apply(this, arguments);
+          }};
+        }}
+      }} catch(e) {{}}
+    }}
+
+    if (NS.cfg.captureFetch && typeof window.fetch === "function") {{
+      const origFetch = window.fetch;
+      window.fetch = async function(input, init){{
+        const url = (typeof input === "string" ? input : (input && input.url ? input.url : ""));
+        const u = safeUrl(url);
+        const mediaish = isMediaishUrl(u);
+
+        try {{
+          const resp = await origFetch.apply(this, arguments);
+          try {{
+            if (mediaish) {{
+              const ct = resp && resp.headers ? resp.headers.get("content-type") : null;
+              const cl = resp && resp.headers ? resp.headers.get("content-length") : null;
+              pushEvt({{event:"fetch_resp", url:u, status: resp ? resp.status : null, content_type: trunc(ct,120), content_length: trunc(cl,30)}});
+            }}
+          }} catch(e) {{}}
+          return resp;
+        }} catch(e) {{
+          try {{
+            if (mediaish) pushEvt({{event:"fetch_err", url:u, error: trunc(e && e.message ? e.message : String(e), 200)}});
+          }} catch(_e) {{}}
+          throw e;
+        }}
+      }};
+    }}
+
+    if (NS.cfg.captureXHR && window.XMLHttpRequest) {{
+      const X = window.XMLHttpRequest;
+      const origOpen = X.prototype.open;
+      const origSend = X.prototype.send;
+
+      X.prototype.open = function(method, url){{
+        try {{
+          this.__ns_xhr_url = safeUrl(url);
+          this.__ns_xhr_method = trunc(method, 16);
+        }} catch(e) {{}}
+        return origOpen.apply(this, arguments);
+      }};
+
+      X.prototype.send = function(body){{
+        try {{
+          const u = this.__ns_xhr_url || "";
+          const mediaish = isMediaishUrl(u);
+          if (mediaish) {{
+            const self = this;
+            const onLoad = function(){{
+              try {{
+                const ct = self.getResponseHeader ? self.getResponseHeader("content-type") : null;
+                const cl = self.getResponseHeader ? self.getResponseHeader("content-length") : null;
+                pushEvt({{event:"xhr_resp", url:u, status: self.status, content_type: trunc(ct,120), content_length: trunc(cl,30), responseType: trunc(self.responseType, 20)}});
+              }} catch(e) {{}}
+            }};
+            self.addEventListener("load", onLoad);
+            self.addEventListener("error", () => pushEvt({{event:"xhr_err", url:u}}));
+          }}
+        }} catch(e) {{}}
+        return origSend.apply(this, arguments);
+      }};
+    }}
+
+  }} catch (e) {{
+    try {{ (window.__NS_MSE = window.__NS_MSE || {{}}).stats = {{errs:999}}; }} catch(_e) {{}}
+  }}
+}})();
+"""
+
+    async def _install_mse_bridge(self, page, mse_events: List[Dict[str, Any]], *, log: Optional[List[str]]):
+        if not self.cfg.enable_mse_sniff:
+            return
+
+        max_events = int(self.cfg.mse_max_events)
+
+        async def _binding(source, payload):
+            try:
+                if payload is None:
+                    return
+                batch = payload if isinstance(payload, list) else [payload]
+                for ev in batch:
+                    if len(mse_events) >= max_events:
+                        return
+                    if isinstance(ev, dict):
+                        mse_events.append(ev)
+                    else:
+                        mse_events.append({"event": "mse_raw", "raw": self._to_str(ev)})
+            except Exception as e:
+                self._log(f"[NetworkSniffer][MSE] binding error: {e}", log)
+
+        try:
+            await page.expose_binding("__ns_mse_push", _binding)
+        except Exception as e:
+            self._log(f"[NetworkSniffer][MSE] expose_binding failed: {e}", log)
+            return
+
+        cfg = {
+            "maxQueue": max(100, int(self.cfg.mse_max_events) * 8),
+            "maxUrlLen": int(self.cfg.mse_max_url_len),
+            "prefixHexBytes": int(self.cfg.mse_prefix_hex_bytes),
+            "flushIntervalMs": int(self.cfg.mse_flush_interval_ms),
+            "captureFetch": bool(self.cfg.mse_capture_fetch),
+            "captureXHR": bool(self.cfg.mse_capture_xhr),
+            "captureMediaSrcAssign": bool(self.cfg.mse_capture_media_src_assign),
+            "mediaishHints": list(self.cfg.mse_mediaish_url_hints or []),
+        }
+
+        try:
+            script = self._mse_init_script(cfg)
+            await page.add_init_script(script=script)
+        except TypeError:
+            try:
+                await page.add_init_script(script)
+            except Exception as e:
+                self._log(f"[NetworkSniffer][MSE] init_script failed: {e}", log)
+        except Exception as e:
+            self._log(f"[NetworkSniffer][MSE] init_script failed: {e}", log)
 
     # ============================== sniff ============================== #
     async def sniff(
@@ -1165,6 +1501,8 @@ class NetworkSniffer:
 
         seen_network: Set[str] = set()
         seen_derived: Set[str] = set()
+        seen_mse_urls: Set[str] = set()
+        seen_binary_sig: Set[str] = set()
 
         blob_placeholders: List[Dict[str, Any]] = []
         req_types: Dict[str, str] = {}
@@ -1176,11 +1514,15 @@ class NetworkSniffer:
         forensics: List[Dict[str, Any]] = []
         seen_forensics: Set[str] = set()
 
-        # new: salvage target table (url -> info), scored + per-host limited
         salvage_info: Dict[str, Dict[str, Any]] = {}
         salvage_host_counts: Dict[str, int] = {}
-
         salvage_bundles: List[Dict[str, Any]] = []
+
+        mse_events: List[Dict[str, Any]] = []
+
+        # NEW: binary signature tasks
+        binary_tasks: List["NetworkSniffer.asyncio.Task"] = []
+        binary_sem = self.asyncio.Semaphore(int(self.cfg.binary_sniff_concurrency))
 
         html: str = ""
 
@@ -1202,6 +1544,9 @@ class NetworkSniffer:
 
         self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
 
+        if self.cfg.enable_mse_sniff:
+            await self._install_mse_bridge(page, mse_events, log=log)
+
         # ---------------- request handler ---------------- #
         def handle_request(req):
             try:
@@ -1210,7 +1555,6 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-            # request-side redirect chain
             try:
                 if self.cfg.enable_redirect_tracking:
                     prev = getattr(req, "redirected_from", None)
@@ -1224,7 +1568,6 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-            # request evidence
             try:
                 if self.cfg.enable_forensics:
                     url = self._to_str(getattr(req, "url", None))
@@ -1267,7 +1610,6 @@ class NetworkSniffer:
                             return
                         if len(body) > int(self.cfg.graphql_max_body_kb) * 1024:
                             return
-
                         try:
                             gql_payload = self.json.loads(body)
                         except Exception:
@@ -1336,6 +1678,61 @@ class NetworkSniffer:
             except Exception as e:
                 self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
 
+        # ---------------- NEW: binary sniff worker ---------------- #
+        def req_hdrs_for(u: str) -> Dict[str, str]:
+            ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
+            return ev.get("headers_subset") or {}
+
+        async def binary_sniff_one(*, url: str, ctype: str, resource_type: str, content_length: Optional[int]):
+            async with binary_sem:
+                cu = self._canonicalize_url(url)
+                if not cu or cu in seen_binary_sig:
+                    return
+                if len(seen_binary_sig) >= int(self.cfg.binary_sniff_max_tasks):
+                    return
+                seen_binary_sig.add(cu)
+
+                prefix = await self._get_prefix_bytes(
+                    api_ctx,
+                    cu,
+                    req_hdrs_for(cu),
+                    timeout_ms=int(self.cfg.binary_sniff_timeout_ms),
+                    prefix_bytes=int(self.cfg.binary_sniff_prefix_bytes),
+                )
+
+                kind2, cth, detail = self._guess_kind_from_magic(prefix)
+                if not kind2:
+                    return
+
+                if not self._is_allowed_by_extensions(cu, extensions, kind2):
+                    return
+
+                if len(found_items) < max_items:
+                    found_items.append({
+                        "url": cu,
+                        "text": f"[BinarySig {kind2.capitalize()}] ({detail})",
+                        "tag": "binary_sig_sniff",
+                        "kind": kind2,
+                        "content_type": cth or (ctype or "?"),
+                        "size": str(content_length) if content_length is not None else "?",
+                    })
+
+                # emit a compact json hit for provenance
+                if len(json_hits) < max_json:
+                    sha = self.hashlib.sha256(prefix).hexdigest() if prefix else None
+                    json_hits.append({
+                        "url": cu,
+                        "json": {
+                            "binary_signature": True,
+                            "detected_kind": kind2,
+                            "detail": detail,
+                            "content_type_hint": cth,
+                            "prefix_sha256": sha,
+                            "prefix_len": len(prefix) if prefix else 0,
+                        },
+                        "source_page": canonical_page_url,
+                    })
+
         # ---------------- response handler ---------------- #
         def handle_response(response):
             try:
@@ -1354,14 +1751,11 @@ class NetworkSniffer:
                     p = self._safe_urlparse(canonical_url)
                     path = self._to_str(p.path or "/").lower()
                     netloc = self._to_str(p.netloc or "")
-                    if self._is_junk_by_extension(path):
-                        return
                     if self._looks_like_ad(netloc, path):
                         return
 
                 seen_network.add(canonical_url)
 
-                # normalize headers to {lower:str -> str}
                 try:
                     hdr_raw = getattr(response, "headers", None) or {}
                     headers = {self._to_str(k).lower(): self._to_str(v) for (k, v) in hdr_raw.items()}
@@ -1371,10 +1765,8 @@ class NetworkSniffer:
                 ctype = (headers.get("content-type") or "").lower()
                 url_lower = canonical_url.lower()
 
-                # header URL mining
                 mine_headers(canonical_url, headers)
 
-                # response redirect info
                 try:
                     if self.cfg.enable_redirect_tracking:
                         loc = self._to_str(headers.get("location"))
@@ -1386,7 +1778,6 @@ class NetworkSniffer:
                 except Exception:
                     pass
 
-                # content-length parse
                 cl_header = self._to_str(headers.get("content-length") or "")
                 content_length: Optional[int] = None
                 try:
@@ -1395,17 +1786,21 @@ class NetworkSniffer:
                 except Exception:
                     content_length = None
 
+                # if it’s a known “junk” extension, still allow binary sig sniffing to override
+                p = self._safe_urlparse(canonical_url)
+                path = self._to_str(p.path or "/").lower()
+                is_junk_ext = self._is_junk_by_extension(path)
+
                 if (not is_blob) and ctype and self._deny_by_content_type(ctype):
-                    return
+                    # deny list applies, but binary signature sniffing can still run if very suspect.
+                    pass
                 if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
                     return
 
-                # SAFE JSON sniff
                 if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
                     self.asyncio.create_task(handle_json(response, canonical_url))
                     return
 
-                # blob media placeholder
                 if is_blob:
                     if resource_type == "media":
                         blob_placeholders.append({
@@ -1424,9 +1819,7 @@ class NetworkSniffer:
                             })
                     return
 
-                p = self._safe_urlparse(canonical_url)
-                path = self._to_str(p.path or "/").lower()
-
+                # normal classification
                 kind = (
                     self._classify_by_extension(path)
                     or (self._classify_by_content_type(ctype) if ctype else None)
@@ -1438,13 +1831,38 @@ class NetworkSniffer:
                     if seg_kind:
                         kind = seg_kind
 
+                # ---------------- NEW: Binary signature sniff scheduling ----------------
+                if self.cfg.enable_binary_signature_sniff:
+                    should_probe = self._is_binary_suspect(
+                        canonical_url,
+                        ctype=ctype,
+                        resource_type=resource_type,
+                        content_length=content_length,
+                    )
+                    if should_probe:
+                        if (not self.cfg.binary_sniff_only_if_unknown_kind) or (kind is None):
+                            if len(binary_tasks) < int(self.cfg.binary_sniff_max_tasks):
+                                binary_tasks.append(self.asyncio.create_task(
+                                    binary_sniff_one(
+                                        url=canonical_url,
+                                        ctype=ctype,
+                                        resource_type=resource_type,
+                                        content_length=content_length,
+                                    )
+                                ))
+
+                # if still no kind, stop here (binary sniff may still add later)
                 if not kind:
                     return
+
+                if is_junk_ext:
+                    # junk extensions normally filtered, but if we already classified as media (via ctype/hints),
+                    # keep it. Otherwise we’d have returned above.
+                    pass
 
                 if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
                     return
 
-                # manifest tracking
                 mkind = self._is_manifest(canonical_url, ctype)
                 if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
                     manifests_to_expand.append((response, mkind, canonical_url))
@@ -1452,7 +1870,6 @@ class NetworkSniffer:
                         manifests_to_expand.sort(key=lambda t: (0 if "master" in self._to_str(t[2]).lower() else 1))
 
                 if len(found_items) < max_items:
-                    # content-disposition filename hint
                     cd = self._to_str(headers.get("content-disposition") or "")
                     filename = None
                     if cd:
@@ -1472,7 +1889,6 @@ class NetworkSniffer:
                         item["text"] = f"[Network {kind.capitalize()}] {filename}"
                     found_items.append(item)
 
-                # forensics bundle
                 if self.cfg.enable_forensics and len(forensics) < int(self.cfg.max_forensics_events):
                     req_ev = request_evidence.get(raw_url) or request_evidence.get(canonical_url) or {}
                     req_hdr_subset = (req_ev.get("headers_subset") or {})
@@ -1510,7 +1926,6 @@ class NetworkSniffer:
                         seen_forensics.add(k)
                         forensics.append(bundle)
 
-                # salvage targets (LESS NOISY + SCORED)
                 if self.cfg.enable_url_salvage:
                     status = getattr(response, "status", None)
                     if self._salvage_should_target(canonical_url, status=status, kind=kind):
@@ -1520,16 +1935,9 @@ class NetworkSniffer:
                             if cnt >= int(self.cfg.salvage_max_targets_per_host):
                                 return
                         score = self._salvage_score(canonical_url, status=status, kind=kind)
-
-                        # keep best score per URL
                         prev = salvage_info.get(canonical_url)
                         if (prev is None) or (float(prev.get("score", 0.0)) < score):
-                            salvage_info[canonical_url] = {
-                                "url": canonical_url,
-                                "score": score,
-                                "status": status,
-                                "kind": kind,
-                            }
+                            salvage_info[canonical_url] = {"url": canonical_url, "score": score, "status": status, "kind": kind}
                             if host:
                                 salvage_host_counts[host] = salvage_host_counts.get(host, 0) + 1
 
@@ -1552,7 +1960,17 @@ class NetworkSniffer:
             await self._auto_scroll(page, tmo, log)
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
-            # redirect chain
+            # wait for pending binary-sniff tasks (bounded)
+            if self.cfg.enable_binary_signature_sniff and binary_tasks:
+                try:
+                    # give them a tight budget; they’re range GETs, should be quick
+                    await self.asyncio.wait_for(
+                        self.asyncio.gather(*binary_tasks, return_exceptions=True),
+                        timeout=max(0.25, min(2.5, tmo * 0.25)),
+                    )
+                except Exception:
+                    pass
+
             if self.cfg.enable_redirect_tracking and redirect_events and len(json_hits) < max_json:
                 json_hits.append({
                     "url": canonical_page_url,
@@ -1560,7 +1978,6 @@ class NetworkSniffer:
                     "source_page": canonical_page_url,
                 })
 
-            # manifest expansion
             if manifests_to_expand:
                 async def expand_one(resp, mkind: str, murl: str):
                     derived_urls = await self._expand_manifest(resp, mkind, murl, log)
@@ -1597,7 +2014,6 @@ class NetworkSniffer:
                     for (resp, mkind, murl) in manifests_to_expand
                 ])
 
-            # forensics hash fill
             if self.cfg.enable_forensics and self.cfg.forensics_hash_via_probe and api_ctx is not None and forensics:
                 sem = self.asyncio.Semaphore(8)
 
@@ -1614,16 +2030,14 @@ class NetworkSniffer:
 
                 await self.asyncio.gather(*[guard_hash(b) for b in forensics])
 
-            # salvage stage (SCORED + TOP-N)
             if self.cfg.enable_url_salvage and api_ctx is not None and salvage_info:
-                # select top targets
                 targets = list(salvage_info.values())
                 targets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
                 targets = targets[: int(self.cfg.salvage_max_targets_total)]
 
                 sem = self.asyncio.Semaphore(int(self.cfg.salvage_probe_concurrency))
 
-                def req_hdrs_for(u: str) -> Dict[str, str]:
+                def req_hdrs_for_salvage(u: str) -> Dict[str, str]:
                     ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
                     return ev.get("headers_subset") or {}
 
@@ -1633,7 +2047,7 @@ class NetworkSniffer:
                         return await self._salvage_one(
                             api_ctx,
                             u,
-                            req_hdrs_for(u),
+                            req_hdrs_for_salvage(u),
                             log=log,
                             observed_status=info.get("status"),
                             observed_kind=info.get("kind"),
@@ -1641,7 +2055,58 @@ class NetworkSniffer:
 
                 salvage_bundles = await self.asyncio.gather(*[salvage_guard(i) for i in targets])
 
-            # emit bundles
+            # --- MSE post-processing ---
+            if self.cfg.enable_mse_sniff and mse_events:
+                for ev in mse_events[: int(self.cfg.mse_max_events)]:
+                    try:
+                        et = self._to_str(ev.get("event"))
+                        u = self._to_str(ev.get("url"))
+                        blob_u = self._to_str(ev.get("blob_url"))
+                        if u and u not in seen_mse_urls and (et in ("fetch_resp", "xhr_resp")):
+                            if any(h in u.lower() for h in (self.cfg.mse_mediaish_url_hints or set())) or self._is_mediaish_url(u):
+                                seen_mse_urls.add(u)
+                                found_items.append({
+                                    "url": self._canonicalize_url(u),
+                                    "text": "[MSE Media Fetch]",
+                                    "tag": "mse_sniff",
+                                    "kind": "video",
+                                    "content_type": self._to_str(ev.get("content_type") or "?"),
+                                    "size": self._to_str(ev.get("content_length") or "?"),
+                                })
+                        if blob_u and blob_u.startswith("blob:"):
+                            if all(self._to_str(x.get("url")) != blob_u for x in blob_placeholders):
+                                blob_placeholders.append({
+                                    "url": blob_u,
+                                    "text": "[MSE Blob URL]",
+                                    "tag": "mse_sniff",
+                                    "kind": "video",
+                                    "content_type": "?",
+                                    "size": "?",
+                                })
+                    except Exception:
+                        pass
+
+                if len(json_hits) < max_json:
+                    if self.cfg.mse_emit_each_event_json:
+                        for ev in mse_events[: max(0, int(self.cfg.mse_max_events) - 1)]:
+                            if len(json_hits) >= max_json:
+                                break
+                            json_hits.append({
+                                "url": canonical_page_url,
+                                "json": {"mse_event": ev},
+                                "source_page": canonical_page_url,
+                            })
+                    else:
+                        json_hits.append({
+                            "url": canonical_page_url,
+                            "json": {"mse_bundle": {
+                                "source_page": canonical_page_url,
+                                "count": len(mse_events),
+                                "items": mse_events[: int(self.cfg.mse_max_events)],
+                            }},
+                            "source_page": canonical_page_url,
+                        })
+
             if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
                 json_hits.append({
                     "url": canonical_page_url,
@@ -1654,7 +2119,6 @@ class NetworkSniffer:
                 })
 
             if self.cfg.enable_url_salvage and salvage_bundles and len(json_hits) < max_json:
-                # keep bundle clean by removing empty salvage results
                 clean = []
                 for b in salvage_bundles:
                     if not isinstance(b, dict):
@@ -1696,7 +2160,8 @@ class NetworkSniffer:
             f"[NetworkSniffer] Finished sniff for {canonical_page_url}: "
             f"media={len(found_items)} derived={len(derived_items)} "
             f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
-            f"forensics={len(forensics)} salvage={len(salvage_bundles)} "
+            f"forensics={len(forensics)} salvage={len(salvage_bundles)} mse={len(mse_events)} "
+            f"binary_sig_tasks={len(binary_tasks)} "
             f"(Total output: {len(merged_items)})"
         )
         self._log(summary, log)
@@ -2762,6 +3227,12 @@ class RuntimeSniffer:
       - Runtime URL hooks: fetch/XHR/WebSocket/EventSource/sendBeacon (URL-only ring buffer)
       - MutationObserver URL collector: href/src/data-* inserted dynamically (URL-only ring buffer)
       - Response header mining: Location + Link headers via page.on("response")
+
+    NEW (added in this rewrite):
+      - Worker/SharedWorker/Worklet visibility + postMessage URL hints (bounded)
+      - Service Worker registration + ready scope/script logging
+      - CSS URL mining: <link rel=preconnect/prefetch/preload> + CSS url(...) via insertRule/setProperty
+      - WebRTC ICE visibility: RTCPeerConnection + iceServers (stun/turn) + basic state signals
     """
 
     @dataclass
@@ -2777,19 +3248,19 @@ class RuntimeSniffer:
         enable_mediasource_sniff: bool = True
         enable_console_sniff: bool = True
 
-        # --- NEW: runtime URL hooks (URL-only) ---
+        # --- runtime URL hooks (URL-only) ---
         enable_runtime_url_hooks: bool = True
         max_runtime_url_events: int = 500
         runtime_url_keywords: Set[str] = field(default_factory=lambda: {
             "api", "graphql", "manifest", "playlist", "m3u8", "mpd", "stream", "vod", "hls", "dash"
         })
 
-        # --- NEW: mutation observer (URL-only) ---
+        # --- mutation observer (URL-only) ---
         enable_mutation_observer: bool = True
         mutation_observer_ms: int = 1500
         max_mutation_url_events: int = 400
 
-        # --- NEW: response header mining (URL-only) ---
+        # --- response header mining (URL-only) ---
         enable_response_header_mining: bool = True
         max_header_url_events: int = 200
 
@@ -2800,7 +3271,7 @@ class RuntimeSniffer:
             "manifest", "playlist", "m3u8", "mpd", "stream",
             "video", "audio", "hls", "dash", "api", "graphql", "next"
         })
-        json_parse_store_parsed: bool = True  # keep your previous behavior
+        json_parse_store_parsed: bool = True
 
         # --- hydration globals ---
         enable_hydration_sniff: bool = True
@@ -2841,16 +3312,39 @@ class RuntimeSniffer:
         # How Playwright waits in page.goto
         goto_wait_until: str = "domcontentloaded"
 
+        # ---------------- NEW: Worker / SharedWorker / Worklet ----------------
+        enable_worker_sniff: bool = True
+        max_worker_events: int = 400
+        worker_message_max_bytes: int = 4096
+
+        # ---------------- NEW: Service Worker ----------------
+        enable_service_worker_sniff: bool = True
+        max_sw_events: int = 200
+
+        # ---------------- NEW: CSS URL mining + <link rel=...> hints ----------------
+        enable_css_url_sniff: bool = True
+        max_css_url_events: int = 600
+        css_url_max_len: int = 2048
+
+        # ---------------- NEW: WebRTC ICE visibility ----------------
+        enable_webrtc_sniff: bool = True
+        max_webrtc_events: int = 200
+
     def __init__(self, config: Optional["RuntimeSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
-        self._log("RuntimeSniffer Initialized (advanced)", None)
+        self._log("RuntimeSniffer Initialized (full+workers+css+webrtc)", None)
 
-        self.cfg.json_body_url_hints.update({
-            "api-v2.soundcloud.com/tracks",
-            "api-v2.soundcloud.com/media",
-            "client_id="
-        })
+        # keep your prior special hints
+        try:
+            self.cfg.json_body_url_hints.update({
+                "api-v2.soundcloud.com/tracks",
+                "api-v2.soundcloud.com/media",
+                "client_id="
+            })
+        except Exception:
+            pass
+
     # ------------------------------ logging ------------------------------ #
 
     def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
@@ -2869,7 +3363,6 @@ class RuntimeSniffer:
         if not s:
             return []
         rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
-        # stable de-dupe preserving order
         out: List[str] = []
         seen: Set[str] = set()
         for m in rx.findall(s):
@@ -2894,16 +3387,13 @@ class RuntimeSniffer:
         max_bytes = int(self.cfg.json_body_max_kb) * 1024
         return content_length <= max_bytes
 
-    # ------------------------- NEW: runtime URL hooks ------------------------- #
+    # =====================================================================
+    # Runtime URL hooks (fetch/xhr/ws/eventsource/beacon) - URL-only ring buf
+    # =====================================================================
 
-    async def _inject_runtime_url_hooks(
-        self,
-        context: "BrowserContext",
-        log: Optional[List[str]],
-    ) -> None:
+    async def _inject_runtime_url_hooks(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
         if not self.cfg.enable_runtime_url_hooks:
             return
-
         max_events = int(self.cfg.max_runtime_url_events)
         kws = sorted({k.lower() for k in (self.cfg.runtime_url_keywords or set()) if k})
         kws_js = json.dumps(kws)
@@ -3014,7 +3504,7 @@ class RuntimeSniffer:
                 }})();
                 """
             )
-            self._log("Injected runtime URL hooks (fetch/xhr/ws/eventsource/beacon).", log)
+            self._log("Injected runtime URL hooks.", log)
         except Exception as e:
             self._log(f"Failed to inject runtime URL hooks: {e}", log)
 
@@ -3027,7 +3517,6 @@ class RuntimeSniffer:
     ) -> None:
         if not self.cfg.enable_runtime_url_hooks:
             return
-
         try:
             events = await page.evaluate(
                 "() => Array.isArray(window.__runtimeUrlEvents) ? window.__runtimeUrlEvents : []"
@@ -3035,11 +3524,9 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Error reading __runtimeUrlEvents: {e}", log)
             return
-
         if not events:
             return
 
-        # de-dupe by kind|url on Python side too
         seen: Set[str] = set()
         for ev in events:
             if not isinstance(ev, dict):
@@ -3060,16 +3547,13 @@ class RuntimeSniffer:
 
         self._log(f"Runtime URL hook events captured: {len(seen)}", log)
 
-    # ------------------------- NEW: mutation observer URLs ------------------------- #
+    # =====================================================================
+    # MutationObserver URL collector (href/src/data-*)
+    # =====================================================================
 
-    async def _inject_mutation_observer(
-        self,
-        context: "BrowserContext",
-        log: Optional[List[str]],
-    ) -> None:
+    async def _inject_mutation_observer(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
         if not self.cfg.enable_mutation_observer:
             return
-
         max_events = int(self.cfg.max_mutation_url_events)
 
         try:
@@ -3164,7 +3648,6 @@ class RuntimeSniffer:
     ) -> None:
         if not self.cfg.enable_mutation_observer:
             return
-
         try:
             events = await page.evaluate(
                 "() => Array.isArray(window.__mutationUrlEvents) ? window.__mutationUrlEvents : []"
@@ -3172,7 +3655,6 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Error reading __mutationUrlEvents: {e}", log)
             return
-
         if not events:
             return
 
@@ -3196,7 +3678,9 @@ class RuntimeSniffer:
 
         self._log(f"Mutation URL events captured: {len(seen)}", log)
 
-    # ------------------------- NEW: response header mining ------------------------- #
+    # =====================================================================
+    # Response header mining (Location/Link)
+    # =====================================================================
 
     def _attach_response_header_miner(
         self,
@@ -3237,13 +3721,11 @@ class RuntimeSniffer:
         page.on("response", on_response)
         self._log("Attached response header miner (Location/Link).", log)
 
-    # ------------------------- JSON.parse hook ------------------------- #
+    # =====================================================================
+    # JSON.parse hook
+    # =====================================================================
 
-    async def _inject_json_parse_hook(
-        self,
-        context: "BrowserContext",
-        log: Optional[List[str]],
-    ) -> None:
+    async def _inject_json_parse_hook(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
         if not self.cfg.enable_json_parse_sniff:
             return
 
@@ -3285,9 +3767,9 @@ class RuntimeSniffer:
                 }})();
                 """
             )
-            self._log("Injected JSON.parse hook script.", log)
+            self._log("Injected JSON.parse hook.", log)
         except Exception as e:
-            self._log(f"Failed to inject JSON.parse hook script: {e}", log)
+            self._log(f"Failed to inject JSON.parse hook: {e}", log)
 
     async def _collect_json_parse_events(
         self,
@@ -3337,7 +3819,9 @@ class RuntimeSniffer:
 
         self._log(f"JSON.parse events captured: {len(events)}", log)
 
-    # ------------------------- hydration globals ------------------------- #
+    # =====================================================================
+    # Hydration globals
+    # =====================================================================
 
     async def _collect_hydration_state(
         self,
@@ -3395,7 +3879,6 @@ class RuntimeSniffer:
                 "preview": js_json[: max_bytes],
             }
 
-            # keep your prior "parsed" behavior
             try:
                 payload["parsed"] = json.loads(js_json)
             except Exception:
@@ -3409,7 +3892,9 @@ class RuntimeSniffer:
 
         self._log(f"Hydration globals captured: {len(hydration_dump)}", log)
 
-    # ------------------------- attach hooks ------------------------- #
+    # =====================================================================
+    # Console sniff
+    # =====================================================================
 
     def _attach_console_sniffer(
         self,
@@ -3436,6 +3921,10 @@ class RuntimeSniffer:
                 pass
 
         page.on("console", on_console)
+
+    # =====================================================================
+    # WebSocket sniff
+    # =====================================================================
 
     def _attach_websocket_sniffer(
         self,
@@ -3486,6 +3975,10 @@ class RuntimeSniffer:
             ws.on("framereceived", lambda msg: asyncio.create_task(handle_frame(msg)))
 
         page.on("websocket", on_ws)
+
+    # =====================================================================
+    # Request body sniff (page.route)
+    # =====================================================================
 
     async def _attach_request_body_sniffer(
         self,
@@ -3544,73 +4037,79 @@ class RuntimeSniffer:
 
         await page.route("**/*", route_handler)
 
-    # ---------------------- MediaSource / MSE hook ---------------------- #
+    # =====================================================================
+    # MediaSource / MSE hook
+    # =====================================================================
 
     async def _inject_mediasource_script(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
         if not self.cfg.enable_mediasource_sniff:
             return
 
         try:
-            await context.add_init_script("""
-            (() => {
-              try {
-                const origCreateObjectURL = URL.createObjectURL;
-                const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
-                window.__networkMediaEvents = window.__networkMediaEvents || [];
-
-                function logMedia(event, payload) {
+            await context.add_init_script(
+                """
+                (() => {
                   try {
-                    window.__networkMediaEvents.push(Object.assign(
-                      {event, ts: Date.now()},
-                      payload || {}
-                    ));
-                  } catch {}
-                }
+                    const origCreateObjectURL = URL.createObjectURL;
+                    const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+                    window.__networkMediaEvents = window.__networkMediaEvents || [];
 
-                URL.createObjectURL = function(obj) {
-                  const url = origCreateObjectURL.call(this, obj);
-                  if (obj instanceof MediaSource) {
-                    logMedia('createObjectURL', { url, mediaSourceType: 'MediaSource' });
-                  }
-                  return url;
-                };
-
-                MediaSource.prototype.addSourceBuffer = function(mime) {
-                  let container = null;
-                  let codecs = null;
-                  try {
-                    const m = /^([^;]+)(?:;\\s*codecs=\\"?([^\\"]+)\\"?)?$/i.exec(String(mime || ""));
-                    if (m) {
-                      container = m[1] || null;
-                      codecs = m[2] || null;
+                    function logMedia(event, payload) {
+                      try {
+                        window.__networkMediaEvents.push(Object.assign(
+                          {event, ts: Date.now()},
+                          payload || {}
+                        ));
+                      } catch {}
                     }
-                  } catch {}
-                  logMedia('addSourceBuffer', {
-                    mime: String(mime || ""),
-                    container,
-                    codecs
-                  });
-                  return origAddSourceBuffer.call(this, mime);
-                };
 
-                const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-                if (desc && desc.set) {
-                  const origSet = desc.set;
-                  Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                    set(value) {
-                      logMedia('setMediaSrc', {
-                        tagName: this.tagName.toLowerCase(),
-                        src: String(value || "")
+                    URL.createObjectURL = function(obj) {
+                      const url = origCreateObjectURL.call(this, obj);
+                      try {
+                        if (obj instanceof MediaSource) {
+                          logMedia('createObjectURL', { url, mediaSourceType: 'MediaSource' });
+                        }
+                      } catch {}
+                      return url;
+                    };
+
+                    MediaSource.prototype.addSourceBuffer = function(mime) {
+                      let container = null;
+                      let codecs = null;
+                      try {
+                        const m = /^([^;]+)(?:;\\s*codecs=\\"?([^\\"]+)\\"?)?$/i.exec(String(mime || ""));
+                        if (m) {
+                          container = m[1] || null;
+                          codecs = m[2] || null;
+                        }
+                      } catch {}
+                      logMedia('addSourceBuffer', {
+                        mime: String(mime || ""),
+                        container,
+                        codecs
                       });
-                      return origSet.call(this, value);
+                      return origAddSourceBuffer.call(this, mime);
+                    };
+
+                    const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+                    if (desc && desc.set) {
+                      const origSet = desc.set;
+                      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                        set(value) {
+                          logMedia('setMediaSrc', {
+                            tagName: this.tagName.toLowerCase(),
+                            src: String(value || "")
+                          });
+                          return origSet.call(this, value);
+                        }
+                      });
                     }
-                  });
-                }
-              } catch (e) {
-                try { console.log("[RuntimeSniffer] MediaSource instrumentation error:", e); } catch {}
-              }
-            })();
-            """)
+                  } catch (e) {
+                    try { console.log("[RuntimeSniffer] MediaSource instrumentation error:", e); } catch {}
+                  }
+                })();
+                """
+            )
             self._log("Injected MediaSource instrumentation script.", log)
         except Exception as e:
             self._log(f"Failed to inject MediaSource script: {e}", log)
@@ -3643,7 +4142,9 @@ class RuntimeSniffer:
         })
         self._log(f"MSE events captured: {len(events)}", log)
 
-    # ---------------------- media events script ---------------------- #
+    # =====================================================================
+    # Media events (video/audio listeners, optional autoplay muted)
+    # =====================================================================
 
     async def _inject_media_events_script(
         self,
@@ -3690,7 +4191,7 @@ class RuntimeSniffer:
                   }
                 }
                 """,
-                {"autoPlay": auto_play}
+                {"autoPlay": auto_play},
             )
 
             if timeout_ms > 0:
@@ -3706,6 +4207,10 @@ class RuntimeSniffer:
                 self._log(f"Captured {len(media_events)} media events.", log)
         except Exception as e:
             self._log(f"Media events sniff error: {e}", log)
+
+    # =====================================================================
+    # Perf entries
+    # =====================================================================
 
     async def _collect_perf_entries(
         self,
@@ -3741,7 +4246,7 @@ class RuntimeSniffer:
                   return out;
                 }
                 """,
-                regex_str
+                regex_str,
             ) or []
 
             if perf_resources:
@@ -3753,6 +4258,10 @@ class RuntimeSniffer:
                 self._log(f"Perf entries hit: {len(perf_resources)}", log)
         except Exception as e:
             self._log(f"Perf sniff error: {e}", log)
+
+    # =====================================================================
+    # Storage sniff (localStorage/sessionStorage)
+    # =====================================================================
 
     async def _collect_storage(
         self,
@@ -3789,7 +4298,7 @@ class RuntimeSniffer:
                   return out;
                 }
                 """,
-                max_bytes
+                max_bytes,
             ) or []
 
             if storage_hits:
@@ -3802,7 +4311,613 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Storage sniff error: {e}", log)
 
-    # ------------------------- main sniff ------------------------- #
+    # =====================================================================
+    # NEW: Worker / SharedWorker / Worklet hooks (+ postMessage URL hints)
+    # =====================================================================
+
+    async def _inject_worker_sniffer(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_worker_sniff:
+            return
+
+        max_events = int(self.cfg.max_worker_events)
+        max_msg = int(self.cfg.worker_message_max_bytes)
+
+        try:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                  try {{
+                    const STORE = "__workerEvents";
+                    const MAX = {max_events};
+                    const MAX_MSG = {max_msg};
+
+                    const out = [];
+                    const seen = new Set();
+
+                    function abs(u) {{
+                      try {{ return new URL(String(u), location.href).href; }}
+                      catch {{ return String(u || ""); }}
+                    }}
+
+                    function push(kind, payload) {{
+                      try {{
+                        const key = kind + "|" + JSON.stringify(payload || {{}});
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push(Object.assign({{ ts: Date.now(), kind }}, payload || {{}}));
+                        if (out.length > MAX) out.shift();
+                        window[STORE] = out;
+                      }} catch (e) {{}}
+                    }}
+
+                    function extractUrls(s) {{
+                      try {{
+                        if (!s) return [];
+                        s = String(s);
+                        if (s.length > MAX_MSG) return [];
+                        const rx = /\\b(?:https?|wss?):\\/\\/[^\\s"'<>]+/ig;
+                        const m = s.match(rx) || [];
+                        const out2 = [];
+                        const set2 = new Set();
+                        for (const u of m) {{
+                          if (!set2.has(u)) {{ set2.add(u); out2.push(u); }}
+                          if (out2.length >= 50) break;
+                        }}
+                        return out2;
+                      }} catch (e) {{ return []; }}
+                    }}
+
+                    // Worker
+                    try {{
+                      const OrigWorker = window.Worker;
+                      if (typeof OrigWorker === "function") {{
+                        window.Worker = function(url, opts) {{
+                          try {{ push("worker:new", {{ url: abs(url), hasOptions: !!opts }}); }} catch (e) {{}}
+                          const w = new OrigWorker(url, opts);
+                          try {{
+                            const origPM = w.postMessage;
+                            if (typeof origPM === "function") {{
+                              w.postMessage = function(msg) {{
+                                try {{
+                                  if (typeof msg === "string") {{
+                                    const urls = extractUrls(msg);
+                                    if (urls.length) push("worker:postMessage", {{
+                                      to: "worker",
+                                      urls,
+                                      preview: msg.slice(0, 512)
+                                    }});
+                                  }}
+                                }} catch (e) {{}}
+                                return origPM.apply(this, arguments);
+                              }};
+                            }}
+                          }} catch (e) {{}}
+                          return w;
+                        }};
+                        window.Worker.prototype = OrigWorker.prototype;
+                      }}
+                    }} catch (e) {{}}
+
+                    // SharedWorker
+                    try {{
+                      const OrigShared = window.SharedWorker;
+                      if (typeof OrigShared === "function") {{
+                        window.SharedWorker = function(url, nameOrOpts) {{
+                          try {{ push("sharedworker:new", {{ url: abs(url) }}); }} catch (e) {{}}
+                          const sw = new OrigShared(url, nameOrOpts);
+                          try {{
+                            const p = sw && sw.port;
+                            if (p && typeof p.postMessage === "function") {{
+                              const origPM = p.postMessage;
+                              p.postMessage = function(msg) {{
+                                try {{
+                                  if (typeof msg === "string") {{
+                                    const urls = extractUrls(msg);
+                                    if (urls.length) push("sharedworker:postMessage", {{
+                                      to: "sharedworker",
+                                      urls,
+                                      preview: msg.slice(0, 512)
+                                    }});
+                                  }}
+                                }} catch (e) {{}}
+                                return origPM.apply(this, arguments);
+                              }};
+                            }}
+                          }} catch (e) {{}}
+                          return sw;
+                        }};
+                        window.SharedWorker.prototype = OrigShared.prototype;
+                      }}
+                    }} catch (e) {{}}
+
+                    // Worklets: AudioWorklet.addModule(url)
+                    try {{
+                      // In many browsers: (new AudioContext()).audioWorklet.addModule(...)
+                      const AC = window.AudioContext || window.webkitAudioContext;
+                      if (typeof AC === "function" && AC.prototype) {{
+                        const desc = Object.getOwnPropertyDescriptor(AC.prototype, "audioWorklet");
+                        if (desc && typeof desc.get === "function") {{
+                          const origGet = desc.get;
+                          Object.defineProperty(AC.prototype, "audioWorklet", {{
+                            get() {{
+                              const aw = origGet.call(this);
+                              try {{
+                                if (aw && typeof aw.addModule === "function" && !aw.___sniffWrapped) {{
+                                  const origAdd = aw.addModule.bind(aw);
+                                  aw.addModule = function(url, options) {{
+                                    try {{ push("audioWorklet:addModule", {{ url: abs(url) }}); }} catch (e) {{}}
+                                    return origAdd(url, options);
+                                  }};
+                                  aw.___sniffWrapped = true;
+                                }}
+                              }} catch (e) {{}}
+                              return aw;
+                            }}
+                          }});
+                        }}
+                      }}
+                    }} catch (e) {{}}
+
+                  }} catch (e) {{
+                    try {{ console.log("[RuntimeSniffer] worker hook init error:", e); }} catch (_) {{}}
+                  }}
+                }})();
+                """
+            )
+            self._log("Injected Worker/SharedWorker/Worklet hooks.", log)
+        except Exception as e:
+            self._log(f"Failed to inject worker hooks: {e}", log)
+
+    async def _collect_worker_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_worker_sniff:
+            return
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__workerEvents) ? window.__workerEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __workerEvents: {e}", log)
+            return
+        if not events:
+            return
+
+        runtime_hits.append({
+            "url": canonical_page_url,
+            "json": {"worker_events": events[: int(self.cfg.max_worker_events)]},
+            "source_page": canonical_page_url,
+        })
+        self._log(f"Worker events captured: {len(events)}", log)
+
+    # =====================================================================
+    # NEW: Service Worker register + ready
+    # =====================================================================
+
+    async def _inject_service_worker_sniffer(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_service_worker_sniff:
+            return
+
+        max_events = int(self.cfg.max_sw_events)
+        try:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                  try {{
+                    const STORE = "__swEvents";
+                    const MAX = {max_events};
+                    const out = [];
+                    const seen = new Set();
+
+                    function abs(u) {{
+                      try {{ return new URL(String(u), location.href).href; }}
+                      catch {{ return String(u || ""); }}
+                    }}
+
+                    function push(kind, payload) {{
+                      try {{
+                        const key = kind + "|" + JSON.stringify(payload || {{}});
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push(Object.assign({{ ts: Date.now(), kind }}, payload || {{}}));
+                        if (out.length > MAX) out.shift();
+                        window[STORE] = out;
+                      }} catch (e) {{}}
+                    }}
+
+                    const sw = navigator && navigator.serviceWorker;
+                    if (!sw) return;
+
+                    // wrap register(scriptURL)
+                    try {{
+                      const origReg = sw.register && sw.register.bind(sw);
+                      if (typeof origReg === "function") {{
+                        sw.register = function(scriptURL, options) {{
+                          try {{
+                            push("sw:register", {{
+                              scriptURL: abs(scriptURL),
+                              scope: (options && options.scope) ? abs(options.scope) : null
+                            }});
+                          }} catch (e) {{}}
+                          return origReg(scriptURL, options);
+                        }};
+                      }}
+                    }} catch (e) {{}}
+
+                    // observe ready promise resolution
+                    try {{
+                      const p = sw.ready;
+                      if (p && typeof p.then === "function") {{
+                        p.then((reg) => {{
+                          try {{
+                            const scope = reg && reg.scope ? String(reg.scope) : null;
+                            const active = reg && reg.active;
+                            const scriptURL = active && active.scriptURL ? String(active.scriptURL) : null;
+                            push("sw:ready", {{
+                              scope: scope ? abs(scope) : null,
+                              scriptURL: scriptURL ? abs(scriptURL) : null
+                            }});
+                          }} catch (e) {{}}
+                        }}).catch(() => {{}});
+                      }}
+                    }} catch (e) {{}}
+
+                  }} catch (e) {{
+                    try {{ console.log("[RuntimeSniffer] service worker init error:", e); }} catch (_) {{}}
+                  }}
+                }})();
+                """
+            )
+            self._log("Injected Service Worker hooks (register/ready).", log)
+        except Exception as e:
+            self._log(f"Failed to inject Service Worker hooks: {e}", log)
+
+    async def _collect_sw_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_service_worker_sniff:
+            return
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__swEvents) ? window.__swEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __swEvents: {e}", log)
+            return
+        if not events:
+            return
+
+        runtime_hits.append({
+            "url": canonical_page_url,
+            "json": {"service_worker_events": events[: int(self.cfg.max_sw_events)]},
+            "source_page": canonical_page_url,
+        })
+        self._log(f"Service Worker events captured: {len(events)}", log)
+
+    # =====================================================================
+    # NEW: CSS URL mining + <link rel=preconnect/prefetch/preload> hints
+    # =====================================================================
+
+    async def _inject_css_url_sniffer(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_css_url_sniff:
+            return
+
+        max_events = int(self.cfg.max_css_url_events)
+        max_len = int(self.cfg.css_url_max_len)
+
+        try:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                  try {{
+                    const STORE = "__cssUrlEvents";
+                    const MAX = {max_events};
+                    const MAXLEN = {max_len};
+                    const out = [];
+                    const seen = new Set();
+
+                    function abs(u) {{
+                      try {{ return new URL(String(u), location.href).href; }}
+                      catch {{ return String(u || ""); }}
+                    }}
+
+                    function push(kind, url, extra) {{
+                      try {{
+                        if (!url) return;
+                        url = String(url);
+                        if (url.length > MAXLEN) return;
+                        const u = abs(url);
+                        const low = u.toLowerCase();
+                        if (low.startsWith("blob:") || low.startsWith("data:") || low.startsWith("javascript:")) return;
+                        const key = kind + "|" + u;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push(Object.assign({{ ts: Date.now(), kind, url: u }}, extra || {{}}));
+                        if (out.length > MAX) out.shift();
+                        window[STORE] = out;
+                      }} catch (e) {{}}
+                    }}
+
+                    function extractCssUrls(txt) {{
+                      try {{
+                        if (!txt) return [];
+                        txt = String(txt);
+                        if (txt.length > 20000) txt = txt.slice(0, 20000);
+                        const rx = /url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/ig;
+                        const out2 = [];
+                        const set2 = new Set();
+                        let m;
+                        while ((m = rx.exec(txt)) !== null) {{
+                          const u = m[2];
+                          if (!u) continue;
+                          if (set2.has(u)) continue;
+                          set2.add(u);
+                          out2.push(u);
+                          if (out2.length >= 50) break;
+                        }}
+                        return out2;
+                      }} catch (e) {{ return []; }}
+                    }}
+
+                    // initial scan of <link rel=... href> hints
+                    function scanLinkHints() {{
+                      try {{
+                        const rels = new Set(["preconnect","prefetch","preload","dns-prefetch","modulepreload"]);
+                        const links = document.querySelectorAll ? document.querySelectorAll("link[rel][href]") : [];
+                        for (const el of links) {{
+                          const rel = (el.getAttribute("rel") || "").toLowerCase().trim();
+                          if (!rels.has(rel)) continue;
+                          const href = el.getAttribute("href");
+                          if (href) push("linkhint:"+rel, href);
+                        }}
+                      }} catch (e) {{}}
+                    }}
+
+                    if (document.readyState === "loading") {{
+                      document.addEventListener("DOMContentLoaded", scanLinkHints, {{ once: true }});
+                    }} else {{
+                      scanLinkHints();
+                    }}
+
+                    // Hook CSSStyleSheet.insertRule
+                    try {{
+                      const origIns = CSSStyleSheet && CSSStyleSheet.prototype && CSSStyleSheet.prototype.insertRule;
+                      if (typeof origIns === "function") {{
+                        CSSStyleSheet.prototype.insertRule = function(rule, index) {{
+                          try {{
+                            const urls = extractCssUrls(rule);
+                            for (const u of urls) push("css:insertRule", u);
+                          }} catch (e) {{}}
+                          return origIns.apply(this, arguments);
+                        }};
+                      }}
+                    }} catch (e) {{}}
+
+                    // Hook style.setProperty
+                    try {{
+                      const origSP = CSSStyleDeclaration && CSSStyleDeclaration.prototype && CSSStyleDeclaration.prototype.setProperty;
+                      if (typeof origSP === "function") {{
+                        CSSStyleDeclaration.prototype.setProperty = function(name, value, priority) {{
+                          try {{
+                            const urls = extractCssUrls(value);
+                            for (const u of urls) push("css:setProperty", u, {{ prop: String(name || "") }});
+                          }} catch (e) {{}}
+                          return origSP.apply(this, arguments);
+                        }};
+                      }}
+                    }} catch (e) {{}}
+
+                  }} catch (e) {{
+                    try {{ console.log("[RuntimeSniffer] css init error:", e); }} catch (_) {{}}
+                  }}
+                }})();
+                """
+            )
+            self._log("Injected CSS URL sniffer + link-hints.", log)
+        except Exception as e:
+            self._log(f"Failed to inject CSS URL sniffer: {e}", log)
+
+    async def _collect_css_url_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_css_url_sniff:
+            return
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__cssUrlEvents) ? window.__cssUrlEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __cssUrlEvents: {e}", log)
+            return
+        if not events:
+            return
+
+        runtime_hits.append({
+            "url": canonical_page_url,
+            "json": {"css_url_events": events[: int(self.cfg.max_css_url_events)]},
+            "source_page": canonical_page_url,
+        })
+        self._log(f"CSS URL events captured: {len(events)}", log)
+
+    # =====================================================================
+    # NEW: WebRTC ICE visibility (RTCPeerConnection + iceServers)
+    # =====================================================================
+
+    async def _inject_webrtc_sniffer(self, context: "BrowserContext", log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_webrtc_sniff:
+            return
+
+        max_events = int(self.cfg.max_webrtc_events)
+
+        try:
+            await context.add_init_script(
+                f"""
+                (() => {{
+                  try {{
+                    const STORE = "__webrtcEvents";
+                    const MAX = {max_events};
+                    const out = [];
+                    const seen = new Set();
+
+                    function push(kind, payload) {{
+                      try {{
+                        const key = kind + "|" + JSON.stringify(payload || {{}});
+                        if (seen.has(key)) return;
+                        seen.add(key);
+                        out.push(Object.assign({{ ts: Date.now(), kind }}, payload || {{}}));
+                        if (out.length > MAX) out.shift();
+                        window[STORE] = out;
+                      }} catch (e) {{}}
+                    }}
+
+                    function normIceServers(cfg) {{
+                      try {{
+                        const ics = (cfg && cfg.iceServers) ? cfg.iceServers : [];
+                        const out2 = [];
+                        for (const s of (ics || [])) {{
+                          if (!s) continue;
+                          let urls = s.urls || s.url;
+                          if (!urls) continue;
+                          if (!Array.isArray(urls)) urls = [urls];
+                          for (const u of urls) {{
+                            const us = String(u || "");
+                            if (!us) continue;
+                            if (/^(stun:|turn:|turns:)/i.test(us)) out2.push(us);
+                          }}
+                        }}
+                        return out2.slice(0, 30);
+                      }} catch (e) {{ return []; }}
+                    }}
+
+                    const OrigPC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+                    if (typeof OrigPC !== "function") return;
+
+                    function WrappedPC(cfg, constraints) {{
+                      try {{
+                        const ice = normIceServers(cfg);
+                        push("webrtc:pc", {{ iceServers: ice }});
+                      }} catch (e) {{}}
+
+                      const pc = new OrigPC(cfg, constraints);
+
+                      try {{
+                        pc.addEventListener("icecandidate", (ev) => {{
+                          try {{
+                            const c = ev && ev.candidate && ev.candidate.candidate;
+                            if (c && /\\b(?:stun|turn|udp|tcp)\\b/i.test(c)) {{
+                              push("webrtc:icecandidate", {{ preview: String(c).slice(0, 300) }});
+                            }}
+                          }} catch (e) {{}}
+                        }});
+                      }} catch (e) {{}}
+
+                      try {{
+                        pc.addEventListener("connectionstatechange", () => {{
+                          try {{ push("webrtc:connectionstate", {{ state: String(pc.connectionState || "") }}); }} catch (e) {{}}
+                        }});
+                      }} catch (e) {{}}
+
+                      try {{
+                        pc.addEventListener("iceconnectionstatechange", () => {{
+                          try {{ push("webrtc:iceconnectionstate", {{ state: String(pc.iceConnectionState || "") }}); }} catch (e) {{}}
+                        }});
+                      }} catch (e) {{}}
+
+                      // optional: timing signals
+                      try {{
+                        const origOffer = pc.createOffer && pc.createOffer.bind(pc);
+                        if (typeof origOffer === "function") {{
+                          pc.createOffer = function() {{
+                            push("webrtc:createOffer", {{}});
+                            return origOffer.apply(this, arguments);
+                          }};
+                        }}
+                      }} catch (e) {{}}
+
+                      try {{
+                        const origSRD = pc.setRemoteDescription && pc.setRemoteDescription.bind(pc);
+                        if (typeof origSRD === "function") {{
+                          pc.setRemoteDescription = function(desc) {{
+                            try {{
+                              const t = desc && desc.type ? String(desc.type) : null;
+                              push("webrtc:setRemoteDescription", {{ type: t }});
+                            }} catch (e) {{}}
+                            return origSRD.apply(this, arguments);
+                          }};
+                        }}
+                      }} catch (e) {{}}
+
+                      try {{
+                        const origSLD = pc.setLocalDescription && pc.setLocalDescription.bind(pc);
+                        if (typeof origSLD === "function") {{
+                          pc.setLocalDescription = function(desc) {{
+                            try {{
+                              const t = desc && desc.type ? String(desc.type) : null;
+                              push("webrtc:setLocalDescription", {{ type: t }});
+                            }} catch (e) {{}}
+                            return origSLD.apply(this, arguments);
+                          }};
+                        }}
+                      }} catch (e) {{}}
+
+                      return pc;
+                    }}
+
+                    WrappedPC.prototype = OrigPC.prototype;
+                    if (window.RTCPeerConnection) window.RTCPeerConnection = WrappedPC;
+                    if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = WrappedPC;
+
+                  }} catch (e) {{
+                    try {{ console.log("[RuntimeSniffer] webrtc init error:", e); }} catch (_) {{}}
+                  }}
+                }})();
+                """
+            )
+            self._log("Injected WebRTC sniffer (RTCPeerConnection).", log)
+        except Exception as e:
+            self._log(f"Failed to inject WebRTC sniffer: {e}", log)
+
+    async def _collect_webrtc_events(
+        self,
+        page: "Page",
+        canonical_page_url: str,
+        runtime_hits: List[Dict[str, Any]],
+        log: Optional[List[str]],
+    ) -> None:
+        if not self.cfg.enable_webrtc_sniff:
+            return
+        try:
+            events = await page.evaluate(
+                "() => Array.isArray(window.__webrtcEvents) ? window.__webrtcEvents : []"
+            ) or []
+        except Exception as e:
+            self._log(f"Error reading __webrtcEvents: {e}", log)
+            return
+        if not events:
+            return
+
+        runtime_hits.append({
+            "url": canonical_page_url,
+            "json": {"webrtc_events": events[: int(self.cfg.max_webrtc_events)]},
+            "source_page": canonical_page_url,
+        })
+        self._log(f"WebRTC events captured: {len(events)}", log)
+
+    # =====================================================================
+    # Main entry
+    # =====================================================================
 
     async def sniff(
         self,
@@ -3824,11 +4939,19 @@ class RuntimeSniffer:
         canonical_page_url = _canonicalize_url(page_url)
         runtime_hits: List[Dict[str, Any]] = []
 
+        # ------------------------------------------------------------
         # Context-level hooks (MUST run before new_page / navigation)
+        # ------------------------------------------------------------
         await self._inject_mediasource_script(context, log)
         await self._inject_json_parse_hook(context, log)
         await self._inject_runtime_url_hooks(context, log)
         await self._inject_mutation_observer(context, log)
+
+        # NEW: workers/sw/css/webrtc
+        await self._inject_worker_sniffer(context, log)
+        await self._inject_service_worker_sniffer(context, log)
+        await self._inject_css_url_sniffer(context, log)
+        await self._inject_webrtc_sniffer(context, log)
 
         page: Page = await context.new_page()
         html: str = ""
@@ -3852,17 +4975,17 @@ class RuntimeSniffer:
                     timeout=goto_timeout_ms,
                 )
             except Exception as e:
-                self._log(
-                    f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}",
-                    log,
-                )
+                self._log(f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
 
             # Let page settle a bit
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
+
+            # Best-effort "play" poke (kept from your code)
             try:
                 await page.click('button[title="Play"], button[aria-label="Play"]', timeout=1500)
             except Exception:
                 pass
+
             # Give MutationObserver a small window to accumulate SPA inserts
             if self.cfg.enable_mutation_observer:
                 await page.wait_for_timeout(max(0, int(self.cfg.mutation_observer_ms)))
@@ -3885,11 +5008,17 @@ class RuntimeSniffer:
             # Hydration globals
             await self._collect_hydration_state(page, canonical_page_url, runtime_hits, log)
 
-            # NEW: runtime URL hook ring buffer
+            # runtime URL hook ring buffer
             await self._collect_runtime_url_events(page, canonical_page_url, runtime_hits, log)
 
-            # NEW: mutation observer URL ring buffer
+            # mutation observer URL ring buffer
             await self._collect_mutation_url_events(page, canonical_page_url, runtime_hits, log)
+
+            # NEW collectors: worker/sw/css/webrtc
+            await self._collect_worker_events(page, canonical_page_url, runtime_hits, log)
+            await self._collect_sw_events(page, canonical_page_url, runtime_hits, log)
+            await self._collect_css_url_events(page, canonical_page_url, runtime_hits, log)
+            await self._collect_webrtc_events(page, canonical_page_url, runtime_hits, log)
 
             try:
                 html = await page.content()
@@ -5950,7 +7079,7 @@ class InteractionSniffer:
     """
     Playwright + CDP sniffer for "Invisible" interactivity & UI barriers.
 
-    Matches your other sniffers' contract:
+    Contract:
 
         html, hits = await sniff(
             context,
@@ -5966,17 +7095,21 @@ class InteractionSniffer:
             "page": <page_url>,
             "url": <page_url or derived>,
             "tag": "interaction",
-            "kind": "event_listener" | "overlay_detected" | "form_definition" | "summary",
+            "kind": "...",
             "meta": {...}
         }
 
-    Key difference:
-      • CDP can ask Chromium which DOM nodes have event listeners attached in memory,
-        even if the HTML has no onclick=... and no href.
-
-    Notes:
-      • CDP requires Chromium. On Firefox/WebKit/Camoufox, we skip CDP gracefully.
-      • Overlay + Form extraction are JS-based and work everywhere.
+    Advanced features added:
+      - UI barrier scan (captcha / paywall / cookie / adblock / cloudflare hints)
+      - Overlay detection (z-index + pointer-events + transparent blockers + scroll-lock)
+      - Hit-test blocker grid (elementFromPoint) to catch invisible panes
+      - CDP event listener extraction (Chromium only) + element confidence scoring
+      - Optional AX tree scan (Chromium CDP if available, else Playwright accessibility snapshot)
+      - Dynamic simulation loop:
+          * short scroll(s)
+          * click 1–2 likely CTAs
+          * re-run overlay + hit-test + barrier scans after each action
+      - Hard budgets: never bricks your pipeline; always returns partial data
     """
 
     # ------------------------------------------------------------------ #
@@ -5986,15 +7119,31 @@ class InteractionSniffer:
     class Config:
         # generic controls
         timeout: float = 8.0
-        max_hits: int = 250
+        max_hits: int = 300
+        wait_after_load_ms: int = 900
 
-        # small settle time after DOMContentLoaded
-        wait_after_load_ms: int = 1000
+        # global hard budgets
+        hard_total_budget_s: float = 12.0         # total sniff budget (guardrail)
+        per_eval_timeout_s: float = 3.5           # JS evaluate timeout
+        per_cdp_timeout_s: float = 2.5            # CDP send timeout
+        per_action_settle_ms: int = 450
+
+        # ---------------- Dynamic simulation ----------------
+        enable_dynamic_simulation: bool = True
+        sim_scroll_steps: int = 3
+        sim_scroll_delay_ms: int = 350
+        sim_click_targets: int = 2
+        sim_click_timeout_ms: int = 2200
+
+        # click target text cues (lowercased contains)
+        cta_text_hints: List[str] = field(default_factory=lambda: [
+            "accept", "agree", "continue", "close", "ok", "okay", "got it",
+            "play", "watch", "enter", "allow", "next", "submit",
+            "sign in", "log in", "login", "sign up", "register",
+        ])
 
         # ---------------- CDP: Event Listener Extraction ----------------
         enable_cdp_listeners: bool = True
-
-        # only keep these listener types to reduce noise
         listener_types: Set[str] = field(default_factory=lambda: {
             "click", "mousedown", "mouseup",
             "submit",
@@ -6002,49 +7151,71 @@ class InteractionSniffer:
             "touchstart", "touchend",
             "pointerdown", "pointerup",
         })
+        max_listener_hits: int = 140
+        max_candidate_nodes: int = 520
 
-        # how many "nodes with relevant listeners" to emit
-        max_listener_hits: int = 120
-
-        # how many candidate nodes to inspect via CDP (upper bound)
-        # (CDP calls are expensive; keep this modest)
-        max_candidate_nodes: int = 500
-
-        # CSS selector for candidate nodes (broad but bounded by max_candidate_nodes)
         candidate_selector: str = (
             "button, a, input, select, textarea, summary, details, label, "
             "[role='button'], [role='link'], [tabindex], [contenteditable='true'], "
             "div, span, li, svg"
         )
 
-        # include capturing / passive info if available
         include_listener_flags: bool = True
-
-        # Try to pull a short DOM snippet to help identify the element (safe bounded)
         include_outer_html_snippet: bool = True
-        outer_html_max_chars: int = 280
+        outer_html_max_chars: int = 320
 
-        # ---------------- Overlay / Modal Detection (JS) ----------------
+        # Listener scoring
+        enable_listener_scoring: bool = True
+        max_scoring_nodes: int = 120  # score only first N listener-passing nodes
+
+        # ---------------- Overlays / Modals (JS) ----------------
         enable_overlay_detection: bool = True
         min_z_index: int = 900
         coverage_threshold_percent: float = 50.0
-        max_overlay_hits: int = 50
+        max_overlay_hits: int = 60
 
-        # ---------------- Form Extraction (JS) ----------------
+        # overlay extras
+        detect_scroll_lock: bool = True
+        overlay_keywords: List[str] = field(default_factory=lambda: [
+            "cookie", "consent", "subscribe", "sign in", "log in",
+            "disable adblock", "adblock", "enable javascript", "paywall",
+            "verify you are human", "captcha", "hcaptcha", "recaptcha",
+        ])
+
+        # ---------------- Hit-test blocker grid (JS) ----------------
+        enable_hit_test_blockers: bool = True
+        hit_test_grid: int = 3            # 3 => 3x3 + center (effectively 9 points)
+        max_hit_test_hits: int = 30
+
+        # ---------------- UI barrier scan (JS) ----------------
+        enable_ui_barrier_scan: bool = True
+        max_barrier_hits: int = 40
+
+        # ---------------- Forms (JS) ----------------
         enable_form_extraction: bool = True
-        max_form_hits: int = 80
-        max_inputs_per_form: int = 80
+        max_form_hits: int = 90
+        max_inputs_per_form: int = 90
 
-        # redact values for sensitive-ish inputs
-        redact_input_types: Set[str] = field(default_factory=lambda: {
-            "password",
-        })
-
-        # additionally redact if field name looks token-ish
+        redact_input_types: Set[str] = field(default_factory=lambda: {"password"})
         redact_name_regex: str = r"(csrf|token|auth|bearer|secret|key|session|jwt)"
-
-        # emit aggregate summary hit
         emit_summary_hit: bool = True
+
+        # form classification
+        enable_form_classification: bool = True
+
+        # honeypot detection
+        enable_honeypot_detection: bool = True
+
+        # ---------------- AX / Accessibility ----------------
+        enable_ax_tree_scan: bool = True
+        # roles to keep
+        ax_roles: Set[str] = field(default_factory=lambda: {
+            "button", "link", "checkbox", "textbox", "combobox", "menuitem"
+        })
+        max_ax_hits: int = 120
+
+        # if using CDP AX tree, we try mapping backendDOMNodeId -> nodeId (best-effort)
+        try_map_ax_to_dom: bool = True
 
     # ------------------------------------------------------------------ #
     # Internal memory dataclasses
@@ -6057,6 +7228,8 @@ class InteractionSniffer:
         attributes: Dict[str, str]
         flags: Dict[str, Any] = field(default_factory=dict)
         outer_html: Optional[str] = None
+        confidence: Optional[float] = None
+        reasons: List[str] = field(default_factory=list)
 
     @dataclass
     class OverlayMem:
@@ -6066,6 +7239,28 @@ class InteractionSniffer:
         z_index: int
         coverage: str
         text_preview: str
+        meta: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class BarrierMem:
+        barrier_type: str
+        evidence: str
+        selector_hint: str = ""
+        meta: Dict[str, Any] = field(default_factory=dict)
+
+    @dataclass
+    class HitTestMem:
+        point: Tuple[int, int]
+        tag_name: str
+        id: str
+        class_name: str
+        pointer_events: str
+        opacity: float
+        z_index: str
+        position: str
+        rect: Dict[str, Any]
+        text_preview: str
+        outer_html: str
 
     @dataclass
     class FormMem:
@@ -6075,6 +7270,21 @@ class InteractionSniffer:
         class_name: str
         input_count: int
         inputs: List[Dict[str, Any]]
+        form_kind: str = "unknown"
+        honeypot_suspected: bool = False
+        honeypot_reasons: List[str] = field(default_factory=list)
+
+    @dataclass
+    class AXMem:
+        role: str
+        name: str
+        value: str
+        disabled: bool
+        focused: bool
+        backend_dom_node_id: Optional[int] = None
+        node_id: Optional[int] = None
+        selector_hint: str = ""
+        meta: Dict[str, Any] = field(default_factory=dict)
 
     # ------------------------------------------------------------------ #
     # Lifecycle
@@ -6088,8 +7298,14 @@ class InteractionSniffer:
     def _reset_memory(self) -> None:
         self._listeners: List[InteractionSniffer.ListenerMem] = []
         self._overlays: List[InteractionSniffer.OverlayMem] = []
+        self._barriers: List[InteractionSniffer.BarrierMem] = []
+        self._hit_tests: List[InteractionSniffer.HitTestMem] = []
         self._forms: List[InteractionSniffer.FormMem] = []
+        self._ax: List[InteractionSniffer.AXMem] = []
         self._seen_fingerprints: Set[Tuple[Any, ...]] = set()
+
+        # used during dynamic passes
+        self._phase_tags: List[str] = []  # e.g. ["pre", "post1", "post2"]
 
     # ------------------------------------------------------------------ #
     # Logging helper
@@ -6100,9 +7316,31 @@ class InteractionSniffer:
             if log_list is not None:
                 log_list.append(full)
             if self.logger is not None:
-                self.logger.log_message(full)
+                # your logger likely has log_message()
+                self.logger.log_message(full)  # type: ignore[attr-defined]
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Helpers: timeouts
+    # ------------------------------------------------------------------ #
+    async def _safe_eval(self, page, script: str, arg: Any, log: Optional[List[str]]) -> Any:
+        try:
+            return await asyncio.wait_for(page.evaluate(script, arg), timeout=self.cfg.per_eval_timeout_s)
+        except Exception as e:
+            self._log(f"page.evaluate failed/timeout: {e}", log)
+            return None
+
+    async def _cdp_send(self, cdp, method: str, params: Optional[Dict[str, Any]], log: Optional[List[str]]) -> Any:
+        try:
+            return await asyncio.wait_for(cdp.send(method, params or {}), timeout=self.cfg.per_cdp_timeout_s)
+        except Exception as e:
+            self._log(f"CDP send {method} failed/timeout: {e}", log)
+            return None
+
+    def _canon_url(self, u: str) -> str:
+        # Keep conservative; your suite likely has a canonicalizer already.
+        return (u or "").strip()
 
     # ------------------------------------------------------------------ #
     # Public API (matches other sniffers)
@@ -6130,27 +7368,38 @@ class InteractionSniffer:
             return "", []
 
         tmo = float(timeout or self.cfg.timeout)
+        total_budget = max(tmo, self.cfg.hard_total_budget_s)
         html: str = ""
         hits: List[Dict[str, Any]] = []
         page = None
 
-        self._log(f"Start interaction sniff: {page_url} timeout={tmo}s", log)
+        self._log(f"Start interaction sniff: {page_url} timeout={tmo}s budget={total_budget}s", log)
 
-        try:
+        async def _run() -> Tuple[str, List[Dict[str, Any]]]:
+            nonlocal html, hits, page
             page = await context.new_page()
             await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
             await page.wait_for_timeout(int(self.cfg.wait_after_load_ms))
 
-            # 1) JS-based: forms + overlays (works on all browsers)
-            if self.cfg.enable_form_extraction:
-                await self._collect_forms(page, page_url, log)
+            # ---------------- PRE SCAN ----------------
+            self._phase_tags.append("pre")
+            await self._collect_phase(page, page_url, log, phase="pre", context=context)
 
-            if self.cfg.enable_overlay_detection:
-                await self._collect_overlays(page, page_url, log)
-
-            # 2) CDP-based: event listeners (Chromium only)
+            # CDP listeners early (helps pick click targets)
             if self.cfg.enable_cdp_listeners:
                 await self._collect_cdp_listeners(context, page, page_url, log)
+
+            # AX scan (optional; helps pick click targets too)
+            if self.cfg.enable_ax_tree_scan:
+                await self._collect_ax_tree(context, page, page_url, log)
+
+            # Listener scoring (optional)
+            if self.cfg.enable_listener_scoring and self._listeners:
+                await self._score_listeners(page, log)
+
+            # ---------------- DYNAMIC SIMULATION ----------------
+            if self.cfg.enable_dynamic_simulation:
+                await self._simulate_and_rescan(context, page, page_url, log)
 
             # HTML snapshot
             try:
@@ -6159,29 +7408,59 @@ class InteractionSniffer:
                 self._log(f"Error getting HTML for {page_url}: {e}", log)
                 html = ""
 
-            # materialize final hits
             hits = self._materialize_hits(page_url)
 
+            # global cap
+            if len(hits) > self.cfg.max_hits:
+                hits = hits[: self.cfg.max_hits]
+            return html or "", hits
+
+        try:
+            # hard guardrail: never hang indefinitely
+            html, hits = await asyncio.wait_for(_run(), timeout=total_budget)
+        except asyncio.TimeoutError:
+            self._log(f"Global sniff budget exceeded for {page_url}; returning partial hits.", log)
+            hits = self._materialize_hits(page_url)
+            if len(hits) > self.cfg.max_hits:
+                hits = hits[: self.cfg.max_hits]
         except PWTimeoutError:
             self._log(f"Timeout while loading {page_url}", log)
+            hits = self._materialize_hits(page_url)
         except Exception as e:
             self._log(f"Fatal error on {page_url}: {e}", log)
+            hits = self._materialize_hits(page_url)
         finally:
             if page is not None:
                 try:
-                    await page.close()
+                    await asyncio.wait_for(page.close(), timeout=3.0)
                 except Exception as e:
                     self._log(f"Error closing page for {page_url}: {e}", log)
-
-        # global cap
-        if len(hits) > self.cfg.max_hits:
-            hits = hits[: self.cfg.max_hits]
 
         self._log(f"Finished interaction sniff for {page_url}: hits={len(hits)}", log)
         return html or "", hits
 
     # ------------------------------------------------------------------ #
-    # JS: Forms
+    # Phase collector (overlays/forms/barriers/hit-test) used pre/post
+    # ------------------------------------------------------------------ #
+    async def _collect_phase(self, page, page_url: str, log: Optional[List[str]], phase: str, context=None) -> None:
+        # 1) Forms
+        if self.cfg.enable_form_extraction:
+            await self._collect_forms(page, page_url, log, phase=phase)
+
+        # 2) Overlays (now includes pointer-events + transparent blockers + scroll-lock)
+        if self.cfg.enable_overlay_detection:
+            await self._collect_overlays(page, page_url, log, phase=phase)
+
+        # 3) UI barrier scan
+        if self.cfg.enable_ui_barrier_scan:
+            await self._collect_ui_barriers(page, page_url, log, phase=phase)
+
+        # 4) Hit-test blockers grid
+        if self.cfg.enable_hit_test_blockers:
+            await self._collect_hit_test_blockers(page, page_url, log, phase=phase)
+
+    # ------------------------------------------------------------------ #
+    # JS: Forms (now includes classification + honeypot detection)
     # ------------------------------------------------------------------ #
     def _should_redact_field(self, name: str, input_type: str) -> bool:
         try:
@@ -6195,19 +7474,71 @@ class InteractionSniffer:
             pass
         return False
 
-    async def _collect_forms(self, page, page_url: str, log: Optional[List[str]]) -> None:
-        """
-        Extract form structures; redact sensitive values.
-        """
+    def _classify_form_kind(self, form_action: str, inputs: List[Dict[str, Any]]) -> str:
+        if not self.cfg.enable_form_classification:
+            return "unknown"
+        a = (form_action or "").lower()
+        if any(x in a for x in ("/login", "/signin", "/sign-in", "/session", "/auth")):
+            return "login"
+        if any(x in a for x in ("/signup", "/sign-up", "/register")):
+            return "signup"
+        # input-based heuristics
+        types = {str(i.get("type") or "").lower() for i in inputs}
+        names = " ".join([str(i.get("name") or "").lower() for i in inputs])
+        if "password" in types:
+            return "login"
+        if any(k in names for k in ("search", "q", "query")):
+            return "search"
+        if any(k in names for k in ("card", "cc", "checkout", "shipping", "billing")):
+            return "checkout"
+        return "unknown"
+
+    def _detect_honeypot(self, raw_inputs: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
+        if not self.cfg.enable_honeypot_detection:
+            return False, []
+        reasons: List[str] = []
+        for i in raw_inputs:
+            try:
+                name = (i.get("name") or "").lower()
+                itype = (i.get("type") or "").lower()
+                style = (i.get("style") or "").lower()
+                aria_hidden = bool(i.get("ariaHidden", False))
+                rect = i.get("rect") or {}
+                w = float(rect.get("w") or 0)
+                h = float(rect.get("h") or 0)
+
+                # classic token hidden fields are not honeypots; they're normal
+                if itype == "hidden" and re.search(self.cfg.redact_name_regex, name, re.IGNORECASE):
+                    continue
+
+                # suspicious: offscreen or zero-size but still present
+                if "left:-9999" in style or "top:-9999" in style or "opacity:0" in style:
+                    reasons.append(f"offscreen/hidden-style field: {name or itype}")
+                if aria_hidden and itype not in ("hidden",):
+                    reasons.append(f"aria-hidden input: {name or itype}")
+                if (w <= 1 or h <= 1) and itype not in ("hidden",):
+                    reasons.append(f"tiny/0-size input: {name or itype}")
+            except Exception:
+                continue
+        return (len(reasons) > 0), reasons[:6]
+
+    async def _collect_forms(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
         try:
-            forms = await page.evaluate(
+            payload = await self._safe_eval(
+                page,
                 """
                 (cfg) => {
                     const maxForms = cfg.maxForms;
                     const maxInputs = cfg.maxInputs;
-
                     const out = [];
                     const forms = Array.from(document.querySelectorAll('form')).slice(0, maxForms);
+
+                    function rectOf(el){
+                        try {
+                            const r = el.getBoundingClientRect();
+                            return {x:r.x,y:r.y,w:r.width,h:r.height};
+                        } catch { return {x:0,y:0,w:0,h:0}; }
+                    }
 
                     for (const f of forms) {
                         const inputs = [];
@@ -6215,13 +7546,28 @@ class InteractionSniffer:
                                          .slice(0, maxInputs);
 
                         for (const i of els) {
+                            const st = (i.getAttribute("style") || "");
                             inputs.push({
                                 name: i.name || i.id || "",
                                 type: (i.type || i.tagName || "").toLowerCase(),
                                 value: (typeof i.value === "string" ? i.value : ""),
                                 required: !!i.required,
                                 disabled: !!i.disabled,
-                                autocomplete: (i.autocomplete || "")
+                                autocomplete: (i.autocomplete || ""),
+                                placeholder: (i.placeholder || ""),
+                                label: (() => {
+                                    try {
+                                      const id = i.id;
+                                      if (id) {
+                                        const l = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                                        if (l) return (l.innerText || "").trim().slice(0,80);
+                                      }
+                                    } catch {}
+                                    return "";
+                                })(),
+                                style: st,
+                                ariaHidden: (i.getAttribute("aria-hidden") === "true"),
+                                rect: rectOf(i)
                             });
                         }
 
@@ -6229,34 +7575,29 @@ class InteractionSniffer:
                             action: f.action || "",
                             method: (f.method || "get").toLowerCase(),
                             id: f.id || "",
-                            className: f.className || "",
+                            className: (typeof f.className === "string" ? f.className : ""),
                             input_count: inputs.length,
                             inputs: inputs
                         });
                     }
-
                     return out;
                 }
                 """,
-                {
-                    "maxForms": int(self.cfg.max_form_hits),
-                    "maxInputs": int(self.cfg.max_inputs_per_form),
-                },
+                {"maxForms": int(self.cfg.max_form_hits), "maxInputs": int(self.cfg.max_inputs_per_form)},
+                log,
             )
 
-            if not isinstance(forms, list):
-                forms = []
-
-            # redact values safely in Python side (more flexible)
+            forms = payload if isinstance(payload, list) else []
             for f in forms[: self.cfg.max_form_hits]:
                 if not isinstance(f, dict):
                     continue
-                inputs = f.get("inputs") or []
-                if not isinstance(inputs, list):
-                    inputs = []
+                raw_inputs = f.get("inputs") or []
+                if not isinstance(raw_inputs, list):
+                    raw_inputs = []
 
+                # redact + bound value
                 redacted_inputs: List[Dict[str, Any]] = []
-                for inp in inputs[: self.cfg.max_inputs_per_form]:
+                for inp in raw_inputs[: self.cfg.max_inputs_per_form]:
                     if not isinstance(inp, dict):
                         continue
                     name = str(inp.get("name") or "")
@@ -6265,20 +7606,22 @@ class InteractionSniffer:
                     if self._should_redact_field(name, itype):
                         val = "[REDACTED]"
                     else:
-                        # keep bounded; we do not want massive values
                         if len(val) > 200:
                             val = val[:200] + "…"
+                    redacted_inputs.append({
+                        "name": name,
+                        "type": itype,
+                        "value": val,
+                        "required": bool(inp.get("required", False)),
+                        "disabled": bool(inp.get("disabled", False)),
+                        "autocomplete": str(inp.get("autocomplete") or ""),
+                        "placeholder": str(inp.get("placeholder") or ""),
+                        "label": str(inp.get("label") or ""),
+                    })
 
-                    redacted_inputs.append(
-                        {
-                            "name": name,
-                            "type": itype,
-                            "value": val,
-                            "required": bool(inp.get("required", False)),
-                            "disabled": bool(inp.get("disabled", False)),
-                            "autocomplete": str(inp.get("autocomplete") or ""),
-                        }
-                    )
+                # classify + honeypot
+                form_kind = self._classify_form_kind(str(f.get("action") or ""), redacted_inputs)
+                honeypot, reasons = self._detect_honeypot(raw_inputs)
 
                 self._forms.append(
                     InteractionSniffer.FormMem(
@@ -6288,79 +7631,153 @@ class InteractionSniffer:
                         class_name=str(f.get("className") or ""),
                         input_count=int(f.get("input_count") or len(redacted_inputs)),
                         inputs=redacted_inputs,
+                        form_kind=form_kind,
+                        honeypot_suspected=honeypot,
+                        honeypot_reasons=reasons,
                     )
                 )
 
             if self._forms:
-                self._log(f"Extracted {len(self._forms)} form definitions", log)
-
+                self._log(f"[{phase}] Extracted {len(self._forms)} form definitions (cum)", log)
         except Exception as e:
             self._log(f"Form extraction error: {e}", log)
 
     # ------------------------------------------------------------------ #
-    # JS: Overlays / Modals
+    # JS: Overlays / Modals (enhanced)
     # ------------------------------------------------------------------ #
-    async def _collect_overlays(self, page, page_url: str, log: Optional[List[str]]) -> None:
-        """
-        Detect high z-index, fixed/absolute elements covering big viewport area.
-        """
+    async def _collect_overlays(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
         try:
-            overlays = await page.evaluate(
+            payload = await self._safe_eval(
+                page,
                 """
                 (config) => {
-                    const { minZ, minCoverage, maxHits } = config;
+                    const { minZ, minCoverage, maxHits, detectScrollLock, keywords } = config;
                     const results = [];
-
-                    const all = document.querySelectorAll('div, section, aside, iframe, dialog, [role="dialog"]');
 
                     const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
                     const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
                     const viewportArea = Math.max(1, vw * vh);
 
+                    const bodyOv = (() => {
+                      try { return (getComputedStyle(document.body).overflow || ""); } catch { return ""; }
+                    })();
+                    const htmlOv = (() => {
+                      try { return (getComputedStyle(document.documentElement).overflow || ""); } catch { return ""; }
+                    })();
+
+                    const all = Array.from(document.querySelectorAll('div, section, aside, iframe, dialog, [role="dialog"], [aria-modal="true"]'));
+
+                    function hasKeyword(txt){
+                      const t = String(txt||"").toLowerCase();
+                      for (const k of (keywords||[])) {
+                        if (k && t.includes(String(k).toLowerCase())) return true;
+                      }
+                      return false;
+                    }
+
                     for (const el of all) {
                         if (results.length >= maxHits) break;
 
                         const style = window.getComputedStyle(el);
-                        const z = parseInt(style.zIndex, 10);
+                        const zRaw = style.zIndex;
+                        const z = parseInt(zRaw, 10);
                         const pos = style.position;
                         const vis = style.visibility;
                         const disp = style.display;
                         const opac = parseFloat(style.opacity || "1");
+                        const pe = style.pointerEvents || "";
+                        const bg = style.backgroundColor || "";
+                        const inset = style.inset || "";
+                        const ta = style.touchAction || "";
+                        const bf = style.backdropFilter || style.webkitBackdropFilter || "";
 
+                        // allow "auto" z-index but still detect full-screen blockers later via hit-test
                         if (Number.isNaN(z)) continue;
 
-                        if (
-                            z >= minZ &&
-                            vis !== 'hidden' && disp !== 'none' && opac > 0 &&
-                            (pos === 'fixed' || pos === 'absolute')
-                        ) {
-                            const rect = el.getBoundingClientRect();
-                            const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-                            if (area <= 0) continue;
+                        const rect = el.getBoundingClientRect();
+                        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+                        if (area <= 0) continue;
 
-                            const coveragePct = (area / viewportArea) * 100;
-                            if (coveragePct >= minCoverage) {
-                                results.push({
-                                    tagName: el.tagName.toLowerCase(),
-                                    id: el.id || "",
-                                    className: (typeof el.className === "string" ? el.className : ""),
-                                    zIndex: z,
-                                    coverage: coveragePct.toFixed(1) + '%',
-                                    textPreview: (el.innerText || "").trim().slice(0, 80)
-                                });
-                            }
-                        }
+                        const coveragePct = (area / viewportArea) * 100;
+
+                        const txt = (el.innerText || "").trim();
+                        const txtPrev = txt.slice(0, 120);
+
+                        const isOverlayLike =
+                            (z >= minZ) &&
+                            vis !== 'hidden' && disp !== 'none' &&
+                            (pos === 'fixed' || pos === 'absolute') &&
+                            coveragePct >= minCoverage;
+
+                        if (!isOverlayLike) continue;
+
+                        // extra blockers: transparent but click-blocking
+                        const transparentBlocker =
+                            (pe !== 'none') &&
+                            ((opac === 0) || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent');
+
+                        const fullScreenLike =
+                            (String(inset).includes("0")) &&
+                            (rect.width >= vw * 0.9) && (rect.height >= vh * 0.9);
+
+                        const keywordHit = hasKeyword(txtPrev);
+
+                        results.push({
+                            tagName: el.tagName.toLowerCase(),
+                            id: el.id || "",
+                            className: (typeof el.className === "string" ? el.className : ""),
+                            zIndex: z,
+                            zIndexRaw: zRaw,
+                            coverage: coveragePct.toFixed(1) + '%',
+                            textPreview: txtPrev.slice(0, 80),
+                            pointerEvents: pe,
+                            opacity: opac,
+                            background: bg,
+                            inset: inset,
+                            touchAction: ta,
+                            backdropFilter: bf,
+                            fullScreenLike: !!fullScreenLike,
+                            transparentBlocker: !!transparentBlocker,
+                            keywordHit: !!keywordHit,
+                            rect: {x: rect.x, y: rect.y, w: rect.width, h: rect.height},
+                            scrollLock: detectScrollLock ? ((bodyOv === "hidden") || (htmlOv === "hidden")) : false,
+                            bodyOverflow: bodyOv,
+                            htmlOverflow: htmlOv
+                        });
                     }
 
-                    return results;
+                    return { overlays: results, bodyOverflow: bodyOv, htmlOverflow: htmlOv };
                 }
                 """,
                 {
                     "minZ": int(self.cfg.min_z_index),
                     "minCoverage": float(self.cfg.coverage_threshold_percent),
                     "maxHits": int(self.cfg.max_overlay_hits),
+                    "detectScrollLock": bool(self.cfg.detect_scroll_lock),
+                    "keywords": list(self.cfg.overlay_keywords),
                 },
+                log,
             )
+
+            overlays = []
+            body_ov = ""
+            html_ov = ""
+            if isinstance(payload, dict):
+                overlays = payload.get("overlays") or []
+                body_ov = str(payload.get("bodyOverflow") or "")
+                html_ov = str(payload.get("htmlOverflow") or "")
+
+                # emit scroll_lock hit if relevant and overlay exists
+                if self.cfg.detect_scroll_lock and overlays:
+                    if body_ov == "hidden" or html_ov == "hidden":
+                        self._barriers.append(
+                            InteractionSniffer.BarrierMem(
+                                barrier_type="scroll_lock",
+                                evidence=f"bodyOverflow={body_ov} htmlOverflow={html_ov}",
+                                selector_hint="document.body/documentElement",
+                                meta={"phase": phase},
+                            )
+                        )
 
             if not isinstance(overlays, list):
                 overlays = []
@@ -6376,27 +7793,237 @@ class InteractionSniffer:
                         z_index=int(ov.get("zIndex") or 0),
                         coverage=str(ov.get("coverage") or ""),
                         text_preview=str(ov.get("textPreview") or ""),
+                        meta={
+                            "phase": phase,
+                            "pointerEvents": ov.get("pointerEvents"),
+                            "opacity": ov.get("opacity"),
+                            "background": ov.get("background"),
+                            "inset": ov.get("inset"),
+                            "touchAction": ov.get("touchAction"),
+                            "backdropFilter": ov.get("backdropFilter"),
+                            "fullScreenLike": bool(ov.get("fullScreenLike", False)),
+                            "transparentBlocker": bool(ov.get("transparentBlocker", False)),
+                            "keywordHit": bool(ov.get("keywordHit", False)),
+                            "rect": ov.get("rect") or {},
+                            "zIndexRaw": ov.get("zIndexRaw"),
+                            "scrollLock": bool(ov.get("scrollLock", False)),
+                        },
                     )
                 )
 
-            if self._overlays:
-                self._log(f"Overlay detection: {len(self._overlays)} hits", log)
+            if overlays:
+                self._log(f"[{phase}] Overlay detection: +{len(overlays)} hits (cum={len(self._overlays)})", log)
 
         except Exception as e:
             self._log(f"Overlay detection error: {e}", log)
 
     # ------------------------------------------------------------------ #
-    # CDP: Event listeners (Chromium only)
+    # JS: UI barrier scan (captcha/paywall/adblock/cloudflare/etc)
+    # ------------------------------------------------------------------ #
+    async def _collect_ui_barriers(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
+        try:
+            payload = await self._safe_eval(
+                page,
+                """
+                (cfg) => {
+                    const maxHits = cfg.maxHits;
+                    const out = [];
+
+                    function push(type, evidence, selector){
+                      if (out.length >= maxHits) return;
+                      out.push({type, evidence, selector: selector || ""});
+                    }
+
+                    // 1) Captcha iframes / scripts
+                    const ifr = Array.from(document.querySelectorAll('iframe[src], script[src]')).slice(0, 250);
+                    for (const el of ifr) {
+                      if (out.length >= maxHits) break;
+                      const src = String(el.getAttribute("src") || "");
+                      const low = src.toLowerCase();
+                      if (!src) continue;
+                      if (low.includes("recaptcha") || low.includes("hcaptcha") || low.includes("captcha") || low.includes("turnstile")) {
+                        push("captcha", src, el.tagName.toLowerCase());
+                      }
+                      if (low.includes("/cdn-cgi/") || low.includes("cloudflare") || low.includes("cf-")) {
+                        push("cloudflare_challenge", src, el.tagName.toLowerCase());
+                      }
+                    }
+
+                    // 2) Keyword walls in visible text (bounded)
+                    const bodyText = (() => {
+                      try { return (document.body && (document.body.innerText || "")) || ""; }
+                      catch { return ""; }
+                    })().toLowerCase();
+
+                    const keywords = [
+                      ["paywall", ["subscribe", "subscription", "continue reading", "to continue reading"]],
+                      ["cookie_consent", ["cookie", "consent", "privacy choices", "gdpr"]],
+                      ["adblock", ["disable adblock", "ad blocker", "turn off adblock"]],
+                      ["bot_check", ["verify you are human", "unusual traffic", "bot detection"]],
+                    ];
+
+                    for (const [typ, ks] of keywords) {
+                      for (const k of ks) {
+                        if (bodyText.includes(k)) {
+                          push(String(typ), `keyword:${k}`, "bodyText");
+                          break;
+                        }
+                      }
+                    }
+
+                    // 3) Known challenge containers (selectors)
+                    const selPairs = [
+                      ["captcha", "[data-sitekey], .h-captcha, .g-recaptcha, iframe[title*='captcha' i]"],
+                      ["cloudflare_challenge", "#challenge-form, .cf-challenge, iframe[src*='cdn-cgi' i]"],
+                      ["consent", "[id*='consent' i], [class*='consent' i], [id*='cookie' i], [class*='cookie' i]"],
+                    ];
+                    for (const [typ, sel] of selPairs) {
+                      if (out.length >= maxHits) break;
+                      let hit = null;
+                      try { hit = document.querySelector(sel); } catch {}
+                      if (hit) push(String(typ), `selector:${sel}`, sel);
+                    }
+
+                    return out;
+                }
+                """,
+                {"maxHits": int(self.cfg.max_barrier_hits)},
+                log,
+            )
+
+            barriers = payload if isinstance(payload, list) else []
+            for b in barriers[: self.cfg.max_barrier_hits]:
+                if not isinstance(b, dict):
+                    continue
+                self._barriers.append(
+                    InteractionSniffer.BarrierMem(
+                        barrier_type=str(b.get("type") or "unknown"),
+                        evidence=str(b.get("evidence") or ""),
+                        selector_hint=str(b.get("selector") or ""),
+                        meta={"phase": phase},
+                    )
+                )
+
+            if barriers:
+                self._log(f"[{phase}] UI barriers: +{len(barriers)} (cum={len(self._barriers)})", log)
+
+        except Exception as e:
+            self._log(f"UI barrier scan error: {e}", log)
+
+    # ------------------------------------------------------------------ #
+    # JS: Hit-test blocker grid (elementFromPoint)
+    # ------------------------------------------------------------------ #
+    async def _collect_hit_test_blockers(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
+        try:
+            payload = await self._safe_eval(
+                page,
+                """
+                (cfg) => {
+                    const grid = Math.max(2, cfg.grid|0);
+                    const maxHits = cfg.maxHits|0;
+
+                    const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
+                    const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
+
+                    const pts = [];
+                    // grid points inside viewport (avoid edges)
+                    for (let gy=0; gy<grid; gy++){
+                      for (let gx=0; gx<grid; gx++){
+                        const x = Math.floor((gx+1) * vw / (grid+1));
+                        const y = Math.floor((gy+1) * vh / (grid+1));
+                        pts.push([x,y]);
+                      }
+                    }
+                    // ensure center
+                    pts.push([Math.floor(vw/2), Math.floor(vh/2)]);
+
+                    function safeOuter(el){
+                      try { return (el && el.outerHTML ? String(el.outerHTML).slice(0, 420) : ""); } catch { return ""; }
+                    }
+
+                    function infoAt(x,y){
+                      let el = null;
+                      try { el = document.elementFromPoint(x,y); } catch { el = null; }
+                      if (!el) return null;
+                      let st = null;
+                      try { st = window.getComputedStyle(el); } catch { st = null; }
+                      let rect = {x:0,y:0,w:0,h:0};
+                      try { const r = el.getBoundingClientRect(); rect = {x:r.x,y:r.y,w:r.width,h:r.height}; } catch {}
+                      const txt = (() => { try { return (el.innerText||"").trim().slice(0,80); } catch { return ""; } })();
+                      return {
+                        point: [x,y],
+                        tagName: (el.tagName||"").toLowerCase(),
+                        id: el.id||"",
+                        className: (typeof el.className==="string" ? el.className : ""),
+                        pointerEvents: st ? (st.pointerEvents||"") : "",
+                        opacity: st ? parseFloat(st.opacity||"1") : 1.0,
+                        zIndex: st ? (st.zIndex||"") : "",
+                        position: st ? (st.position||"") : "",
+                        rect,
+                        textPreview: txt,
+                        outerHTML: safeOuter(el),
+                      };
+                    }
+
+                    const out = [];
+                    const seen = new Set();
+                    for (const [x,y] of pts){
+                      if (out.length >= maxHits) break;
+                      const it = infoAt(x,y);
+                      if (!it) continue;
+                      const fp = `${it.tagName}#${it.id}.${it.className}|${it.pointerEvents}|${it.opacity}|${it.position}|${it.zIndex}`;
+                      if (seen.has(fp)) continue;
+                      seen.add(fp);
+
+                      // blocker-ish heuristic: pointer-events active AND element covers large area OR is fixed
+                      const area = Math.max(0, it.rect.w) * Math.max(0, it.rect.h);
+                      const viewportArea = Math.max(1, vw*vh);
+                      const coverPct = (area / viewportArea) * 100;
+
+                      const isBlocker = (it.pointerEvents !== "none") && (
+                        (it.position === "fixed") || (coverPct >= 20) || (it.tagName === "dialog")
+                      );
+
+                      if (isBlocker) out.push({...it, coveragePct: coverPct.toFixed(1)});
+                    }
+
+                    return out;
+                }
+                """,
+                {"grid": int(self.cfg.hit_test_grid), "maxHits": int(self.cfg.max_hit_test_hits)},
+                log,
+            )
+
+            items = payload if isinstance(payload, list) else []
+            for it in items[: self.cfg.max_hit_test_hits]:
+                if not isinstance(it, dict):
+                    continue
+                self._hit_tests.append(
+                    InteractionSniffer.HitTestMem(
+                        point=tuple(it.get("point") or (0, 0)),
+                        tag_name=str(it.get("tagName") or ""),
+                        id=str(it.get("id") or ""),
+                        class_name=str(it.get("className") or ""),
+                        pointer_events=str(it.get("pointerEvents") or ""),
+                        opacity=float(it.get("opacity") or 1.0),
+                        z_index=str(it.get("zIndex") or ""),
+                        position=str(it.get("position") or ""),
+                        rect=dict(it.get("rect") or {}),
+                        text_preview=str(it.get("textPreview") or ""),
+                        outer_html=str(it.get("outerHTML") or ""),
+                    )
+                )
+
+            if items:
+                self._log(f"[{phase}] Hit-test blockers: +{len(items)} (cum={len(self._hit_tests)})", log)
+
+        except Exception as e:
+            self._log(f"Hit-test scan error: {e}", log)
+
+    # ------------------------------------------------------------------ #
+    # CDP: Event listeners (Chromium only) + confidence scoring hooks
     # ------------------------------------------------------------------ #
     async def _collect_cdp_listeners(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
-        """
-        Use CDP DOMDebugger.getEventListeners to find nodes with in-memory listeners.
-
-        Important:
-          • Works only on Chromium.
-          • We query candidates with a broad selector, then filter by actual listeners.
-        """
-        # Best-effort detection of browser type
         browser_name = "unknown"
         try:
             if getattr(context, "browser", None) and context.browser:
@@ -6418,16 +8045,14 @@ class InteractionSniffer:
         inspected = 0
 
         try:
-            # 1) Get document root
-            doc = await cdp.send("DOM.getDocument", {"depth": 1, "pierce": True})
+            doc = await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
             root_node_id = (doc or {}).get("root", {}).get("nodeId")
             if not root_node_id:
                 self._log("CDP: no DOM root nodeId", log)
                 return
 
-            # 2) Query candidate nodes
             sel = str(self.cfg.candidate_selector or "div,span,button,a,input")
-            qs = await cdp.send("DOM.querySelectorAll", {"nodeId": root_node_id, "selector": sel})
+            qs = await self._cdp_send(cdp, "DOM.querySelectorAll", {"nodeId": root_node_id, "selector": sel}, log)
             node_ids = (qs or {}).get("nodeIds", []) or []
             if not node_ids:
                 self._log("CDP: no candidates matched selector", log)
@@ -6435,39 +8060,33 @@ class InteractionSniffer:
 
             node_ids = node_ids[: int(self.cfg.max_candidate_nodes)]
 
-            # helper: flatten CDP attributes list into dict
             def _attr_list_to_dict(attr_list: List[str]) -> Dict[str, str]:
                 try:
                     return dict(zip(attr_list[0::2], attr_list[1::2]))
                 except Exception:
                     return {}
 
-            # 3) For each candidate, resolve -> getEventListeners -> filter
             for nid in node_ids:
                 if found >= int(self.cfg.max_listener_hits):
                     break
 
                 inspected += 1
-
                 try:
-                    remote_obj = await cdp.send("DOM.resolveNode", {"nodeId": nid})
+                    remote_obj = await self._cdp_send(cdp, "DOM.resolveNode", {"nodeId": nid}, log)
                     object_id = (remote_obj or {}).get("object", {}).get("objectId")
                     if not object_id:
                         continue
 
-                    # Correct CDP method name is getEventListeners (plural)
-                    listeners_resp = await cdp.send(
+                    listeners_resp = await self._cdp_send(
+                        cdp,
                         "DOMDebugger.getEventListeners",
-                        {
-                            "objectId": object_id,
-                            "depth": 1,
-                        },
+                        {"objectId": object_id, "depth": 1},
+                        log,
                     )
                     listeners = (listeners_resp or {}).get("listeners", []) or []
                     if not listeners:
                         continue
 
-                    # filter to relevant types
                     relevant = []
                     for l in listeners:
                         if not isinstance(l, dict):
@@ -6475,25 +8094,18 @@ class InteractionSniffer:
                         lt = str(l.get("type") or "")
                         if lt in self.cfg.listener_types:
                             relevant.append(l)
-
                     if not relevant:
                         continue
 
-                    # attributes + nodeName
-                    attrs_resp = await cdp.send("DOM.getAttributes", {"nodeId": nid})
+                    attrs_resp = await self._cdp_send(cdp, "DOM.getAttributes", {"nodeId": nid}, log)
                     attr_list = (attrs_resp or {}).get("attributes", []) or []
                     attr_dict = _attr_list_to_dict(attr_list)
 
-                    desc = await cdp.send("DOM.describeNode", {"nodeId": nid})
-                    node_name = ""
-                    try:
-                        node_name = str((desc or {}).get("node", {}).get("nodeName") or "")
-                    except Exception:
-                        node_name = ""
+                    desc = await self._cdp_send(cdp, "DOM.describeNode", {"nodeId": nid}, log)
+                    node_name = str((desc or {}).get("node", {}).get("nodeName") or "")
 
                     flags: Dict[str, Any] = {}
                     if self.cfg.include_listener_flags:
-                        # Keep only small, non-explosive fields
                         flags = {
                             "count": len(relevant),
                             "capture": any(bool(r.get("useCapture")) for r in relevant),
@@ -6503,15 +8115,11 @@ class InteractionSniffer:
 
                     outer_html = None
                     if self.cfg.include_outer_html_snippet:
-                        try:
-                            oh = await cdp.send("DOM.getOuterHTML", {"nodeId": nid})
-                            outer_html = str((oh or {}).get("outerHTML") or "")
-                            if outer_html and len(outer_html) > int(self.cfg.outer_html_max_chars):
-                                outer_html = outer_html[: int(self.cfg.outer_html_max_chars)] + "…"
-                        except Exception:
-                            outer_html = None
+                        oh = await self._cdp_send(cdp, "DOM.getOuterHTML", {"nodeId": nid}, log)
+                        outer_html = str((oh or {}).get("outerHTML") or "")
+                        if outer_html and len(outer_html) > int(self.cfg.outer_html_max_chars):
+                            outer_html = outer_html[: int(self.cfg.outer_html_max_chars)] + "…"
 
-                    # dedupe fingerprint (node + listener types + id/class)
                     fp = (
                         int(nid),
                         node_name,
@@ -6534,15 +8142,10 @@ class InteractionSniffer:
                         )
                     )
                     found += 1
-
                 except Exception:
                     continue
 
-            self._log(
-                f"CDP listener scan: inspected={inspected} candidates, found={found} interactive nodes",
-                log,
-            )
-
+            self._log(f"CDP listener scan: inspected={inspected} found={found}", log)
         except Exception as e:
             self._log(f"CDP listener scan failed: {e}", log)
         finally:
@@ -6552,12 +8155,451 @@ class InteractionSniffer:
                 pass
 
     # ------------------------------------------------------------------ #
-    # Memory -> Final hits
+    # Listener scoring (computed style / rect / visibility / cues)
+    # ------------------------------------------------------------------ #
+    async def _score_listeners(self, page, log: Optional[List[str]]) -> None:
+        try:
+            # score only first N to keep it bounded
+            todo = self._listeners[: int(self.cfg.max_scoring_nodes)]
+            if not todo:
+                return
+
+            node_ids = [int(x.node_id) for x in todo]
+            payload = await self._safe_eval(
+                page,
+                """
+                (nodeIds) => {
+                  // Given CDP nodeIds, we cannot directly access nodes by nodeId in JS.
+                  // So we approximate: return a list of "best effort" candidates by querying for common id/class.
+                  // We'll do scoring by fingerprints from attributes we already have in Python later.
+                  return { ok: true };
+                }
+                """,
+                node_ids,
+                log,
+            )
+
+            # We can't map CDP nodeId -> DOM element in pure page.evaluate without CDP.
+            # Instead: do a scoring heuristic purely from attributes + outerHTML when available.
+            for l in todo:
+                conf, reasons = self._score_from_attrs(l.attributes, l.outer_html or "", l.node_name, l.types)
+                l.confidence = conf
+                l.reasons = reasons
+
+            self._log(f"Listener scoring: scored={len(todo)} (attr/outerHTML heuristic)", log)
+        except Exception as e:
+            self._log(f"Listener scoring error: {e}", log)
+
+    def _score_from_attrs(self, attrs: Dict[str, str], outer_html: str, node_name: str, types: List[str]) -> Tuple[float, List[str]]:
+        reasons: List[str] = []
+        score = 0.0
+
+        nn = (node_name or "").lower()
+        if nn in ("button", "a", "input", "select", "textarea", "label"):
+            score += 0.35
+            reasons.append(f"native:{nn}")
+
+        role = (attrs.get("role") or "").lower()
+        if role in ("button", "link", "menuitem"):
+            score += 0.25
+            reasons.append(f"role:{role}")
+
+        tabindex = attrs.get("tabindex")
+        if tabindex is not None:
+            score += 0.10
+            reasons.append("tabindex")
+
+        if "contenteditable" in (attrs.get("contenteditable") or "").lower():
+            score += 0.08
+            reasons.append("contenteditable")
+
+        # aria signals
+        for k in ("aria-label", "aria-controls", "aria-expanded"):
+            if attrs.get(k):
+                score += 0.08
+                reasons.append(k)
+
+        # dataset tracking signals
+        for k in list(attrs.keys()):
+            lk = k.lower()
+            if lk.startswith("data-") and any(x in lk for x in ("testid", "action", "track", "analytics")):
+                score += 0.07
+                reasons.append(f"data:{lk}")
+                break
+
+        # class hints
+        cls = (attrs.get("class") or "").lower()
+        if any(s in cls for s in ("btn", "button", "cta", "primary", "submit")):
+            score += 0.10
+            reasons.append("class-hint")
+
+        # outerHTML hints
+        oh = (outer_html or "").lower()
+        if any(s in oh for s in ("onclick", "data-action", "aria-label", "role=\"button\"")):
+            score += 0.07
+            reasons.append("outerHTML-hint")
+
+        # types
+        if "click" in types:
+            score += 0.05
+            reasons.append("has-click")
+
+        score = max(0.0, min(1.0, score))
+        return score, reasons[:8]
+
+    # ------------------------------------------------------------------ #
+    # AX / Accessibility scan (CDP first, fallback to Playwright snapshot)
+    # ------------------------------------------------------------------ #
+    async def _collect_ax_tree(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
+        # Try CDP AX tree on Chromium; fallback to page.accessibility.snapshot
+        browser_name = "unknown"
+        try:
+            if getattr(context, "browser", None) and context.browser:
+                browser_name = context.browser.browser_type.name
+        except Exception:
+            browser_name = "unknown"
+
+        if browser_name == "chromium":
+            try:
+                cdp = await context.new_cdp_session(page)
+                try:
+                    await self._cdp_send(cdp, "Accessibility.enable", {}, log)
+                    ax = await self._cdp_send(cdp, "Accessibility.getFullAXTree", {}, log)
+                    nodes = (ax or {}).get("nodes", []) or []
+                    if not nodes:
+                        return
+
+                    # helper: pull properties
+                    def _prop(node: Dict[str, Any], key: str) -> str:
+                        try:
+                            v = node.get(key)
+                            if isinstance(v, dict) and "value" in v:
+                                return str(v.get("value") or "")
+                            return str(v or "")
+                        except Exception:
+                            return ""
+
+                    kept = 0
+                    for n in nodes:
+                        if kept >= int(self.cfg.max_ax_hits):
+                            break
+                        if not isinstance(n, dict):
+                            continue
+
+                        role = _prop(n, "role").lower()
+                        if role and role not in self.cfg.ax_roles:
+                            continue
+
+                        name = _prop(n, "name")
+                        value = _prop(n, "value")
+                        disabled = False
+                        focused = False
+                        try:
+                            props = n.get("properties") or []
+                            for p in props:
+                                pn = str(p.get("name") or "")
+                                pv = p.get("value") or {}
+                                if pn == "disabled":
+                                    disabled = bool(pv.get("value", False))
+                                if pn == "focused":
+                                    focused = bool(pv.get("value", False))
+                        except Exception:
+                            pass
+
+                        backend_id = None
+                        try:
+                            backend_id = int(n.get("backendDOMNodeId")) if n.get("backendDOMNodeId") else None
+                        except Exception:
+                            backend_id = None
+
+                        self._ax.append(
+                            InteractionSniffer.AXMem(
+                                role=role or "unknown",
+                                name=str(name or ""),
+                                value=str(value or ""),
+                                disabled=bool(disabled),
+                                focused=bool(focused),
+                                backend_dom_node_id=backend_id,
+                                selector_hint="ax_tree",
+                                meta={"source": "cdp", "page": page_url},
+                            )
+                        )
+                        kept += 1
+
+                    # Best-effort: map backendDOMNodeId -> nodeId (optional)
+                    if self.cfg.try_map_ax_to_dom and self._ax:
+                        await self._map_ax_backend_to_dom_nodeid(cdp, log)
+
+                    self._log(f"AX tree (CDP): kept={len(self._ax)}", log)
+                finally:
+                    try:
+                        await cdp.detach()
+                    except Exception:
+                        pass
+                return
+            except Exception as e:
+                self._log(f"AX tree via CDP failed; will fallback: {e}", log)
+
+        # Fallback: Playwright snapshot
+        try:
+            snap = await asyncio.wait_for(page.accessibility.snapshot(), timeout=self.cfg.per_eval_timeout_s)
+            # snapshot is a tree; we BFS it and keep nodes with roles
+            kept = 0
+            q = [snap] if isinstance(snap, dict) else []
+            while q and kept < int(self.cfg.max_ax_hits):
+                cur = q.pop(0)
+                if not isinstance(cur, dict):
+                    continue
+                role = str(cur.get("role") or "").lower()
+                name = str(cur.get("name") or "")
+                value = str(cur.get("value") or "")
+                disabled = bool(cur.get("disabled", False))
+                focused = bool(cur.get("focused", False))
+
+                if role in self.cfg.ax_roles:
+                    self._ax.append(
+                        InteractionSniffer.AXMem(
+                            role=role,
+                            name=name,
+                            value=value,
+                            disabled=disabled,
+                            focused=focused,
+                            selector_hint="ax_snapshot",
+                            meta={"source": "playwright", "page": page_url},
+                        )
+                    )
+                    kept += 1
+
+                ch = cur.get("children") or []
+                if isinstance(ch, list):
+                    q.extend(ch)
+
+            if self._ax:
+                self._log(f"AX snapshot (Playwright): kept={len(self._ax)}", log)
+        except Exception as e:
+            self._log(f"AX snapshot failed: {e}", log)
+
+    async def _map_ax_backend_to_dom_nodeid(self, cdp, log: Optional[List[str]]) -> None:
+        # In CDP, DOM.pushNodesByBackendIdsToFrontend can map backend ids -> nodeIds.
+        backend_ids = []
+        for a in self._ax:
+            if a.backend_dom_node_id and a.node_id is None:
+                backend_ids.append(int(a.backend_dom_node_id))
+        backend_ids = backend_ids[: 200]
+        if not backend_ids:
+            return
+
+        resp = await self._cdp_send(
+            cdp,
+            "DOM.pushNodesByBackendIdsToFrontend",
+            {"backendNodeIds": backend_ids},
+            log,
+        )
+        node_ids = (resp or {}).get("nodeIds") or []
+        if not isinstance(node_ids, list) or len(node_ids) != len(backend_ids):
+            return
+
+        # assign back
+        idx = 0
+        for a in self._ax:
+            if a.backend_dom_node_id and a.node_id is None:
+                a.node_id = int(node_ids[idx]) if node_ids[idx] else None
+                idx += 1
+
+    # ------------------------------------------------------------------ #
+    # Dynamic simulation: scroll + click likely CTAs + rescan per step
+    # ------------------------------------------------------------------ #
+    async def _simulate_and_rescan(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
+        try:
+            # 1) short scroll(s)
+            for i in range(max(0, int(self.cfg.sim_scroll_steps))):
+                try:
+                    await page.evaluate("() => window.scrollBy(0, Math.max(200, window.innerHeight * 0.7));")
+                    await page.wait_for_timeout(int(self.cfg.sim_scroll_delay_ms))
+                except Exception:
+                    break
+
+            # collect post-scroll phase (no click yet)
+            self._phase_tags.append("post_scroll")
+            await self._collect_phase(page, page_url, log, phase="post_scroll", context=context)
+
+            # 2) choose click targets
+            targets = await self._pick_click_targets(page, log)
+            if not targets:
+                self._log("Dynamic sim: no click targets selected.", log)
+                return
+
+            clicks_done = 0
+            for t in targets[: int(self.cfg.sim_click_targets)]:
+                if clicks_done >= int(self.cfg.sim_click_targets):
+                    break
+                try:
+                    # click via selector
+                    sel = t.get("selector") or ""
+                    if not sel:
+                        continue
+
+                    # ensure visible
+                    try:
+                        h = await page.query_selector(sel)
+                        if not h:
+                            continue
+                        await h.scroll_into_view_if_needed(timeout=1200)
+                        await h.click(timeout=int(self.cfg.sim_click_timeout_ms))
+                    except Exception:
+                        # fallback: click by JS
+                        try:
+                            await page.evaluate(
+                                """
+                                (sel) => {
+                                  const el = document.querySelector(sel);
+                                  if (el) el.click();
+                                }
+                                """,
+                                sel,
+                            )
+                        except Exception:
+                            continue
+
+                    clicks_done += 1
+                    await page.wait_for_timeout(int(self.cfg.per_action_settle_ms))
+
+                    phase = f"post_click_{clicks_done}"
+                    self._phase_tags.append(phase)
+                    await self._collect_phase(page, page_url, log, phase=phase, context=context)
+
+                except Exception:
+                    continue
+
+            self._log(f"Dynamic sim: scroll_steps={self.cfg.sim_scroll_steps} clicks={clicks_done}", log)
+        except Exception as e:
+            self._log(f"Dynamic simulation error: {e}", log)
+
+    async def _pick_click_targets(self, page, log: Optional[List[str]]) -> List[Dict[str, Any]]:
+        """
+        Choose likely CTAs:
+          - visible buttons / role=button / a[role=button] with text hints
+          - if we have listener hits with good confidence, prefer those by looking for IDs/classes in outerHTML
+        Returns a list of {selector, text, reason}
+        """
+        # Primary: DOM-based selection (works everywhere)
+        try:
+            payload = await self._safe_eval(
+                page,
+                """
+                (cfg) => {
+                  const hints = (cfg.hints || []).map(s => String(s||"").toLowerCase());
+                  const max = cfg.max|0;
+
+                  function isVisible(el){
+                    try {
+                      const st = getComputedStyle(el);
+                      if (st.display === "none" || st.visibility === "hidden" || parseFloat(st.opacity||"1") <= 0) return false;
+                      const r = el.getBoundingClientRect();
+                      if (r.width <= 2 || r.height <= 2) return false;
+                      if (r.bottom < 0 || r.right < 0) return false;
+                      const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
+                      const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
+                      if (r.top > vh || r.left > vw) return false;
+                      return true;
+                    } catch { return false; }
+                  }
+
+                  function textOf(el){
+                    try {
+                      const t = (el.innerText || el.textContent || el.value || "").trim();
+                      return t.slice(0, 90);
+                    } catch { return ""; }
+                  }
+
+                  function makeSelector(el){
+                    // best-effort stable selector
+                    try {
+                      if (el.id) return `#${CSS.escape(el.id)}`;
+                      const cls = (typeof el.className === "string" ? el.className : "");
+                      const c1 = cls.split(/\\s+/).filter(Boolean)[0];
+                      if (c1) return `${el.tagName.toLowerCase()}.${CSS.escape(c1)}`;
+                      const tn = el.tagName.toLowerCase();
+                      if (tn === "button") return "button";
+                      if (tn === "a") return "a";
+                      return tn;
+                    } catch {
+                      return el.tagName ? el.tagName.toLowerCase() : "";
+                    }
+                  }
+
+                  const candSel = "button, [role='button'], a[role='button'], input[type='button'], input[type='submit'], [onclick]";
+                  const cands = Array.from(document.querySelectorAll(candSel)).slice(0, 260);
+
+                  const scored = [];
+                  for (const el of cands){
+                    if (!isVisible(el)) continue;
+                    const t = textOf(el);
+                    const tl = t.toLowerCase();
+                    let score = 0;
+                    let why = [];
+                    if (t) { score += 0.2; }
+                    for (const h of hints){
+                      if (h && tl.includes(h)) { score += 1.0; why.push(`text:${h}`); break; }
+                    }
+                    const st = getComputedStyle(el);
+                    if ((st.cursor||"") === "pointer") { score += 0.15; why.push("cursor:pointer"); }
+                    if (el.tagName.toLowerCase() === "button") { score += 0.2; why.push("button"); }
+                    if (el.getAttribute("aria-label")) { score += 0.15; why.push("aria-label"); }
+
+                    const sel = makeSelector(el);
+                    if (!sel) continue;
+                    scored.push({selector: sel, text: t, score, reason: why.join(",")});
+                  }
+
+                  scored.sort((a,b) => (b.score - a.score));
+                  return scored.slice(0, max);
+                }
+                """,
+                {"hints": self.cfg.cta_text_hints, "max": 6},
+                log,
+            )
+            out = payload if isinstance(payload, list) else []
+        except Exception:
+            out = []
+
+        # Secondary: blend in listener-confidence elements (if we can make stable selectors)
+        # We only have id/class and outerHTML; so we can promote those by preferring #id and .class selectors.
+        promoted: List[Dict[str, Any]] = []
+        for l in self._listeners:
+            conf = float(l.confidence or 0.0)
+            if conf < 0.45:
+                continue
+            attrs = l.attributes or {}
+            if attrs.get("id"):
+                promoted.append({"selector": f"#{attrs['id']}", "text": "", "score": 0.9 + conf * 0.1, "reason": "listener:id"})
+            else:
+                cls = (attrs.get("class") or "").split()
+                if cls:
+                    promoted.append({"selector": f".{cls[0]}", "text": "", "score": 0.75 + conf * 0.1, "reason": "listener:class"})
+
+        # combine, dedupe selectors
+        combined = []
+        seen = set()
+        for it in (out or []) + promoted:
+            try:
+                sel = str(it.get("selector") or "")
+                if not sel or sel in seen:
+                    continue
+                seen.add(sel)
+                combined.append({"selector": sel, "text": it.get("text", ""), "reason": it.get("reason", "")})
+            except Exception:
+                continue
+
+        return combined[: max(1, int(self.cfg.sim_click_targets) * 3)]
+
+    # ------------------------------------------------------------------ #
+    # Materialize final hits
     # ------------------------------------------------------------------ #
     def _materialize_hits(self, page_url: str) -> List[Dict[str, Any]]:
         hits: List[Dict[str, Any]] = []
 
-        # 1) Event listener hits
+        # 1) Event listener hits (now includes confidence/reasons)
         for l in self._listeners:
             meta = {
                 "nodeId": l.node_id,
@@ -6565,80 +8607,132 @@ class InteractionSniffer:
                 "types": list(l.types),
                 "attributes": dict(l.attributes or {}),
                 "flags": dict(l.flags or {}),
-                "is_pure_js": True,  # indicates discovered via CDP memory, not HTML attrs
+                "is_pure_js": True,
             }
             if l.outer_html:
                 meta["outerHTML"] = l.outer_html
+            if l.confidence is not None:
+                meta["confidence"] = float(l.confidence)
+            if l.reasons:
+                meta["reasons"] = list(l.reasons)
 
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": page_url,
-                    "tag": "interaction",
-                    "kind": "event_listener",
-                    "meta": meta,
-                }
-            )
+            hits.append({"page": page_url, "url": page_url, "tag": "interaction", "kind": "event_listener", "meta": meta})
 
-        # 2) Overlay hits
+        # 2) Overlays
         for ov in self._overlays:
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": page_url,
-                    "tag": "interaction",
-                    "kind": "overlay_detected",
-                    "meta": {
-                        "tagName": ov.tag_name,
-                        "id": ov.id,
-                        "className": ov.class_name,
-                        "zIndex": ov.z_index,
-                        "coverage": ov.coverage,
-                        "textPreview": ov.text_preview,
-                    },
-                }
-            )
+            hits.append({
+                "page": page_url,
+                "url": page_url,
+                "tag": "interaction",
+                "kind": "overlay_detected",
+                "meta": {
+                    "tagName": ov.tag_name,
+                    "id": ov.id,
+                    "className": ov.class_name,
+                    "zIndex": ov.z_index,
+                    "coverage": ov.coverage,
+                    "textPreview": ov.text_preview,
+                    **(ov.meta or {}),
+                },
+            })
 
-        # 3) Form definition hits
+        # 3) UI barriers (captcha/paywall/consent/adblock/scroll_lock/etc)
+        for b in self._barriers:
+            hits.append({
+                "page": page_url,
+                "url": page_url,
+                "tag": "interaction",
+                "kind": "ui_barrier",
+                "meta": {
+                    "barrier_type": b.barrier_type,
+                    "evidence": b.evidence,
+                    "selector_hint": b.selector_hint,
+                    **(b.meta or {}),
+                },
+            })
+
+        # 4) Hit-test blockers
+        for ht in self._hit_tests:
+            hits.append({
+                "page": page_url,
+                "url": page_url,
+                "tag": "interaction",
+                "kind": "hit_test_blocker",
+                "meta": {
+                    "point": list(ht.point),
+                    "tagName": ht.tag_name,
+                    "id": ht.id,
+                    "className": ht.class_name,
+                    "pointerEvents": ht.pointer_events,
+                    "opacity": ht.opacity,
+                    "zIndex": ht.z_index,
+                    "position": ht.position,
+                    "rect": ht.rect,
+                    "textPreview": ht.text_preview,
+                    "outerHTML": ht.outer_html,
+                },
+            })
+
+        # 5) Forms (now includes kind + honeypot)
         for f in self._forms:
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": (f.action or page_url),
-                    "tag": "interaction",
-                    "kind": "form_definition",
-                    "meta": {
-                        "action": f.action,
-                        "method": f.method,
-                        "id": f.id,
-                        "class": f.class_name,
-                        "input_count": f.input_count,
-                        "inputs": f.inputs,
-                    },
-                }
-            )
+            hits.append({
+                "page": page_url,
+                "url": (f.action or page_url),
+                "tag": "interaction",
+                "kind": "form_definition",
+                "meta": {
+                    "action": f.action,
+                    "method": f.method,
+                    "id": f.id,
+                    "class": f.class_name,
+                    "input_count": f.input_count,
+                    "inputs": f.inputs,
+                    "form_kind": f.form_kind,
+                    "honeypot_suspected": bool(f.honeypot_suspected),
+                    "honeypot_reasons": list(f.honeypot_reasons or []),
+                },
+            })
 
-        # 4) Summary hit (optional)
+        # 6) AX nodes
+        for a in self._ax:
+            hits.append({
+                "page": page_url,
+                "url": page_url,
+                "tag": "interaction",
+                "kind": "ax_node",
+                "meta": {
+                    "role": a.role,
+                    "name": a.name,
+                    "value": a.value,
+                    "disabled": bool(a.disabled),
+                    "focused": bool(a.focused),
+                    "backendDOMNodeId": a.backend_dom_node_id,
+                    "nodeId": a.node_id,
+                    "selector_hint": a.selector_hint,
+                    **(a.meta or {}),
+                },
+            })
+
+        # 7) Summary
         if self.cfg.emit_summary_hit:
-            summary = self._build_summary_hit(page_url)
-            if summary is not None:
-                hits.append(summary)
+            s = self._build_summary_hit(page_url)
+            if s is not None:
+                hits.append(s)
 
         return hits
 
     def _build_summary_hit(self, page_url: str) -> Optional[Dict[str, Any]]:
-        if not self._listeners and not self._overlays and not self._forms:
+        if not self._listeners and not self._overlays and not self._forms and not self._barriers and not self._hit_tests and not self._ax:
             return None
 
-        # counts + quick highlights
+        # listener type counts
         top_listener_types: Dict[str, int] = {}
         for l in self._listeners:
             for t in l.types:
                 top_listener_types[t] = top_listener_types.get(t, 0) + 1
-
         top_types = sorted(top_listener_types.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
-        # overlay severity heuristic: max coverage / max z
+        # overlay severity
         max_coverage = None
         max_z = None
         for ov in self._overlays:
@@ -6652,22 +8746,27 @@ class InteractionSniffer:
             except Exception:
                 pass
 
+        # barrier histogram
+        barrier_counts: Dict[str, int] = {}
+        for b in self._barriers:
+            barrier_counts[b.barrier_type] = barrier_counts.get(b.barrier_type, 0) + 1
+        top_barriers = sorted(barrier_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
+
         meta: Dict[str, Any] = {
             "listener_count": len(self._listeners),
             "overlay_count": len(self._overlays),
             "form_count": len(self._forms),
+            "barrier_count": len(self._barriers),
+            "hit_test_blocker_count": len(self._hit_tests),
+            "ax_node_count": len(self._ax),
             "top_listener_types": top_types,
+            "top_barriers": top_barriers,
             "max_overlay_coverage_percent": max_coverage,
             "max_overlay_z_index": max_z,
+            "phases_seen": list(dict.fromkeys(self._phase_tags)),
         }
 
-        return {
-            "page": page_url,
-            "url": page_url,
-            "tag": "interaction",
-            "kind": "summary",
-            "meta": meta,
-        }
+        return {"page": page_url, "url": page_url, "tag": "interaction", "kind": "summary", "meta": meta}
 
 # ======================================================================
 # Database
@@ -7390,6 +9489,130 @@ class HTTPSSubmanager:
         self._host_cooldown_until.clear()
         self._host_last_ok_url.clear()
 
+    async def get_prefix(
+            self,
+            url: str,
+            *,
+            size: int = 8192,
+            timeout_ms: Optional[int] = None,
+            headers: Optional[Dict[str, str]] = None,
+            allow_redirects: bool = True,
+    ) -> bytes:
+        """
+        Fetches only the first `size` bytes of a resource (best-effort),
+        using a Range request and the Secure Gateway protections.
+
+        Returns: bytes (possibly shorter than requested).
+        """
+        url = str(url or "")
+        size = max(0, int(size))
+        if not url or size <= 0:
+            return b""
+
+        # Range header for prefix fetch
+        h = dict(headers or {})
+        if not any(k.lower() == "range" for k in h.keys()):
+            h["Range"] = f"bytes=0-{max(0, size - 1)}"
+
+        # NOTE: We don't plumb timeout_ms into aiohttp per-request here because your engine
+        # already enforces strict total/connect/sock_read/chunk timeouts globally.
+        # But we *can* guard the whole operation with asyncio.wait_for if you want.
+        async def _do() -> bytes:
+            r = await self._request(
+                "GET",
+                url,
+                want_body=True,
+                allow_redirects=allow_redirects,
+                headers=h,
+                max_bytes=size,
+            )
+            if not r.ok or not r.body:
+                return b""
+            # r.body is already bounded by max_bytes and passed through your secure reader.
+            return bytes(r.body[:size])
+
+        if timeout_ms and timeout_ms > 0:
+            try:
+                return await asyncio.wait_for(_do(), timeout=float(timeout_ms) / 1000.0)
+            except Exception:
+                return b""
+
+        try:
+            return await _do()
+        except Exception:
+            return b""
+
+    async def probe(
+            self,
+            url: str,
+            *,
+            range_bytes: int = 8192,
+            timeout_ms: Optional[int] = None,
+            headers: Optional[Dict[str, str]] = None,
+            allow_redirects: bool = True,
+            hash_algo: str = "sha256",
+    ) -> Dict[str, Any]:
+        """
+        Convenience probe for sniffers:
+          - HEAD for status + headers
+          - bounded GET prefix for hashing / verification
+
+        Returns a dict shaped similarly to what NetworkSniffer._probe_url() builds.
+        """
+        url = str(url or "")
+        out: Dict[str, Any] = {
+            "url": url,
+            "ok": False,
+            "status": None,
+            "final_url": url,
+            "content_type": None,
+            "content_length": None,
+            "hash_prefix": None,
+            "hash_algo": hash_algo,
+            "error": "",
+        }
+        if not url:
+            out["error"] = "empty_url"
+            return out
+
+        try:
+            status, hdrs = await self.head(url)
+            out["status"] = status
+            # Your head() returns the response headers dict from _request
+            ct = (hdrs.get("Content-Type") or hdrs.get("content-type") or None)
+            cl = (hdrs.get("Content-Length") or hdrs.get("content-length") or None)
+            out["content_type"] = ct
+            out["content_length"] = cl
+        except Exception as e:
+            out["error"] = f"head_failed:{e}"
+
+        try:
+            prefix = await self.get_prefix(
+                url,
+                size=int(range_bytes),
+                timeout_ms=timeout_ms,
+                headers=headers,
+                allow_redirects=allow_redirects,
+            )
+            if prefix:
+                if (hash_algo or "").lower() == "sha1":
+                    out["hash_prefix"] = hashlib.sha1(prefix).hexdigest()
+                elif (hash_algo or "").lower() == "md5":
+                    out["hash_prefix"] = hashlib.md5(prefix).hexdigest()
+                else:
+                    out["hash_prefix"] = hashlib.sha256(prefix).hexdigest()
+        except Exception as e:
+            # don’t clobber prior error unless empty
+            if not out["error"]:
+                out["error"] = f"prefix_failed:{e}"
+
+        try:
+            if out["status"] is not None and 200 <= int(out["status"]) < 300:
+                out["ok"] = True
+        except Exception:
+            pass
+
+        return out
     # ------------------------------------------------------------- #
     # SSL / TLS helpers
     # ------------------------------------------------------------- #

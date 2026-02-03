@@ -7242,16 +7242,22 @@ class LinkTrackerBlock(BaseBlock):
     # Playwright shared context manager (unchanged)
     # ------------------------------------------------------------------ #
     async def _open_playwright_context(
-        self,
-        ua: str,
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
-        log: List[str],
-        *,
-        use_camoufox: bool = False,               # <-- NEW
-        camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
+            self,
+            ua: str,
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
+            log: List[str],
+            *,
+            use_camoufox: bool = False,
+            camoufox_options: Optional[Dict[str, Any]] = None,
+
+            # NEW:
+            pw_launch_args: Optional[List[str]] = None,
+            pw_headless: bool = True,
+            pw_channel: Optional[str] = None,
+            pw_proxy: Optional[Dict[str, Any]] = None,
     ):
         """
         Open a shared Playwright/Camoufox browser context.
@@ -7330,7 +7336,17 @@ class LinkTrackerBlock(BaseBlock):
             return None, None, None
 
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+
+        launch_opts = {
+            "headless": pw_headless,
+            "args": list(pw_launch_args or []),
+        }
+        if pw_channel:
+            launch_opts["channel"] = pw_channel
+        if pw_proxy:
+            launch_opts["proxy"] = pw_proxy
+
+        browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(user_agent=ua)
 
         if block_resources or block_domains:
@@ -7686,10 +7702,28 @@ class LinkTrackerBlock(BaseBlock):
         if block_domains:
             blocked_domains = default_blocked_domains.union(user_blocked_domains)
 
+        pw_launch_args = params.get("pw_launch_args") or []
+        if isinstance(pw_launch_args, str):
+            # allow comma-separated string
+            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
+        if not isinstance(pw_launch_args, list):
+            pw_launch_args = []
+
+        pw_headless = bool(params.get("pw_headless", True))
+        pw_channel = params.get("pw_channel", None)  # e.g. "chrome"
+        pw_proxy = params.get("pw_proxy", None)  # e.g. {"server":"http://127.0.0.1:8080"}
+
         # ------------------- Targets -------------------- #
         targets: set[str] = set()
         if mode == "media":
             targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
+        elif mode == "pictures":
+            targets.update([
+                ".jpg", ".jpeg", ".png", ".gif", ".webp",
+                ".bmp", ".tiff", ".tif",
+                ".heic", ".heif",
+                ".avif", ".svg"
+            ])
         elif mode == "docs":
             targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
         elif mode == "archives":
@@ -8188,8 +8222,12 @@ class LinkTrackerBlock(BaseBlock):
                         block_domains=block_domains,
                         blocked_domains=blocked_domains,
                         log=log,
-                        use_camoufox=use_camoufox,           # <-- NEW
-                        camoufox_options=camoufox_options,   # <-- NEW
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                        pw_launch_args=pw_launch_args,  # NEW
+                        pw_headless=pw_headless,  # NEW
+                        pw_channel=pw_channel,  # NEW
+                        pw_proxy=pw_proxy,  # NEW
                     )
             except:
                 # ALWAYS close Camoufox/Playwright if we opened it
@@ -9152,6 +9190,14 @@ class LinkTrackerBlock(BaseBlock):
             "http_ca_bundle": "",   # path to bundled cacert.pem if needed
             "use_camoufox": False,
             "camoufox_options": {},
+            "pw_headless": True,
+            "pw_channel": "",  # e.g. "chrome"
+            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
+            "pw_launch_args": [
+                "--disable-quic",
+                "--disable-http3",
+                "--disable-features=UseDnsHttpsSvcb"
+            ],
             "searxng_url": "http://127.0.0.1:8080"
         }
 
@@ -10590,8 +10636,14 @@ class VideoLinkTrackerBlock(BaseBlock):
             blocked_domains: set[str],
             log: List[str],
             *,
-            use_camoufox: bool = False,  # <-- NEW
-            camoufox_options: Optional[Dict[str, Any]] = None,  # <-- NEW
+            use_camoufox: bool = False,
+            camoufox_options: Optional[Dict[str, Any]] = None,
+
+            # NEW:
+            pw_launch_args: Optional[List[str]] = None,
+            pw_headless: bool = True,
+            pw_channel: Optional[str] = None,
+            pw_proxy: Optional[Dict[str, Any]] = None,
     ):
         """
         Open a shared Playwright/Camoufox browser context.
@@ -10671,7 +10723,17 @@ class VideoLinkTrackerBlock(BaseBlock):
             return None, None, None
 
         p = await async_playwright().start()
-        browser = await p.chromium.launch(headless=True)
+
+        launch_opts = {
+            "headless": pw_headless,
+            "args": list(pw_launch_args or []),
+        }
+        if pw_channel:
+            launch_opts["channel"] = pw_channel
+        if pw_proxy:
+            launch_opts["proxy"] = pw_proxy
+
+        browser = await p.chromium.launch(**launch_opts)
         context = await browser.new_context(user_agent=ua)
 
         if block_resources or block_domains:
@@ -11526,6 +11588,17 @@ class VideoLinkTrackerBlock(BaseBlock):
         if block_domains:
             blocked_domains = default_blocked_domains.union(user_blocked_domains)
 
+        pw_launch_args = params.get("pw_launch_args") or []
+        if isinstance(pw_launch_args, str):
+            # allow comma-separated string
+            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
+        if not isinstance(pw_launch_args, list):
+            pw_launch_args = []
+
+        pw_headless = bool(params.get("pw_headless", True))
+        pw_channel = params.get("pw_channel", None)  # e.g. "chrome"
+        pw_proxy = params.get("pw_proxy", None)  # e.g. {"server":"http://127.0.0.1:8080"}
+
         # Keywords
         keywords: List[str] = self._get_keywords_from_query(query_raw)
         if not keywords and query_raw:
@@ -12219,8 +12292,12 @@ class VideoLinkTrackerBlock(BaseBlock):
                         block_domains=block_domains,
                         blocked_domains=blocked_domains,
                         log=log,
-                        use_camoufox=use_camoufox,           # <-- NEW
-                        camoufox_options=camoufox_options,   # <-- NEW
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                        pw_launch_args=pw_launch_args,  # NEW
+                        pw_headless=pw_headless,  # NEW
+                        pw_channel=pw_channel,  # NEW
+                        pw_proxy=pw_proxy,  # NEW
                     )
             except:
                 # ALWAYS close Camoufox/Playwright if we opened it
@@ -13180,6 +13257,14 @@ class VideoLinkTrackerBlock(BaseBlock):
             "searxng_url": "http://127.0.0.1:8080",
             "reverse_image_url": "",
             "ffmpeg_bin": "",
+            "pw_headless": True,
+            "pw_channel": "",  # e.g. "chrome"
+            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
+            "pw_launch_args": [
+                "--disable-quic",
+                "--disable-http3",
+                "--disable-features=UseDnsHttpsSvcb"
+            ],
         }
 
 
