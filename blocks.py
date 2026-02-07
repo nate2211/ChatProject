@@ -39,7 +39,7 @@ from models import get_chat_model  # <-- models now live separately
 import xml.etree.ElementTree as ET
 import re as _re
 from dotenv import load_dotenv
-
+from PIL import Image
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
     CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore, DirectLinkTrackerStore
@@ -12536,8 +12536,9 @@ class VideoLinkTrackerBlock(BaseBlock):
                     for link in links_on_page:
                         raw_link = link["url"]
                         full_url = urljoin(page_url, raw_link)
-                        canon = self._canonicalize_url(full_url)
-                        cid = self._get_content_id(canon)
+                        raw = full_url
+                        canon = self._canonicalize_url(raw)
+                        cid = self._get_content_id(raw)
 
                         parsed_asset_url = urlparse(canon)
                         asset_netloc = parsed_asset_url.netloc
@@ -12611,25 +12612,32 @@ class VideoLinkTrackerBlock(BaseBlock):
                         similarity = None
 
                         if seed_visual_sig is not None:
-                            # Try frame extraction even if heuristics didn't call it "video".
-                            # Reverse-search often returns extension-less / signed / HLS endpoints.
-                            discovery_frame = await self._extract_frame_from_video(
-                                canon,
-                                ffmpeg_bin_path,
-                                local_log
+                            # only attempt frame extraction if URL looks plausibly video-ish
+                            looks_videoish = (
+                                    any(asset_path.endswith(ext) for ext in self.VIDEO_EXTENSIONS)
+                                    or "m3u8" in asset_url_lower
+                                    or "mpd" in asset_url_lower
+                                    or any(k in asset_url_lower for k in self.STREAM_HINT_KEYWORDS)
+                                    or tag_type in ("network_sniff", "runtime_sniff", "db_link", "video", "source")
                             )
+                            if looks_videoish:
+                                discovery_frame = await self._extract_frame_from_video(
+                                    canon,
+                                    ffmpeg_bin_path,
+                                    local_log
+                                )
 
-                            if discovery_frame:
-                                discovery_sig = self._get_visual_signature(discovery_frame)
-                                similarity = self._compare_visual_signatures(seed_visual_sig, discovery_sig)
+                                if discovery_frame:
+                                    discovery_sig = self._get_visual_signature(discovery_frame)
+                                    similarity = self._compare_visual_signatures(seed_visual_sig, discovery_sig)
 
-                                if similarity > 0.75:
-                                    is_visual_match = True
-                                    DEBUG_LOGGER.log_message(
-                                        f"[VideoLinkTracker][Image] Visual match! score={similarity:.2f} url={canon}"
-                                    )
-                            else:
-                                local_log.append(f"[VideoLinkTracker][Image] Could not extract frame for: {canon}")
+                                    if similarity > 0.75:
+                                        is_visual_match = True
+                                        DEBUG_LOGGER.log_message(
+                                            f"[VideoLinkTracker][Image] Visual match! score={similarity:.2f} url={canon}"
+                                        )
+                                else:
+                                    local_log.append(f"[VideoLinkTracker][Image] Could not extract frame for: {canon}")
 
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
@@ -12658,6 +12666,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             if seed_visual_sig is not None:
                                 if similarity is not None and not is_visual_match:
                                     continue
+                        asset["score"] = asset_score
                         status = "unverified"
                         size = "?"
                         content_type = ""
@@ -21423,3 +21432,967 @@ class CDNBlock(BaseBlock):
 
 # register
 BLOCKS.register("cdn", CDNBlock)
+
+
+# ======================= HiddenContentTrackerBlock ===========================
+
+@dataclass
+class HiddenContentTrackerBlock(BaseBlock):
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
+    }
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+    _IMAGE_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|gif|bmp|tiff|avif)(\?|#|$)", re.I)
+
+    def __post_init__(self):
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[PageTrackerStore] = None
+
+        self.js_sniffer = submanagers.JSSniffer(
+            submanagers.JSSniffer.Config(enable_auto_scroll=True, max_scroll_steps=20, scroll_step_delay_ms=350)
+        )
+        self.network_sniffer = submanagers.NetworkSniffer(
+            submanagers.NetworkSniffer.Config(enable_auto_scroll=True, max_scroll_steps=20, scroll_step_delay_ms=350)
+        )
+        self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(hook_history_api=True, hook_link_clicks=True, inspect_react_devtools_hook=True)
+        )
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,
+                enable_backend_fingerprint=True,
+                enable_html_link_scan=True,
+                enable_backend_link_scan=True,
+            )
+        )
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True,
+            )
+        )
+
+    # ------------------------------------------------------------------ #
+    # Playwright context helpers
+    # ------------------------------------------------------------------ #
+    async def _open_playwright_context(
+        self,
+        *,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: Set[str],
+        block_domains: bool,
+        blocked_domains: Set[str],
+        log: List[str],
+        use_camoufox: bool = False,
+        camoufox_options: Optional[Dict[str, Any]] = None,
+        headless: bool = True,
+    ):
+        camoufox_options = camoufox_options or {}
+
+        def _host_blocked(url: str) -> bool:
+            try:
+                host = urlparse(url).netloc.lower().split(":", 1)[0]
+            except Exception:
+                return False
+            if not host:
+                return False
+            for d in blocked_domains:
+                dd = (d or "").strip().lower()
+                if not dd:
+                    continue
+                if host == dd or host.endswith("." + dd):
+                    return True
+            return False
+
+        async def _install_route_blocking(context):
+            if not (block_resources or block_domains):
+                return
+
+            async def route_handler(route, request):
+                try:
+                    rtype = (request.resource_type or "").lower()
+                except Exception:
+                    rtype = ""
+
+                if block_domains and _host_blocked(request.url):
+                    await route.abort()
+                    return
+
+                if block_resources and rtype in blocked_resource_types:
+                    await route.abort()
+                    return
+
+                await route.continue_()
+
+            await context.route("**/*", route_handler)
+
+        # Camoufox
+        if use_camoufox and AsyncCamoufox is not None:
+            try:
+                opts = dict(camoufox_options or {})
+                opts.setdefault("headless", headless)
+                opts.setdefault("block_webrtc", True)
+                opts.setdefault("geoip", False)
+                opts.setdefault("humanize", False)
+
+                cm = AsyncCamoufox(**opts)
+                browser = await cm.__aenter__()
+                context = await browser.new_context(user_agent=ua)
+                await _install_route_blocking(context)
+                log.append("[HiddenContentTracker][PW] Camoufox context opened.")
+                return cm, browser, context
+            except Exception as e:
+                log.append(f"[HiddenContentTracker][PW] Camoufox failed ({e}); falling back to Chromium.")
+
+        # Standard Playwright
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            log.append(f"[HiddenContentTracker][PW] Playwright not available: {e}")
+            return None, None, None
+
+        pw = await async_playwright().start()
+        browser = await pw.chromium.launch(headless=headless)
+        context = await browser.new_context(user_agent=ua)
+        await _install_route_blocking(context)
+
+        log.append("[HiddenContentTracker][PW] Chromium context opened.")
+        return pw, browser, context
+
+    async def _close_playwright_context(self, pw_handle, browser, context, log: List[str]):
+        try:
+            if context is not None:
+                await context.close()
+        except Exception as e:
+            log.append(f"[HiddenContentTracker][PW] context.close error: {e}")
+
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception as e:
+            log.append(f"[HiddenContentTracker][PW] browser.close error: {e}")
+
+        try:
+            if pw_handle is not None:
+                stop = getattr(pw_handle, "stop", None)
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    aexit = getattr(pw_handle, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+        except Exception as e:
+            log.append(f"[HiddenContentTracker][PW] stop/__aexit__ error: {e}")
+
+        log.append("[HiddenContentTracker][PW] context closed.")
+
+    # ------------------------------------------------------------------ #
+    # DB lifecycle
+    # ------------------------------------------------------------------ #
+    def _initialize_database(self, db_path: str, logger=None) -> None:
+        if self.db and self.store:
+            return
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "link_corpus.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
+        self.store = PageTrackerStore(db=self.db)
+        self.store.ensure_schema()
+
+    # ------------------------------------------------------------------ #
+    # Reverse image fingerprinting (optional)
+    # ------------------------------------------------------------------ #
+    def _sha256_file(self, path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _phash(self, img_path: str) -> Optional[str]:
+        if Image is None:
+            return None
+        try:
+            img = Image.open(img_path).convert("L").resize((32, 32))
+            pixels = list(img.getdata())
+            mat = [pixels[i * 32:(i + 1) * 32] for i in range(32)]
+            small = []
+            for y in range(8):
+                for x in range(8):
+                    small.append(mat[y][x])
+            avg = sum(small) / max(1, len(small))
+            bits = ["1" if v > avg else "0" for v in small]
+            return hex(int("".join(bits), 2))[2:].rjust(16, "0")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------ #
+    # NEW: Reverse-image helpers (NO API KEYS)
+    # ------------------------------------------------------------------ #
+    async def _search_searxng_json(
+        self,
+        searxng_url: str,
+        query: str,
+        limit: int,
+        timeout: float,
+        log: List[str],
+        *,
+        engines: str = "",
+        safesearch: int = 0,
+        language: str = "en",
+    ) -> List[str]:
+        """
+        Minimal SearXNG JSON search. Returns list of result URLs.
+        Requires: searxng_url points at your instance, e.g. "http://127.0.0.1:8080"
+        """
+        searxng_url = (searxng_url or "").rstrip("/")
+        if not searxng_url:
+            log.append("[HiddenContentTracker][SearXNG] missing searxng_url.")
+            return []
+
+        params = {
+            "q": query,
+            "format": "json",
+            "language": language,
+            "safesearch": str(int(safesearch)),
+        }
+        if engines:
+            params["engines"] = engines
+
+        out: List[str] = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{searxng_url}/search",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    headers={"User-Agent": "Mozilla/5.0 PromptChat/HiddenContentTracker"},
+                ) as resp:
+                    txt = await resp.text()
+                    if resp.status != 200:
+                        log.append(f"[HiddenContentTracker][SearXNG] HTTP {resp.status}: {txt[:300]}")
+                        return []
+                    js = json.loads(txt)
+
+            for r in (js.get("results") or []):
+                u = (r.get("url") or "").strip()
+                if u:
+                    out.append(u)
+                    if len(out) >= int(limit):
+                        break
+        except Exception as e:
+            log.append(f"[HiddenContentTracker][SearXNG] error: {e}")
+            return []
+
+        return out
+
+    async def _coerce_reverse_image_inputs(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        timeout: float,
+        log: List[str],
+        ffmpeg_bin: str = "ffmpeg",
+    ) -> Tuple[str, str, List[str]]:
+        """
+        (your function verbatim, lightly namespaced for this block)
+        """
+        import tempfile
+        import subprocess
+        from urllib.parse import urlparse
+
+        temp_files: List[str] = []
+
+        image_url = (image_url or "").strip()
+        image_path = (image_path or "").strip()
+
+        IMG_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".avif", ".svg")
+        VID_EXTS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".wmv", ".flv", ".m4v", ".gif")
+
+        def _is_http_url(u: str) -> bool:
+            try:
+                p = urlparse(u)
+                return p.scheme in ("http", "https") and bool(p.netloc)
+            except Exception:
+                return False
+
+        def _looks_like_image_file(path: str) -> bool:
+            return (path or "").lower().endswith(IMG_EXTS)
+
+        def _looks_like_video_file(path: str) -> bool:
+            low = (path or "").lower()
+            return low.endswith(VID_EXTS) or any(x in low for x in (".m3u8", ".mpd"))
+
+        def _looks_like_image_url(u: str) -> bool:
+            low = (u or "").lower()
+            return low.endswith(IMG_EXTS) or bool(self._IMAGE_EXT_RE.search(low))
+
+        async def _download_to_temp(url: str) -> str:
+            parsed = urlparse(url)
+            base = os.path.basename(parsed.path or "")
+            ext = os.path.splitext(base)[1].lower()
+            if not ext or len(ext) > 8:
+                ext = ".bin"
+
+            fd, outp = tempfile.mkstemp(prefix="revimg_", suffix=ext)
+            os.close(fd)
+            temp_files.append(outp)
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        headers={"User-Agent": "Mozilla/5.0 PromptChat/HiddenContentTracker"},
+                    ) as resp:
+                        resp.raise_for_status()
+                        with open(outp, "wb") as f:
+                            while True:
+                                chunk = await resp.content.read(1024 * 64)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+            except Exception as e:
+                log.append(f"[HiddenContentTracker][RevImg] download failed url={url!r}: {e}")
+                return ""
+
+            return outp
+
+        def _ffmpeg_extract_first_frame(src_path: str) -> str:
+            fd, outp = tempfile.mkstemp(prefix="revimg_frame_", suffix=".png")
+            os.close(fd)
+            temp_files.append(outp)
+
+            cmd = [ffmpeg_bin, "-y", "-i", src_path, "-frames:v", "1", outp]
+            try:
+                p = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=max(5, int(timeout)),
+                    check=False,
+                )
+                if p.returncode != 0 or not os.path.exists(outp) or os.path.getsize(outp) <= 0:
+                    err = (p.stderr or b"")[:800].decode("utf-8", "ignore")
+                    log.append(f"[HiddenContentTracker][RevImg] ffmpeg extract failed rc={p.returncode} err={err}")
+                    return ""
+            except Exception as e:
+                log.append(f"[HiddenContentTracker][RevImg] ffmpeg error: {e}")
+                return ""
+
+            return outp
+
+        # 1) Prefer local path if valid
+        if image_path:
+            if not os.path.exists(image_path):
+                log.append(f"[HiddenContentTracker][RevImg] image_path does not exist: {image_path}")
+                image_path = ""
+            else:
+                if _looks_like_image_file(image_path):
+                    return "", image_path, temp_files
+                if _looks_like_video_file(image_path):
+                    frame = _ffmpeg_extract_first_frame(image_path)
+                    if frame:
+                        log.append(f"[HiddenContentTracker][RevImg] extracted frame -> {frame}")
+                        return "", frame, temp_files
+                return "", image_path, temp_files
+
+        # 2) URL input
+        if image_url and _is_http_url(image_url):
+            if _looks_like_image_url(image_url):
+                return image_url, "", temp_files
+
+            tmp = await _download_to_temp(image_url)
+            if not tmp:
+                return image_url, "", temp_files
+
+            if _looks_like_image_file(tmp):
+                return "", tmp, temp_files
+
+            frame = _ffmpeg_extract_first_frame(tmp)
+            if frame:
+                return "", frame, temp_files
+
+            return "", tmp, temp_files
+
+        return "", "", temp_files
+
+    async def _reverse_image_search_seeds(
+        self,
+        *,
+        image_url: str,
+        image_path: str,
+        limit: int,
+        timeout: float,
+        log: List[str],
+        searxng_url: str,
+        searxng_engines: str = "",
+        catbox_upload: bool = True,
+    ) -> List[str]:
+        """
+        (your function, adjusted to call _search_searxng_json + optional catbox toggle)
+        """
+        import aiohttp
+
+        limit = max(1, int(limit or 10))
+
+        # 1) Catbox upload (optional)
+        if catbox_upload and image_path and os.path.exists(image_path) and not image_url:
+            log.append(f"[HiddenContentTracker][RevImg] Uploading {os.path.basename(image_path)} to Catbox...")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field("reqtype", "fileupload")
+                    with open(image_path, "rb") as f:
+                        data.add_field("fileToUpload", f, filename=os.path.basename(image_path))
+                        async with session.post(
+                            "https://catbox.moe/user/api.php",
+                            data=data,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            if resp.status == 200:
+                                image_url = (await resp.text()).strip()
+                                log.append(f"[HiddenContentTracker][RevImg] Catbox URL: {image_url}")
+                            else:
+                                log.append(f"[HiddenContentTracker][RevImg] Catbox upload failed: {resp.status}")
+            except Exception as e:
+                log.append(f"[HiddenContentTracker][RevImg] Catbox error: {e}")
+
+        queries: List[str] = []
+
+        # 2) Footprint queries
+        if image_url:
+            queries.append(f'"{image_url}"')
+            queries.append(f'"{image_url}" (source OR original OR mirror)')
+            # (Optional) mild “visual engine pages” hunting; many instances will just be noise:
+            queries.append(f'"{image_url}" site:yandex')
+            queries.append(f'"{image_url}" site:bing')
+            queries.append(f'"{image_url}" site:google')
+
+        if image_path:
+            fn = os.path.basename(image_path)
+            if fn:
+                queries.append(f'"{fn}"')
+            stem = os.path.splitext(fn)[0]
+            if stem and len(stem) > 4:
+                queries.append(f'"{stem}" source')
+
+        if not queries:
+            log.append("[HiddenContentTracker][RevImg] No usable seeds after coercion.")
+            return []
+
+        seeds: List[str] = []
+        seen: Set[str] = set()
+        per_query = max(15, limit * 2)
+
+        for q in queries:
+            found = await self._search_searxng_json(
+                searxng_url,
+                q,
+                per_query,
+                timeout,
+                log,
+                engines=searxng_engines,
+            )
+            for u in found:
+                u = (u or "").strip()
+                # filter common engine noise
+                low = u.lower()
+                if (
+                    not u
+                    or u in seen
+                    or "google.com/search" in low
+                    or "bing.com/images" in low
+                    or "yandex" in low and "/images" in low
+                ):
+                    continue
+                seen.add(u)
+                seeds.append(u)
+                if len(seeds) >= limit:
+                    break
+            if len(seeds) >= limit:
+                break
+
+        log.append(f"[HiddenContentTracker][RevImg] Seeds discovered: {len(seeds)}")
+        return seeds[:limit]
+
+    # ------------------------------------------------------------------ #
+    # Search methods (you must have at least one)
+    # ------------------------------------------------------------------ #
+    async def _search_duckduckgo(self, query: str, *, max_results: int, ua: str, timeout: float, page_limit: int, per_page: int) -> List[str]:
+        """
+        Placeholder: keep whatever you already have in PageTracker.
+        If you prefer SearXNG for *normal* search too, just call _search_searxng_json here.
+        """
+        return []
+
+    # ------------------------------------------------------------------ #
+    # Main execution (key changes: reverse_provider removed)
+    # ------------------------------------------------------------------ #
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+
+        timeout = float(params.get("timeout", 6.0))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
+        # Reverse-image inputs (NEW)
+        reverse_image_path = str(params.get("reverse_image_path", "") or "").strip()
+        reverse_image_url = str(params.get("reverse_image_url", "") or "").strip()
+        reverse_seed_limit = int(params.get("reverse_seed_limit", 20))
+        searxng_url = str(params.get("searxng_url", "") or "").strip()  # e.g. "http://127.0.0.1:8080"
+        searxng_engines = str(params.get("searxng_engines", "") or "").strip()  # optional, e.g. "duckduckgo,brave"
+        catbox_upload = bool(params.get("catbox_upload", True))
+        ffmpeg_bin = str(params.get("ffmpeg_bin", "ffmpeg") or "ffmpeg")
+
+        # Crawl controls
+        max_pages_total = int(params.get("max_pages_total", 32))
+        max_depth = max(0, int(params.get("max_depth", 0)))
+        min_term_overlap = max(1, int(params.get("min_term_overlap", 1)))
+        required_sites = [s.strip().lower() for s in str(params.get("site_require", "")).split(",") if s.strip()]
+
+        # sniffers
+        use_js = bool(params.get("use_js", False))
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_debug = bool(params.get("return_debug", False))
+
+        # archive
+        enable_wayback = bool(params.get("enable_wayback", True))
+        wayback_limit = int(params.get("wayback_limit", 30))
+
+        # Keyword extraction
+        keywords: List[str] = [w.strip().lower() for w in query_raw.split() if w.strip()]
+        keywords.extend([w.strip().lower() for w in str(params.get("url_keywords", "")).split(",") if w.strip()])
+        keywords = list(dict.fromkeys([k for k in keywords if k]))
+
+        def _clean_domain(u: str) -> str:
+            try:
+                return urlparse(u).netloc.lower().split(":")[0]
+            except Exception:
+                return ""
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if not required_sites:
+                return True
+            d = _clean_domain(u)
+            return any(req in d for req in required_sites)
+
+        def _term_overlap_ok(haystack: str) -> bool:
+            if not keywords:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in keywords:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_term_overlap:
+                        return True
+            return False
+
+        def _score(u: str, title: str) -> int:
+            s = 0
+            low = (u or "").lower()
+            for tok, w in [
+                ("/watch", 3), ("/view", 3), ("/post", 3), ("/thread", 3),
+                ("/gallery", 3), ("/image", 2), ("/video", 2),
+                ("/download", 4), (".m3u8", 6), (".mpd", 6),
+            ]:
+                if tok in low:
+                    s += w
+            s += sum(2 for k in keywords if k and k in low)
+            tl = (title or "").lower()
+            s += sum(2 for k in keywords if k and k in tl)
+            return s
+
+        log: List[str] = []
+        candidate_pages: List[str] = []
+
+        # --- Reverse-image seed discovery (NO reverse_provider, NO keys) ---
+        temp_files: List[str] = []
+        if reverse_image_path or reverse_image_url:
+            coerced_url, coerced_path, temp_files = await self._coerce_reverse_image_inputs(
+                image_url=reverse_image_url,
+                image_path=reverse_image_path,
+                timeout=timeout,
+                log=log,
+                ffmpeg_bin=ffmpeg_bin,
+            )
+
+            if coerced_path:
+                sha = self._sha256_file(coerced_path)
+                ph = self._phash(coerced_path)
+                log.append(f"[HiddenContentTracker] reverse_image sha256={sha[:16]}… phash={ph or 'n/a'}")
+
+            # Only run SearXNG reverse seeds if we have searxng_url
+            if searxng_url:
+                seeds = await self._reverse_image_search_seeds(
+                    image_url=coerced_url,
+                    image_path=coerced_path,
+                    limit=reverse_seed_limit,
+                    timeout=timeout,
+                    log=log,
+                    searxng_url=searxng_url,
+                    searxng_engines=searxng_engines,
+                    catbox_upload=catbox_upload,
+                )
+                for u in seeds:
+                    if u and _allowed_by_required_sites(u):
+                        candidate_pages.append(u)
+            else:
+                log.append("[HiddenContentTracker] reverse inputs provided but searxng_url is blank; skipping reverse seed search.")
+
+        # --- Normal query search (keep your existing behavior) ---
+        if query_raw:
+            if engine == "searxng":
+                if not searxng_url:
+                    log.append("[HiddenContentTracker] engine=searxng but searxng_url is blank.")
+                    urls = []
+                else:
+                    urls = await self._search_searxng_json(
+                        searxng_url,
+                        query_raw,
+                        limit=max(20, int(params.get("search_per_page", 50))),
+                        timeout=timeout,
+                        log=log,
+                        engines=searxng_engines,
+                    )
+            else:
+                # duckduckgo / etc via your PageTracker methods
+                try:
+                    urls = await self._search_duckduckgo(
+                        query_raw,
+                        max_results=256,
+                        ua="PromptChat/HiddenContentTracker",
+                        timeout=timeout,
+                        page_limit=int(params.get("search_page_limit", 1)),
+                        per_page=int(params.get("search_per_page", 50)),
+                    )
+                except Exception as e:
+                    log.append(f"[HiddenContentTracker] search error: {e}")
+                    urls = []
+
+            for u in urls:
+                if u and _allowed_by_required_sites(u):
+                    candidate_pages.append(u)
+
+        candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+
+        # ---------------- Playwright shared context ----------------
+        pw_needed = (
+            use_js or use_network_sniff or use_runtime_sniff or use_react_sniff or
+            use_database_sniff or use_interaction_sniff
+        )
+
+        pw_p = pw_browser = pw_context = None
+        if pw_needed:
+            ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/HiddenContentTracker"
+            pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                ua=ua_pw,
+                block_resources=bool(params.get("block_resources", False)),
+                blocked_resource_types={t.strip().lower() for t in str(params.get("blocked_resource_types", "image,stylesheet,font")).split(",") if t.strip()},
+                block_domains=bool(params.get("block_domains", True)),
+                blocked_domains={d.strip().lower() for d in str(params.get("blocked_domains", "")).split(",") if d.strip()},
+                log=log,
+                use_camoufox=bool(params.get("use_camoufox", False)),
+                camoufox_options=(params.get("camoufox_options") or {}),
+            )
+
+        # ---------------- Crawl ----------------
+        found_pages: List[Dict[str, Any]] = []
+        visited: Set[str] = set()
+
+        all_debug = {
+            "js_links": [],
+            "network_links": [],
+            "runtime_hits": [],
+            "react_hits": [],
+            "database_hits": [],
+            "interaction_hits": [],
+        }
+
+        ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/HiddenContentTracker"
+        async with submanagers.HTTPSSubmanager(user_agent=ua_http, timeout=timeout, retries=2, max_conn_per_host=8) as http:
+
+            async def _process_page(page_url: str, depth: int) -> Tuple[List[Dict[str, Any]], List[str]]:
+                local_pages: List[Dict[str, Any]] = []
+                next_pages: List[str] = []
+                html = ""
+
+                # sniffers
+                if pw_context and use_network_sniff:
+                    try:
+                        sniff_result = await self.network_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log, extensions=None)
+                        if isinstance(sniff_result, tuple) and sniff_result:
+                            html = sniff_result[0] or html
+                            items = sniff_result[1] if len(sniff_result) > 1 else []
+                        else:
+                            items = []
+                        for it in items:
+                            u = it.get("url") or ""
+                            if u and _allowed_by_required_sites(u):
+                                all_debug["network_links"].append({"page": page_url, **it})
+                                if depth < max_depth and (not any(urlparse(u).path.lower().endswith(ext) for ext in self.IGNORED_EXTENSIONS)):
+                                    next_pages.append(u)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][Network] {page_url}: {e}")
+
+                if pw_context and use_runtime_sniff:
+                    try:
+                        rt_html, rt_hits = await self.runtime_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log)
+                        if rt_html and not html:
+                            html = rt_html
+                        for h in (rt_hits or []):
+                            all_debug["runtime_hits"].append(h)
+                            u = (h.get("url") or "").strip()
+                            if depth < max_depth and u and _allowed_by_required_sites(u):
+                                next_pages.append(u)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][Runtime] {page_url}: {e}")
+
+                if pw_context and use_react_sniff:
+                    try:
+                        r_html, r_hits = await self.react_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log)
+                        if r_html and not html:
+                            html = r_html
+                        for h in (r_hits or []):
+                            all_debug["react_hits"].append(h)
+                            u = (h.get("url") or "").strip()
+                            if depth < max_depth and u and _allowed_by_required_sites(u):
+                                next_pages.append(u)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][React] {page_url}: {e}")
+
+                if pw_context and use_database_sniff:
+                    try:
+                        d_html, d_hits = await self.database_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log)
+                        if d_html and not html:
+                            html = d_html
+                        for h in (d_hits or []):
+                            all_debug["database_hits"].append(h)
+                            u = (h.get("url") or "").strip()
+                            if depth < max_depth and u and _allowed_by_required_sites(u):
+                                next_pages.append(u)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][DB] {page_url}: {e}")
+
+                if pw_context and use_interaction_sniff:
+                    try:
+                        i_html, i_hits = await self.interaction_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log)
+                        if i_html and not html:
+                            html = i_html
+                        for h in (i_hits or []):
+                            all_debug["interaction_hits"].append(h)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][Interaction] {page_url}: {e}")
+
+                if pw_context and use_js:
+                    try:
+                        js_html, js_links = await self.js_sniffer.sniff(pw_context, page_url, timeout=timeout, log=log, extensions=None)
+                        if js_html:
+                            html = js_html
+                        for jl in (js_links or []):
+                            all_debug["js_links"].append({"page": page_url, **jl})
+                            u = jl.get("url") or ""
+                            if depth < max_depth and u and _allowed_by_required_sites(u):
+                                next_pages.append(u)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][JS] {page_url}: {e}")
+
+                # fallback HTTP
+                if not html:
+                    try:
+                        html = await http.get_text(page_url)
+                    except Exception as e:
+                        log.append(f"[HiddenContentTracker][HTTP] {page_url}: {e}")
+                        html = ""
+
+                soup = BeautifulSoup(html or "", "html.parser")
+
+                title = ""
+                try:
+                    if soup.title and soup.title.string:
+                        title = soup.title.string.strip()
+                except Exception:
+                    title = ""
+
+                hay = f"{title} {page_url}"
+                if _allowed_by_required_sites(page_url) and (not keywords or _term_overlap_ok(hay)):
+                    local_pages.append({"title": (title or "[no title]")[:200], "url": page_url, "source": None, "depth": depth, "score": _score(page_url, title)})
+
+                for a in soup.select("a[href]"):
+                    href = a.get("href")
+                    if not href:
+                        continue
+                    u = urljoin(page_url, href)
+                    p = urlparse(u).path.lower()
+                    if any(p.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        continue
+                    if not _allowed_by_required_sites(u):
+                        continue
+                    txt = a.get_text(strip=True) or ""
+                    if keywords and not _term_overlap_ok(f"{txt} {u}"):
+                        continue
+                    local_pages.append({"title": (txt or "[no title]")[:200], "url": u, "source": page_url, "depth": depth + 1, "score": _score(u, txt)})
+                    if depth < max_depth:
+                        next_pages.append(u)
+
+                if enable_wayback:
+                    try:
+                        snaps = await self._wayback_cdx(http, page_url, timeout=timeout, limit=wayback_limit)
+                        for s in snaps:
+                            if _allowed_by_required_sites(s):
+                                local_pages.append({"title": "[Wayback snapshot]", "url": s, "source": page_url, "depth": depth + 1, "score": _score(s, "[wayback]") + 3})
+                    except Exception:
+                        pass
+
+                return local_pages, list(dict.fromkeys(next_pages))
+
+            # BFS
+            frontier = candidate_pages[:]
+            depth = 0
+            while frontier and depth <= max_depth and len(visited) < max_pages_total:
+                batch = []
+                for u in frontier:
+                    if u in visited:
+                        continue
+                    visited.add(u)
+                    batch.append(u)
+                    if len(batch) >= max_pages_total:
+                        break
+
+                results = await asyncio.gather(*[_process_page(u, depth) for u in batch], return_exceptions=True)
+
+                next_candidates: List[str] = []
+                for r in results:
+                    if isinstance(r, Exception):
+                        log.append(f"[HiddenContentTracker] page task exception: {r}")
+                        continue
+                    pages, nxt = r
+                    found_pages.extend(pages)
+                    next_candidates.extend(nxt)
+
+                frontier = []
+                seen_next = set()
+                for u in next_candidates:
+                    if u not in visited and u not in seen_next:
+                        seen_next.add(u)
+                        frontier.append(u)
+                frontier = frontier[:max_pages_total]
+                depth += 1
+
+        if pw_needed:
+            await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # cleanup temp files from coercion
+        for p in temp_files:
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+
+        # final dedupe
+        final: Dict[str, Dict[str, Any]] = {}
+        for p in found_pages:
+            u = p.get("url")
+            if not u:
+                continue
+            if u not in final or p.get("score", 0) > final[u].get("score", 0):
+                final[u] = p
+
+        final_list = sorted(final.values(), key=lambda x: x.get("score", 0), reverse=True)[:500]
+
+        lines = [f"### HiddenContentTracker Found {len(final_list)} Pages"]
+        lines.append(f"_Query: {query_raw or '[none]'} | reverse_image: {bool(reverse_image_path or reverse_image_url)} | engine: {engine} | depth: {max_depth}_\n")
+        for p in final_list[:100]:
+            title = p.get("title") or "[no title]"
+            url = p.get("url")
+            host = urlparse(url).netloc
+            lines.append(f"- **[{title}]({url})**")
+            lines.append(f"  - *Host: {host} | Score: {p.get('score', 0)} | Depth: {p.get('depth', 0)}*")
+
+        result = {
+            "found": len(final_list),
+            "pages": final_list,
+            "visited": len(visited),
+            "keywords_used": keywords,
+            "required_sites": required_sites,
+            "reverse_image_used": bool(reverse_image_path or reverse_image_url),
+            "log": log,
+        }
+        if return_debug:
+            result.update(all_debug)
+
+        return "\n".join(lines), result
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "example query",
+            "timeout": 6.0,
+
+            # search engine: "duckduckgo" (your old) or "searxng"
+            "engine": "searxng",
+            "searxng_url": "http://127.0.0.1:8080",
+            "searxng_engines": "",  # optional: "duckduckgo,brave,bing"
+
+            "search_page_limit": 1,
+            "search_per_page": 50,
+
+            "site_require": "",
+            "max_pages_total": 32,
+            "max_depth": 1,
+            "min_term_overlap": 1,
+            "url_keywords": "",
+
+            # sniffers
+            "use_js": False,
+            "use_network_sniff": True,
+            "use_runtime_sniff": True,
+            "use_react_sniff": False,
+            "use_database_sniff": False,
+            "use_interaction_sniff": False,
+
+            # archive boost
+            "enable_wayback": True,
+            "wayback_limit": 30,
+
+            # reverse image (NO reverse_provider)
+            "reverse_image_path": "",
+            "reverse_image_url": "",
+            "reverse_seed_limit": 20,
+            "catbox_upload": True,      # set False if you do NOT want any upload
+            "ffmpeg_bin": "ffmpeg",
+
+            # Playwright settings
+            "use_camoufox": False,
+            "camoufox_options": {},
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",
+
+            # db (optional)
+            "use_database": False,
+            "db_path": "link_corpus.db",
+
+            "return_debug": False,
+        }
+
+BLOCKS.register("hiddencontenttracker", HiddenContentTrackerBlock)

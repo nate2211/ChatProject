@@ -79,6 +79,7 @@ def _canonicalize_url(u: str) -> str:
         return u
 
 
+
 # ======================================================================
 # NetworkSniffer
 # ======================================================================
@@ -2179,14 +2180,11 @@ class JSSniffer:
     Output schema:
       link = {url, text, tag}
 
-    NEW "long-lost content" additions:
-      - performance entries mining (resource timing URLs)
-      - <link rel=preload/prefetch/modulepreload> + meta/content mining
-      - srcset parsing + background-image/style url() extraction
-      - JSON-LD + script[type=application/json] + common SPA blobs (__NEXT_DATA__, __NUXT__, etc.)
-      - localStorage/sessionStorage URL mining (bounded)
-      - optional global JSON scan from known window keys (bounded)
-      - stronger URL unescaping (\\u0026, \\/, \\u003a, etc.)
+    Key design points:
+      - NEVER passes timeout= to page.evaluate/page.content/page.close (older PW compat)
+      - All timeouts enforced via asyncio.wait_for wrappers
+      - Multi-pass, budgeted scanning to avoid reverse-image / heavy pages wedging you
+      - Watchdog hard-cap for the entire sniff run (returns partials)
     """
 
     # ------------------------------------------------------------------ #
@@ -2209,67 +2207,68 @@ class JSSniffer:
         scroll_back_to_top: bool = False
 
         # ------------------ anti-freeze budgets ------------------ #
-        evaluate_timeout_s: float = 6.0          # hard timeout for page.evaluate
-        content_timeout_s: float = 4.0           # hard timeout for page.content
+        evaluate_timeout_s: float = 2.5          # per evaluate call
+        content_timeout_s: float = 2.0           # page.content() budget
+        close_timeout_s: float = 1.2             # page.close budget
+        watchdog_multiplier: float = 1.25        # whole sniff hard-cap multiplier
+
         max_items_soft_limit: int = 1800         # browser-side cap before returning to Python
 
         # Shadow DOM traversal caps
-        shadow_host_soft_limit: int = 400        # how many potential shadow hosts to inspect
-        max_dom_nodes_scanned: int = 14000       # global cap for scanned elements
+        shadow_host_soft_limit: int = 250        # how many potential shadow hosts to inspect
+        max_dom_nodes_scanned: int = 9000        # global cap for scanned elements
 
         # Script scanning caps
         enable_script_scan: bool = True
-        script_soft_limit: int = 90              # number of <script> tags to inspect
-        max_script_chars: int = 80_000           # truncate per-script text
+        script_soft_limit: int = 60              # number of <script> tags to inspect
+        max_script_chars: int = 60_000           # truncate per-script text
+        enable_json_parse_in_scripts: bool = True
+        max_json_parse_chars: int = 90_000       # cap JSON.parse text length
 
         # Optional click simulation
         enable_click_simulation: bool = False
         max_click_targets: int = 6
         click_timeout_ms: int = 2500
         click_target_selectors: List[str] = field(default_factory=lambda: [
-            "a[href]", "button", "[role=button]", "[onclick]",
-            "div[role=link]", "span[role=link]"
+            "button", "[role=button]", "[onclick]", "div[role=link]", "span[role=link]"
         ])
 
-        # ------------------ Webpack module scan ------------------ #
-        enable_webpack_scan: bool = True
-        webpack_module_soft_limit: int = 250
-        max_webpack_fn_chars: int = 90_000
+        # ------------------ Webpack module scan (safe/off by default) -- #
+        enable_webpack_scan: bool = False
+        webpack_module_soft_limit: int = 120
+        max_webpack_fn_chars: int = 70_000
         webpack_url_regex: str = r"(https?:\/\/[^\s'\"`]+|\/api\/[a-zA-Z0-9_\/\-\?\=&]+)"
         webpack_api_hints: Set[str] = field(default_factory=lambda: {
             "/api/", "/graphql", "/auth", "/login", "/logout", "/stream",
             ".m3u8", ".mpd", "/cdn/", "/v1/", "/v2/"
         })
 
-        # ------------------ "long lost content" scans ------------------ #
+        # ------------------ “long lost content” scans ------------------ #
         enable_perf_entries: bool = True
-        max_perf_entries: int = 700
+        max_perf_entries: int = 500
 
         enable_meta_scan: bool = True  # meta content, canonical, og:, twitter:
         enable_link_rel_scan: bool = True  # preload/prefetch/modulepreload/alternate
 
         enable_srcset_scan: bool = True
+
+        # NOTE: computedStyle can be EXPENSIVE on huge pages.
         enable_css_url_scan: bool = True   # style tags + inline style url(...)
-        max_style_chars: int = 90_000
+        enable_computed_style_bg_scan: bool = False  # OFF by default for anti-stuck
+        computed_style_bg_budget: int = 350          # max elements to computed-style scan
+        max_style_chars: int = 80_000
 
         enable_storage_scan: bool = True
-        max_storage_keys: int = 120
-        max_storage_chars: int = 120_000
+        max_storage_keys: int = 90
+        max_storage_chars: int = 90_000
 
         enable_spa_state_scan: bool = True
-        max_spa_json_chars: int = 140_000
+        max_spa_json_chars: int = 120_000
         spa_state_keys: List[str] = field(default_factory=lambda: [
             "__NEXT_DATA__", "__NUXT__", "__NUXT_DATA__", "__APOLLO_STATE__",
             "__INITIAL_STATE__", "__PRELOADED_STATE__", "__SSR_STATE__",
             "REDUX_STATE", "INITIAL_REDUX_STATE",
         ])
-
-        # optional: try scanning a few known global objects (bounded stringify)
-        enable_global_json_scan: bool = False
-        global_json_keys: List[str] = field(default_factory=lambda: [
-            "webpackChunk", "__VUE_DEVTOOLS_GLOBAL_HOOK__", "requirejs",
-        ])
-        max_global_json_chars: int = 80_000
 
         # selectors for direct URL-bearing elements
         selectors: List[str] = field(default_factory=lambda: [
@@ -2278,7 +2277,7 @@ class JSSniffer:
             "audio[src]", "audio source[src]",
             "img[src]", "img[srcset]",
             "iframe[src]", "embed[src]",
-            "link[href]",  # rel scans filter in JS
+            "link[href]",
             "meta[content]",
         ])
 
@@ -2329,12 +2328,13 @@ class JSSniffer:
         block_resource_types: bool = False
         blocked_types: Set[str] = field(default_factory=lambda: {"image", "media", "font"})
 
+
     def __init__(self, config: Optional["JSSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
         self._log("JSSniffer initialized", None)
 
-    # ------------------------- helpers ------------------------- #
+    # ------------------------- logging ------------------------- #
 
     def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
         full = f"[JSSniffer] {msg}"
@@ -2346,10 +2346,37 @@ class JSSniffer:
         except Exception:
             pass
 
+    # ------------------------- PW-safe wrappers ------------------------- #
+
+    async def _pw_eval(self, page, script: str, arg: dict, log: Optional[List[str]]) -> dict:
+        try:
+            return await asyncio.wait_for(page.evaluate(script, arg), timeout=self.cfg.evaluate_timeout_s)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"page.evaluate exceeded {self.cfg.evaluate_timeout_s}s")
+        except Exception as e:
+            raise RuntimeError(f"page.evaluate failed: {e}")
+
+    async def _pw_content(self, page, log: Optional[List[str]]) -> str:
+        try:
+            return await asyncio.wait_for(page.content(), timeout=self.cfg.content_timeout_s)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"page.content exceeded {self.cfg.content_timeout_s}s")
+        except Exception as e:
+            raise RuntimeError(f"page.content failed: {e}")
+
+    async def _pw_close(self, page, log: Optional[List[str]]) -> None:
+        try:
+            await asyncio.wait_for(page.close(), timeout=self.cfg.close_timeout_s)
+        except Exception:
+            # if it's wedged, don't propagate—sniffer must return
+            return None
+
+    # ------------------------- URL helpers ------------------------- #
+
     def _is_junk_url(self, url: str) -> bool:
         if not url:
             return True
-        u = url.lower()
+        u = url.lower().strip()
         return any(u.startswith(pfx) for pfx in self.cfg.junk_prefixes)
 
     def _classify_kind(self, url: str) -> Optional[str]:
@@ -2370,7 +2397,6 @@ class JSSniffer:
         p = (parsed.path or "").lower()
         if any(p.endswith(ext.lower()) for ext in extensions):
             return True
-        # keep video/audio even if extension filter is narrow (your prior behavior)
         if kind in ("video", "audio"):
             return True
         return False
@@ -2379,11 +2405,6 @@ class JSSniffer:
         return {"url": url, "text": text or "", "tag": tag or "a"}
 
     def _fix_common_escapes(self, url: str) -> str:
-        """
-        JS-heavy apps love escaping:
-          \\u0026, %5Cu0026, \\/, \\u003a, \\u002f, etc.
-        We keep it conservative (no heavy unescape libs).
-        """
         if not url:
             return url
         try:
@@ -2398,44 +2419,570 @@ class JSSniffer:
             pass
         return url
 
-    async def _auto_scroll(self, page: "Page", tmo: float, log: Optional[List[str]]) -> None:
+    # ------------------------- auto-scroll ------------------------- #
+
+    async def _auto_scroll(self, page, tmo: float, log: Optional[List[str]]) -> None:
         if not self.cfg.enable_auto_scroll:
             return
+
         try:
             max_steps = max(1, int(self.cfg.max_scroll_steps))
-            step_delay = max(50, int(self.cfg.scroll_step_delay_ms))
-            max_total_ms = int(tmo * 1000 * 0.7)
+            step_delay = max(60, int(self.cfg.scroll_step_delay_ms))
+            max_total_ms = int(tmo * 1000 * 0.65)
             used_ms = 0
 
             self._log(f"Auto-scroll enabled: steps={max_steps}, step_delay={step_delay}ms", log)
 
-            last_height = await page.evaluate("() => document.body ? document.body.scrollHeight : 0")
+            last_height = 0
+            try:
+                last_height = await asyncio.wait_for(
+                    page.evaluate("() => document.scrollingElement ? document.scrollingElement.scrollHeight : (document.body ? document.body.scrollHeight : 0)"),
+                    timeout=self.cfg.evaluate_timeout_s,
+                )
+            except Exception as e:
+                self._log(f"Auto-scroll: initial height read failed: {e}", log)
+                return
 
             for i in range(max_steps):
                 if used_ms >= max_total_ms:
                     self._log("Auto-scroll: reached time budget; stopping.", log)
                     break
 
-                await page.evaluate("() => window.scrollBy(0, window.innerHeight);")
+                # no timeout kwarg; use asyncio.wait_for around evaluate
+                try:
+                    await asyncio.wait_for(
+                        page.evaluate("() => window.scrollBy(0, window.innerHeight);"),
+                        timeout=self.cfg.evaluate_timeout_s,
+                    )
+                except Exception as e:
+                    self._log(f"Auto-scroll: scrollBy failed: {e}", log)
+                    break
+
                 await page.wait_for_timeout(step_delay)
                 used_ms += step_delay
 
-                new_height = await page.evaluate("() => document.body ? document.body.scrollHeight : 0")
+                try:
+                    new_height = await asyncio.wait_for(
+                        page.evaluate("() => document.scrollingElement ? document.scrollingElement.scrollHeight : (document.body ? document.body.scrollHeight : 0)"),
+                        timeout=self.cfg.evaluate_timeout_s,
+                    )
+                except Exception as e:
+                    self._log(f"Auto-scroll: height read failed: {e}", log)
+                    break
+
                 self._log(f"Auto-scroll step {i+1}/{max_steps}: height {last_height} -> {new_height}", log)
 
-                if new_height <= last_height:
+                if int(new_height or 0) <= int(last_height or 0):
                     self._log("Auto-scroll: no further height growth; stopping.", log)
                     break
                 last_height = new_height
 
             if self.cfg.scroll_back_to_top:
                 try:
-                    await page.evaluate("() => window.scrollTo(0, 0);")
-                    self._log("Auto-scroll: scrolled back to top.", log)
-                except Exception as e:
-                    self._log(f"Auto-scroll: failed to scroll back to top: {e}", log)
+                    await asyncio.wait_for(
+                        page.evaluate("() => window.scrollTo(0, 0);"),
+                        timeout=self.cfg.evaluate_timeout_s,
+                    )
+                except Exception:
+                    pass
+
         except Exception as e:
             self._log(f"Auto-scroll error: {e}", log)
+
+    # ------------------------- JS passes ------------------------- #
+
+    _JS_COMMON = r"""
+    (args) => {
+      const {
+        selectors, includeShadow, dataKeys,
+        onclickRegexes, redirectHints, scriptJsonHints,
+        baseUrl, maxItems, maxDomNodes, shadowHostLimit,
+        enableMeta, enableRelLinks, enablePerf, maxPerf,
+        enableCssUrls, enableComputedBg, computedBgBudget, maxStyleChars,
+        enableSrcset,
+        enableScriptScan, scriptLimit, maxScriptChars, enableJsonParse, maxJsonParseChars,
+        enableStorage, maxStorageKeys, maxStorageChars,
+        enableSpa, maxSpaChars, spaKeys,
+        enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints
+      } = args;
+
+      const out = [];
+      const seen = new Set();
+
+      function normalizeUrlRaw(u) {
+        if (!u) return "";
+        try { u = String(u); } catch { return ""; }
+        try { u = u.replace(/\\u0026/gi, "&"); } catch {}
+        try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
+        try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
+        try { u = u.replace(/\\\//g, "/"); } catch {}
+        return u;
+      }
+
+      function absUrl(u) {
+        if (!u) return "";
+        try { u = normalizeUrlRaw(String(u).trim()); return new URL(u, baseUrl).href; }
+        catch { return String(u).trim(); }
+      }
+
+      function push(el, url, tag, reason=null) {
+        if (out.length >= maxItems) return false;
+        url = absUrl(url);
+        if (!url ||
+            url.startsWith("blob:") ||
+            url.startsWith("javascript:") ||
+            url.startsWith("data:") ||
+            seen.has(url)) {
+          return true;
+        }
+        seen.add(url);
+
+        let text = "";
+        try { text = (el && (el.innerText || el.textContent || el.title) || "").trim(); } catch {}
+        const item = { url, text, tag };
+        if (reason) item.reason = reason;
+        out.push(item);
+        return true;
+      }
+
+      function pushAny(el, s, tag, reason) {
+        if (!s) return true;
+        const txt = normalizeUrlRaw(s);
+        if (!txt) return true;
+
+        const rx = /((https?:)?\/\/[^\s'"`<>]{6,}|\/[^\s'"`<>]{6,})/ig;
+        let m;
+        rx.lastIndex = 0;
+        while ((m = rx.exec(txt)) !== null) {
+          const cand = m[1];
+          if (!cand) continue;
+          if (!push(el, cand, tag, reason)) return false;
+          if (out.length >= maxItems) return false;
+        }
+        return true;
+      }
+
+      function parseSrcsetValue(v) {
+        const parts = String(v || "").split(",");
+        const urls = [];
+        for (const p of parts) {
+          const u = (p || "").trim().split(/\s+/)[0];
+          if (u) urls.push(u);
+        }
+        return urls;
+      }
+
+      function sniffDataAttrs(el) {
+        for (const k of dataKeys) {
+          const v = el.getAttribute?.(k);
+          if (v) { if (!push(el, v, (el.tagName||"").toLowerCase(), "data-attr")) return false; }
+        }
+        for (const attr of (el.attributes || [])) {
+          const n = (attr.name || "").toLowerCase();
+          const v = attr.value;
+          if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://") || v.startsWith("/"))) {
+            if (!pushAny(el, v, (el.tagName||"").toLowerCase(), "data-generic")) return false;
+          }
+        }
+        return true;
+      }
+
+      function sniffOnclick(el) {
+        const oc = el.getAttribute?.("onclick") || "";
+        if (!oc) return true;
+
+        for (const rx of onclickRegexes) {
+          try {
+            const r = new RegExp(rx, "ig");
+            let m;
+            while ((m = r.exec(oc)) !== null) {
+              if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), "onclick")) return false; }
+            }
+          } catch {}
+        }
+
+        const ocl = oc.toLowerCase();
+        for (const h of redirectHints) {
+          if (ocl.includes(h)) {
+            const urlMatch = ocl.match(/(https?:)?\/\/[^\s'"]+/);
+            if (urlMatch) {
+              if (!push(el, urlMatch[0], (el.tagName||"").toLowerCase(), "redirect-hint-url")) return false;
+            } else {
+              if (!pushAny(el, oc, (el.tagName||"").toLowerCase(), "redirect-hint")) return false;
+            }
+            break;
+          }
+        }
+        return true;
+      }
+
+      function sniffInlineListeners(el) {
+        const inlineEvents = ["onclick","onmousedown","onmouseup","ontouchstart","ontouchend","onplay","oncanplay"];
+        for (const k of inlineEvents) {
+          const v = el.getAttribute?.(k);
+          if (!v) continue;
+          for (const rx of onclickRegexes) {
+            try {
+              const r = new RegExp(rx, "ig");
+              let m;
+              while ((m = r.exec(v)) !== null) {
+                if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), `inline-${k}`)) return false; }
+              }
+            } catch {}
+          }
+          if (!pushAny(el, v, (el.tagName||"").toLowerCase(), `inline-text-${k}`)) return false;
+        }
+        return true;
+      }
+
+      function sniffStyleUrls(el) {
+        if (!enableCssUrls) return true;
+
+        // inline style attribute is cheap
+        try {
+          const st = el.getAttribute?.("style") || "";
+          if (st) { if (!pushAny(el, st, (el.tagName||"").toLowerCase(), "style-attr")) return false; }
+        } catch {}
+
+        // computed background-image can be expensive; do it only if enabled and budgeted
+        if (!enableComputedBg) return true;
+        return true;
+      }
+
+      function scanRoot(root) {
+        let scanned = 0;
+        try {
+          const els = root.querySelectorAll?.(selectors) || [];
+          for (const el of els) {
+            scanned++;
+            if (scanned > maxDomNodes) break;
+
+            const tag = (el.tagName || "a").toLowerCase();
+
+            const url = el.href || el.currentSrc || el.src ||
+                        el.getAttribute?.("href") || el.getAttribute?.("src") || "";
+            if (!push(el, url, tag, "dom")) return;
+
+            if (enableSrcset) {
+              try {
+                const ss = el.getAttribute?.("srcset") || "";
+                if (ss) {
+                  for (const u of parseSrcsetValue(ss)) {
+                    if (!push(el, u, tag, "srcset")) return;
+                  }
+                }
+              } catch {}
+            }
+
+            try {
+              const poster = el.getAttribute?.("poster") || "";
+              if (poster) { if (!push(el, poster, tag, "poster")) return; }
+            } catch {}
+
+            if (!sniffDataAttrs(el)) return;
+            if (!sniffOnclick(el)) return;
+            if (!sniffInlineListeners(el)) return;
+
+            if (!sniffStyleUrls(el)) return;
+
+            if (out.length >= maxItems) return;
+          }
+        } catch {}
+      }
+
+      function scanComputedBgBudgeted() {
+        if (!enableCssUrls || !enableComputedBg) return;
+        let cnt = 0;
+        let els = [];
+        try { els = Array.from(document.querySelectorAll("*")).slice(0, Math.max(1, computedBgBudget)); } catch {}
+        for (const el of els) {
+          if (out.length >= maxItems) return;
+          cnt++;
+          try {
+            const cs = window.getComputedStyle?.(el);
+            const bg = cs && cs.getPropertyValue && cs.getPropertyValue("background-image");
+            if (bg && bg.includes("url(")) {
+              if (!pushAny(el, bg, (el.tagName||"").toLowerCase(), "style-bg")) return;
+            }
+          } catch {}
+        }
+      }
+
+      function scanShadowRootsBounded() {
+        if (!includeShadow) return;
+        let hosts = [];
+        try {
+          hosts = Array.from(document.querySelectorAll("[id],[class],*")).slice(0, shadowHostLimit);
+        } catch {
+          try { hosts = Array.from(document.querySelectorAll("*")).slice(0, shadowHostLimit); } catch {}
+        }
+        for (const el of hosts) {
+          try {
+            if (el && el.shadowRoot) {
+              scanRoot(el.shadowRoot);
+              if (out.length >= maxItems) return;
+            }
+          } catch {}
+        }
+      }
+
+      function scanMetaAndRelLinks() {
+        if (!enableMeta && !enableRelLinks) return;
+
+        if (enableRelLinks) {
+          try {
+            const rels = new Set(["preload","prefetch","modulepreload","dns-prefetch","preconnect","alternate","canonical"]);
+            const links = Array.from(document.querySelectorAll("link[href]")).slice(0, 500);
+            for (const l of links) {
+              if (out.length >= maxItems) return;
+              const rel = String(l.getAttribute("rel") || "").toLowerCase().trim();
+              if (!rel) continue;
+              const relParts = rel.split(/\s+/);
+              if (!relParts.some(r => rels.has(r))) continue;
+              const href = l.getAttribute("href") || "";
+              if (!push(l, href, "link", `link-rel-${rel}`)) return;
+            }
+          } catch {}
+        }
+
+        if (enableMeta) {
+          try {
+            const metas = Array.from(document.querySelectorAll("meta[content]")).slice(0, 600);
+            for (const m of metas) {
+              if (out.length >= maxItems) return;
+              const content = m.getAttribute("content") || "";
+              const name = (m.getAttribute("name") || m.getAttribute("property") || "").toLowerCase();
+              if (name.includes("url") || name.startsWith("og:") || name.startsWith("twitter:") || name.includes("image")) {
+                if (!pushAny(m, content, "meta", `meta-${name || "content"}`)) return;
+              } else if (content.includes("http") || content.includes("://") || content.startsWith("/")) {
+                if (!pushAny(m, content, "meta", "meta-content")) return;
+              }
+            }
+          } catch {}
+        }
+      }
+
+      function scanPerfEntries() {
+        if (!enablePerf) return;
+        try {
+          const entries = performance.getEntriesByType?.("resource") || [];
+          const sliced = entries.slice(0, Math.max(1, maxPerf));
+          for (const e of sliced) {
+            if (out.length >= maxItems) return;
+            const n = e && e.name;
+            if (!n) continue;
+            if (!push(document, n, "perf", "performance-resource")) return;
+          }
+        } catch {}
+      }
+
+      function scanCssTextBounded() {
+        if (!enableCssUrls) return;
+        let styleText = "";
+        try {
+          const styles = Array.from(document.querySelectorAll("style")).slice(0, 40);
+          for (const s of styles) {
+            if (out.length >= maxItems) return;
+            let t = "";
+            try { t = (s.textContent || "").trim(); } catch {}
+            if (!t) continue;
+            styleText += "\n" + t;
+            if (styleText.length >= maxStyleChars) break;
+          }
+        } catch {}
+        if (!styleText) return;
+        if (styleText.length > maxStyleChars) styleText = styleText.slice(0, maxStyleChars);
+        pushAny(document, styleText, "style", "style-tag");
+      }
+
+      function scanScriptsBounded() {
+        if (!enableScriptScan) return;
+        let scripts = [];
+        try { scripts = Array.from(document.querySelectorAll("script")).slice(0, scriptLimit); } catch {}
+        for (const s of scripts) {
+          if (out.length >= maxItems) return;
+
+          const type = String(s.getAttribute("type") || "").toLowerCase();
+          const isJsonType = type.includes("json") || type.includes("ld+json");
+
+          let txt = "";
+          try { txt = (s.textContent || "").trim(); } catch {}
+          if (!txt) continue;
+          if (txt.length > maxScriptChars) txt = txt.slice(0, maxScriptChars);
+
+          pushAny(s, txt, "script", "script-text");
+
+          if (!enableJsonParse) continue;
+
+          // only attempt JSON parse when it looks like JSON and is within size cap
+          if (!(isJsonType || txt.startsWith("{") || txt.startsWith("["))) continue;
+          if (txt.length > maxJsonParseChars) continue;
+
+          try {
+            const data = JSON.parse(txt);
+            const stack = [data];
+            const visited = new WeakSet();
+            while (stack.length) {
+              if (out.length >= maxItems) return;
+              const cur = stack.pop();
+              if (!cur || typeof cur !== "object" || visited.has(cur)) continue;
+              visited.add(cur);
+
+              if (Array.isArray(cur)) {
+                for (let i = cur.length - 1; i >= 0; i--) stack.push(cur[i]);
+                continue;
+              }
+
+              for (const [k, v] of Object.entries(cur)) {
+                const kl = String(k || "").toLowerCase();
+                if (typeof v === "string") {
+                  const low = v.toLowerCase();
+                  if (low.includes("http") || low.includes("m3u8") || low.includes("mpd") || low.startsWith("/")) {
+                    if (!push(s, v, "script", "script-json-string")) return;
+                  }
+                  if (scriptJsonHints.some(h => kl.includes(h))) {
+                    if (!push(s, v, "script", "script-json-key")) return;
+                  }
+                } else {
+                  stack.push(v);
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+
+      function scanStorage() {
+        if (!enableStorage) return;
+
+        function dumpStorage(st, tag) {
+          try {
+            if (!st) return true;
+            const n = Math.min(st.length || 0, Math.max(1, maxStorageKeys));
+            let acc = "";
+            for (let i = 0; i < n; i++) {
+              if (out.length >= maxItems) return false;
+              const k = st.key(i);
+              if (!k) continue;
+              const v = st.getItem(k) || "";
+              acc += "\n" + k + "\n" + v;
+              if (acc.length >= maxStorageChars) break;
+            }
+            if (acc) {
+              if (acc.length > maxStorageChars) acc = acc.slice(0, maxStorageChars);
+              return pushAny(document, acc, tag, `${tag}-dump`);
+            }
+          } catch {}
+          return true;
+        }
+
+        if (!dumpStorage(window.localStorage, "localStorage")) return;
+        if (!dumpStorage(window.sessionStorage, "sessionStorage")) return;
+      }
+
+      function scanSpaState() {
+        if (!enableSpa) return;
+
+        for (const k of spaKeys || []) {
+          if (out.length >= maxItems) return;
+          try {
+            const v = window[k];
+            if (!v) continue;
+            let s = "";
+            try { s = JSON.stringify(v); } catch { s = String(v); }
+            if (!s) continue;
+            if (s.length > maxSpaChars) s = s.slice(0, maxSpaChars);
+            if (!pushAny(document, s, "spa", `spa-${k}`)) return;
+          } catch {}
+        }
+
+        try {
+          const nodes = [];
+          const n1 = document.querySelector("script#__NEXT_DATA__");
+          if (n1) nodes.push(n1);
+          const n2 = document.querySelector("script[type='application/ld+json']");
+          if (n2) nodes.push(n2);
+
+          for (const n of nodes.slice(0, 6)) {
+            if (out.length >= maxItems) return;
+            let txt = "";
+            try { txt = (n.textContent || "").trim(); } catch {}
+            if (!txt) continue;
+            if (txt.length > maxSpaChars) txt = txt.slice(0, maxSpaChars);
+            if (!pushAny(n, txt, "spa", "spa-embedded-script")) return;
+          }
+        } catch {}
+      }
+
+      function scanWebpackModulesBounded() {
+        if (!enableWebpack) return;
+        let req = null;
+        try {
+          if (window.__webpack_require__ && window.__webpack_require__.c) req = window.__webpack_require__;
+        } catch {}
+        if (!req || !req.c) return;
+
+        let modules = [];
+        try { modules = Object.values(req.c || {}); } catch {}
+        if (!modules.length) return;
+
+        const limit = Math.max(1, webpackLimit);
+        if (modules.length > limit) modules = modules.slice(0, limit);
+
+        let rx;
+        try { rx = new RegExp(webpackUrlRegex, "ig"); } catch { return; }
+
+        const host = document.documentElement || document.body || document;
+
+        for (const mod of modules) {
+          if (out.length >= maxItems) return;
+          let src = "";
+          try {
+            let fn = null;
+            if (mod && typeof mod.toString === "function") fn = mod;
+            else if (mod && mod.exports && typeof mod.exports.toString === "function") fn = mod.exports;
+            if (!fn) continue;
+            src = String(fn.toString());
+          } catch { continue; }
+
+          if (!src) continue;
+          if (src.length > maxWebpackFnChars) src = src.slice(0, maxWebpackFnChars);
+
+          rx.lastIndex = 0;
+          let m;
+          while ((m = rx.exec(src)) !== null) {
+            if (out.length >= maxItems) return;
+            const candidate = m[0];
+            if (!candidate) continue;
+            const low = candidate.toLowerCase();
+            let ok = false;
+            for (const hint of webpackApiHints) {
+              if (low.includes(String(hint).toLowerCase())) { ok = true; break; }
+            }
+            if (!ok) continue;
+            if (!push(host, candidate, "webpack", "webpack-module")) return;
+          }
+        }
+      }
+
+      // Execute in cheap→heavier order
+      scanRoot(document);
+      scanShadowRootsBounded();
+      scanMetaAndRelLinks();
+      scanPerfEntries();
+      scanCssTextBounded();
+
+      // computedStyle scan last (and optional)
+      scanComputedBgBudgeted();
+
+      scanStorage();
+      scanSpaState();
+      scanScriptsBounded();
+      scanWebpackModulesBounded();
+
+      return { items: out, capped: out.length >= maxItems };
+    }
+    """
 
     # ------------------------- main sniff ------------------------- #
 
@@ -2460,748 +3007,210 @@ class JSSniffer:
         links: List[Dict[str, str]] = []
         seen_urls_in_js: Set[str] = set()
 
-        page: "Page" = await context.new_page()
+        page = await context.new_page()
 
-        try:
-            page.set_default_timeout(int(max(1.0, tmo) * 1000))
-            page.set_default_navigation_timeout(int(max(5.0, tmo) * 1000))
-        except Exception:
-            pass
+        # Whole-run watchdog hard cap
+        hard_cap = max(3.0, tmo * float(self.cfg.watchdog_multiplier))
 
-        if self.cfg.block_resource_types:
-            try:
-                async def _route_handler(route):
-                    try:
-                        req = route.request
-                        if req.resource_type in self.cfg.blocked_types:
-                            return await route.abort()
-                    except Exception:
-                        pass
-                    return await route.continue_()
-                await page.route("**/*", _route_handler)
-            except Exception as e:
-                self._log(f"Resource blocking setup failed: {e}", log)
-
-        js_timeout_ms = int(max(tmo, 10.0) * 1000)
-        wait_after_ms = int(self.cfg.wait_after_goto_ms)
-        wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
-
-        selector_js = ", ".join(self.cfg.selectors)
-
-        self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
-
-        try:
-            try:
-                await page.goto(canonical_page_url, wait_until=wait_mode, timeout=js_timeout_ms)
-            except Exception as e:
-                self._log(f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
-
-            if wait_after_ms > 0:
-                await page.wait_for_timeout(wait_after_ms)
-
-            await self._auto_scroll(page, tmo, log)
-
-            extra_wait = max(200, int(tmo * 1000 * 0.1))
-            await page.wait_for_timeout(extra_wait)
+        async def _run() -> Tuple[str, List[Dict[str, str]]]:
+            nonlocal html, links, seen_urls_in_js
 
             try:
-                html = await asyncio.wait_for(page.content(), timeout=self.cfg.content_timeout_s)
-            except Exception as e:
-                self._log(f"page.content() skipped/timeout: {e}", log)
-                html = ""
-
-            eval_args = {
-                "selectors": selector_js,
-                "includeShadow": bool(self.cfg.include_shadow_dom),
-                "dataKeys": list(self.cfg.data_url_keys),
-                "onclickRegexes": [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes],
-                "redirectHints": list(self.cfg.redirect_hints),
-                "scriptJsonHints": list(self.cfg.script_json_hints),
-                "baseUrl": canonical_page_url,
-
-                "maxItems": int(self.cfg.max_items_soft_limit),
-                "maxDomNodes": int(self.cfg.max_dom_nodes_scanned),
-                "shadowHostLimit": int(self.cfg.shadow_host_soft_limit),
-
-                "enableScriptScan": bool(self.cfg.enable_script_scan),
-                "scriptLimit": int(self.cfg.script_soft_limit),
-                "maxScriptChars": int(self.cfg.max_script_chars),
-
-                "enableWebpack": bool(self.cfg.enable_webpack_scan),
-                "webpackLimit": int(self.cfg.webpack_module_soft_limit),
-                "maxWebpackFnChars": int(self.cfg.max_webpack_fn_chars),
-                "webpackUrlRegex": self.cfg.webpack_url_regex,
-                "webpackApiHints": list(self.cfg.webpack_api_hints),
-
-                # long-lost content toggles/budgets
-                "enablePerf": bool(self.cfg.enable_perf_entries),
-                "maxPerf": int(self.cfg.max_perf_entries),
-
-                "enableMeta": bool(self.cfg.enable_meta_scan),
-                "enableRelLinks": bool(self.cfg.enable_link_rel_scan),
-
-                "enableSrcset": bool(self.cfg.enable_srcset_scan),
-                "enableCssUrls": bool(self.cfg.enable_css_url_scan),
-                "maxStyleChars": int(self.cfg.max_style_chars),
-
-                "enableStorage": bool(self.cfg.enable_storage_scan),
-                "maxStorageKeys": int(self.cfg.max_storage_keys),
-                "maxStorageChars": int(self.cfg.max_storage_chars),
-
-                "enableSpa": bool(self.cfg.enable_spa_state_scan),
-                "maxSpaChars": int(self.cfg.max_spa_json_chars),
-                "spaKeys": list(self.cfg.spa_state_keys),
-
-                "enableGlobalJson": bool(self.cfg.enable_global_json_scan),
-                "globalKeys": list(self.cfg.global_json_keys),
-                "maxGlobalChars": int(self.cfg.max_global_json_chars),
-            }
-
-            raw_payload = {}
-            try:
-                raw_payload = await asyncio.wait_for(
-                    page.evaluate(
-                        r"""
-                        (args) => {
-                          const {
-                            selectors, includeShadow,
-                            dataKeys, onclickRegexes, redirectHints, scriptJsonHints,
-                            baseUrl,
-                            maxItems, maxDomNodes, shadowHostLimit,
-                            enableScriptScan, scriptLimit, maxScriptChars,
-                            enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints,
-
-                            enablePerf, maxPerf,
-                            enableMeta, enableRelLinks,
-                            enableSrcset, enableCssUrls, maxStyleChars,
-                            enableStorage, maxStorageKeys, maxStorageChars,
-                            enableSpa, maxSpaChars, spaKeys,
-                            enableGlobalJson, globalKeys, maxGlobalChars,
-                          } = args;
-
-                          const out = [];
-                          const seen = new Set();
-
-                          function normalizeUrlRaw(u) {
-                            if (!u) return "";
-                            try { u = String(u); } catch { return ""; }
-                            try { u = u.replace(/\\u0026/gi, "&"); } catch {}
-                            try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
-                            try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
-                            try { u = u.replace(/\\\//g, "/"); } catch {}
-                            return u;
-                          }
-
-                          function absUrl(u) {
-                            if (!u) return "";
-                            try {
-                              u = normalizeUrlRaw(String(u).trim());
-                              return new URL(u, baseUrl).href;
-                            } catch {
-                              return String(u).trim();
-                            }
-                          }
-
-                          function push(el, url, tag, reason=null) {
-                            if (out.length >= maxItems) return false;
-                            url = absUrl(url);
-                            if (!url ||
-                                url.startsWith("blob:") ||
-                                url.startsWith("javascript:") ||
-                                url.startsWith("data:") ||
-                                seen.has(url)) {
-                              return true;
-                            }
-                            seen.add(url);
-
-                            let text = "";
-                            try { text = (el && (el.innerText || el.textContent || el.title) || "").trim(); } catch {}
-                            const item = { url, text, tag };
-                            if (reason) item.reason = reason;
-                            out.push(item);
-                            return true;
-                          }
-
-                          function pushAny(el, s, tag, reason) {
-                            if (!s) return true;
-                            const txt = normalizeUrlRaw(s);
-                            if (!txt) return true;
-
-                            // find URL-ish tokens in text
-                            const rx = /((https?:)?\/\/[^\s'"`<>]{6,}|\/[^\s'"`<>]{6,})/ig;
-                            let m;
-                            rx.lastIndex = 0;
-                            while ((m = rx.exec(txt)) !== null) {
-                              const cand = m[1];
-                              if (!cand) continue;
-                              if (!push(el, cand, tag, reason)) return false;
-                              if (out.length >= maxItems) return false;
-                            }
-                            return true;
-                          }
-
-                          function parseSrcsetValue(v) {
-                            // "url1 1x, url2 2x" / "url 640w"
-                            const parts = String(v || "").split(",");
-                            const urls = [];
-                            for (const p of parts) {
-                              const u = (p || "").trim().split(/\s+/)[0];
-                              if (u) urls.push(u);
-                            }
-                            return urls;
-                          }
-
-                          function sniffDataAttrs(el) {
-                            for (const k of dataKeys) {
-                              const v = el.getAttribute?.(k);
-                              if (v) { if (!push(el, v, (el.tagName||"").toLowerCase(), "data-attr")) return false; }
-                            }
-                            for (const attr of (el.attributes || [])) {
-                              const n = (attr.name || "").toLowerCase();
-                              const v = attr.value;
-                              if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://") || v.startsWith("/"))) {
-                                if (!pushAny(el, v, (el.tagName||"").toLowerCase(), "data-generic")) return false;
-                              }
-                            }
-                            return true;
-                          }
-
-                          function sniffOnclick(el) {
-                            const oc = el.getAttribute?.("onclick") || "";
-                            if (!oc) return true;
-
-                            for (const rx of onclickRegexes) {
-                              try {
-                                const r = new RegExp(rx, "ig");
-                                let m;
-                                while ((m = r.exec(oc)) !== null) {
-                                  if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), "onclick")) return false; }
-                                }
-                              } catch {}
-                            }
-
-                            const ocl = oc.toLowerCase();
-                            for (const h of redirectHints) {
-                              if (ocl.includes(h)) {
-                                const urlMatch = ocl.match(/(https?:)?\/\/[^\s'"]+/);
-                                if (urlMatch) {
-                                  if (!push(el, urlMatch[0], (el.tagName||"").toLowerCase(), "redirect-hint-url")) return false;
-                                } else {
-                                  if (!pushAny(el, oc, (el.tagName||"").toLowerCase(), "redirect-hint")) return false;
-                                }
-                                break;
-                              }
-                            }
-                            return true;
-                          }
-
-                          function sniffInlineListeners(el) {
-                            const inlineEvents = ["onclick","onmousedown","onmouseup","ontouchstart","ontouchend","onplay","oncanplay"];
-                            for (const k of inlineEvents) {
-                              const v = el.getAttribute?.(k);
-                              if (!v) continue;
-                              for (const rx of onclickRegexes) {
-                                try {
-                                  const r = new RegExp(rx, "ig");
-                                  let m;
-                                  while ((m = r.exec(v)) !== null) {
-                                    if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), `inline-listener-${k}`)) return false; }
-                                  }
-                                } catch {}
-                              }
-                              if (!pushAny(el, v, (el.tagName||"").toLowerCase(), `inline-listener-text-${k}`)) return false;
-                            }
-                            return true;
-                          }
-
-                          function sniffStyleUrls(el) {
-                            if (!enableCssUrls) return true;
-
-                            // inline style attr
-                            try {
-                              const st = el.getAttribute?.("style") || "";
-                              if (st) { if (!pushAny(el, st, (el.tagName||"").toLowerCase(), "style-attr")) return false; }
-                            } catch {}
-
-                            // computed background-image (cheap-ish, but bounded by DOM scan caps)
-                            try {
-                              const cs = window.getComputedStyle?.(el);
-                              const bg = cs && cs.getPropertyValue && cs.getPropertyValue("background-image");
-                              if (bg && bg.includes("url(")) {
-                                if (!pushAny(el, bg, (el.tagName||"").toLowerCase(), "style-bg")) return false;
-                              }
-                            } catch {}
-                            return true;
-                          }
-
-                          // ---- bounded DOM scan (NO querySelectorAll("*") everywhere) ----
-                          function scanRoot(root) {
-                            let scanned = 0;
-                            try {
-                              const els = root.querySelectorAll?.(selectors) || [];
-                              for (const el of els) {
-                                scanned++;
-                                if (scanned > maxDomNodes) break;
-
-                                const tag = (el.tagName || "a").toLowerCase();
-
-                                // direct URLs
-                                const url = el.href || el.currentSrc || el.src ||
-                                            el.getAttribute?.("href") || el.getAttribute?.("src") || "";
-                                if (!push(el, url, tag, "dom")) return;
-
-                                // srcset
-                                if (enableSrcset) {
-                                  try {
-                                    const ss = el.getAttribute?.("srcset") || "";
-                                    if (ss) {
-                                      for (const u of parseSrcsetValue(ss)) {
-                                        if (!push(el, u, tag, "srcset")) return;
-                                      }
-                                    }
-                                  } catch {}
-                                }
-
-                                // video poster
-                                try {
-                                  const poster = el.getAttribute?.("poster") || "";
-                                  if (poster) { if (!push(el, poster, tag, "poster")) return; }
-                                } catch {}
-
-                                if (!sniffDataAttrs(el)) return;
-                                if (!sniffOnclick(el)) return;
-                                if (!sniffInlineListeners(el)) return;
-                                if (!sniffStyleUrls(el)) return;
-
-                                if (out.length >= maxItems) return;
-                              }
-                            } catch {}
-                          }
-
-                          function scanShadowRootsBounded() {
-                            if (!includeShadow) return;
-                            let hosts = [];
-                            try {
-                              hosts = Array.from(document.querySelectorAll("[id],[class],*")).slice(0, shadowHostLimit);
-                            } catch {
-                              try { hosts = Array.from(document.querySelectorAll("*")).slice(0, shadowHostLimit); } catch {}
-                            }
-                            for (const el of hosts) {
-                              try {
-                                if (el && el.shadowRoot) {
-                                  scanRoot(el.shadowRoot);
-                                  if (out.length >= maxItems) return;
-                                }
-                              } catch {}
-                            }
-                          }
-
-                          function scanMetaAndRelLinks() {
-                            if (!enableMeta && !enableRelLinks) return;
-                            const host = document.head || document.documentElement || document.body || document;
-
-                            if (enableRelLinks) {
-                              try {
-                                const rels = new Set(["preload","prefetch","modulepreload","dns-prefetch","preconnect","alternate","canonical"]);
-                                const links = Array.from(document.querySelectorAll("link[href]")).slice(0, 500);
-                                for (const l of links) {
-                                  if (out.length >= maxItems) return;
-                                  const rel = String(l.getAttribute("rel") || "").toLowerCase().trim();
-                                  if (!rel) continue;
-                                  // rel can be space-separated
-                                  const relParts = rel.split(/\s+/);
-                                  if (!relParts.some(r => rels.has(r))) continue;
-                                  const href = l.getAttribute("href") || "";
-                                  if (!push(l, href, "link", `link-rel-${rel}`)) return;
-                                }
-                              } catch {}
-                            }
-
-                            if (enableMeta) {
-                              try {
-                                const metas = Array.from(document.querySelectorAll("meta[content]")).slice(0, 600);
-                                for (const m of metas) {
-                                  if (out.length >= maxItems) return;
-                                  const content = m.getAttribute("content") || "";
-                                  const name = (m.getAttribute("name") || m.getAttribute("property") || "").toLowerCase();
-                                  // prefer url-ish meta keys, but still mine content for URLs
-                                  if (name.includes("url") || name.startsWith("og:") || name.startsWith("twitter:") || name.includes("image")) {
-                                    if (!pushAny(m, content, "meta", `meta-${name || "content"}`)) return;
-                                  } else if (content.includes("http") || content.includes("://") || content.startsWith("/")) {
-                                    if (!pushAny(m, content, "meta", "meta-content")) return;
-                                  }
-                                }
-                              } catch {}
-                            }
-                          }
-
-                          function scanCssTextBounded() {
-                            if (!enableCssUrls) return;
-                            let styleText = "";
-                            try {
-                              const styles = Array.from(document.querySelectorAll("style")).slice(0, 40);
-                              for (const s of styles) {
-                                if (out.length >= maxItems) return;
-                                let t = "";
-                                try { t = (s.textContent || "").trim(); } catch {}
-                                if (!t) continue;
-                                styleText += "\n" + t;
-                                if (styleText.length >= maxStyleChars) break;
-                              }
-                            } catch {}
-                            if (!styleText) return;
-                            if (styleText.length > maxStyleChars) styleText = styleText.slice(0, maxStyleChars);
-                            // mine url(...) and raw url-like tokens
-                            pushAny(document, styleText, "style", "style-tag");
-                          }
-
-                          function scanScriptsBounded() {
-                            if (!enableScriptScan) return;
-                            let scripts = [];
-                            try { scripts = Array.from(document.querySelectorAll("script")).slice(0, scriptLimit); } catch {}
-                            for (const s of scripts) {
-                              if (out.length >= maxItems) return;
-
-                              // prioritize JSON-ish script types too
-                              const type = String(s.getAttribute("type") || "").toLowerCase();
-                              const isJsonType = type.includes("json") || type.includes("ld+json");
-
-                              let txt = "";
-                              try { txt = (s.textContent || "").trim(); } catch {}
-                              if (!txt) continue;
-                              if (txt.length > maxScriptChars) txt = txt.slice(0, maxScriptChars);
-
-                              // raw URL-ish tokens
-                              pushAny(s, txt, "script", "script-text");
-
-                              // JSON parse for JSON-ish blobs
-                              const head = txt.slice(0, 1);
-                              if (isJsonType || head === "{" || head === "[") {
-                                try {
-                                  const data = JSON.parse(txt);
-                                  const stack = [data];
-                                  const visited = new WeakSet();
-                                  while (stack.length) {
-                                    if (out.length >= maxItems) return;
-                                    const cur = stack.pop();
-                                    if (!cur || typeof cur !== "object" || visited.has(cur)) continue;
-                                    visited.add(cur);
-
-                                    if (Array.isArray(cur)) {
-                                      for (let i = cur.length - 1; i >= 0; i--) stack.push(cur[i]);
-                                      continue;
-                                    }
-
-                                    for (const [k, v] of Object.entries(cur)) {
-                                      const kl = String(k || "").toLowerCase();
-                                      if (typeof v === "string") {
-                                        const low = v.toLowerCase();
-                                        if (low.includes("http") || low.includes("m3u8") || low.includes("mpd") || low.startsWith("/")) {
-                                          if (!push(s, v, "script", "script-json-string")) return;
-                                        }
-                                        if (scriptJsonHints.some(h => kl.includes(h))) {
-                                          if (!push(s, v, "script", "script-json-key")) return;
-                                        }
-                                      } else {
-                                        stack.push(v);
-                                      }
-                                    }
-                                  }
-                                } catch {}
-                              }
-                            }
-                          }
-
-                          function scanPerfEntries() {
-                            if (!enablePerf) return;
-                            try {
-                              const entries = performance.getEntriesByType?.("resource") || [];
-                              const sliced = entries.slice(0, Math.max(1, maxPerf));
-                              for (const e of sliced) {
-                                if (out.length >= maxItems) return;
-                                const n = e && e.name;
-                                if (!n) continue;
-                                if (!push(document, n, "perf", "performance-resource")) return;
-                              }
-                            } catch {}
-                          }
-
-                          function scanStorage() {
-                            if (!enableStorage) return;
-
-                            function dumpStorage(st, tag) {
-                              try {
-                                if (!st) return true;
-                                const n = Math.min(st.length || 0, Math.max(1, maxStorageKeys));
-                                let acc = "";
-                                for (let i = 0; i < n; i++) {
-                                  if (out.length >= maxItems) return false;
-                                  const k = st.key(i);
-                                  if (!k) continue;
-                                  const v = st.getItem(k) || "";
-                                  // mine key + value
-                                  acc += "\n" + k + "\n" + v;
-                                  if (acc.length >= maxStorageChars) break;
-                                }
-                                if (acc) {
-                                  if (acc.length > maxStorageChars) acc = acc.slice(0, maxStorageChars);
-                                  return pushAny(document, acc, tag, `${tag}-dump`);
-                                }
-                              } catch {}
-                              return true;
-                            }
-
-                            if (!dumpStorage(window.localStorage, "localStorage")) return;
-                            if (!dumpStorage(window.sessionStorage, "sessionStorage")) return;
-                          }
-
-                          function scanSpaState() {
-                            if (!enableSpa) return;
-
-                            // 1) known window keys
-                            for (const k of spaKeys || []) {
-                              if (out.length >= maxItems) return;
-                              try {
-                                const v = window[k];
-                                if (!v) continue;
-                                let s = "";
-                                try { s = JSON.stringify(v); } catch { s = String(v); }
-                                if (!s) continue;
-                                if (s.length > maxSpaChars) s = s.slice(0, maxSpaChars);
-                                if (!pushAny(document, s, "spa", `spa-${k}`)) return;
-                              } catch {}
-                            }
-
-                            // 2) common embedded JSON nodes
-                            try {
-                              const nodes = [];
-                              // next.js often uses this id; nuxt has __NUXT__ script sometimes
-                              const n1 = document.querySelector("script#__NEXT_DATA__");
-                              if (n1) nodes.push(n1);
-                              const n2 = document.querySelector("script[type='application/ld+json']");
-                              if (n2) nodes.push(n2);
-
-                              for (const n of nodes.slice(0, 6)) {
-                                if (out.length >= maxItems) return;
-                                let txt = "";
-                                try { txt = (n.textContent || "").trim(); } catch {}
-                                if (!txt) continue;
-                                if (txt.length > maxSpaChars) txt = txt.slice(0, maxSpaChars);
-                                if (!pushAny(n, txt, "spa", "spa-embedded-script")) return;
-                              }
-                            } catch {}
-                          }
-
-                          function scanGlobalJson() {
-                            if (!enableGlobalJson) return;
-                            for (const k of globalKeys || []) {
-                              if (out.length >= maxItems) return;
-                              try {
-                                const v = window[k];
-                                if (!v) continue;
-                                let s = "";
-                                try { s = JSON.stringify(v); } catch { s = String(v); }
-                                if (!s) continue;
-                                if (s.length > maxGlobalChars) s = s.slice(0, maxGlobalChars);
-                                if (!pushAny(document, s, "global", `global-${k}`)) return;
-                              } catch {}
-                            }
-                          }
-
-                          function scanWebpackModulesBounded() {
-                            if (!enableWebpack) return;
-                            let req = null;
-                            try {
-                              if (window.__webpack_require__ && window.__webpack_require__.c) req = window.__webpack_require__;
-                            } catch {}
-                            if (!req || !req.c) return;
-
-                            let modules = [];
-                            try { modules = Object.values(req.c || {}); } catch {}
-                            if (!modules.length) return;
-
-                            const limit = Math.max(1, webpackLimit);
-                            if (modules.length > limit) modules = modules.slice(0, limit);
-
-                            let rx;
-                            try { rx = new RegExp(webpackUrlRegex, "ig"); } catch { return; }
-
-                            const host = document.documentElement || document.body || document;
-
-                            for (const mod of modules) {
-                              if (out.length >= maxItems) return;
-                              let src = "";
-                              try {
-                                let fn = null;
-                                if (mod && typeof mod.toString === "function") fn = mod;
-                                else if (mod && mod.exports && typeof mod.exports.toString === "function") fn = mod.exports;
-                                if (!fn) continue;
-                                src = String(fn.toString());
-                              } catch { continue; }
-
-                              if (!src) continue;
-                              if (src.length > maxWebpackFnChars) src = src.slice(0, maxWebpackFnChars);
-
-                              rx.lastIndex = 0;
-                              let m;
-                              while ((m = rx.exec(src)) !== null) {
-                                if (out.length >= maxItems) return;
-                                const candidate = m[0];
-                                if (!candidate) continue;
-                                const low = candidate.toLowerCase();
-                                let ok = false;
-                                for (const hint of webpackApiHints) {
-                                  if (low.includes(String(hint).toLowerCase())) { ok = true; break; }
-                                }
-                                if (!ok) continue;
-                                if (!push(host, candidate, "webpack", "webpack-module")) return;
-                              }
-                            }
-                          }
-
-                          // Execute (ordered from “cheap + high signal” → “heavier”)
-                          scanRoot(document);
-                          scanShadowRootsBounded();
-                          scanMetaAndRelLinks();
-                          scanPerfEntries();
-                          scanCssTextBounded();
-                          scanStorage();
-                          scanSpaState();
-                          scanScriptsBounded();
-                          scanGlobalJson();
-                          scanWebpackModulesBounded();
-
-                          return { items: out, capped: out.length >= maxItems };
-                        }
-                        """,
-                        eval_args,
-                    ),
-                    timeout=self.cfg.evaluate_timeout_s,
-                ) or {}
-            except Exception as e:
-                self._log(f"page.evaluate() timed out/failed: {e}", log)
-                raw_payload = {}
-
-            raw_links = raw_payload.get("items") or []
-            self._log(f"Raw links from DOM/scripts/webpack/perf/storage/spa: {len(raw_links)}", log)
-
-            # Optional click simulation (still bounded)
-            if self.cfg.enable_click_simulation:
-                self._log("Starting click simulation…", log)
+                # these are safe in older PW
                 try:
-                    click_sel = ", ".join(self.cfg.click_target_selectors)
-                    handles = await page.query_selector_all(click_sel)
-                    handles = handles[: int(self.cfg.max_click_targets)]
-                    self._log(f"Found {len(handles)} click targets.", log)
+                    page.set_default_timeout(int(max(1.0, tmo) * 1000))
+                    page.set_default_navigation_timeout(int(max(5.0, tmo) * 1000))
+                except Exception:
+                    pass
 
-                    for h_idx, h in enumerate(handles):
-                        try:
-                            el_info = await h.evaluate("""el => ({
-                                tagName: (el.tagName || "").toLowerCase(),
-                                hasHref: !!el.href,
-                                innerText: el.innerText,
-                                isVisible: el.offsetParent !== null
-                            })""")
+                # optional resource blocking
+                if self.cfg.block_resource_types:
+                    try:
+                        async def _route_handler(route):
+                            try:
+                                req = route.request
+                                if req.resource_type in self.cfg.blocked_types:
+                                    return await route.abort()
+                            except Exception:
+                                pass
+                            return await route.continue_()
+                        await page.route("**/*", _route_handler)
+                    except Exception as e:
+                        self._log(f"Resource blocking setup failed: {e}", log)
 
-                            if (not el_info["isVisible"] or (el_info["tagName"] == "a" and el_info["hasHref"])):
-                                continue
+                js_timeout_ms = int(max(tmo, 6.0) * 1000)
+                wait_after_ms = int(self.cfg.wait_after_goto_ms)
+                wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
 
-                            await h.scroll_into_view_if_needed(timeout=1000)
-                            await h.click(timeout=int(self.cfg.click_timeout_ms))
-                            await page.wait_for_timeout(250)
+                selector_js = ", ".join(self.cfg.selectors)
 
-                            click_raw = await asyncio.wait_for(
-                                page.evaluate(
-                                    r"""
-                                    (baseUrl) => {
-                                      const out = [];
-                                      const seen = new Set();
-                                      function normalizeUrlRaw(u) {
-                                        if (!u) return "";
-                                        try { u = String(u); } catch { return ""; }
-                                        try { u = u.replace(/\\u0026/gi, "&"); } catch {}
-                                        try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
-                                        try { u = u.replace(/\\\//g, "/"); } catch {}
-                                        return u;
-                                      }
-                                      function absUrl(u) {
-                                        if (!u) return "";
-                                        try { u = normalizeUrlRaw(String(u).trim()); return new URL(u, baseUrl).href; }
-                                        catch { return String(u).trim(); }
-                                      }
-                                      document.querySelectorAll("a[href], video[src], audio[src], img[src], source[src], link[href]").forEach(el => {
-                                        const url = absUrl(el.href || el.currentSrc || el.src || el.getAttribute("href") || el.getAttribute("src"));
-                                        if (!url || seen.has(url)) return;
-                                        seen.add(url);
-                                        out.push({url, tag: (el.tagName || "a").toLowerCase()});
-                                      });
-                                      return out.slice(0, 500);
-                                    }
-                                    """,
-                                    canonical_page_url,
-                                ),
-                                timeout=2.5,
-                            ) or []
+                self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
 
-                            for it in click_raw:
-                                raw_links.append({
-                                    "url": it.get("url"),
-                                    "text": "",
-                                    "tag": it.get("tag") or "a",
-                                    "reason": "click-sim",
-                                })
-
-                        except Exception as click_e:
-                            self._log(f"Error during click sim for target {h_idx + 1}: {click_e}", log)
-                            continue
+                # navigation
+                try:
+                    await page.goto(canonical_page_url, wait_until=wait_mode, timeout=js_timeout_ms)
                 except Exception as e:
-                    self._log(f"Overall click-sim error: {e}", log)
+                    self._log(f"goto timeout/fail on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
 
-            # Filter + normalize (Python-side)
-            max_links = int(self.cfg.max_links)
-            for item in raw_links:
-                if len(links) >= max_links:
-                    break
+                if wait_after_ms > 0:
+                    await page.wait_for_timeout(wait_after_ms)
 
-                url = (item.get("url") or "").strip()
-                if not url:
-                    continue
+                # auto-scroll (budgeted)
+                await self._auto_scroll(page, tmo, log)
 
-                url = self._fix_common_escapes(url)
+                # extra settle
+                await page.wait_for_timeout(max(200, int(tmo * 1000 * 0.08)))
 
-                canonical_url_py = _canonicalize_url(url)
-                if canonical_url_py in seen_urls_in_js:
-                    continue
-                seen_urls_in_js.add(canonical_url_py)
+                # html snapshot (never uses timeout kwarg)
+                try:
+                    html = await self._pw_content(page, log)
+                except Exception as e:
+                    self._log(f"page.content() skipped/timeout: {e}", log)
+                    html = ""
 
-                if self._is_junk_url(url):
-                    continue
+                # evaluate once with all passes (single evaluate is safer than many)
+                eval_args = {
+                    "selectors": selector_js,
+                    "includeShadow": bool(self.cfg.include_shadow_dom),
+                    "dataKeys": list(self.cfg.data_url_keys),
+                    "onclickRegexes": [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes],
+                    "redirectHints": list(self.cfg.redirect_hints),
+                    "scriptJsonHints": list(self.cfg.script_json_hints),
+                    "baseUrl": canonical_page_url,
 
-                kind = self._classify_kind(url)
-                if not self._is_allowed_by_extensions(url, extensions, kind):
-                    continue
+                    "maxItems": int(self.cfg.max_items_soft_limit),
+                    "maxDomNodes": int(self.cfg.max_dom_nodes_scanned),
+                    "shadowHostLimit": int(self.cfg.shadow_host_soft_limit),
 
-                links.append(self._normalize_link(
-                    url=canonical_url_py,
-                    text=(item.get("text") or "").strip(),
-                    tag=(item.get("tag") or "a"),
-                ))
+                    "enableMeta": bool(self.cfg.enable_meta_scan),
+                    "enableRelLinks": bool(self.cfg.enable_link_rel_scan),
 
-            self._log(f"Done: {len(links)} links for {canonical_page_url}", log)
+                    "enablePerf": bool(self.cfg.enable_perf_entries),
+                    "maxPerf": int(self.cfg.max_perf_entries),
 
-        except Exception as e:
-            self._log(f"Overall error on {canonical_page_url}: {e}", log)
+                    "enableCssUrls": bool(self.cfg.enable_css_url_scan),
+                    "enableComputedBg": bool(self.cfg.enable_computed_style_bg_scan),
+                    "computedBgBudget": int(self.cfg.computed_style_bg_budget),
+                    "maxStyleChars": int(self.cfg.max_style_chars),
 
-        # Robust close
+                    "enableSrcset": bool(self.cfg.enable_srcset_scan),
+
+                    "enableScriptScan": bool(self.cfg.enable_script_scan),
+                    "scriptLimit": int(self.cfg.script_soft_limit),
+                    "maxScriptChars": int(self.cfg.max_script_chars),
+                    "enableJsonParse": bool(self.cfg.enable_json_parse_in_scripts),
+                    "maxJsonParseChars": int(self.cfg.max_json_parse_chars),
+
+                    "enableStorage": bool(self.cfg.enable_storage_scan),
+                    "maxStorageKeys": int(self.cfg.max_storage_keys),
+                    "maxStorageChars": int(self.cfg.max_storage_chars),
+
+                    "enableSpa": bool(self.cfg.enable_spa_state_scan),
+                    "maxSpaChars": int(self.cfg.max_spa_json_chars),
+                    "spaKeys": list(self.cfg.spa_state_keys),
+
+                    "enableWebpack": bool(self.cfg.enable_webpack_scan),
+                    "webpackLimit": int(self.cfg.webpack_module_soft_limit),
+                    "maxWebpackFnChars": int(self.cfg.max_webpack_fn_chars),
+                    "webpackUrlRegex": self.cfg.webpack_url_regex,
+                    "webpackApiHints": list(self.cfg.webpack_api_hints),
+                }
+
+                raw_payload = {}
+                try:
+                    raw_payload = await self._pw_eval(page, self._JS_COMMON, eval_args, log) or {}
+                except Exception as e:
+                    self._log(f"DOM/Meta/Perf/Style/Script/Storage/SPA pass failed/timeout: {e}", log)
+                    raw_payload = {}
+
+                raw_links = raw_payload.get("items") or []
+                self._log(f"Raw items total (single-pass): {len(raw_links)}", log)
+
+                # optional click simulation (bounded) — uses action timeouts, no kwarg timeouts
+                if self.cfg.enable_click_simulation:
+                    self._log("Starting click simulation…", log)
+                    try:
+                        click_sel = ", ".join(self.cfg.click_target_selectors)
+                        handles = await page.query_selector_all(click_sel)
+                        handles = handles[: int(self.cfg.max_click_targets)]
+                        self._log(f"Found {len(handles)} click targets.", log)
+
+                        for h_idx, h in enumerate(handles):
+                            try:
+                                el_info = await h.evaluate("""el => ({
+                                    tagName: (el.tagName || "").toLowerCase(),
+                                    hasHref: !!el.href,
+                                    innerText: el.innerText,
+                                    isVisible: el.offsetParent !== null
+                                })""")
+
+                                if not el_info.get("isVisible"):
+                                    continue
+
+                                await h.scroll_into_view_if_needed(timeout=1000)
+                                await h.click(timeout=int(self.cfg.click_timeout_ms))
+                                await page.wait_for_timeout(250)
+
+                                # after click, re-run the single evaluate quickly
+                                try:
+                                    click_payload = await self._pw_eval(page, self._JS_COMMON, eval_args, log) or {}
+                                    raw_links.extend(click_payload.get("items") or [])
+                                except Exception as e:
+                                    self._log(f"Click re-scan failed: {e}", log)
+
+                            except Exception as click_e:
+                                self._log(f"Error during click sim for target {h_idx + 1}: {click_e}", log)
+                                continue
+                    except Exception as e:
+                        self._log(f"Overall click-sim error: {e}", log)
+
+                # Filter + normalize (Python-side)
+                max_links = int(self.cfg.max_links)
+                for item in raw_links:
+                    if len(links) >= max_links:
+                        break
+
+                    url = (item.get("url") or "").strip()
+                    if not url:
+                        continue
+
+                    url = self._fix_common_escapes(url)
+
+                    canonical_url_py = _canonicalize_url(url)
+                    if canonical_url_py in seen_urls_in_js:
+                        continue
+                    seen_urls_in_js.add(canonical_url_py)
+
+                    if self._is_junk_url(url):
+                        continue
+
+                    kind = self._classify_kind(url)
+                    if not self._is_allowed_by_extensions(url, extensions, kind):
+                        continue
+
+                    links.append(self._normalize_link(
+                        url=canonical_url_py,
+                        text=(item.get("text") or "").strip(),
+                        tag=(item.get("tag") or "a"),
+                    ))
+
+                self._log(f"Done: {len(links)} links for {canonical_page_url}", log)
+
+            except Exception as e:
+                self._log(f"Overall error on {canonical_page_url}: {e}", log)
+
+            return html, links
+
         try:
+            return await asyncio.wait_for(_run(), timeout=hard_cap)
+        except asyncio.TimeoutError:
+            self._log(f"Watchdog: sniff exceeded hard cap {hard_cap:.2f}s; returning partials.", log)
+            return html, links
+        finally:
             try:
-                await asyncio.wait_for(page.close(), timeout=3.0)
-            except asyncio.TimeoutError:
-                self._log("page.close() timed out; ignoring and continuing.", log)
-        except Exception as e:
-            self._log(f"Failed to close page: {e}", log)
-
-        return html, links
+                await self._pw_close(page, log)
+            except Exception:
+                pass
 
 
 # ======================================================================
