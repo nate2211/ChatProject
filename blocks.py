@@ -12667,7 +12667,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             if seed_visual_sig is not None:
                                 if similarity is not None and not is_visual_match:
                                     continue
-                        asset["score"] = asset_score
+
                         status = "unverified"
                         size = "?"
                         content_type = ""
@@ -12722,8 +12722,10 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "tag": link["tag"],
                                 "content_id": cid,
                             }
+                            asset["score"] = str(asset_score)
                             DEBUG_LOGGER.log_message(
-                                f"[BFS] FOUND ASSET on {page_url}: {asset['text']} ({asset['url']})")
+                                f"[BFS] FOUND ASSET on {page_url}: Score: {asset['score']} Text: {asset['text']} URL: ({asset['url']})")
+
                             is_hls_manifest = canon.lower().endswith(".m3u8") or (
                                     content_type in self.HLS_CONTENT_TYPES
                             )
