@@ -6,6 +6,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import collections
+import fnmatch
 import functools
 import gzip
 import hashlib
@@ -20383,9 +20384,17 @@ BLOCKS.register("urlexpander", URLExpanderBlock)
 @dataclass
 class LinkContentCrawlerBlock(BaseBlock):
     """
-    Same behavior as your version, but:
-      - networking: HTTPSSubmanager
-      - DB: DatabaseSubmanager via LinkContentCrawlerStore
+    Advanced version implementing the 3 high-impact URL-param features:
+
+    ✅ 1) Canonicalization with tracking-param drop + sorted query
+    ✅ 2) Identity rules per host/path (keep only key params)
+    ✅ 3) Volatile signed-link handling + redaction (drop/mask sensitive tokens)
+
+    Notes:
+      - Dedupe keys are based on canonical_url (stable form).
+      - Memory stores both raw_url (redacted) and canonical_url.
+      - "Volatile" URLs are those containing signed/token params; canonical_url removes those
+        (unless identity rules require them, which you usually won’t).
     """
 
     _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
@@ -20415,12 +20424,16 @@ class LinkContentCrawlerBlock(BaseBlock):
         ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
     )
 
+    # --------------------------- DB ---------------------------------
+
     def _make_store(self, db_path: str) -> LinkContentCrawlerStore:
         cfg = submanagers.DatabaseConfig(path=db_path)
         db = submanagers.DatabaseSubmanager(cfg, logger=DEBUG_LOGGER)
         store = LinkContentCrawlerStore(db=db)
         store.ensure_schema()
         return store
+
+    # --------------------------- URL extraction helpers ------------------------------
 
     def _flatten_memory_urls(self, raw: Any) -> List[str]:
         out: List[str] = []
@@ -20489,6 +20502,204 @@ class LinkContentCrawlerBlock(BaseBlock):
             pass
         return ""
 
+    # --------------------------- NEW: param rule parsing ------------------------------
+
+    def _split_csv(self, s: Any) -> List[str]:
+        raw = str(s or "").strip()
+        if not raw:
+            return []
+        return [x.strip() for x in raw.split(",") if x.strip()]
+
+    def _parse_identity_rules(self, params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        identity_rules format (params):
+          [
+            {"host": "example.com", "path_prefix": "/watch", "keep": ["v"]},
+            {"host": "*.examplecdn.com", "path_prefix": "/player", "keep": "id,token"},
+          ]
+        """
+        rules = params.get("identity_rules", None)
+        if not rules:
+            return []
+        if isinstance(rules, dict):
+            rules = [rules]
+        if not isinstance(rules, list):
+            return []
+
+        out: List[Dict[str, Any]] = []
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            host = str(r.get("host", "") or "").strip().lower()
+            path_prefix = str(r.get("path_prefix", "") or "").strip()
+            keep = r.get("keep", [])
+            if isinstance(keep, str):
+                keep = [x.strip() for x in keep.split(",") if x.strip()]
+            if not host and not path_prefix:
+                continue
+            out.append({
+                "host": host,  # supports wildcard via fnmatch
+                "path_prefix": path_prefix,
+                "keep": [str(x).strip() for x in (keep or []) if str(x).strip()],
+            })
+        return out
+
+    def _match_identity_rule(self, url: str, rules: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        try:
+            pu = urlparse(url)
+            host = (pu.netloc or "").lower()
+            path = pu.path or ""
+        except Exception:
+            return None
+
+        for r in rules:
+            rh = r.get("host", "") or ""
+            rp = r.get("path_prefix", "") or ""
+            if rh:
+                if not fnmatch.fnmatch(host, rh):
+                    continue
+            if rp:
+                if not path.startswith(rp):
+                    continue
+            return r
+        return None
+
+    # --------------------------- NEW: canonicalize + volatile + redaction ------------------------------
+
+    def _is_tracking_param(self, name: str, patterns: List[str]) -> bool:
+        n = (name or "").strip().lower()
+        if not n:
+            return False
+        for pat in patterns:
+            p = pat.strip().lower()
+            if not p:
+                continue
+            # allow utm_* style
+            if "*" in p:
+                if fnmatch.fnmatch(n, p):
+                    return True
+            else:
+                if n == p:
+                    return True
+        return False
+
+    def _canonicalize_url(
+        self,
+        url: str,
+        *,
+        drop_query_patterns: List[str],
+        volatile_param_names: List[str],
+        redact_param_names: List[str],
+        redact_mode: str,
+        identity_rules: List[Dict[str, Any]],
+        sort_query: bool,
+    ) -> Tuple[str, str, bool, bool]:
+        """
+        Returns:
+          canonical_url: stable URL used for dedupe
+          raw_redacted_url: original URL but with sensitive params masked/dropped
+          is_volatile: True if signed/token-ish params were present
+          was_redacted: True if we changed raw URL due to redaction
+        """
+        try:
+            pu = urlparse(url)
+        except Exception:
+            return url, url, False, False
+
+        # normalize scheme/host casing
+        scheme = (pu.scheme or "").lower()
+        netloc = pu.netloc
+        path = pu.path or ""
+        fragment = ""  # drop fragments for both raw+canonical
+        base = pu._replace(scheme=scheme, fragment=fragment)
+
+        # parse query into list (preserve duplicates)
+        q_pairs = parse_qsl(pu.query or "", keep_blank_values=True)
+
+        # determine rule for identity params
+        rule = self._match_identity_rule(url, identity_rules)
+        keep_only = set((rule.get("keep") or [])) if rule else set()
+
+        volatile_set = {x.lower() for x in volatile_param_names}
+        redact_set = {x.lower() for x in redact_param_names}
+
+        # detect volatility from original query
+        is_volatile = any((k or "").lower() in volatile_set for (k, _v) in q_pairs)
+
+        # 1) produce a "raw but redacted" version for storage
+        raw_pairs: List[Tuple[str, str]] = []
+        was_redacted = False
+        for k, v in q_pairs:
+            kn = (k or "").strip()
+            kl = kn.lower()
+            if not kn:
+                continue
+
+            # tracking params: keep in raw? generally no value; but raw can keep them if you want.
+            # We'll keep them unless they are also in redact list; but we will DROP them later in canonical.
+            if kl in redact_set:
+                was_redacted = True
+                if (redact_mode or "mask").lower() == "drop":
+                    continue
+                raw_pairs.append((kn, "REDACTED"))
+                continue
+
+            raw_pairs.append((kn, v if v is not None else ""))
+
+        if sort_query:
+            raw_pairs = sorted(raw_pairs, key=lambda kv: (kv[0].lower(), kv[1]))
+
+        raw_redacted = urlunparse(base._replace(query=urlencode(raw_pairs, doseq=True)))
+
+        # 2) produce canonical version used for dedupe:
+        #    - drop tracking params
+        #    - drop volatile params (signed links) unless identity rule explicitly keeps them
+        #    - optionally keep only identity params if rule matched
+        canon_pairs: List[Tuple[str, str]] = []
+        for k, v in q_pairs:
+            kn = (k or "").strip()
+            kl = kn.lower()
+            if not kn:
+                continue
+
+            # identity rules: keep only specified names
+            if keep_only:
+                if kn not in keep_only and kl not in {x.lower() for x in keep_only}:
+                    continue
+            else:
+                # otherwise: drop tracking patterns by default
+                if self._is_tracking_param(kn, drop_query_patterns):
+                    continue
+
+            # drop volatile signature params from canonical (unless identity keeps them)
+            if (kl in volatile_set) and not keep_only:
+                continue
+
+            # redact sensitive params from canonical as well
+            if kl in redact_set:
+                # safest: drop them from canonical entirely
+                continue
+
+            canon_pairs.append((kn, v if v is not None else ""))
+
+        if sort_query:
+            canon_pairs = sorted(canon_pairs, key=lambda kv: (kv[0].lower(), kv[1]))
+
+        canonical = urlunparse(base._replace(query=urlencode(canon_pairs, doseq=True)))
+
+        # normalize: remove trailing "?" if empty query
+        if canonical.endswith("?"):
+            canonical = canonical[:-1]
+        if raw_redacted.endswith("?"):
+            raw_redacted = raw_redacted[:-1]
+
+        # also normalize double slashes in path? (optional)
+        # leaving as-is to avoid altering semantics.
+
+        return canonical, raw_redacted, is_volatile, was_redacted
+
+    # --------------------------- Classification (unchanged; uses canonical URL) ------------------------------
+
     def _classify(self, u: str) -> Tuple[str, int]:
         if self._is_junk(u):
             return "junk", 0
@@ -20508,7 +20719,10 @@ class LinkContentCrawlerBlock(BaseBlock):
         if ext in self.DOC_EXTS:
             return "doc", 40
 
-        path = urlparse(u).path.lower() if u else ""
+        try:
+            path = urlparse(u).path.lower() if u else ""
+        except Exception:
+            path = ""
         if any(tok in path for tok in self.CONTENT_PATH_TOKENS):
             return "page", 25
 
@@ -20542,6 +20756,55 @@ class LinkContentCrawlerBlock(BaseBlock):
 
         return links
 
+    # --------------------------- Store API compatibility helpers ------------------------------
+
+    def _store_has_emitted(self, store: Any, key_url: str) -> bool:
+        # Prefer key-based methods if your store supports them, otherwise fallback.
+        try:
+            if hasattr(store, "has_emitted_key"):
+                return bool(store.has_emitted_key(key_url))
+            return bool(store.has_emitted(key_url))
+        except Exception:
+            return False
+
+    def _store_mark_emitted(
+        self,
+        store: Any,
+        *,
+        key_url: str,
+        raw_url: str,
+        now_ts: float,
+        source: str,
+        seed_url: str,
+        final_url: str,
+        kind: str,
+        score: int,
+        is_volatile: bool,
+        was_redacted: bool,
+    ) -> None:
+        # Your existing store.mark_emitted probably keys on URL. We pass key_url (canonical).
+        try:
+            store.mark_emitted(
+                key_url,
+                now_ts=now_ts,
+                source=source,
+                seed_url=seed_url,
+                final_url=final_url,
+                kind=kind,
+                score=score,
+            )
+        except Exception:
+            pass
+
+        # Optional: if you later add methods, we’ll use them without breaking older stores.
+        try:
+            if hasattr(store, "mark_last_raw_url"):
+                store.mark_last_raw_url(key_url=key_url, raw_url=raw_url, now_ts=now_ts, volatile=is_volatile, redacted=was_redacted)
+        except Exception:
+            pass
+
+    # --------------------------- Execution ------------------------------
+
     async def _execute_async(self, payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         log: List[str] = []
 
@@ -20566,10 +20829,38 @@ class LinkContentCrawlerBlock(BaseBlock):
         db_path = str(params.get("db_path", "link_corpus.db"))
         seed_ttl_seconds = float(params.get("seed_ttl_seconds", 6 * 3600))
 
+        # --------------------------- NEW: canonicalization + identity + volatile/redaction settings ---------------------------
+
+        canonicalize_urls = bool(params.get("canonicalize_urls", True))
+        sort_query_params = bool(params.get("sort_query_params", True))
+
+        drop_query_params = self._split_csv(params.get(
+            "drop_query_params",
+            # a decent default set
+            "utm_*,gclid,fbclid,msclkid,igshid,mc_cid,mc_eid,ref,ref_src,spm,cmpid,vero_conv,vero_id"
+        ))
+
+        volatile_params = self._split_csv(params.get(
+            "volatile_params",
+            "token,access_token,refresh_token,sig,signature,expires,exp,policy,key,cdn_hash,hash,hmac"
+        ))
+
+        redact_params = self._split_csv(params.get(
+            "redact_params",
+            "access_token,refresh_token,authorization,auth,bearer,session,sessionid,sid,token"
+        ))
+
+        redact_mode = str(params.get("redact_mode", "mask")).strip().lower()
+        if redact_mode not in ("mask", "drop"):
+            redact_mode = "mask"
+
+        identity_rules = self._parse_identity_rules(params)
+
         DEBUG_LOGGER.log_message(
-            f"[LinkContentCrawler] start | memory_sources={memory_sources} "
-            f"timeout={timeout} max_seeds={max_seeds} max_concurrency={max_concurrency} "
-            f"min_score={min_score} use_database={use_database} out_key={out_key!r}"
+            f"[LinkContentCrawler] start | memory_sources={memory_sources} timeout={timeout} "
+            f"max_seeds={max_seeds} max_concurrency={max_concurrency} min_score={min_score} "
+            f"use_database={use_database} canonicalize_urls={canonicalize_urls} "
+            f"identity_rules={len(identity_rules)}"
         )
 
         mem = Memory.load()
@@ -20597,7 +20888,10 @@ class LinkContentCrawlerBlock(BaseBlock):
         now_ts = time.time()
         seeds_to_fetch = seed_urls
         if store:
-            seeds_to_fetch = [u for u in seed_urls if store.seed_should_fetch(u, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)]
+            seeds_to_fetch = [
+                u for u in seed_urls
+                if store.seed_should_fetch(u, ttl_seconds=seed_ttl_seconds, now_ts=now_ts)
+            ]
             skipped = len(seed_urls) - len(seeds_to_fetch)
             if skipped:
                 msg = f"[LinkContentCrawler][DB] Skipping {skipped} seed(s) due to TTL."
@@ -20607,7 +20901,7 @@ class LinkContentCrawlerBlock(BaseBlock):
         sem = asyncio.Semaphore(max_concurrency)
 
         found_objs: List[Dict[str, Any]] = []
-        found_urls_set = set()
+        found_keys_set = set()  # canonical_url dedupe
         per_seed_stats: Dict[str, Dict[str, Any]] = {}
 
         async with submanagers.HTTPSSubmanager(timeout=timeout) as http:
@@ -20624,14 +20918,11 @@ class LinkContentCrawlerBlock(BaseBlock):
                     try:
                         DEBUG_LOGGER.log_message(f"[LinkContentCrawler][Seed] fetch={seed}")
 
-                        # Try HEAD first for status + content-type + redirect resolution signal
+                        # HEAD first
                         st, hdrs = await http.head(seed)
                         hdrs = hdrs or {}
                         ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
 
-                        # HEAD doesn't give final_url; your HTTPSSubmanager tracks redirects internally,
-                        # but head() returns only status+headers. We use the seed as "final_url" for stats,
-                        # and rely on GET for real final URLs when we fetch.
                         final_url = seed
                         status = st
 
@@ -20641,29 +20932,58 @@ class LinkContentCrawlerBlock(BaseBlock):
                             except Exception:
                                 pass
 
-                        # Non-HTML: treat as a direct content candidate (classify the URL)
+                        # If non-HTML: treat as direct candidate.
                         if ctype and ("text/html" not in ctype):
-                            kind, score = self._classify(final_url)
+                            # canonicalize + redaction
+                            if canonicalize_urls:
+                                key_url, raw_redacted, is_volatile, was_redacted = self._canonicalize_url(
+                                    final_url,
+                                    drop_query_patterns=drop_query_params,
+                                    volatile_param_names=volatile_params,
+                                    redact_param_names=redact_params,
+                                    redact_mode=redact_mode,
+                                    identity_rules=identity_rules,
+                                    sort_query=sort_query_params,
+                                )
+                            else:
+                                key_url, raw_redacted, is_volatile, was_redacted = final_url, final_url, False, False
+
+                            kind, score = self._classify(key_url)
                             kept = 0
+
                             if score >= min_score and (include_pages or kind != "page") and kind != "junk":
-                                if (not store) or (not store.has_emitted(final_url)):
-                                    if final_url not in found_urls_set:
-                                        found_urls_set.add(final_url)
+                                if (not store) or (not self._store_has_emitted(store, key_url)):
+                                    if key_url not in found_keys_set:
+                                        found_keys_set.add(key_url)
                                         obj = {
-                                            "url": final_url,
+                                            "url": key_url,                 # canonical URL used as primary
+                                            "canonical_url": key_url,
+                                            "raw_url": raw_redacted,        # redacted raw URL
                                             "source": "linkcontentcrawler_seed_nonhtml",
                                             "seed": seed,
                                             "final_url": final_url,
                                             "kind": kind,
                                             "score": score,
+                                            "volatile": bool(is_volatile),
+                                            "redacted": bool(was_redacted),
                                             "first_seen": time.time(),
                                         }
                                         found_objs.append(obj)
                                         kept += 1
+
                                         if store:
-                                            store.mark_emitted(
-                                                final_url, now_ts=time.time(), source="seed_nonhtml",
-                                                seed_url=seed, final_url=final_url, kind=kind, score=score
+                                            self._store_mark_emitted(
+                                                store,
+                                                key_url=key_url,
+                                                raw_url=raw_redacted,
+                                                now_ts=time.time(),
+                                                source="seed_nonhtml",
+                                                seed_url=seed,
+                                                final_url=final_url,
+                                                kind=kind,
+                                                score=score,
+                                                is_volatile=is_volatile,
+                                                was_redacted=was_redacted,
                                             )
 
                             per_seed_stats[seed] = {"status": f"non_html({ctype[:40]})", "out_links": 0, "kept": kept}
@@ -20681,7 +21001,23 @@ class LinkContentCrawlerBlock(BaseBlock):
 
                         kept = 0
                         for u in out_links:
-                            kind, score = self._classify(u)
+                            if self._is_junk(u):
+                                continue
+
+                            if canonicalize_urls:
+                                key_url, raw_redacted, is_volatile, was_redacted = self._canonicalize_url(
+                                    u,
+                                    drop_query_patterns=drop_query_params,
+                                    volatile_param_names=volatile_params,
+                                    redact_param_names=redact_params,
+                                    redact_mode=redact_mode,
+                                    identity_rules=identity_rules,
+                                    sort_query=sort_query_params,
+                                )
+                            else:
+                                key_url, raw_redacted, is_volatile, was_redacted = u, u, False, False
+
+                            kind, score = self._classify(key_url)
                             if kind == "junk":
                                 continue
                             if score < min_score:
@@ -20689,27 +21025,41 @@ class LinkContentCrawlerBlock(BaseBlock):
                             if (not include_pages) and kind == "page":
                                 continue
 
-                            if store and store.has_emitted(u):
+                            if store and self._store_has_emitted(store, key_url):
                                 continue
-                            if u in found_urls_set:
+                            if key_url in found_keys_set:
                                 continue
 
-                            found_urls_set.add(u)
+                            found_keys_set.add(key_url)
+
                             found_objs.append({
-                                "url": u,
+                                "url": key_url,             # canonical primary
+                                "canonical_url": key_url,
+                                "raw_url": raw_redacted,    # redacted raw
                                 "source": "linkcontentcrawler",
                                 "seed": seed,
                                 "final_url": seed,
                                 "kind": kind,
                                 "score": score,
+                                "volatile": bool(is_volatile),
+                                "redacted": bool(was_redacted),
                                 "first_seen": time.time(),
                             })
                             kept += 1
 
                             if store:
-                                store.mark_emitted(
-                                    u, now_ts=time.time(), source="crawl",
-                                    seed_url=seed, final_url=seed, kind=kind, score=score
+                                self._store_mark_emitted(
+                                    store,
+                                    key_url=key_url,
+                                    raw_url=raw_redacted,
+                                    now_ts=time.time(),
+                                    source="crawl",
+                                    seed_url=seed,
+                                    final_url=seed,
+                                    kind=kind,
+                                    score=score,
+                                    is_volatile=is_volatile,
+                                    was_redacted=was_redacted,
                                 )
 
                         per_seed_stats[seed] = {
@@ -20733,18 +21083,21 @@ class LinkContentCrawlerBlock(BaseBlock):
         if not isinstance(existing, list):
             existing = []
 
-        existing_urls = {
-            str(x.get("url")) for x in existing
-            if isinstance(x, dict) and x.get("url")
-        }
+        # dedupe based on canonical_url
+        existing_keys = set()
+        for x in existing:
+            if isinstance(x, dict):
+                cu = x.get("canonical_url") or x.get("url")
+                if isinstance(cu, str) and cu:
+                    existing_keys.add(cu)
 
         new_added = 0
         for obj in found_objs:
-            u = obj.get("url")
-            if not u or u in existing_urls:
+            key_url = obj.get("canonical_url") or obj.get("url")
+            if not key_url or key_url in existing_keys:
                 continue
             existing.append(obj)
-            existing_urls.add(u)
+            existing_keys.add(key_url)
             new_added += 1
 
         max_memory_items = int(params.get("max_memory_items", 4000))
@@ -20754,17 +21107,27 @@ class LinkContentCrawlerBlock(BaseBlock):
         mem2[out_key] = existing
         mem2[stats_key] = per_seed_stats
         if out_urls_key:
-            mem2[out_urls_key] = [x["url"] for x in existing if isinstance(x, dict) and x.get("url")][-max_memory_items:]
+            mem2[out_urls_key] = [
+                (x.get("canonical_url") or x.get("url"))
+                for x in existing
+                if isinstance(x, dict) and (x.get("canonical_url") or x.get("url"))
+            ][-max_memory_items:]
 
         Memory.save(mem2)
 
         # Report
+        volatile_count = sum(1 for o in found_objs if o.get("volatile"))
+        redacted_count = sum(1 for o in found_objs if o.get("redacted"))
+
         lines = [
-            "### 🧠 LinkContentCrawler Report (HTTPSSubmanager + DatabaseSubmanager)",
+            "### 🧠 LinkContentCrawler Report (URL Canonicalization + Identity Rules + Volatile Handling)",
             f"_Memory Sources: {', '.join(memory_sources)}_",
             f"_Seeds: {len(seed_urls)} | Fetched: {len(seeds_to_fetch)} | Found: {len(found_objs)} | Added to Memory: {new_added}_",
             "",
             f"**min_score:** {min_score} | **include_pages:** {include_pages}",
+            f"**canonicalize_urls:** {canonicalize_urls} | **sort_query_params:** {sort_query_params}",
+            f"**identity_rules:** {len(identity_rules)}",
+            f"**volatile_found:** {volatile_count} | **redacted_found:** {redacted_count} (mode={redact_mode})",
             f"**DB Cache:** {'ON' if use_database else 'OFF'}",
         ]
         if use_database:
@@ -20772,9 +21135,14 @@ class LinkContentCrawlerBlock(BaseBlock):
             lines.append(f"**seed_ttl_seconds:** {seed_ttl_seconds:.0f}")
 
         lines.append("")
-        lines.append("**Sample Found Content:**")
+        lines.append("**Sample Found Content (canonical_url | raw_url):**")
         for o in found_objs[:12]:
-            lines.append(f"- [{o.get('kind')}] score={o.get('score')} {o.get('url')}")
+            lines.append(
+                f"- [{o.get('kind')}] score={o.get('score')} "
+                f"volatile={bool(o.get('volatile'))} redacted={bool(o.get('redacted'))}\n"
+                f"  • canon: {o.get('canonical_url')}\n"
+                f"  • raw:   {o.get('raw_url')}"
+            )
 
         if log:
             lines.append("\n**Log:**")
@@ -20791,7 +21159,11 @@ class LinkContentCrawlerBlock(BaseBlock):
             "use_database": use_database,
             "db_path": db_path if use_database else None,
             "seed_ttl_seconds": seed_ttl_seconds,
-            "urls": [o["url"] for o in found_objs],
+            "canonicalize_urls": canonicalize_urls,
+            "sort_query_params": sort_query_params,
+            "identity_rules_count": len(identity_rules),
+            "volatile_found": volatile_count,
+            "redacted_found": redacted_count,
             "items": found_objs,
             "stats": per_seed_stats,
         }
@@ -20819,6 +21191,26 @@ class LinkContentCrawlerBlock(BaseBlock):
             "use_database": False,
             "db_path": "link_corpus.db",
             "seed_ttl_seconds": 21600,
+
+            # ---------------- NEW ----------------
+            "canonicalize_urls": True,
+            "sort_query_params": True,
+
+            # Drops “tracking/noise” from canonical URL
+            "drop_query_params": "utm_*,gclid,fbclid,msclkid,igshid,mc_cid,mc_eid,ref,ref_src,spm,cmpid",
+
+            # Params that indicate signed/expiring media URLs (removed from canonical URL by default)
+            "volatile_params": "token,access_token,refresh_token,sig,signature,expires,exp,policy,key,cdn_hash,hash,hmac",
+
+            # Sensitive params to mask/drop from stored raw_url and remove from canonical_url
+            "redact_params": "access_token,refresh_token,authorization,auth,bearer,session,sessionid,sid,token",
+            "redact_mode": "mask",  # "mask" or "drop"
+
+            # Host/path-specific identity rules (keep only these params in canonical URL)
+            "identity_rules": [
+                # {"host": "www.youtube.com", "path_prefix": "/watch", "keep": ["v"]},
+                # {"host": "*.example.com", "path_prefix": "/player", "keep": "id"},
+            ],
         }
 
 
