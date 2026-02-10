@@ -287,13 +287,17 @@ class NetworkSniffer:
             "playlist", "video", "audio", "graphql"
         })
         json_content_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
-            "application/json", "text/json", "application/problem+json"
+            "application/json", "text/json", "application/problem+json",
+            "application/ld+json", "application/vnd.api+json"
+        })
+        json_loose_body_sniff: bool = True
+        json_loose_max_kb: int = 384  # allow a bit more than 256 if you want
+        json_accept_any_app_json: bool = True
+        json_url_suffixes: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {".json"})
+        json_url_patterns: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
+            "/api/", "metadata", "manifest", "playlist", "player", "graphql"
         })
         json_body_max_kb: int = 256
-        json_url_patterns: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
-            "/api/player", "/player_api", "/player/",
-            "/manifest", "/playlist", "/video/", "/audio/", "/graphql"
-        })
 
         enable_graphql_sniff: bool = True
         graphql_endpoint_keywords: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"/graphql"})
@@ -524,18 +528,101 @@ class NetworkSniffer:
     def _should_sniff_json(self, url_lower: str, ctype: str, content_length: "NetworkSniffer.Optional[int]") -> bool:
         if not self.cfg.enable_json_sniff:
             return False
-        ct = (ctype or "").lower()
-        if not (any(jt in ct for jt in self.cfg.json_content_types) or "/metadata/" in url_lower):
-            return False
-        if not any(h in url_lower for h in self.cfg.json_url_hints):
-            return False
+
+        ct = (ctype or "").lower().split(";")[0].strip()
+
+        # Size gate (use loose max if enabled)
         if content_length is None:
             return False
-        if content_length > int(self.cfg.json_body_max_kb) * 1024:
+        max_bytes = int((self.cfg.json_loose_max_kb if getattr(self.cfg, "json_loose_body_sniff",
+                                                               True) else self.cfg.json_body_max_kb)) * 1024
+        if content_length > max_bytes:
             return False
-        if not self._matches_json_pattern(url_lower):
-            return False
-        return True
+
+        # Fast accept: any application/json-like
+        if getattr(self.cfg, "json_accept_any_app_json", True):
+            if ct in (self.cfg.json_content_types or set()):
+                return True
+
+        # Otherwise score signals
+        score = 0.0
+
+        # hinty content-type
+        if "json" in ct:
+            score += 2.0
+
+        # URL hints
+        if any(h in url_lower for h in (self.cfg.json_url_hints or set())):
+            score += 1.5
+        if any(pat in url_lower for pat in (self.cfg.json_url_patterns or set())):
+            score += 2.0
+        if any(url_lower.endswith(suf) for suf in (getattr(self.cfg, "json_url_suffixes", {".json"}) or set())):
+            score += 1.0
+
+        # If it *might* carry media metadata
+        if any(h in url_lower for h in ("pixabay", "video", "videos", "media", "asset", "cdn")):
+            score += 1.0
+
+        return score >= 2.0
+
+    def _iter_urls_in_json(self, obj: "NetworkSniffer.Any", *, limit: int = 2500):
+        """
+        Yield string values that look like URLs from a nested JSON structure.
+        Hard limits to avoid huge recursion.
+        """
+        seen = 0
+        stack = [obj]
+        while stack and seen < limit:
+            cur = stack.pop()
+            if cur is None:
+                continue
+            if isinstance(cur, str):
+                s = cur.strip()
+                if s.startswith(("http://", "https://", "wss://", "ws://")):
+                    yield s
+                    seen += 1
+                continue
+            if isinstance(cur, dict):
+                for v in cur.values():
+                    stack.append(v)
+                continue
+            if isinstance(cur, (list, tuple)):
+                for v in cur:
+                    stack.append(v)
+                continue
+
+    def _emit_media_url(self, url: str, *, tag: str, kind_hint: "NetworkSniffer.Optional[str]",
+                        found_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+                        seen_network: "NetworkSniffer.Set[str]",
+                        max_items: int):
+        cu = self._canonicalize_url(url)
+        if not cu or cu in seen_network:
+            return
+        if not self._host_allowed(cu):
+            return
+
+        ul = cu.lower()
+        p = self._safe_urlparse(cu)
+        path = self._to_str(p.path).lower()
+
+        kind = (
+                self._classify_by_extension(path)
+                or self._classify_by_stream_hint(ul)
+                or kind_hint
+        )
+        if kind not in ("video", "audio", "image"):
+            return
+
+        if len(found_items) < max_items:
+            found_items.append({
+                "url": cu,
+                "text": f"[JSON→URL {kind.capitalize()}]",
+                "tag": tag,
+                "kind": kind,
+                "content_type": "?",
+                "size": "?",
+            })
+        seen_network.add(cu)
 
     def _looks_like_graphql_endpoint(self, url_lower: str) -> bool:
         return any(k in url_lower for k in self.cfg.graphql_endpoint_keywords)
@@ -2121,10 +2208,82 @@ class NetworkSniffer:
             if len(json_hits) >= max_json:
                 return
             try:
-                data = await resp.json()
-                json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
+                status = getattr(resp, "status", None)
+                if status is not None and 300 <= int(status) < 400:
+                    return
+                # Common for analytics beacons
+                if status in (204, 205):
+                    return
+
+                # Content-Type gate (still allow "application/json; charset=utf-8")
+                try:
+                    hdrs = getattr(resp, "headers", None) or {}
+                    ct = (hdrs.get("content-type") or hdrs.get("Content-Type") or "").lower()
+                except Exception:
+                    ct = ""
+
+                # Read text first so we can verify it looks like JSON
+                txt = await resp.text()
+                t = (txt or "").lstrip()
+
+                # Empty body or not JSON-looking -> skip quietly
+                if not t or not (t.startswith("{") or t.startswith("[")):
+                    return
+
+                data = self.json.loads(t)
+
             except Exception as e:
-                self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
+                # Downgrade noise: only log if it "should" have been JSON
+                self._log(f"[NetworkSniffer] JSON parse skipped/failed from {url}: {e}", log)
+                return
+
+            json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
+
+            # mine urls
+            try:
+                mined = 0
+                max_mined = 400  # keep bounded
+
+                for u in self._iter_urls_in_json(data, limit=4000):
+                    ul = (u or "").lower()
+
+                    # Skip obvious noise
+                    if not u.startswith(("http://", "https://", "ws://", "wss://")):
+                        continue
+                    if len(u) > 4096:
+                        continue
+
+                    # Optional: skip analytics-ish URLs (keep this light)
+                    if any(x in ul for x in ("snowplow", "google-analytics", "doubleclick", "/collect", "/tp2")):
+                        continue
+
+                    # Decide a hint (your _emit_media_url will still re-classify)
+                    kind_hint = None
+                    if ul.endswith((".m3u8", ".mpd", ".m4s", ".ts")) or any(
+                            k in ul for k in ("hls", "dash", "manifest", "playlist")):
+                        kind_hint = "video"
+                    elif ul.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi")):
+                        kind_hint = "video"
+                    elif ul.endswith((".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".weba", ".wav")):
+                        kind_hint = "audio"
+                    elif ul.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".heic", ".heif")):
+                        kind_hint = "image"
+
+                    # Emit: _emit_media_url will only keep items that classify as video/audio/image
+                    self._emit_media_url(
+                        u,
+                        tag="json_url_mine",
+                        kind_hint=kind_hint,
+                        found_items=found_items,
+                        seen_network=seen_network,
+                        max_items=max_items,
+                    )
+
+                    mined += 1
+                    if mined >= max_mined:
+                        break
+            except Exception:
+                pass
 
         # ---------------- binary sniff helpers ---------------- #
         def req_hdrs_for(u: str) -> "NetworkSniffer.Dict[str, str]":
@@ -2268,6 +2427,87 @@ class NetworkSniffer:
                 if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
                     self.asyncio.create_task(handle_json(response, canonical_url))
                     return
+                # Loose JSON sniff (ctype lies): try if URL looks hinty and body is small enough
+                if self.cfg.enable_json_sniff and getattr(self.cfg, "json_loose_body_sniff", True):
+                    ct0 = (ctype or "").lower().split(";")[0].strip()
+
+                    hinty = (
+                            any(h in url_lower for h in (self.cfg.json_url_hints or set())) or
+                            any(x in url_lower for x in
+                                ("video", "videos", "media", "api", "manifest", "playlist", "stream", "cdn"))
+                    )
+
+                    small = (content_length is not None and content_length <= int(self.cfg.json_loose_max_kb) * 1024)
+
+                    if hinty and small and ("json" not in ct0) and (not self._deny_by_content_type(ct0)):
+                        async def loose_parse():
+                            try:
+                                txt = await response.text()
+                                t = (txt or "").lstrip()
+                                if not t or not (t.startswith("{") or t.startswith("[")):
+                                    return
+
+                                data = self.json.loads(t)
+
+                                if len(json_hits) < max_json:
+                                    json_hits.append(
+                                        {"url": canonical_url, "json": data, "source_page": canonical_page_url})
+
+                                # mine urls from the parsed data (ANY CDN / ANY HOST)
+                                mined = 0
+                                max_mined = 400
+
+                                for u in self._iter_urls_in_json(data, limit=4000):
+                                    if not isinstance(u, str):
+                                        continue
+                                    s = u.strip()
+                                    if not s.startswith(("http://", "https://", "ws://", "wss://")):
+                                        continue
+                                    if len(s) > 4096:
+                                        continue
+
+                                    sl = s.lower()
+
+                                    # optional noise filter (analytics/beacons)
+                                    if any(x in sl for x in (
+                                            "snowplow", "google-analytics", "doubleclick", "/collect", "/tp2",
+                                            "segment.io", "sentry.io", "datadog", "newrelic"
+                                    )):
+                                        continue
+
+                                    # weak kind hint (emit still re-classifies)
+                                    kind_hint = None
+                                    if sl.endswith((".m3u8", ".mpd", ".m4s", ".ts")) or any(
+                                            k in sl for k in ("hls", "dash", "manifest", "playlist")):
+                                        kind_hint = "video"
+                                    elif sl.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi")):
+                                        kind_hint = "video"
+                                    elif sl.endswith(
+                                            (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".weba", ".wav")):
+                                        kind_hint = "audio"
+                                    elif sl.endswith(
+                                            (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".heic",
+                                             ".heif")):
+                                        kind_hint = "image"
+
+                                    self._emit_media_url(
+                                        s,
+                                        tag="json_url_mine",
+                                        kind_hint=kind_hint,
+                                        found_items=found_items,
+                                        seen_network=seen_network,
+                                        max_items=max_items,
+                                    )
+
+                                    mined += 1
+                                    if mined >= max_mined:
+                                        break
+
+                            except Exception:
+                                return
+
+                        self.asyncio.create_task(loose_parse())
+                        return
 
                 if is_blob:
                     if resource_type == "media":
@@ -7857,6 +8097,12 @@ class InteractionSniffer:
         try:
             return await asyncio.wait_for(cdp.send(method, params or {}), timeout=self.cfg.per_cdp_timeout_s)
         except Exception as e:
+            msg = str(e)
+
+            # known benign CDP condition: DOM doc not ready for backend->frontend mapping
+            if method == "DOM.pushNodesByBackendIdsToFrontend" and "Document needs to be requested first" in msg:
+                return None
+
             self._log(f"CDP send {method} failed/timeout: {e}", log)
             return None
 
@@ -8850,6 +9096,8 @@ class InteractionSniffer:
 
                     # Best-effort: map backendDOMNodeId -> nodeId (optional)
                     if self.cfg.try_map_ax_to_dom and self._ax:
+                        # IMPORTANT: DOM.pushNodesByBackendIdsToFrontend requires DOM.getDocument first (per session)
+                        _ = await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
                         await self._map_ax_backend_to_dom_nodeid(cdp, log)
 
                     self._log(f"AX tree (CDP): kept={len(self._ax)}", log)
@@ -8902,14 +9150,14 @@ class InteractionSniffer:
             self._log(f"AX snapshot failed: {e}", log)
 
     async def _map_ax_backend_to_dom_nodeid(self, cdp, log: Optional[List[str]]) -> None:
-        # In CDP, DOM.pushNodesByBackendIdsToFrontend can map backend ids -> nodeIds.
-        backend_ids = []
-        for a in self._ax:
-            if a.backend_dom_node_id and a.node_id is None:
-                backend_ids.append(int(a.backend_dom_node_id))
-        backend_ids = backend_ids[: 200]
+        backend_ids = [int(a.backend_dom_node_id) for a in self._ax
+                       if a.backend_dom_node_id and a.node_id is None]
+        backend_ids = backend_ids[:200]
         if not backend_ids:
             return
+
+        # DOM document must be requested first (per CDP session)
+        await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
 
         resp = await self._cdp_send(
             cdp,
@@ -8917,11 +9165,13 @@ class InteractionSniffer:
             {"backendNodeIds": backend_ids},
             log,
         )
+
+        # If protocol rejected, silently bail (best-effort mapping only)
         node_ids = (resp or {}).get("nodeIds") or []
         if not isinstance(node_ids, list) or len(node_ids) != len(backend_ids):
             return
 
-        # assign back
+        # assign back in-order
         idx = 0
         for a in self._ax:
             if a.backend_dom_node_id and a.node_id is None:
