@@ -11893,7 +11893,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 candidate_pages.extend(db_pages)
                 direct_asset_urls.extend(db_assets)
 
-                skip_search_engine_for_payload = True
+                skip_search_engine_for_payload = False
                 queries_to_run = ["<database seeds + prediction + hubs>"]
 
                 candidate_pages = list(dict.fromkeys(candidate_pages))
