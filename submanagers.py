@@ -2250,7 +2250,20 @@ class NetworkSniffer:
                 is_junk_ext = self._is_junk_by_extension(path)
 
                 if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
-                    return
+                    # If URL/content-type strongly suggests media, keep it.
+                    ul_tmp = canonical_url.lower()
+                    p_tmp = self._safe_urlparse(canonical_url)
+                    path_tmp = self._to_str(p_tmp.path or "").lower()
+                    looks_media = (
+                            self._classify_by_extension(path_tmp) is not None
+                            or self._classify_by_stream_hint(ul_tmp) is not None
+                            or (("video/" in (ctype or "")) or ("audio/" in (ctype or "")))
+                            or (ctype in self.cfg.hls_types)
+                            or (ctype in self.cfg.dash_types)
+                            or self._looks_like_segment(ul_tmp, ctype, content_length, headers) is not None
+                    )
+                    if not looks_media:
+                        return
 
                 if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
                     self.asyncio.create_task(handle_json(response, canonical_url))
