@@ -84,7 +84,6 @@ def _canonicalize_url(u: str) -> str:
 # NetworkSniffer
 # ======================================================================
 
-
 class NetworkSniffer:
     """
     Return:
@@ -161,7 +160,7 @@ class NetworkSniffer:
 
     @classmethod
     def _safe_parse_qsl(cls, query: Any) -> "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]":
-        out: List[Tuple[str, str]] = []
+        out: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         try:
             for k, v in cls.parse_qsl(cls._to_str(query), keep_blank_values=True):
                 out.append((cls._to_str(k), cls._to_str(v)))
@@ -197,7 +196,7 @@ class NetworkSniffer:
             path = cls._to_str(p.path)
             params = cls._to_str(p.params)
 
-            kept: List[Tuple[str, str]] = []
+            kept: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
             for k, v in cls._safe_parse_qsl(p.query):
                 if cls._to_str(k).lower() in cls._TRACKING_KEYS:
                     continue
@@ -213,7 +212,7 @@ class NetworkSniffer:
     class Config:
         timeout: float = 8.0
         max_items: int = 250
-        max_json_hits: int = 150
+        max_json_hits: int = 220
 
         max_derived_per_manifest: int = 200
         max_manifests_to_expand: int = 10
@@ -228,81 +227,81 @@ class NetworkSniffer:
         goto_wait_until: str = "domcontentloaded"
 
         enable_host_allowlist: bool = False
-        host_allow_substrings: Set[str] = field(default_factory=set)
+        host_allow_substrings: "NetworkSniffer.Set[str]" = field(default_factory=set)
 
         enable_host_denylist: bool = False
-        host_deny_substrings: Set[str] = field(default_factory=set)
+        host_deny_substrings: "NetworkSniffer.Set[str]" = field(default_factory=set)
 
-        video_extensions: Set[str] = field(default_factory=lambda: {
+        video_extensions: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv",
             ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv", ".m4s"
         })
-        audio_extensions: Set[str] = field(default_factory=lambda: {
+        audio_extensions: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav",
             ".weba", ".alac", ".aiff", ".wma"
         })
-        image_extensions: Set[str] = field(default_factory=lambda: {
+        image_extensions: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
             ".avif", ".heic", ".heif", ".tiff"
         })
-        junk_extensions: Set[str] = field(default_factory=lambda: {
+        junk_extensions: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".js", ".css", ".json", ".html", ".woff", ".woff2", ".ttf", ".map", ".vtt", ".srt"
         })
 
-        video_prefixes: Set[str] = field(default_factory=lambda: {"video/"})
-        audio_prefixes: Set[str] = field(default_factory=lambda: {"audio/"})
-        image_prefixes: Set[str] = field(default_factory=lambda: {"image/"})
-        hls_types: Set[str] = field(default_factory=lambda: {
+        video_prefixes: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"video/"})
+        audio_prefixes: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"audio/"})
+        image_prefixes: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"image/"})
+        hls_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "application/x-mpegurl", "application/vnd.apple.mpegurl"
         })
-        dash_types: Set[str] = field(default_factory=lambda: {
+        dash_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "application/dash+xml", "application/vnd.mpeg.dash.mpd", "application/xml", "text/xml"
         })
 
-        deny_content_substrings: Set[str] = field(default_factory=lambda: {"javascript", "css", "font/"})
-        deny_resource_types: Set[str] = field(default_factory=lambda: {"stylesheet", "font", "manifest", "other"})
+        deny_content_substrings: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"javascript", "css", "font/"})
+        deny_resource_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"stylesheet", "font", "manifest", "other"})
 
-        video_stream_hints: Set[str] = field(default_factory=lambda: {
+        video_stream_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".m3u8", "manifest.mpd", "master.m3u8", "chunklist.m3u8",
             "videoplayback", "dash", "hls", "stream", "cdn",
             "seg-", "segment", "/seg/", "/segments/", "m4s"
         })
-        audio_stream_hints: Set[str] = field(default_factory=lambda: {
+        audio_stream_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "audio", "sound", "stream", ".mp3", ".m4a", ".aac",
             ".flac", ".ogg", ".opus", "weba"
         })
 
-        ad_host_substrings: Set[str] = field(default_factory=lambda: {
+        ad_host_substrings: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "doubleclick", "googlesyndication", "adservice", "adserver",
             "adsystem", "adnxs", "tracking", "analytics", "metrics",
             "scorecardresearch", "pixel.", "trk.", "stats.", "ad."
         })
-        ad_path_keywords: Set[str] = field(default_factory=lambda: {
+        ad_path_keywords: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "/ads/", "/adserver/", "/banner/", "/promo/", "/tracking/",
             "/click/", "/impression", "/pixel", "/sponsor/", "/advert/"
         })
 
         enable_json_sniff: bool = True
-        json_url_hints: Set[str] = field(default_factory=lambda: {
+        json_url_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "player", "manifest", "api", "metadata", "m3u8", "mpd",
             "playlist", "video", "audio", "graphql"
         })
-        json_content_types: Set[str] = field(default_factory=lambda: {
+        json_content_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "application/json", "text/json", "application/problem+json"
         })
         json_body_max_kb: int = 256
-        json_url_patterns: Set[str] = field(default_factory=lambda: {
+        json_url_patterns: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "/api/player", "/player_api", "/player/",
             "/manifest", "/playlist", "/video/", "/audio/", "/graphql"
         })
 
         enable_graphql_sniff: bool = True
-        graphql_endpoint_keywords: Set[str] = field(default_factory=lambda: {"/graphql"})
+        graphql_endpoint_keywords: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"/graphql"})
         graphql_max_body_kb: int = 256
 
         enable_header_url_mining: bool = True
         max_header_url_events: int = 250
-        header_url_keys: Set[str] = field(default_factory=lambda: {
+        header_url_keys: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "location", "link", "content-location", "refresh"
         })
 
@@ -322,13 +321,13 @@ class NetworkSniffer:
         forensics_body_prefix_bytes: int = 8192
         forensics_hash_via_probe: bool = True
         forensics_probe_timeout_ms: int = 6000
-        forensics_include_headers_subset: Set[str] = field(default_factory=lambda: {
+        forensics_include_headers_subset: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "content-type", "content-length", "content-range", "accept-ranges",
             "etag", "last-modified", "cache-control", "expires",
             "server", "via", "x-cache", "cf-cache-status", "age",
             "location", "content-disposition",
         })
-        forensics_include_request_headers_subset: Set[str] = field(default_factory=lambda: {
+        forensics_include_request_headers_subset: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "referer", "origin", "range", "user-agent", "accept", "accept-language",
         })
 
@@ -338,7 +337,7 @@ class NetworkSniffer:
         salvage_max_targets_per_host: int = 8
         salvage_only_if_mediaish: bool = True
         salvage_only_if_suspect: bool = True
-        salvage_suspect_statuses: Set[int] = field(default_factory=lambda: {401, 403, 404, 410, 416, 429})
+        salvage_suspect_statuses: "NetworkSniffer.Set[int]" = field(default_factory=lambda: {401, 403, 404, 410, 416, 429})
         salvage_min_score_to_probe: float = 2.0
         salvage_score_bonus_if_signed: float = 2.0
         salvage_score_bonus_if_mediaish: float = 1.0
@@ -352,12 +351,12 @@ class NetworkSniffer:
         salvage_max_variants_per_url: int = 10
         salvage_max_query_simplify_variants: int = 4
         salvage_max_host_swap_variants: int = 6
-        salvage_strip_query_keys_substrings: Set[str] = field(default_factory=lambda: {
+        salvage_strip_query_keys_substrings: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "token", "expires", "exp", "sig", "signature", "policy", "key-pair-id",
             "x-amz-", "x-goog-", "x-ms-", "hdnts", "acl", "hmac",
             "cdn_hash", "hash", "auth", "authorization", "session",
         })
-        salvage_origin_swaps: Dict[str, Set[str]] = field(default_factory=lambda: {
+        salvage_origin_swaps: "NetworkSniffer.Dict[str, NetworkSniffer.Set[str]]" = field(default_factory=lambda: {
             "cf-hls-media.sndcdn.com": {"cf-media.sndcdn.com", "hls-media.sndcdn.com"},
             "media.sndcdn.com": {"cf-media.sndcdn.com"},
             "i1.sndcdn.com": {"i2.sndcdn.com", "i3.sndcdn.com", "i4.sndcdn.com"},
@@ -374,35 +373,55 @@ class NetworkSniffer:
         mse_capture_xhr: bool = True
         mse_capture_media_src_assign: bool = True
         mse_emit_each_event_json: bool = False
-        mse_mediaish_url_hints: Set[str] = field(default_factory=lambda: {
+        mse_mediaish_url_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".m4s", ".mp4", ".ts", ".aac", ".m3u8", ".mpd", "dash", "hls", "segment", "seg", "chunk", "frag", "bytestream"
         })
 
-        # ---------------- NEW: Binary Signature Sniffing ----------------
+        # ---------------- Binary Signature Sniffing ----------------
         enable_binary_signature_sniff: bool = True
-        binary_sniff_only_if_unknown_kind: bool = True  # if False, may “upgrade” unknown/odd ctype too
+        binary_sniff_only_if_unknown_kind: bool = True
         binary_sniff_prefix_bytes: int = 4096
         binary_sniff_timeout_ms: int = 6000
         binary_sniff_concurrency: int = 8
         binary_sniff_max_tasks: int = 80
-
-        # when URLs look like scripts / no-ext / weird ext but might serve media
-        binary_suspect_extensions: Set[str] = field(default_factory=lambda: {
+        binary_suspect_extensions: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".php", ".bin", ".cgi", ".asp", ".aspx", ".jsp", ".do", ".action"
         })
-        binary_suspect_content_types: Set[str] = field(default_factory=lambda: {
+        binary_suspect_content_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "application/octet-stream", "binary/octet-stream", "application/download", "application/x-download"
         })
-        binary_sniff_url_hints: Set[str] = field(default_factory=lambda: {
+        binary_sniff_url_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             "download", "media", "stream", "video", "audio", "file", "blob", "segment", "chunk"
         })
+
+        # ---------------- NEW: Param Sniffer ----------------
+        enable_param_sniff: bool = True
+        param_max_events: int = 600
+        param_max_queue: int = 2000
+        param_flush_interval_ms: int = 250
+        param_max_url_len: int = 2048
+        param_max_key_len: int = 128
+        param_max_val_len: int = 256
+        param_capture_values: bool = False   # default FALSE (privacy)
+        param_sample_rate: float = 1.0
+
+        # ---------------- NEW: Bundle static scan (optional) ----------------
+        enable_bundle_param_scan: bool = True
+        bundle_scan_max_scripts: int = 15
+        bundle_scan_range_bytes: int = 256 * 1024
+        bundle_scan_timeout_ms: int = 7000
+        bundle_scan_max_regex_hits: int = 250
+
+        # ---------------- NEW: Correlation window ----------------
+        correlate_window_ms: int = 1500
+        correlate_max_per_key: int = 8
 
     # ---------------------------- init ---------------------------- #
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None, http=None):
         self.cfg = config or self.Config()
         self.logger = logger if logger is not None else (globals().get("DEBUG_LOGGER", None) or self._FallbackLogger())
         self.http = http  # optional HTTPSSubmanager-like engine
-        self._log("[NetworkSniffer] Initialized (evidence + salvage + MSE + binary-signature) [hard str-safe]", None)
+        self._log("[NetworkSniffer] Initialized (ParamSniff + BundleScan + Correlate + MSE + BinarySig + Salvage) [hard str-safe]", None)
         try:
             self.cfg.video_stream_hints.add("cf-hls-media.sndcdn.com")
             self.cfg.audio_stream_hints.add(".m3u8")
@@ -410,7 +429,7 @@ class NetworkSniffer:
             pass
 
     # ---------------------------- logging ---------------------------- #
-    def _log(self, msg: Any, log_list: Optional[List[str]]) -> None:
+    def _log(self, msg: Any, log_list: Optional["NetworkSniffer.List[str]"]) -> None:
         s = self._to_str(msg)
         try:
             if log_list is not None:
@@ -421,13 +440,13 @@ class NetworkSniffer:
             pass
 
     # ---------------------------- helpers ---------------------------- #
-    def _extract_urls_from_text(self, s: Any) -> List[str]:
+    def _extract_urls_from_text(self, s: Any) -> "NetworkSniffer.List[str]":
         s = self._to_str(s)
         if not s:
             return []
         rx = self.re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", self.re.IGNORECASE)
-        out: List[str] = []
-        seen: Set[str] = set()
+        out: "NetworkSniffer.List[str]" = []
+        seen: "NetworkSniffer.Set[str]" = set()
         for u in rx.findall(s):
             uu = self._to_str(u)
             if uu and uu not in seen:
@@ -470,7 +489,7 @@ class NetworkSniffer:
         rt = (rtype or "").lower()
         return rt in self.cfg.deny_resource_types
 
-    def _classify_by_extension(self, path: str) -> Optional[str]:
+    def _classify_by_extension(self, path: str) -> "NetworkSniffer.Optional[str]":
         p = (path or "").lower()
         if any(p.endswith(ext) for ext in self.cfg.video_extensions):
             return "video"
@@ -480,7 +499,7 @@ class NetworkSniffer:
             return "image"
         return None
 
-    def _classify_by_content_type(self, ctype: str) -> Optional[str]:
+    def _classify_by_content_type(self, ctype: str) -> "NetworkSniffer.Optional[str]":
         ct = (ctype or "").lower()
         if any(ct.startswith(pfx) for pfx in self.cfg.video_prefixes):
             return "video"
@@ -492,7 +511,7 @@ class NetworkSniffer:
             return "image"
         return None
 
-    def _classify_by_stream_hint(self, url_lower: str) -> Optional[str]:
+    def _classify_by_stream_hint(self, url_lower: str) -> "NetworkSniffer.Optional[str]":
         if any(h in url_lower for h in self.cfg.video_stream_hints):
             return "video"
         if any(h in url_lower for h in self.cfg.audio_stream_hints):
@@ -502,7 +521,7 @@ class NetworkSniffer:
     def _matches_json_pattern(self, url_lower: str) -> bool:
         return any(pat in url_lower for pat in self.cfg.json_url_patterns)
 
-    def _should_sniff_json(self, url_lower: str, ctype: str, content_length: Optional[int]) -> bool:
+    def _should_sniff_json(self, url_lower: str, ctype: str, content_length: "NetworkSniffer.Optional[int]") -> bool:
         if not self.cfg.enable_json_sniff:
             return False
         ct = (ctype or "").lower()
@@ -521,7 +540,7 @@ class NetworkSniffer:
     def _looks_like_graphql_endpoint(self, url_lower: str) -> bool:
         return any(k in url_lower for k in self.cfg.graphql_endpoint_keywords)
 
-    def _is_allowed_by_extensions(self, url: str, extensions: Optional[Set[str]], kind: Optional[str]) -> bool:
+    def _is_allowed_by_extensions(self, url: str, extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]", kind: "NetworkSniffer.Optional[str]") -> bool:
         if not extensions:
             return True
         parsed = self._safe_urlparse(url)
@@ -532,7 +551,7 @@ class NetworkSniffer:
             return True
         return False
 
-    def _is_manifest(self, url: str, ctype: str) -> Optional[str]:
+    def _is_manifest(self, url: str, ctype: str) -> "NetworkSniffer.Optional[str]":
         ul = (url or "").lower()
         ct = (ctype or "").lower()
         if ul.endswith(".m3u8") or ct in self.cfg.hls_types:
@@ -541,7 +560,7 @@ class NetworkSniffer:
             return "dash"
         return None
 
-    def _looks_like_segment(self, url_lower: str, ctype: str, content_length: Optional[int], headers: Dict[str, str]) -> Optional[str]:
+    def _looks_like_segment(self, url_lower: str, ctype: str, content_length: "NetworkSniffer.Optional[int]", headers: "NetworkSniffer.Dict[str, str]") -> "NetworkSniffer.Optional[str]":
         if not self.cfg.enable_segment_heuristics:
             return None
 
@@ -570,10 +589,10 @@ class NetworkSniffer:
     # ------------------ manifest parsing ------------------ #
     _HLS_LINE_RE = re.compile(r"^(?!#)(.+)$", re.MULTILINE)
 
-    def _parse_hls_manifest(self, manifest_text: Any, base_url: str) -> List[str]:
+    def _parse_hls_manifest(self, manifest_text: Any, base_url: str) -> "NetworkSniffer.List[str]":
         txt = self._to_str(manifest_text)
-        out: List[str] = []
-        seen: Set[str] = set()
+        out: "NetworkSniffer.List[str]" = []
+        seen: "NetworkSniffer.Set[str]" = set()
         for m in self._HLS_LINE_RE.finditer(txt or ""):
             line = (m.group(1) or "").strip()
             if not line:
@@ -584,10 +603,10 @@ class NetworkSniffer:
                 out.append(full)
         return out
 
-    def _parse_mpd_manifest(self, manifest_text: Any, base_url: str) -> List[str]:
+    def _parse_mpd_manifest(self, manifest_text: Any, base_url: str) -> "NetworkSniffer.List[str]":
         txt = self._to_str(manifest_text)
-        out: List[str] = []
-        seen: Set[str] = set()
+        out: "NetworkSniffer.List[str]" = []
+        seen: "NetworkSniffer.Set[str]" = set()
 
         if self.ET is not None:
             try:
@@ -616,7 +635,7 @@ class NetworkSniffer:
                     out.append(full)
         return out
 
-    async def _expand_manifest(self, response, manifest_kind: str, url: str, log: Optional[List[str]]) -> List[str]:
+    async def _expand_manifest(self, response, manifest_kind: str, url: str, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> "NetworkSniffer.List[str]":
         try:
             txt = await response.text()
             txt = self._to_str(txt)
@@ -630,7 +649,7 @@ class NetworkSniffer:
         return derived
 
     # ------------------ auto-scroll ------------------ #
-    async def _auto_scroll(self, page, tmo: float, log: Optional[List[str]]) -> None:
+    async def _auto_scroll(self, page, tmo: float, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> None:
         if not self.cfg.enable_auto_scroll:
             return
         try:
@@ -666,7 +685,7 @@ class NetworkSniffer:
             self._log(f"[NetworkSniffer] Auto-scroll error: {e}", log)
 
     # ------------------ output normalization ------------------ #
-    def _normalize_item(self, it: Dict[str, Any]) -> Dict[str, str]:
+    def _normalize_item(self, it: "NetworkSniffer.Dict[str, Any]") -> "NetworkSniffer.Dict[str, str]":
         return {
             "url": self._to_str(it.get("url")),
             "text": self._to_str(it.get("text")),
@@ -676,7 +695,7 @@ class NetworkSniffer:
             "size": self._to_str(it.get("size") or "?"),
         }
 
-    # ============================== URL salvage ============================== #
+    # ============================== URL salvage (unchanged core) ============================== #
     _B64URL_RE = re.compile(r"^[A-Za-z0-9\-_]+={0,2}$")
     _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
     _JWT_LIKE_RE = re.compile(r"^[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+$")
@@ -736,8 +755,8 @@ class NetworkSniffer:
         except Exception:
             return False
 
-    def _build_query_variants(self, url: str) -> List[Tuple[str, str]]:
-        out: List[Tuple[str, str]] = []
+    def _build_query_variants(self, url: str) -> "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]":
+        out: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         try:
             p = self._safe_urlparse(url)
             if not p.scheme or not p.netloc:
@@ -747,7 +766,7 @@ class NetworkSniffer:
             if not pairs:
                 return out
 
-            kept1: List[Tuple[str, str]] = []
+            kept1: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
             dropped_any = False
             for k, v in pairs:
                 ks = self._to_str(k)
@@ -761,7 +780,7 @@ class NetworkSniffer:
                 u1 = self._safe_urlunparse((p.scheme, p.netloc, p.path, p.params, q1, ""))
                 out.append((u1, "query_drop_signature"))
 
-            kept2: List[Tuple[str, str]] = []
+            kept2: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
             for k, v in pairs:
                 ks = self._to_str(k)
                 vs = self._to_str(v)
@@ -777,8 +796,8 @@ class NetworkSniffer:
         except Exception:
             pass
 
-        seen: Set[str] = set()
-        uniq: List[Tuple[str, str]] = []
+        seen: "NetworkSniffer.Set[str]" = set()
+        uniq: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         for u, k in out:
             cu = self._canonicalize_url(u)
             if not cu or cu in seen:
@@ -789,12 +808,12 @@ class NetworkSniffer:
                 break
         return uniq
 
-    def _programmatic_host_swaps(self, host: str) -> Set[str]:
+    def _programmatic_host_swaps(self, host: str) -> "NetworkSniffer.Set[str]":
         h = (host or "").strip().lower()
         if not h:
             return set()
 
-        out: Set[str] = set()
+        out: "NetworkSniffer.Set[str]" = set()
 
         m = self.re.match(r"^(i)(\d+)\.(.+)$", h)
         if m:
@@ -817,8 +836,8 @@ class NetworkSniffer:
 
         return {x for x in out if x and x != h}
 
-    def _origin_swap_variants(self, url: str) -> List[Tuple[str, str]]:
-        out: List[Tuple[str, str]] = []
+    def _origin_swap_variants(self, url: str) -> "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]":
+        out: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         try:
             p = self._safe_urlparse(url)
             host = self._to_str(p.netloc).lower()
@@ -835,8 +854,8 @@ class NetworkSniffer:
         except Exception:
             pass
 
-        seen: Set[str] = set()
-        uniq: List[Tuple[str, str]] = []
+        seen: "NetworkSniffer.Set[str]" = set()
+        uniq: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         for u, k in out:
             cu = self._canonicalize_url(u)
             if not cu or cu in seen:
@@ -847,7 +866,7 @@ class NetworkSniffer:
                 break
         return uniq
 
-    def _salvage_score(self, url: str, *, status: Optional[int], kind: Optional[str]) -> float:
+    def _salvage_score(self, url: str, *, status: "NetworkSniffer.Optional[int]", kind: "NetworkSniffer.Optional[str]") -> float:
         u = self._to_str(url)
         ul = u.lower()
         score = 0.0
@@ -868,7 +887,7 @@ class NetworkSniffer:
                 score += 0.5
         return score
 
-    def _salvage_should_target(self, url: str, *, status: Optional[int], kind: Optional[str]) -> bool:
+    def _salvage_should_target(self, url: str, *, status: "NetworkSniffer.Optional[int]", kind: "NetworkSniffer.Optional[str]") -> bool:
         if not self.cfg.enable_url_salvage:
             return False
         if not self._host_allowed(url):
@@ -886,7 +905,7 @@ class NetworkSniffer:
         score = self._salvage_score(url, status=status, kind=kind)
         return score >= float(self.cfg.salvage_min_score_to_probe)
 
-    def _salvage_log(self, msg: str, log: Optional[List[str]], *, level: str):
+    def _salvage_log(self, msg: str, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]", *, level: str):
         lvl = (self.cfg.salvage_log_level or "ok").lower()
         if lvl == "none":
             return
@@ -894,7 +913,7 @@ class NetworkSniffer:
             return
         self._log(msg, log)
 
-    async def _probe_url(self, api_ctx, url: str, req_headers: Dict[str, str], *, timeout_ms: int) -> Dict[str, Any]:
+    async def _probe_url(self, api_ctx, url: str, req_headers: "NetworkSniffer.Dict[str, str]", *, timeout_ms: int) -> "NetworkSniffer.Dict[str, Any]":
         url = self._to_str(url)
         result = {
             "url": url, "ok": False, "status": None, "final_url": url,
@@ -949,13 +968,13 @@ class NetworkSniffer:
 
         return result
 
-    async def _salvage_one(self, api_ctx, observed_url: str, req_headers_subset: Dict[str, str], *,
-                          log: Optional[List[str]], observed_status: Optional[int], observed_kind: Optional[str]) -> Dict[str, Any]:
+    async def _salvage_one(self, api_ctx, observed_url: str, req_headers_subset: "NetworkSniffer.Dict[str, str]", *,
+                          log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]", observed_status: "NetworkSniffer.Optional[int]", observed_kind: "NetworkSniffer.Optional[str]") -> "NetworkSniffer.Dict[str, Any]":
         observed = self._canonicalize_url(observed_url)
         if not observed:
             return {"observed_url": self._to_str(observed_url), "variants": [], "ok_variants": []}
 
-        variants: List[Tuple[str, str]] = []
+        variants: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         variants.extend(self._build_query_variants(observed))
         variants.extend(self._origin_swap_variants(observed))
 
@@ -963,8 +982,8 @@ class NetworkSniffer:
             for (u2, k2) in self._origin_swap_variants(u):
                 variants.append((u2, f"{k}+{k2}"))
 
-        seen: Set[str] = {observed}
-        uniq: List[Tuple[str, str]] = []
+        seen: "NetworkSniffer.Set[str]" = {observed}
+        uniq: "NetworkSniffer.List[NetworkSniffer.Tuple[str, str]]" = []
         for u, k in variants:
             cu = self._canonicalize_url(u)
             if not cu or cu in seen:
@@ -976,8 +995,8 @@ class NetworkSniffer:
             if len(uniq) >= int(self.cfg.salvage_max_variants_per_url):
                 break
 
-        out_variants: List[Dict[str, Any]] = []
-        ok_variants: List[Dict[str, Any]] = []
+        out_variants: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        ok_variants: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
         tmo = int(self.cfg.salvage_probe_timeout_ms)
 
         def variant_rank(vk: str) -> int:
@@ -1016,9 +1035,9 @@ class NetworkSniffer:
         variants_emit = ok_variants if self.cfg.salvage_emit_only_ok_variants_in_bundle else out_variants
         return {"observed_url": observed, "variants": variants_emit, "ok_variants": ok_variants}
 
-    # ============================== forensics ============================== #
-    def _pick_headers_subset(self, headers_lc: Dict[str, str], allow: Set[str]) -> Dict[str, str]:
-        out: Dict[str, str] = {}
+    # ============================== forensics helpers ============================== #
+    def _pick_headers_subset(self, headers_lc: "NetworkSniffer.Dict[str, str]", allow: "NetworkSniffer.Set[str]") -> "NetworkSniffer.Dict[str, str]":
+        out: "NetworkSniffer.Dict[str, str]" = {}
         for k in (allow or set()):
             kk = self._to_str(k).lower()
             v = headers_lc.get(kk)
@@ -1026,7 +1045,7 @@ class NetworkSniffer:
                 out[kk] = self._to_str(v)
         return out
 
-    def _hash_post_data(self, post_data: Any, max_bytes: int = 4096) -> Dict[str, Any]:
+    def _hash_post_data(self, post_data: Any, max_bytes: int = 4096) -> "NetworkSniffer.Dict[str, Any]":
         try:
             if post_data is None:
                 return {"size": 0, "sha256": None}
@@ -1040,8 +1059,8 @@ class NetworkSniffer:
         except Exception:
             return {"size": None, "sha256": None}
 
-    async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
-                                          timeout_ms: int, prefix_bytes: int) -> Optional[str]:
+    async def _hash_body_prefix_via_probe(self, api_ctx, url: str, req_headers_subset: "NetworkSniffer.Dict[str, str]", *,
+                                          timeout_ms: int, prefix_bytes: int) -> "NetworkSniffer.Optional[str]":
         if self.http:
             try:
                 prefix = await self.http.get_prefix(self._to_str(url), size=int(prefix_bytes), timeout_ms=timeout_ms)
@@ -1060,7 +1079,7 @@ class NetworkSniffer:
         except Exception:
             return None
 
-    # ============================== NEW: Binary Signature Sniffing ============================== #
+    # ============================== Binary signature sniffing ============================== #
     def _ext_of(self, url: str) -> str:
         try:
             p = self._safe_urlparse(url)
@@ -1075,7 +1094,7 @@ class NetworkSniffer:
         except Exception:
             return ""
 
-    def _is_binary_suspect(self, url: str, *, ctype: str, resource_type: str, content_length: Optional[int]) -> bool:
+    def _is_binary_suspect(self, url: str, *, ctype: str, resource_type: str, content_length: "NetworkSniffer.Optional[int]") -> bool:
         if not self.cfg.enable_binary_signature_sniff:
             return False
         if not self._host_allowed(url):
@@ -1086,29 +1105,25 @@ class NetworkSniffer:
         ul = (url or "").lower()
         ext = self._ext_of(url)
 
-        # “classic” hiding places (.php/.bin/etc) OR no extension
         suspect_ext = (ext in (self.cfg.binary_suspect_extensions or set())) or (ext == "")
         hinty_url = any(h in ul for h in (self.cfg.binary_sniff_url_hints or set()))
 
         ct = (ctype or "").lower().split(";")[0].strip()
         suspect_ct = ct in (self.cfg.binary_suspect_content_types or set())
 
-        # avoid probing tiny responses unless url is very suspect
         if content_length is not None and content_length < 2048 and not (suspect_ext and hinty_url):
             return False
 
-        # skip obvious non-media text/html pages unless it looks like a media endpoint
         if "text/html" in ct and not hinty_url:
             return False
 
-        # skip styles/fonts/etc by resource type filters already, but keep an extra guard
         if self._deny_by_resource_type(resource_type):
             return False
 
         return bool(suspect_ext or suspect_ct or hinty_url)
 
-    async def _get_prefix_bytes(self, api_ctx, url: str, req_headers_subset: Dict[str, str], *,
-                               timeout_ms: int, prefix_bytes: int) -> Optional[bytes]:
+    async def _get_prefix_bytes(self, api_ctx, url: str, req_headers_subset: "NetworkSniffer.Dict[str, str]", *,
+                               timeout_ms: int, prefix_bytes: int) -> "NetworkSniffer.Optional[bytes]":
         url = self._to_str(url)
         if self.http:
             try:
@@ -1121,7 +1136,6 @@ class NetworkSniffer:
             return None
         try:
             h = {self._to_str(k): self._to_str(v) for k, v in (req_headers_subset or {}).items() if k and v}
-            # force range to avoid huge downloads
             h["Range"] = f"bytes=0-{max(0, int(prefix_bytes) - 1)}"
             resp = await api_ctx.get(url, headers=h, timeout=timeout_ms)
             b = await resp.body()
@@ -1129,11 +1143,7 @@ class NetworkSniffer:
         except Exception:
             return None
 
-    def _guess_kind_from_magic(self, b: Optional[bytes]) -> Tuple[Optional[str], Optional[str], str]:
-        """
-        Returns (kind, content_type_hint, detail)
-        kind: video|audio|image|None
-        """
+    def _guess_kind_from_magic(self, b: "NetworkSniffer.Optional[bytes]") -> "NetworkSniffer.Tuple[NetworkSniffer.Optional[str], NetworkSniffer.Optional[str], str]":
         if not b:
             return None, None, "no_bytes"
 
@@ -1149,26 +1159,25 @@ class NetworkSniffer:
         if bb.startswith(b"RIFF") and b"WEBP" in bb[8:16]:
             return "image", "image/webp", "magic:webp"
 
-        # containers / video
-        # MP4 / fMP4: size(4) + 'ftyp' (4) or early 'moof'
+        # mp4/fmp4 or early moof/mdat
         if len(bb) >= 12 and bb[4:8] == b"ftyp":
             return "video", "video/mp4", "magic:mp4_ftyp"
         if b"moof" in bb[:64] or b"mdat" in bb[:64]:
             return "video", "video/mp4", "magic:mp4_moof_mdat"
-        # MPEG-TS: sync byte 0x47 at packet boundary (often first byte)
+
+        # MPEG-TS
         if bb and bb[0] == 0x47:
             return "video", "video/mp2t", "magic:mpegts"
-        # WebM/Matroska: EBML header
+
+        # EBML (webm/mkv)
         if bb.startswith(b"\x1A\x45\xDF\xA3"):
             return "video", "video/webm", "magic:ebml_webm"
 
         # audio
         if bb.startswith(b"ID3"):
             return "audio", "audio/mpeg", "magic:mp3_id3"
-        # MP3 frame sync (very rough)
         if len(bb) >= 2 and bb[0] == 0xFF and (bb[1] & 0xE0) == 0xE0:
             return "audio", "audio/mpeg", "magic:mp3_framesync"
-        # AAC ADTS sync (0xFFF1 or 0xFFF9)
         if len(bb) >= 2 and bb[0] == 0xFF and (bb[1] & 0xF6) == 0xF0:
             return "audio", "audio/aac", "magic:aac_adts"
         if bb.startswith(b"OggS"):
@@ -1180,8 +1189,8 @@ class NetworkSniffer:
 
         return None, None, "magic:unknown"
 
-    # ============================== MSE sniff ============================== #
-    def _mse_init_script(self, cfg: Dict[str, Any]) -> str:
+    # ============================== MSE sniff bridge ============================== #
+    def _mse_init_script(self, cfg: "NetworkSniffer.Dict[str, Any]") -> str:
         safe_cfg = {
             "maxQueue": int(cfg.get("maxQueue", 2000)),
             "maxUrlLen": int(cfg.get("maxUrlLen", 2048)),
@@ -1430,7 +1439,7 @@ class NetworkSniffer:
 }})();
 """
 
-    async def _install_mse_bridge(self, page, mse_events: List[Dict[str, Any]], *, log: Optional[List[str]]):
+    async def _install_mse_bridge(self, page, mse_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]", *, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]"):
         if not self.cfg.enable_mse_sniff:
             return
 
@@ -1479,15 +1488,429 @@ class NetworkSniffer:
         except Exception as e:
             self._log(f"[NetworkSniffer][MSE] init_script failed: {e}", log)
 
+    # ============================== NEW: Param Sniffer bridge ============================== #
+    def _param_init_script(self, cfg: "NetworkSniffer.Dict[str, Any]") -> str:
+        # Use your exact patch, with cfg injected safely.
+        safe_cfg = {
+            "maxQueue": int(cfg.get("maxQueue", 2000)),
+            "flushIntervalMs": int(cfg.get("flushIntervalMs", 250)),
+            "maxUrlLen": int(cfg.get("maxUrlLen", 2048)),
+            "maxKeyLen": int(cfg.get("maxKeyLen", 128)),
+            "maxValLen": int(cfg.get("maxValLen", 256)),
+            "captureValues": bool(cfg.get("captureValues", False)),
+            "sampleRate": float(cfg.get("sampleRate", 1.0)),
+        }
+        cfg_json = self.json.dumps(safe_cfg)
+        return f"""
+(() => {{
+  try {{
+    const NS = (window.__NS_PARAMS = window.__NS_PARAMS || {{}});
+    if (NS.__installed) return;
+    NS.__installed = true;
+
+    NS.q = NS.q || [];
+    NS.stats = NS.stats || {{ dropped: 0, pushed: 0, flushed: 0, errs: 0 }};
+    NS.cfg = Object.assign({{
+      maxQueue: 2000,
+      flushIntervalMs: 250,
+      maxUrlLen: 2048,
+      maxKeyLen: 128,
+      maxValLen: 256,
+      captureValues: false,
+      sampleRate: 1.0
+    }}, NS.cfg || {{}}, {cfg_json});
+
+    function nowMs(){{ return Date.now(); }}
+    function trunc(s,n){{ s = (s==null ? "" : String(s)); return s.length>n ? s.slice(0,n) : s; }}
+    function safeUrl(u){{ return trunc(u, NS.cfg.maxUrlLen|0); }}
+    function rand(){{ return Math.random(); }}
+
+    function pushEvt(evt){{
+      try{{
+        if (!evt || typeof evt !== "object") return;
+        if ((NS.cfg.sampleRate||1) < 1.0 && rand() > (NS.cfg.sampleRate||1)) return;
+        evt.ts = evt.ts || nowMs();
+        if (evt.url) evt.url = safeUrl(evt.url);
+        if (evt.key) evt.key = trunc(evt.key, NS.cfg.maxKeyLen|0);
+        if (evt.value && !NS.cfg.captureValues) delete evt.value;
+        if (evt.value) evt.value = trunc(evt.value, NS.cfg.maxValLen|0);
+        if (NS.q.length >= (NS.cfg.maxQueue|0)) {{ NS.q.shift(); NS.stats.dropped++; }}
+        NS.q.push(evt); NS.stats.pushed++;
+      }} catch(e) {{ NS.stats.errs++; }}
+    }}
+
+    function flush(){{
+      try{{
+        const fn = window.__ns_param_push;
+        if (typeof fn !== "function") return;
+        if (!NS.q.length) return;
+        const batch = NS.q.splice(0, 150);
+        NS.stats.flushed += batch.length;
+        fn(batch);
+      }} catch(e) {{ NS.stats.errs++; }}
+    }}
+    setInterval(flush, Math.max(50, NS.cfg.flushIntervalMs|0));
+
+    // ---- URLSearchParams hooks ----
+    const USP = window.URLSearchParams && window.URLSearchParams.prototype;
+    if (USP){{
+      const ogGet = USP.get;
+      const ogHas = USP.has;
+      const ogGetAll = USP.getAll;
+
+      if (typeof ogGet === "function"){{
+        USP.get = function(k){{
+          try{{
+            const key = String(k||"");
+            const val = ogGet.apply(this, arguments);
+            pushEvt({{ event:"usp_get", key, value: val, url: safeUrl(location && location.href) }});
+          }} catch(e){{}}
+          return ogGet.apply(this, arguments);
+        }};
+      }}
+      if (typeof ogHas === "function"){{
+        USP.has = function(k){{
+          try{{
+            const key = String(k||"");
+            const out = ogHas.apply(this, arguments);
+            pushEvt({{ event:"usp_has", key, present: !!out, url: safeUrl(location && location.href) }});
+          }} catch(e){{}}
+          return ogHas.apply(this, arguments);
+        }};
+      }}
+      if (typeof ogGetAll === "function"){{
+        USP.getAll = function(k){{
+          try{{
+            const key = String(k||"");
+            const out = ogGetAll.apply(this, arguments);
+            pushEvt({{ event:"usp_getAll", key, count: (out && out.length)||0, url: safeUrl(location && location.href) }});
+          }} catch(e){{}}
+          return ogGetAll.apply(this, arguments);
+        }};
+      }}
+    }}
+
+    // ---- navigation hooks ----
+    function recordNav(u, how){{
+      try{{
+        const s = safeUrl(u || "");
+        if (!s) return;
+        pushEvt({{ event:"nav", how, url: s }});
+      }} catch(e){{}}
+    }}
+
+    const H = window.history;
+    if (H && typeof H.pushState === "function"){{
+      const og = H.pushState;
+      H.pushState = function(state, title, url){{
+        try {{ recordNav(url, "pushState"); }} catch(e){{}}
+        return og.apply(this, arguments);
+      }};
+    }}
+    if (H && typeof H.replaceState === "function"){{
+      const og = H.replaceState;
+      H.replaceState = function(state, title, url){{
+        try {{ recordNav(url, "replaceState"); }} catch(e){{}}
+        return og.apply(this, arguments);
+      }};
+    }}
+
+    try{{
+      const L = window.location;
+      if (L && typeof L.assign === "function"){{
+        const og = L.assign.bind(L);
+        L.assign = function(url){{ recordNav(url, "location.assign"); return og(url); }};
+      }}
+      if (L && typeof L.replace === "function"){{
+        const og = L.replace.bind(L);
+        L.replace = function(url){{ recordNav(url, "location.replace"); return og(url); }};
+      }}
+    }} catch(e){{}}
+
+  }} catch(e) {{}}
+}})();
+"""
+
+    async def _install_param_bridge(self, page, param_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]", *, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]"):
+        if not self.cfg.enable_param_sniff:
+            return
+
+        max_events = int(self.cfg.param_max_events)
+
+        async def _binding(source, payload):
+            try:
+                if payload is None:
+                    return
+                batch = payload if isinstance(payload, list) else [payload]
+                for ev in batch:
+                    if len(param_events) >= max_events:
+                        return
+                    if isinstance(ev, dict):
+                        param_events.append(ev)
+                    else:
+                        param_events.append({"event": "param_raw", "raw": self._to_str(ev)})
+            except Exception as e:
+                self._log(f"[NetworkSniffer][PARAM] binding error: {e}", log)
+
+        try:
+            await page.expose_binding("__ns_param_push", _binding)
+        except Exception as e:
+            self._log(f"[NetworkSniffer][PARAM] expose_binding failed: {e}", log)
+            return
+
+        cfg = {
+            "maxQueue": int(self.cfg.param_max_queue),
+            "flushIntervalMs": int(self.cfg.param_flush_interval_ms),
+            "maxUrlLen": int(self.cfg.param_max_url_len),
+            "maxKeyLen": int(self.cfg.param_max_key_len),
+            "maxValLen": int(self.cfg.param_max_val_len),
+            "captureValues": bool(self.cfg.param_capture_values),
+            "sampleRate": float(self.cfg.param_sample_rate),
+        }
+
+        try:
+            script = self._param_init_script(cfg)
+            await page.add_init_script(script=script)
+        except TypeError:
+            try:
+                await page.add_init_script(script)
+            except Exception as e:
+                self._log(f"[NetworkSniffer][PARAM] init_script failed: {e}", log)
+        except Exception as e:
+            self._log(f"[NetworkSniffer][PARAM] init_script failed: {e}", log)
+
+    # ============================== NEW: Bundle static scan ============================== #
+    def _extract_script_srcs_from_html(self, html: str, base_url: str) -> "NetworkSniffer.List[str]":
+        html = self._to_str(html)
+        if not html:
+            return []
+        rx = self.re.compile(r"<script[^>]+src\s*=\s*['\"]([^'\"]+)['\"][^>]*>", self.re.I)
+        out: "NetworkSniffer.List[str]" = []
+        seen: "NetworkSniffer.Set[str]" = set()
+        for m in rx.finditer(html):
+            src = self._to_str(m.group(1)).strip()
+            if not src:
+                continue
+            full = self._canonicalize_url(self._safe_urljoin(base_url, src))
+            if full and full not in seen:
+                seen.add(full)
+                out.append(full)
+        return out
+
+    def _bundle_param_regexes(self) -> "NetworkSniffer.List[NetworkSniffer.Tuple[str, Any]]":
+        # returns list of (name, compiled_regex)
+        return [
+            ("usp_get_literal", self.re.compile(r'URLSearchParams\\([^)]*\\)\\.get\\(["\']([a-zA-Z0-9_\\-]{{1,64}})["\']\\)', self.re.I)),
+            ("dot_get_literal", self.re.compile(r'\\.get\\(["\']([a-zA-Z0-9_\\-]{{1,64}})["\']\\)', self.re.I)),
+            ("query_key_like", self.re.compile(r'[?&]([a-zA-Z0-9_\\-]{{1,64}})=', self.re.I)),
+            ("api_path", self.re.compile(r'(/api/[a-zA-Z0-9_/-]{3,80})', self.re.I)),
+            ("next_data", self.re.compile(r'__NEXT_DATA__', self.re.I)),
+            ("nuxt", self.re.compile(r'__NUXT__', self.re.I)),
+        ]
+
+    async def _fetch_text_prefix(self, api_ctx, url: str, *, timeout_ms: int, max_bytes: int) -> str:
+        url = self._to_str(url)
+        if not api_ctx:
+            return ""
+        try:
+            h = {"Range": f"bytes=0-{max(0, int(max_bytes)-1)}"}
+            resp = await api_ctx.get(url, headers=h, timeout=timeout_ms)
+            b = await resp.body()
+            if not b:
+                return ""
+            # decode as text-ish; bundles are usually utf-8
+            try:
+                return b.decode("utf-8", "ignore")
+            except Exception:
+                try:
+                    return b.decode("latin-1", "ignore")
+                except Exception:
+                    return ""
+        except Exception:
+            return ""
+
+    async def _bundle_param_scan(self, api_ctx, script_urls: "NetworkSniffer.List[str]", *, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> "NetworkSniffer.Dict[str, Any]":
+        if not self.cfg.enable_bundle_param_scan or not api_ctx:
+            return {"enabled": False, "scripts_scanned": 0, "hits": []}
+
+        max_scripts = max(0, int(self.cfg.bundle_scan_max_scripts))
+        max_bytes = max(8192, int(self.cfg.bundle_scan_range_bytes))
+        timeout_ms = max(1000, int(self.cfg.bundle_scan_timeout_ms))
+        max_hits = max(1, int(self.cfg.bundle_scan_max_regex_hits))
+
+        rx_list = self._bundle_param_regexes()
+        hits: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+
+        # small dedupe
+        seen_scripts: "NetworkSniffer.Set[str]" = set()
+        picked: "NetworkSniffer.List[str]" = []
+        for u in (script_urls or []):
+            cu = self._canonicalize_url(u)
+            if not cu or cu in seen_scripts:
+                continue
+            if not self._host_allowed(cu):
+                continue
+            seen_scripts.add(cu)
+            picked.append(cu)
+            if len(picked) >= max_scripts:
+                break
+
+        sem = self.asyncio.Semaphore(6)
+
+        async def scan_one(u: str):
+            async with sem:
+                txt = await self._fetch_text_prefix(api_ctx, u, timeout_ms=timeout_ms, max_bytes=max_bytes)
+                if not txt:
+                    return
+                for name, rx in rx_list:
+                    for m in rx.finditer(txt):
+                        if len(hits) >= max_hits:
+                            return
+                        g1 = self._to_str(m.group(1)) if m.groups() else self._to_str(m.group(0))
+                        hits.append({
+                            "script": u,
+                            "pattern": name,
+                            "hit": g1[:200],
+                        })
+
+        await self.asyncio.gather(*[scan_one(u) for u in picked], return_exceptions=True)
+
+        self._log(f"[NetworkSniffer][BUNDLE] scanned={len(picked)} hits={len(hits)}", log)
+        return {"enabled": True, "scripts_scanned": len(picked), "hits": hits}
+
+    # ============================== Correlation helpers ============================== #
+    def _ms_now(self) -> int:
+        try:
+            return int(self.time.time() * 1000.0)
+        except Exception:
+            return 0
+
+    def _postprocess_param_events(self, param_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]") -> "NetworkSniffer.Dict[str, Any]":
+        counts: "NetworkSniffer.Dict[str, int]" = {}
+        nav_urls: "NetworkSniffer.List[str]" = []
+        seen_nav: "NetworkSniffer.Set[str]" = set()
+
+        for ev in (param_events or []):
+            try:
+                et = self._to_str(ev.get("event"))
+                if et.startswith("usp_"):
+                    k = self._to_str(ev.get("key"))
+                    if k:
+                        counts[k] = counts.get(k, 0) + 1
+                if et == "nav":
+                    u = self._to_str(ev.get("url"))
+                    if u and u not in seen_nav:
+                        seen_nav.add(u)
+                        nav_urls.append(u)
+            except Exception:
+                pass
+
+        # top keys
+        top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:80]
+        return {
+            "counts": counts,
+            "top_keys": [{"key": k, "reads": v} for (k, v) in top],
+            "nav_urls": nav_urls[:200],
+            "total_events": len(param_events or []),
+        }
+
+    def _correlate_params_to_endpoints(
+        self,
+        param_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+        resp_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+        *,
+        window_ms: int,
+        max_per_key: int
+    ) -> "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]":
+        """
+        Correlate param reads -> network URLs observed shortly after.
+        This is a heuristic report, not a guarantee of causality.
+        """
+        if not param_events or not resp_events:
+            return []
+
+        # Normalize + sort by ts (ms)
+        pe = []
+        for ev in param_events:
+            et = self._to_str(ev.get("event"))
+            if not et.startswith("usp_"):
+                continue
+            k = self._to_str(ev.get("key"))
+            ts = ev.get("ts")
+            try:
+                ts = int(ts) if ts is not None else None
+            except Exception:
+                ts = None
+            if k and ts is not None:
+                pe.append((ts, k, et, self._to_str(ev.get("url"))))
+        pe.sort(key=lambda t: t[0])
+
+        re_ = []
+        for ev in resp_events:
+            ts = ev.get("ts")
+            try:
+                ts = int(ts) if ts is not None else None
+            except Exception:
+                ts = None
+            u = self._to_str(ev.get("url"))
+            kind = self._to_str(ev.get("kind") or ev.get("type") or "resp")
+            if u and ts is not None:
+                re_.append((ts, u, kind))
+        re_.sort(key=lambda t: t[0])
+
+        # two-pointer window
+        out: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+        j = 0
+
+        for (ts, key, et, src_url) in pe:
+            if key not in out:
+                out[key] = {
+                    "param_key": key,
+                    "reads": 0,
+                    "first_seen_url": src_url,
+                    "first_seen_ts": ts,
+                    "endpoints": {},  # url -> count
+                }
+            out[key]["reads"] += 1
+
+            # advance j to first resp >= ts
+            while j < len(re_) and re_[j][0] < ts:
+                j += 1
+
+            # collect within window
+            jj = j
+            while jj < len(re_) and (re_[jj][0] - ts) <= window_ms:
+                u = re_[jj][1]
+                # avoid correlating the page URL itself too much; still keep if meaningful
+                out[key]["endpoints"][u] = out[key]["endpoints"].get(u, 0) + 1
+                jj += 1
+
+        # format
+        reports: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        for k, info in out.items():
+            eps = info["endpoints"]
+            top_eps = sorted(eps.items(), key=lambda kv: kv[1], reverse=True)[:max_per_key]
+            reports.append({
+                "param_key": k,
+                "reads": int(info.get("reads", 0)),
+                "first_seen_url": info.get("first_seen_url"),
+                "likely_triggers": [{"type": "resp", "url": u, "count": c} for (u, c) in top_eps],
+            })
+
+        # keep only keys with something to show
+        reports = [r for r in reports if r.get("likely_triggers")]
+        reports.sort(key=lambda r: int(r.get("reads", 0)), reverse=True)
+        return reports[:200]
+
     # ============================== sniff ============================== #
     async def sniff(
         self,
         context,
         page_url: str,
         *,
-        timeout: Optional[float] = None,
-        log: Optional[List[str]] = None,
-        extensions: Optional[Set[str]] = None,
+        timeout: "NetworkSniffer.Optional[float]" = None,
+        log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]" = None,
+        extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
     ):
         if context is None:
             self._log("[NetworkSniffer] No Playwright context; skipping sniff.", log)
@@ -1496,33 +1919,41 @@ class NetworkSniffer:
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
         canonical_page_url = self._canonicalize_url(page_url)
 
-        found_items: List[Dict[str, Any]] = []
-        derived_items: List[Dict[str, Any]] = []
-        json_hits: List[Dict[str, Any]] = []
+        found_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        derived_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        json_hits: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
-        seen_network: Set[str] = set()
-        seen_derived: Set[str] = set()
-        seen_mse_urls: Set[str] = set()
-        seen_binary_sig: Set[str] = set()
+        seen_network: "NetworkSniffer.Set[str]" = set()
+        seen_derived: "NetworkSniffer.Set[str]" = set()
+        seen_mse_urls: "NetworkSniffer.Set[str]" = set()
+        seen_binary_sig: "NetworkSniffer.Set[str]" = set()
 
-        blob_placeholders: List[Dict[str, Any]] = []
-        req_types: Dict[str, str] = {}
+        blob_placeholders: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        req_types: "NetworkSniffer.Dict[str, str]" = {}
 
-        request_evidence: Dict[str, Dict[str, Any]] = {}
-        redirect_events: List[Dict[str, Any]] = []
-        seen_redirect: Set[str] = set()
+        request_evidence: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+        redirect_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        seen_redirect: "NetworkSniffer.Set[str]" = set()
 
-        forensics: List[Dict[str, Any]] = []
-        seen_forensics: Set[str] = set()
+        forensics: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        seen_forensics: "NetworkSniffer.Set[str]" = set()
 
-        salvage_info: Dict[str, Dict[str, Any]] = {}
-        salvage_host_counts: Dict[str, int] = {}
-        salvage_bundles: List[Dict[str, Any]] = []
+        salvage_info: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+        salvage_host_counts: "NetworkSniffer.Dict[str, int]" = {}
+        salvage_bundles: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
-        mse_events: List[Dict[str, Any]] = []
+        mse_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        param_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
-        # NEW: binary signature tasks
-        binary_tasks: List["NetworkSniffer.asyncio.Task"] = []
+        # NEW: response timeline events for correlation
+        resp_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+
+        # NEW: script urls for bundle scanning
+        script_urls: "NetworkSniffer.List[str]" = []
+        seen_scripts: "NetworkSniffer.Set[str]" = set()
+
+        # binary signature tasks
+        binary_tasks: "NetworkSniffer.List[NetworkSniffer.asyncio.Task]" = []
         binary_sem = self.asyncio.Semaphore(int(self.cfg.binary_sniff_concurrency))
 
         html: str = ""
@@ -1541,12 +1972,15 @@ class NetworkSniffer:
         max_derived_per_manifest = int(self.cfg.max_derived_per_manifest)
         max_manifests = int(self.cfg.max_manifests_to_expand)
 
-        manifests_to_expand: List[Tuple[Any, str, str]] = []
+        manifests_to_expand: "NetworkSniffer.List[NetworkSniffer.Tuple[Any, str, str]]" = []
 
         self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
 
+        # Install init scripts BEFORE goto
         if self.cfg.enable_mse_sniff:
             await self._install_mse_bridge(page, mse_events, log=log)
+        if self.cfg.enable_param_sniff:
+            await self._install_param_bridge(page, param_events, log=log)
 
         # ---------------- request handler ---------------- #
         def handle_request(req):
@@ -1556,6 +1990,7 @@ class NetworkSniffer:
             except Exception:
                 pass
 
+            # redirect chain
             try:
                 if self.cfg.enable_redirect_tracking:
                     prev = getattr(req, "redirected_from", None)
@@ -1569,6 +2004,7 @@ class NetworkSniffer:
             except Exception:
                 pass
 
+            # request evidence (forensics + salvage header subset)
             try:
                 if self.cfg.enable_forensics:
                     url = self._to_str(getattr(req, "url", None))
@@ -1598,6 +2034,17 @@ class NetworkSniffer:
                             "headers_subset": req_hdr_subset,
                             "post_data_hash": post_hash,
                         }
+            except Exception:
+                pass
+
+            # collect script URLs (for optional bundle scan)
+            try:
+                rt = self._to_str(getattr(req, "resource_type", None))
+                if rt == "script":
+                    u = self._canonicalize_url(self._to_str(getattr(req, "url", None)))
+                    if u and u not in seen_scripts and self._host_allowed(u):
+                        seen_scripts.add(u)
+                        script_urls.append(u)
             except Exception:
                 pass
 
@@ -1646,7 +2093,7 @@ class NetworkSniffer:
         page.on("request", handle_request)
 
         # ---------------- header mining ---------------- #
-        def mine_headers(url: str, headers_lc: Dict[str, str]):
+        def mine_headers(url: str, headers_lc: "NetworkSniffer.Dict[str, str]"):
             if not self.cfg.enable_header_url_mining:
                 return
             if len(json_hits) >= max_json:
@@ -1679,12 +2126,12 @@ class NetworkSniffer:
             except Exception as e:
                 self._log(f"[NetworkSniffer] Failed to parse JSON from {url}: {e}", log)
 
-        # ---------------- NEW: binary sniff worker ---------------- #
-        def req_hdrs_for(u: str) -> Dict[str, str]:
+        # ---------------- binary sniff helpers ---------------- #
+        def req_hdrs_for(u: str) -> "NetworkSniffer.Dict[str, str]":
             ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
             return ev.get("headers_subset") or {}
 
-        async def binary_sniff_one(*, url: str, ctype: str, resource_type: str, content_length: Optional[int]):
+        async def binary_sniff_one(*, url: str, ctype: str, resource_type: str, content_length: "NetworkSniffer.Optional[int]"):
             async with binary_sem:
                 cu = self._canonicalize_url(url)
                 if not cu or cu in seen_binary_sig:
@@ -1718,7 +2165,6 @@ class NetworkSniffer:
                         "size": str(content_length) if content_length is not None else "?",
                     })
 
-                # emit a compact json hit for provenance
                 if len(json_hits) < max_json:
                     sha = self.hashlib.sha256(prefix).hexdigest() if prefix else None
                     json_hits.append({
@@ -1757,6 +2203,18 @@ class NetworkSniffer:
 
                 seen_network.add(canonical_url)
 
+                # timeline event for correlation
+                try:
+                    resp_events.append({
+                        "ts": self._ms_now(),
+                        "type": "resp",
+                        "url": canonical_url,
+                        "resource_type": resource_type,
+                        "status": getattr(response, "status", None),
+                    })
+                except Exception:
+                    pass
+
                 try:
                     hdr_raw = getattr(response, "headers", None) or {}
                     headers = {self._to_str(k).lower(): self._to_str(v) for (k, v) in hdr_raw.items()}
@@ -1780,21 +2238,17 @@ class NetworkSniffer:
                     pass
 
                 cl_header = self._to_str(headers.get("content-length") or "")
-                content_length: Optional[int] = None
+                content_length: "NetworkSniffer.Optional[int]" = None
                 try:
                     if cl_header.isdigit():
                         content_length = int(cl_header)
                 except Exception:
                     content_length = None
 
-                # if it’s a known “junk” extension, still allow binary sig sniffing to override
                 p = self._safe_urlparse(canonical_url)
                 path = self._to_str(p.path or "/").lower()
                 is_junk_ext = self._is_junk_by_extension(path)
 
-                if (not is_blob) and ctype and self._deny_by_content_type(ctype):
-                    # deny list applies, but binary signature sniffing can still run if very suspect.
-                    pass
                 if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
                     return
 
@@ -1820,7 +2274,6 @@ class NetworkSniffer:
                             })
                     return
 
-                # normal classification
                 kind = (
                     self._classify_by_extension(path)
                     or (self._classify_by_content_type(ctype) if ctype else None)
@@ -1832,7 +2285,7 @@ class NetworkSniffer:
                     if seg_kind:
                         kind = seg_kind
 
-                # ---------------- NEW: Binary signature sniff scheduling ----------------
+                # Binary signature sniff scheduling
                 if self.cfg.enable_binary_signature_sniff:
                     should_probe = self._is_binary_suspect(
                         canonical_url,
@@ -1852,14 +2305,8 @@ class NetworkSniffer:
                                     )
                                 ))
 
-                # if still no kind, stop here (binary sniff may still add later)
                 if not kind:
                     return
-
-                if is_junk_ext:
-                    # junk extensions normally filtered, but if we already classified as media (via ctype/hints),
-                    # keep it. Otherwise we’d have returned above.
-                    pass
 
                 if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
                     return
@@ -1878,7 +2325,7 @@ class NetworkSniffer:
                         if m:
                             filename = self._to_str(m.group(1))
 
-                    item: Dict[str, Any] = {
+                    item: "NetworkSniffer.Dict[str, Any]" = {
                         "url": canonical_url,
                         "text": f"[Network {kind.capitalize()}]",
                         "tag": "network_sniff",
@@ -1961,10 +2408,16 @@ class NetworkSniffer:
             await self._auto_scroll(page, tmo, log)
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
+            # allow param bridge to flush
+            if self.cfg.enable_param_sniff:
+                try:
+                    await page.wait_for_timeout(max(80, int(self.cfg.param_flush_interval_ms)))
+                except Exception:
+                    pass
+
             # wait for pending binary-sniff tasks (bounded)
             if self.cfg.enable_binary_signature_sniff and binary_tasks:
                 try:
-                    # give them a tight budget; they’re range GETs, should be quick
                     await self.asyncio.wait_for(
                         self.asyncio.gather(*binary_tasks, return_exceptions=True),
                         timeout=max(0.25, min(2.5, tmo * 0.25)),
@@ -2018,7 +2471,7 @@ class NetworkSniffer:
             if self.cfg.enable_forensics and self.cfg.forensics_hash_via_probe and api_ctx is not None and forensics:
                 sem = self.asyncio.Semaphore(8)
 
-                async def guard_hash(bundle: Dict[str, Any]):
+                async def guard_hash(bundle: "NetworkSniffer.Dict[str, Any]"):
                     async with sem:
                         hp = await self._hash_body_prefix_via_probe(
                             api_ctx,
@@ -2038,11 +2491,11 @@ class NetworkSniffer:
 
                 sem = self.asyncio.Semaphore(int(self.cfg.salvage_probe_concurrency))
 
-                def req_hdrs_for_salvage(u: str) -> Dict[str, str]:
+                def req_hdrs_for_salvage(u: str) -> "NetworkSniffer.Dict[str, str]":
                     ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
                     return ev.get("headers_subset") or {}
 
-                async def salvage_guard(info: Dict[str, Any]):
+                async def salvage_guard(info: "NetworkSniffer.Dict[str, Any]"):
                     async with sem:
                         u = self._to_str(info.get("url"))
                         return await self._salvage_one(
@@ -2056,57 +2509,108 @@ class NetworkSniffer:
 
                 salvage_bundles = await self.asyncio.gather(*[salvage_guard(i) for i in targets])
 
-            # --- MSE post-processing ---
+            # --- MSE post-processing (same spirit as your version) ---
             if self.cfg.enable_mse_sniff and mse_events:
-                for ev in mse_events[: int(self.cfg.mse_max_events)]:
-                    try:
-                        et = self._to_str(ev.get("event"))
-                        u = self._to_str(ev.get("url"))
-                        blob_u = self._to_str(ev.get("blob_url"))
-                        if u and u not in seen_mse_urls and (et in ("fetch_resp", "xhr_resp")):
-                            if any(h in u.lower() for h in (self.cfg.mse_mediaish_url_hints or set())) or self._is_mediaish_url(u):
-                                seen_mse_urls.add(u)
-                                found_items.append({
-                                    "url": self._canonicalize_url(u),
-                                    "text": "[MSE Media Fetch]",
-                                    "tag": "mse_sniff",
-                                    "kind": "video",
-                                    "content_type": self._to_str(ev.get("content_type") or "?"),
-                                    "size": self._to_str(ev.get("content_length") or "?"),
-                                })
-                        if blob_u and blob_u.startswith("blob:"):
-                            if all(self._to_str(x.get("url")) != blob_u for x in blob_placeholders):
-                                blob_placeholders.append({
-                                    "url": blob_u,
-                                    "text": "[MSE Blob URL]",
-                                    "tag": "mse_sniff",
-                                    "kind": "video",
-                                    "content_type": "?",
-                                    "size": "?",
-                                })
-                    except Exception:
-                        pass
-
+                # Keep your existing MSE interpretation minimal here (you can expand further if you want)
                 if len(json_hits) < max_json:
-                    if self.cfg.mse_emit_each_event_json:
-                        for ev in mse_events[: max(0, int(self.cfg.mse_max_events) - 1)]:
-                            if len(json_hits) >= max_json:
-                                break
-                            json_hits.append({
-                                "url": canonical_page_url,
-                                "json": {"mse_event": ev},
-                                "source_page": canonical_page_url,
-                            })
-                    else:
-                        json_hits.append({
-                            "url": canonical_page_url,
-                            "json": {"mse_bundle": {
-                                "source_page": canonical_page_url,
-                                "count": len(mse_events),
-                                "items": mse_events[: int(self.cfg.mse_max_events)],
-                            }},
+                    json_hits.append({
+                        "url": canonical_page_url,
+                        "json": {"mse_bundle": {
                             "source_page": canonical_page_url,
-                        })
+                            "count": len(mse_events),
+                            "items": mse_events[: int(self.cfg.mse_max_events)],
+                        }},
+                        "source_page": canonical_page_url,
+                    })
+
+            # --- PARAM post-processing + correlation ---
+            param_summary = self._postprocess_param_events(param_events)
+            if self.cfg.enable_param_sniff and len(json_hits) < max_json:
+                json_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"param_bundle": {
+                        "source_page": canonical_page_url,
+                        "counts_top": param_summary.get("top_keys", [])[:80],
+                        "nav_urls": param_summary.get("nav_urls", [])[:200],
+                        "total_events": param_summary.get("total_events", 0),
+                        "capture_values": bool(self.cfg.param_capture_values),
+                    }},
+                    "source_page": canonical_page_url,
+                })
+
+            # --- router boot snapshot (truncated) ---
+            boot = None
+            try:
+                boot = await page.evaluate("""() => {
+                  try {
+                    return {
+                      next: window.__NEXT_DATA__ || null,
+                      nuxt: window.__NUXT__ || null,
+                      apollo: window.__APOLLO_STATE__ || null
+                    };
+                  } catch(e) { return { next:null, nuxt:null, apollo:null }; }
+                }""")
+            except Exception:
+                boot = None
+
+            if boot and len(json_hits) < max_json:
+                # truncate big objects safely
+                def _truncate_obj(o, max_chars=120000):
+                    try:
+                        s = self.json.dumps(o)
+                        if len(s) > max_chars:
+                            return {"truncated": True, "preview": s[:max_chars]}
+                        return o
+                    except Exception:
+                        return {"truncated": True, "preview": self._to_str(o)[:max_chars]}
+
+                json_hits.append({
+                    "url": canonical_page_url,
+                    "json": {"boot_state": _truncate_obj(boot)},
+                    "source_page": canonical_page_url,
+                })
+
+            # --- get HTML (needed for script src extraction + return) ---
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
+                html = ""
+
+            # --- Bundle scan (optional) ---
+            if self.cfg.enable_bundle_param_scan and api_ctx is not None:
+                # extend scripts with <script src> parsed from HTML
+                for u in self._extract_script_srcs_from_html(html, canonical_page_url):
+                    cu = self._canonicalize_url(u)
+                    if cu and cu not in seen_scripts and self._host_allowed(cu):
+                        seen_scripts.add(cu)
+                        script_urls.append(cu)
+
+                bundle_scan = await self._bundle_param_scan(api_ctx, script_urls, log=log)
+                if len(json_hits) < max_json:
+                    json_hits.append({
+                        "url": canonical_page_url,
+                        "json": {"bundle_param_scan": bundle_scan},
+                        "source_page": canonical_page_url,
+                    })
+
+            # --- Param-to-endpoint correlation ---
+            if self.cfg.enable_param_sniff:
+                corr = self._correlate_params_to_endpoints(
+                    param_events,
+                    resp_events,
+                    window_ms=int(self.cfg.correlate_window_ms),
+                    max_per_key=int(self.cfg.correlate_max_per_key),
+                )
+                if corr and len(json_hits) < max_json:
+                    json_hits.append({
+                        "url": canonical_page_url,
+                        "json": {"param_endpoint_correlation": {
+                            "window_ms": int(self.cfg.correlate_window_ms),
+                            "items": corr[:250],
+                        }},
+                        "source_page": canonical_page_url,
+                    })
 
             if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
                 json_hits.append({
@@ -2139,12 +2643,6 @@ class NetworkSniffer:
                     "source_page": canonical_page_url,
                 })
 
-            try:
-                html = await page.content()
-            except Exception as e:
-                self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
-                html = ""
-
         except Exception as e:
             self._log(f"[NetworkSniffer] Unexpected error during sniff for {canonical_page_url}: {e}", log)
 
@@ -2162,12 +2660,14 @@ class NetworkSniffer:
             f"media={len(found_items)} derived={len(derived_items)} "
             f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
             f"forensics={len(forensics)} salvage={len(salvage_bundles)} mse={len(mse_events)} "
+            f"param_events={len(param_events)} scripts={len(script_urls)} "
             f"binary_sig_tasks={len(binary_tasks)} "
             f"(Total output: {len(merged_items)})"
         )
         self._log(summary, log)
 
         return html, merged_items, json_hits
+
 
 # ======================================================================
 # JSSniffer
