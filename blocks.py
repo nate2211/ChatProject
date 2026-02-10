@@ -8572,6 +8572,9 @@ class LinkTrackerBlock(BaseBlock):
                                 "status": status,
                                 "tag": tag,
                             }
+                            DEBUG_LOGGER.log_message(
+                                f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})")
+
                             local_assets.append(asset)
                             if use_database and store:
                                 store.upsert_asset(asset)
@@ -8617,6 +8620,9 @@ class LinkTrackerBlock(BaseBlock):
                                     "size": size,
                                     "status": status,
                                 }
+                                DEBUG_LOGGER.log_message(
+                                    f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})")
+
                                 local_assets.append(asset)
                                 if use_database and store:
                                     store.upsert_asset(asset)
