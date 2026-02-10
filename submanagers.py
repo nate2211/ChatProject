@@ -259,7 +259,7 @@ class NetworkSniffer:
         })
 
         deny_content_substrings: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"javascript", "css", "font/"})
-        deny_resource_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"stylesheet", "font", "manifest", "other"})
+        deny_resource_types: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {"stylesheet", "font"})
 
         video_stream_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".m3u8", "manifest.mpd", "master.m3u8", "chunklist.m3u8",
