@@ -11426,6 +11426,13 @@ class VideoLinkTrackerBlock(BaseBlock):
 
         log.append(f"[VideoLinkTracker][download] Cached {url} -> {local_path}")
         return local_path
+
+    def _search_url_ok(self, url: str, keywords: list[str], min_overlap: int) -> bool:
+        if not keywords or min_overlap <= 0:
+            return True
+        hay = (url or "").lower().replace("%20", " ")
+        return self._term_overlap_ok_check(hay, keywords, min_overlap)
+
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
 
         text = str(payload or "")
@@ -11963,11 +11970,6 @@ class VideoLinkTrackerBlock(BaseBlock):
         sites_seed_pages: List[str] = []
         use_sites_engine = False
 
-        def _search_url_ok(self, url: str, keywords: list[str], min_overlap: int) -> bool:
-            if not keywords or min_overlap <= 0:
-                return True
-            hay = (url or "").lower().replace("%20", " ")
-            return self._term_overlap_ok_check(hay, keywords, min_overlap)
 
         if not skip_search_engine_for_payload and queries_to_run and source != "database":
             ua_search = ua
