@@ -11623,6 +11623,8 @@ class VideoLinkTrackerBlock(BaseBlock):
             if lt and lt not in keywords:
                 keywords.append(lt)
 
+        check_search_url = bool(params.get("check_search_url", False))
+
         # Subpipeline
         pipeline_result: Any = query_raw
         pipeline_queries: List[str] = []
@@ -12027,7 +12029,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             break
                         if not u or u in seen_search_urls:
                             continue
-                        if not self._search_url_ok(u, keywords, min_term_overlap): continue
+                        if check_search_url and not self._search_url_ok(u, keywords, min_term_overlap): continue
                         if _allowed_by_required_sites_check(u):
                             candidate_pages.append(u)
                             seen_search_urls.add(u)
@@ -12048,7 +12050,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             break
                         if not u or u in seen_search_urls:
                             continue
-                        if not self._search_url_ok(u, keywords, min_term_overlap): continue
+                        if check_search_url and not self._search_url_ok(u, keywords, min_term_overlap): continue
                         if _allowed_by_required_sites_check(u):
                             candidate_pages.append(u)
                             seen_search_urls.add(u)
@@ -12074,7 +12076,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 break
                             if not u:
                                 continue
-                            if not self._search_url_ok(u, keywords, min_term_overlap): continue
+                            if check_search_url and not self._search_url_ok(u, keywords, min_term_overlap): continue
                             if _allowed_by_required_sites_check(u):
                                 if u not in seen_search_urls:
                                     candidate_pages.append(u)
@@ -13279,6 +13281,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "use_camoufox": False,
             "camoufox_options": {},
 
+            "check_search_url": True,
             "download_assets": False,            # NEW: actually fetch media bytes
             "download_dir": "video_cache",       # NEW: base dir to stash files
             "max_download_bytes": 300 * 1024**2, # NEW: 300 MB per asset safety cap
