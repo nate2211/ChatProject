@@ -11963,6 +11963,12 @@ class VideoLinkTrackerBlock(BaseBlock):
         sites_seed_pages: List[str] = []
         use_sites_engine = False
 
+        def _search_url_ok(self, url: str, keywords: list[str], min_overlap: int) -> bool:
+            if not keywords or min_overlap <= 0:
+                return True
+            hay = (url or "").lower().replace("%20", " ")
+            return self._term_overlap_ok_check(hay, keywords, min_overlap)
+
         if not skip_search_engine_for_payload and queries_to_run and source != "database":
             ua_search = ua
             seen_search_urls: set[str] = set()
@@ -12019,6 +12025,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             break
                         if not u or u in seen_search_urls:
                             continue
+                        if not self._search_url_ok(u, keywords, min_term_overlap): continue
                         if _allowed_by_required_sites_check(u):
                             candidate_pages.append(u)
                             seen_search_urls.add(u)
@@ -12039,6 +12046,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             break
                         if not u or u in seen_search_urls:
                             continue
+                        if not self._search_url_ok(u, keywords, min_term_overlap): continue
                         if _allowed_by_required_sites_check(u):
                             candidate_pages.append(u)
                             seen_search_urls.add(u)
@@ -12064,6 +12072,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 break
                             if not u:
                                 continue
+                            if not self._search_url_ok(u, keywords, min_term_overlap): continue
                             if _allowed_by_required_sites_check(u):
                                 if u not in seen_search_urls:
                                     candidate_pages.append(u)
