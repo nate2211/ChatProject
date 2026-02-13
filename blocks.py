@@ -11512,7 +11512,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         query_raw = str(params.get("query", "") or str(payload or "")).strip()
         subpipeline = params.get("subpipeline", None)
         log: List[str] = []
-
+        use_body = bool(params.get("use_body", False))
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options") or {}
         if not isinstance(camoufox_options, dict):
@@ -12556,13 +12556,16 @@ class VideoLinkTrackerBlock(BaseBlock):
                     except Exception:
                         page_title = ""
 
-                    body_text = ""
-                    try:
-                        body_text = soup.get_text(strip=True)[:4000]
-                    except Exception:
-                        pass
+                    if use_body:
+                        body_text = ""
+                        try:
+                            body_text = soup.get_text(strip=True)[:4000]
+                        except Exception:
+                            pass
 
-                    page_haystack = f"{page_title} {page_url} {body_text}"
+                        page_haystack = f"{page_title} {page_url} {body_text}"
+                    else:
+                        page_haystack = f"{page_title} {page_url}"
                     page_has_keywords = self._term_overlap_ok_check(page_haystack, keywords, min_term_overlap)
 
                     # Gather links
@@ -13303,6 +13306,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             "extract_urls_from_db_text": True,
             "ignored_exts": [".m3u8"],
+            "use_body": True,
             # Cooldown
             "output_cooldown_hours": 48,
 
