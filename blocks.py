@@ -11436,7 +11436,7 @@ class VideoLinkTrackerBlock(BaseBlock):
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         # --- NEW: runtime skip extensions (CLI) ---
         # Accepts: list[str] OR comma-separated string
-        skip_ext_param = params.get("skip_extensions", params.get("skip_exts", ""))
+        skip_ext_param = params.get("ignored_extensions", params.get("ignored_exts", ""))
 
         runtime_skip_exts: set[str] = set()
         if isinstance(skip_ext_param, (list, tuple, set)):
@@ -13293,7 +13293,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "db_allow_rescan": False,
 
             "extract_urls_from_db_text": True,
-
+            "ignored_exts": [".m3u8"],
             # Cooldown
             "output_cooldown_hours": 48,
 
