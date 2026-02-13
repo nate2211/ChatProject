@@ -11435,8 +11435,15 @@ class VideoLinkTrackerBlock(BaseBlock):
 
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         # --- NEW: runtime skip extensions (CLI) ---
-        # Accepts: list[str] OR comma-separated string
-        skip_ext_param = params.get("ignored_extensions", params.get("ignored_exts", ""))
+        # Canonical: skip_extensions
+        # Aliases: ignored_extensions, ignored_exts, skip_exts
+        skip_ext_param = (
+                params.get("skip_extensions")
+                or params.get("skip_exts")
+                or params.get("ignored_extensions")
+                or params.get("ignored_exts")
+                or ""
+        )
 
         runtime_skip_exts: set[str] = set()
         if isinstance(skip_ext_param, (list, tuple, set)):
@@ -11456,7 +11463,9 @@ class VideoLinkTrackerBlock(BaseBlock):
         ignored_exts = set(self.IGNORED_EXTENSIONS) | runtime_skip_exts
 
         if runtime_skip_exts:
-            DEBUG_LOGGER.log(f"[VideoLinkTracker] Runtime skip extensions enabled: {sorted(runtime_skip_exts)}")
+            DEBUG_LOGGER.log_message(
+                f"[VideoLinkTracker] Runtime skip extensions enabled: {sorted(runtime_skip_exts)}"
+            )
         text = str(payload or "")
         inline_ctx: str = ""
         inline_lex: List[str] = []
