@@ -10123,7 +10123,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         data = aiohttp.FormData()
         data.add_field("reqtype", "fileupload")
         data.add_field("userhash", "")
-        data.add_field("fileToUpload", image_bytes, filename="frame.jpg", content_type="image/jpeg")
+        data.add_field("fileToUpload", image_bytes, filename="frame.png", content_type="image/png")
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -11434,7 +11434,29 @@ class VideoLinkTrackerBlock(BaseBlock):
         return self._term_overlap_ok_check(hay, keywords, min_overlap)
 
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # --- NEW: runtime skip extensions (CLI) ---
+        # Accepts: list[str] OR comma-separated string
+        skip_ext_param = params.get("skip_extensions", params.get("skip_exts", ""))
 
+        runtime_skip_exts: set[str] = set()
+        if isinstance(skip_ext_param, (list, tuple, set)):
+            raw_items = [str(x) for x in skip_ext_param]
+        else:
+            raw_items = [x.strip() for x in str(skip_ext_param or "").split(",")]
+
+        for x in raw_items:
+            x = (x or "").strip().lower()
+            if not x:
+                continue
+            if not x.startswith("."):
+                x = "." + x
+            runtime_skip_exts.add(x)
+
+        # Combined ignore list used throughout the run
+        ignored_exts = set(self.IGNORED_EXTENSIONS) | runtime_skip_exts
+
+        if runtime_skip_exts:
+            DEBUG_LOGGER.log(f"[VideoLinkTracker] Runtime skip extensions enabled: {sorted(runtime_skip_exts)}")
         text = str(payload or "")
         inline_ctx: str = ""
         inline_lex: List[str] = []
@@ -11932,7 +11954,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         direct_asset_urls.append(u)
                         continue
 
-                    if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                    if any(path.endswith(ext) for ext in ignored_exts):
                         continue
 
                     candidate_pages.append(u)
@@ -12525,7 +12547,13 @@ class VideoLinkTrackerBlock(BaseBlock):
                     except Exception:
                         page_title = ""
 
-                    page_haystack = (page_title or "") + " " + page_url
+                    body_text = ""
+                    try:
+                        body_text = soup.get_text(strip=True)[:4000]
+                    except Exception:
+                        pass
+
+                    page_haystack = f"{page_title} {page_url} {body_text}"
                     page_has_keywords = self._term_overlap_ok_check(page_haystack, keywords, min_term_overlap)
 
                     # Gather links
@@ -12661,7 +12689,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
-                        trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
+                        trusted_tag = tag_type in ("network_sniff", "runtime_sniff", "db_link", "video", "source")
                         if is_visual_match:
                             asset_score += 100
 
@@ -12700,7 +12728,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                                 # 1. Hard Filter: Is it obviously NOT a video? (Junk extensions)
                                 path_low = canon.lower().split('?')[0]
-                                is_junk = any(path_low.endswith(ext) for ext in self.IGNORED_EXTENSIONS)
+                                is_junk = any(path_low.endswith(ext) for ext in ignored_exts)
 
                                 if h_status == 200 and not is_junk:
                                     if cl := headers.get("content-length"):
@@ -12741,7 +12769,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "tag": link["tag"],
                                 "content_id": cid,
                             }
-                            asset["score"] = str(asset_score)
+                            asset["score"] = int(asset_score)
                             DEBUG_LOGGER.log_message(
                                 f"[BFS] FOUND ASSET on {page_url}: Score: {asset['score']} Text: {asset['text']} URL: ({asset['url']})")
 
@@ -12819,7 +12847,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                     next_pages.append(full_url)
                                 continue
                             lpath = urlparse(full_url).path.lower()
-                            if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            if any(lpath.endswith(ext) for ext in ignored_exts):
                                 continue
                             if self._is_probable_video_url(full_url, lpath, full_url.lower()):
                                 continue
@@ -12904,13 +12932,15 @@ class VideoLinkTrackerBlock(BaseBlock):
                 )
 
                 batch: List[str] = []
-                # Calculate remaining slots to strictly enforce page limit
-                slots_left = max_pages_total
+
+                # Strict global page cap across all depths
+                slots_left = max(0, max_pages_total - len(visited_pages))
+                if slots_left <= 0:
+                    break
 
                 for u in frontier:
                     if len(batch) >= slots_left:
                         break
-
                     if u in visited_pages:
                         continue
 
@@ -12924,8 +12954,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                             logged_rescan_notice = True
 
                     batch.append(u)
-                    # CRITICAL: Mark visited immediately so we don't re-queue it in next_frontier
-                    visited_pages.add(u)
+                    visited_pages.add(u)  # mark immediately so it can't be re-queue
 
                 if not batch:
                     DEBUG_LOGGER.log_message(
@@ -13039,9 +13068,16 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             if return_all_js_links and all_js_links:
                 lines.append("\n### All JS-Gathered Links (debug)\n")
-                for jl in all_js_links:
-                    host = urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
-                    lines.append(f"- <{jl.get('tag')}> [{jl.get('text')}]({jl.get('url')}) @ {host}")
+                for jl in all_js_links[:500]:
+                    page = (jl.get("page") or "")
+                    host = urlparse(page).netloc if page else "(unknown)"
+                    tag = jl.get("tag") or "js_link"
+                    text = (jl.get("text") or "").strip()[:120] or "(no text)"
+                    url = jl.get("url") or ""
+                    if url:
+                        lines.append(f"- <{tag}> [{text}]({url}) @ {host}")
+                    else:
+                        lines.append(f"- <{tag}> {text} @ {host} (no url)")
 
             if return_network_sniff_links and all_network_links:
                 lines.append("\n### All Network-Sniffed Video Links (debug)\n")
@@ -17740,8 +17776,12 @@ class PageTrackerBlock(BaseBlock):
                             page_title = soup.title.string
                     except Exception:
                         page_title = ""
-
-                    page_haystack = (page_title or "") + " " + page_url
+                    body_text = ""
+                    try:
+                        body_text = soup.get_text(strip=True)[:4000]
+                    except Exception:
+                        pass
+                    page_haystack = (page_title or "") + " " + page_url + body_text
                     page_has_keywords = _term_overlap_ok(page_haystack)
 
                     # The main page itself can be a match
