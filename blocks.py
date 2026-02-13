@@ -16771,7 +16771,7 @@ class PageTrackerBlock(BaseBlock):
                 lexicon_url_seeds.append(t)
             else:
                 non_url_lex_terms.append(t)
-
+        use_body = bool(params.get("use_body", False))
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options") or {}
         if not isinstance(camoufox_options, dict):
@@ -17789,12 +17789,15 @@ class PageTrackerBlock(BaseBlock):
                             page_title = soup.title.string
                     except Exception:
                         page_title = ""
-                    body_text = ""
-                    try:
-                        body_text = soup.get_text(strip=True)[:4000]
-                    except Exception:
-                        pass
-                    page_haystack = (page_title or "") + " " + page_url + body_text
+                    if use_body:
+                        body_text = ""
+                        try:
+                            body_text = soup.get_text(strip=True)[:4000]
+                        except Exception:
+                            pass
+                        page_haystack = (page_title or "") + " " + page_url + body_text
+                    else:
+                        page_haystack = (page_title or "") + " " + page_url
                     page_has_keywords = _term_overlap_ok(page_haystack)
 
                     # The main page itself can be a match
@@ -18490,6 +18493,7 @@ class PageTrackerBlock(BaseBlock):
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
             "http_ca_bundle": "",
+            "use_body": True,
             "use_camoufox": False,
             "camoufox_options": {},
             "searxng_url": "http://127.0.0.1:8080",
