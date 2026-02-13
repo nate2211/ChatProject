@@ -7634,6 +7634,7 @@ class LinkTrackerBlock(BaseBlock):
         verify_links = bool(params.get("verify", True))
         engine = str(params.get("engine", "duckduckgo")).lower()
 
+        use_body = bool(params.get("use_body", False))
         use_js = bool(params.get("use_js", False))
         return_all_js_links = bool(params.get("return_all_js_links", False))
         max_links_per_page = int(params.get("max_links_per_page", 500))
@@ -7924,8 +7925,26 @@ class LinkTrackerBlock(BaseBlock):
                     proven_urls = [row["url"] for row in db_assets if row.get("url")]
                     predicted_urls = self._predict_next_in_sequence(proven_urls)
                     if predicted_urls:
-                        print(f"[db] Generated {len(predicted_urls)} predictive sequence URLs (fuzzing).")
-                        direct_asset_urls.extend(predicted_urls)
+                        filtered_predicted: list[str] = []
+                        for pu in predicted_urls:
+                            ppath = _clean_path(pu)
+
+                            # allow MEGA always
+                            if self._is_mega_link(pu):
+                                filtered_predicted.append(pu)
+                                continue
+
+                            # hard-block known junk
+                            if any(ppath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue
+
+                            # only keep if it matches your target extensions
+                            if any(ppath.endswith(ext) for ext in targets):
+                                filtered_predicted.append(pu)
+
+                        if filtered_predicted:
+                            print(f"[db] Generated {len(filtered_predicted)} predictive sequence URLs (filtered).")
+                            direct_asset_urls.extend(filtered_predicted)
 
                     proven_hubs = store.fetch_proven_hubs(required_sites, min_hits=1)
                     if proven_hubs:
@@ -8132,6 +8151,7 @@ class LinkTrackerBlock(BaseBlock):
         found_assets: List[Dict[str, Any]] = []
         seen_asset_urls: set[str] = set()
         visited_pages: set[str] = set()
+        inflight_pages: set[str] = set()
 
         log: List[str] = []
         all_js_links: List[Dict[str, str]] = []
@@ -8156,6 +8176,16 @@ class LinkTrackerBlock(BaseBlock):
             # ---------------- Direct assets ---------------- #
             if direct_asset_urls:
                 for u in direct_asset_urls:
+                    upath = _clean_path(u)
+
+                    # [PATCH] never treat ignored extensions as assets
+                    if not self._is_mega_link(u):
+                        if any(upath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            continue
+                        # [PATCH] never treat non-target extensions as assets
+                        if targets and not any(upath.endswith(ext) for ext in targets):
+                            continue
+
                     if use_database and store and store.asset_exists(u):
                         log.append(f"Skipping {u} (already in database)")
                         continue
@@ -8181,7 +8211,7 @@ class LinkTrackerBlock(BaseBlock):
                         except Exception:
                             status = "Timeout/Error"
 
-                    if not verify_links or status == "200 OK":
+                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
                         filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
                         asset = {
                             "text": filename[:100],
@@ -8254,6 +8284,15 @@ class LinkTrackerBlock(BaseBlock):
                     html = ""
 
                     sniff_items: List[Dict[str, str]] = []
+                    for si in sniff_items:
+                        url_hit = si.get("url", "")
+                        if not url_hit:
+                            continue
+                        links_on_page.append({
+                            "url": url_hit,
+                            "text": si.get("text", ""),
+                            "tag": si.get("tag", "network_sniff"),
+                        })
                     sniff_parent_pages: List[str] = []
 
                     # 1) Network sniff (shared PW)
@@ -8332,12 +8371,6 @@ class LinkTrackerBlock(BaseBlock):
                                 "tag": si.get("tag", "network_sniff"),
                                 "size": si.get("size", "?"),
                             })
-                            local_js_links.append({
-                                "page": page_url,
-                                "url": url_hit,
-                                "text": si.get("text", ""),
-                                "tag": si.get("tag", "network_sniff"),
-                            })
 
                             try:
                                 parsed = urlparse(url_hit)
@@ -8414,7 +8447,7 @@ class LinkTrackerBlock(BaseBlock):
                     # 2) JS render/gather (shared PW)
                     if use_js and pw_context:
                         js_html, js_links = await self._pw_fetch_js_links(
-                            pw_context, page_url, timeout, local_log
+                            pw_context, page_url, timeout, local_log, extensions=targets
                         )
                         if js_html:
                             html = js_html
@@ -8500,8 +8533,16 @@ class LinkTrackerBlock(BaseBlock):
                             page_title = soup.title.string
                     except Exception:
                         page_title = ""
+                    if use_body:
+                        body_text = ""
+                        try:
+                            body_text = soup.get_text(strip=True)[:4000]
+                        except Exception:
+                            pass
 
-                    page_haystack = (page_title or "") + " " + page_url
+                        page_haystack = f"{page_title} {page_url} {body_text}"
+                    else:
+                        page_haystack = f"{page_title} {page_url}"
                     page_has_keywords = _term_overlap_ok(page_haystack)
 
                     # Plain <a> links
@@ -8561,7 +8602,7 @@ class LinkTrackerBlock(BaseBlock):
                         elif is_mega:
                             status = "MEGA link"
 
-                        if not verify_links or status == "200 OK":
+                        if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
                             display_text = (link.get("text", "") or path.split("/")[-1])[:100]
                             tag = "mega" if is_mega else "a"
                             asset = {
@@ -8579,7 +8620,7 @@ class LinkTrackerBlock(BaseBlock):
                             if use_database and store:
                                 store.upsert_asset(asset)
 
-                    # Network-sniffed assets (already in sniff_items)
+                    # Network-sniffed assets (STRICT)
                     if sniff_items:
                         for item in sniff_items:
                             full_url = item.get("url")
@@ -8591,28 +8632,76 @@ class LinkTrackerBlock(BaseBlock):
                                 local_log.append(f"Skipping sniffed asset {full_url} (already in database)")
                                 continue
 
+                            is_mega = self._is_mega_link(full_url)
+                            lpath = urlparse(full_url).path.lower()
+
+                            # [PATCH] hard-block obvious junk always
+                            if not is_mega and any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue
+
+                            head_status = None
+                            head_headers: dict[str, str] = {}
+                            ct = ""
+
+                            # One HEAD only (and reuse it for filtering + status/size)
+                            if verify_links and not is_mega:
+                                try:
+                                    head_status, head_headers = await http.head(full_url)
+                                    ct = (head_headers.get("Content-Type") or head_headers.get(
+                                        "content-type") or "").lower()
+                                except Exception:
+                                    head_status, head_headers, ct = None, {}, ""
+
+                            # [PATCH] accept rules:
+                            # - If URL ends with a target ext: accept
+                            # - Else: ONLY accept if HEAD content-type matches the mode (prevents JS/non-audio)
+                            if not is_mega:
+                                has_target_ext = any(lpath.endswith(ext) for ext in targets)
+
+                                if not has_target_ext:
+                                    # If we can't verify, we do NOT accept extensionless sniffed "assets"
+                                    if not verify_links:
+                                        continue
+
+                                    if mode == "media":
+                                        if not ct.startswith("audio/"):
+                                            continue
+                                    elif mode == "pictures":
+                                        if not ct.startswith("image/"):
+                                            continue
+                                    elif mode == "docs":
+                                        if ("pdf" not in ct) and ("epub" not in ct) and ("msword" not in ct) and (
+                                                "officedocument" not in ct):
+                                            continue
+                                    elif mode == "archives":
+                                        if not any(x in ct for x in ["zip", "rar", "7z", "tar", "gzip"]):
+                                            continue
+                                    else:
+                                        continue
+
+                            # Status/size (reuse HEAD results)
                             status = "sniffed"
                             size = item.get("size") or "?"
-                            if verify_links:
-                                try:
-                                    h_status, headers = await http.head(full_url)
-                                    if h_status == 200:
-                                        status = "200 OK"
-                                        cl = headers.get("Content-Length")
-                                        if cl:
-                                            try:
-                                                size = f"{int(cl) // 1024} KB"
-                                            except ValueError:
-                                                size = "?"
-                                    elif h_status is None:
-                                        status = "Timeout/Error"
-                                    else:
-                                        status = f"Dead ({h_status})"
-                                except Exception:
-                                    status = "Timeout/Error"
 
-                            if not verify_links or status == "200 OK":
-                                display_text = (item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]")[:100]
+                            if is_mega:
+                                status = "MEGA link"
+                            elif verify_links:
+                                if head_status == 200:
+                                    status = "200 OK"
+                                    cl = head_headers.get("Content-Length") or head_headers.get("content-length")
+                                    if cl:
+                                        try:
+                                            size = f"{int(cl) // 1024} KB"
+                                        except ValueError:
+                                            size = "?"
+                                elif head_status is None:
+                                    status = "Timeout/Error"
+                                else:
+                                    status = f"Dead ({head_status})"
+
+                            if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                                display_text = (item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]")[
+                                    :100]
                                 asset = {
                                     "text": display_text,
                                     "url": full_url,
@@ -8620,8 +8709,10 @@ class LinkTrackerBlock(BaseBlock):
                                     "size": size,
                                     "status": status,
                                 }
+
                                 DEBUG_LOGGER.log_message(
-                                    f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})")
+                                    f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
+                                )
 
                                 local_assets.append(asset)
                                 if use_database and store:
@@ -8726,6 +8817,7 @@ class LinkTrackerBlock(BaseBlock):
 
             # --- BFS LOOP START ---
             # We check pages_scanned against max_pages_total to ensure global termination
+            # --- BFS LOOP START ---
             while frontier and current_depth <= max_depth:
 
                 DEBUG_LOGGER.log_message(
@@ -8734,28 +8826,29 @@ class LinkTrackerBlock(BaseBlock):
                     f"Scanned: {pages_scanned}/{max_pages_total} ---"
                 )
 
+                # [PATCH] global termination
+                slots_left = max_pages_total - pages_scanned
+                if slots_left <= 0:
+                    DEBUG_LOGGER.log_message("[BFS] Global max_pages_total reached. Stopping.")
+                    break
+
                 batch: List[str] = []
 
-                # Calculate how many slots are left before hitting the global cap
-
-
                 for u in frontier:
-                    if u in visited_pages:
+                    if len(batch) >= slots_left:
+                        break
+                    if u in visited_pages or u in inflight_pages:
                         continue
 
-                    # DB Page Scanned Check (Logic preserved from your snippet)
                     if use_database and self.store and self.store.page_scanned(u):
                         if not logged_rescan_notice:
                             DEBUG_LOGGER.log_message(
                                 "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
                             )
                             logged_rescan_notice = True
-                        # We still fall through and add 'u' to batch, as requested
 
                     batch.append(u)
-
-                    # CRITICAL: Mark as visited immediately to prevent re-queueing in next_frontier
-                    visited_pages.add(u)
+                    inflight_pages.add(u)
 
                 if not batch:
                     DEBUG_LOGGER.log_message(
@@ -8765,34 +8858,50 @@ class LinkTrackerBlock(BaseBlock):
 
                 DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
 
-                # Process this depth's batch
+                results: List[Dict[str, Any]] = []
+
                 if use_camoufox:
-                    results: List[Dict[str, Any]] = []
                     for url in batch:
                         try:
                             res = await _process_page(url, current_depth, http)
                             results.append(res)
                         except Exception as e:
                             DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
-                            continue
+                        finally:
+                            # allow retry later if it failed
+                            inflight_pages.discard(url)
                 else:
-                    # Original concurrent behaviour
-                    results = await asyncio.gather(
-                        *[_process_page(url, current_depth, http) for url in batch]
-                    )
+                    tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
+                    done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+
+                    for (url, _t), r in zip(tasks, done):
+                        inflight_pages.discard(url)
+
+                        # count attempts toward global cap (prevents infinite loops)
+                        pages_scanned += 1
+
+                        if isinstance(r, Exception):
+                            DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
+                            # do NOT mark visited -> it can be retried if it shows up again
+                            continue
+
+                        visited_pages.add(url)
+                        results.append(r)
+
+                        if pages_scanned >= max_pages_total:
+                            break
 
                 next_frontier_candidates: List[str] = []
 
                 for res in results:
-                    pages_scanned += 1
-
                     # Aggregate Logs & Links
                     all_js_links.extend(res.get("js_links", []))
                     all_network_links.extend(res.get("network_links", []))
                     all_runtime_hits.extend(res.get("runtime_hits", []))
-                    all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
+                    all_react_hits.extend(res.get("react_hits", []))
                     all_database_hits.extend(res.get("database_hits", []))
                     all_interaction_hits.extend(res.get("interaction_hits", []))
+
                     # Collect Assets
                     for asset in res.get("assets", []):
                         a_url = asset.get("url")
@@ -8800,24 +8909,24 @@ class LinkTrackerBlock(BaseBlock):
                             seen_asset_urls.add(a_url)
                             found_assets.append(asset)
 
-                    # Collect Next Pages (only if we haven't hit max depth)
+                    # Collect Next Pages
                     if current_depth < max_depth:
                         next_pages = res.get("next_pages", [])
                         if next_pages:
                             next_frontier_candidates.extend(next_pages)
 
-                # Filter next frontier against visited pages and current batch
                 next_frontier = []
                 seen_in_next = set()
 
                 for url in next_frontier_candidates:
-                    # Ensure we don't circle back to pages we just visited or are about to visit
-                    if url not in visited_pages and url not in seen_in_next:
-                        next_frontier.append(url)
-                        seen_in_next.add(url)
+                    if url in visited_pages or url in inflight_pages or url in seen_in_next:
+                        continue
+                    next_frontier.append(url)
+                    seen_in_next.add(url)
 
-                # Update frontier for next depth
-                frontier = next_frontier[:max_pages_total]
+                # [PATCH] don’t exceed remaining global capacity
+                remaining = max_pages_total - pages_scanned
+                frontier = next_frontier[:max(0, remaining)]
 
                 DEBUG_LOGGER.log_message(
                     f"[BFS] Depth {current_depth} complete. "
@@ -9195,6 +9304,7 @@ class LinkTrackerBlock(BaseBlock):
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
             "http_ca_bundle": "",   # path to bundled cacert.pem if needed
+            "use_body": True,
             "use_camoufox": False,
             "camoufox_options": {},
             "pw_headless": True,
@@ -22867,3 +22977,5 @@ class HiddenContentTrackerBlock(BaseBlock):
         }
 
 BLOCKS.register("hiddencontenttracker", HiddenContentTrackerBlock)
+
+
