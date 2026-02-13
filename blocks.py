@@ -12698,7 +12698,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                         asset_text = link.get("text", "")
                         asset_score = self._score_video_asset(canon, asset_text, keywords)
-                        trusted_tag = tag_type in ("network_sniff", "runtime_sniff", "db_link", "video", "source")
+                        trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link", "video", "source")
                         if is_visual_match:
                             asset_score += 100
 
@@ -12728,7 +12728,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         size = "?"
                         content_type = ""
                         do_head = verify_links or smart_sniff_param
-                        trusted_hit = tag_type in ("network_sniff", "runtime_sniff", "db_link")
+
                         # --- REFINED VERIFICATION GATE ---
                         if do_head:
                             try:
