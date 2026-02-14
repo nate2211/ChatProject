@@ -46,7 +46,14 @@ from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusSt
     CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore, DirectLinkTrackerStore
 from loggers import DEBUG_LOGGER
 
-load_dotenv()
+def get_env_path():
+    # If running as a PyInstaller bundle
+    if hasattr(sys, '_MEIPASS'):
+        return os.path.join(sys._MEIPASS, '.env')
+    # If running as a script
+    return os.path.join(os.getcwd(), '.env')
+
+load_dotenv(get_env_path())
 # ---------------- Paths & helpers ----------------
 APP_DIR = _os.path.join(_os.path.expanduser("~"), ".promptchat")
 MEMORY_PATH = _os.path.join(APP_DIR, "memory.json")
