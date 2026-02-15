@@ -12,13 +12,17 @@ import gzip
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 import threading
+import urllib
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 import random
 from typing import Any, Dict, Tuple, List, Optional, Set
@@ -22986,4 +22990,3843 @@ class HiddenContentTrackerBlock(BaseBlock):
 
 BLOCKS.register("hiddencontenttracker", HiddenContentTrackerBlock)
 
+# ======================= MemorySourceMiner =======================
+@dataclass
+class MemorySourceMinerBlock(BaseBlock):
+    """
+    Adaptive pre-tracker miner.
 
+    What’s new vs static synthesis:
+      • Learns per-host URL templates from observed URLs (path/query ID placeholders).
+      • Synthesizes "shadow URLs" ONLY by filling learned templates with mined IDs.
+      • Iterative "mining rounds": mine -> learn -> synthesize -> repeat until stop condition.
+      • Works with any site you've already encountered in memory/payload (no domain list).
+
+    Safety/Scope:
+      • No brute-force random guessing; only recombines already-observed IDs/tokens with
+        already-observed URL shapes.
+    """
+
+    # -------------------- regex extractors --------------------
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
+
+    _UUID_RE = re.compile(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+        re.I
+    )
+    _HEX_ID_RE = re.compile(r"\b[a-f0-9]{24,64}\b", re.I)  # common content hashes/ids
+    _B64URL_RE = re.compile(r"\b[A-Za-z0-9_-]{18,256}\b")  # URL-safe base64-ish tokens
+    _NUM_ID_RE = re.compile(r"\b\d{6,20}\b")              # numeric IDs, snowflakes, etc
+
+    _URLISH_KEYS = ("url", "href", "src", "download", "stream", "playback", "manifest", "m3u8", "mp4", "cdn")
+    _IDISH_KEYS = ("id", "token", "hash", "key", "guid", "uuid", "sig", "signature")
+
+    _NOISE_TOKENS = {
+        "color", "style", "width", "height", "border", "padding", "margin",
+        "display", "position", "absolute", "relative", "static", "true", "false", "null",
+    }
+
+    _HIGH_VALUE_MARKERS_DEFAULT = (
+        ".m3u8", ".mp4", ".webm", ".mp3", ".wav",
+        "manifest", "playlist", "hls", "dash", "segment",
+        "/api/", "/download", "/stream", "/media", "/assets", "/file", "/files",
+    )
+
+    # -------------------- helpers: scanning limits --------------------
+    def _clamp_str(self, s: str, max_chars: int) -> str:
+        if len(s) <= max_chars:
+            return s
+        return s[:max_chars]
+
+    def _iter_strings(self, obj: Any, *, max_items: int, max_str_chars: int):
+        """
+        Yield (bounded) strings found by recursively walking obj.
+        Also yields dict keys as strings (bounded), because keys can hold URLs/paths.
+        """
+        seen = 0
+        stack = [obj]
+        while stack and seen < max_items:
+            cur = stack.pop()
+            if cur is None:
+                continue
+
+            if isinstance(cur, str):
+                seen += 1
+                yield self._clamp_str(cur, max_str_chars)
+                continue
+
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    if seen >= max_items:
+                        break
+                    if isinstance(k, str):
+                        seen += 1
+                        yield self._clamp_str(k, max_str_chars)
+                    stack.append(v)
+                continue
+
+            if isinstance(cur, (list, tuple, set)):
+                for it in cur:
+                    if seen >= max_items:
+                        break
+                    stack.append(it)
+                continue
+
+    def _looks_like_noise(self, s: str) -> bool:
+        t = s.strip().lower()
+        if not t:
+            return True
+        if t in self._NOISE_TOKENS:
+            return True
+        if len(t) < 6:
+            return True
+        if len(t) < 120 and t.count(" ") >= 3:
+            return True
+        return False
+
+    def _mine_from_string(self, s: str, ids: Set[str], urls: Set[str]):
+        for m in self._URL_RE.finditer(s):
+            urls.add(m.group(0))
+
+        for m in self._UUID_RE.finditer(s):
+            ids.add(m.group(0))
+        for m in self._HEX_ID_RE.finditer(s):
+            ids.add(m.group(0))
+        for m in self._NUM_ID_RE.finditer(s):
+            ids.add(m.group(0))
+        for m in self._B64URL_RE.finditer(s):
+            tok = m.group(0)
+            if not self._looks_like_noise(tok) and "http" not in tok.lower():
+                ids.add(tok)
+
+    def _walk_and_mine(self, obj: Any, ids: Set[str], urls: Set[str], *, max_items: int, max_str_chars: int):
+        for s in self._iter_strings(obj, max_items=max_items, max_str_chars=max_str_chars):
+            self._mine_from_string(s, ids, urls)
+
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                kl = str(k).lower()
+                if any(x in kl for x in self._IDISH_KEYS) and isinstance(v, str) and not self._looks_like_noise(v):
+                    ids.add(v.strip())
+                if any(x in kl for x in self._URLISH_KEYS) and isinstance(v, str):
+                    for m in self._URL_RE.finditer(v):
+                        urls.add(m.group(0))
+
+    # -------------------- template learning & synthesis --------------------
+    def _is_id_segment(self, seg: str) -> bool:
+        if not seg or len(seg) < 6:
+            return False
+        if self._UUID_RE.fullmatch(seg):
+            return True
+        if self._HEX_ID_RE.fullmatch(seg):
+            return True
+        if self._NUM_ID_RE.fullmatch(seg):
+            return True
+        if self._B64URL_RE.fullmatch(seg) and not self._looks_like_noise(seg):
+            has_digit = any(c.isdigit() for c in seg)
+            has_alpha = any(c.isalpha() for c in seg)
+            return has_digit and has_alpha
+        return False
+
+    def _learn_templates_from_url(self, u: str, templates: Set[str], hosts: Set[str]):
+        try:
+            p = urlparse(u)
+        except Exception:
+            return
+        if not p.scheme or not p.netloc:
+            return
+
+        host = p.netloc.lower()
+        hosts.add(host)
+
+        path_segs = [s for s in p.path.split("/") if s != ""]
+        replaced = 0
+        for i, seg in enumerate(path_segs):
+            if replaced >= 2:
+                break
+            if self._is_id_segment(seg):
+                path_segs[i] = "{id}"
+                replaced += 1
+
+        path_tpl = "/" + "/".join(path_segs) if path_segs else (p.path or "/")
+
+        q = parse_qsl(p.query, keep_blank_values=True)
+        q2 = []
+        q_replaced = 0
+        for k, v in q:
+            if q_replaced < 2:
+                kl = k.lower()
+                if any(x in kl for x in self._IDISH_KEYS) or self._is_id_segment(v):
+                    q2.append((k, "{id}"))
+                    q_replaced += 1
+                else:
+                    q2.append((k, v))
+            else:
+                q2.append((k, v))
+
+        query_tpl = urlencode(q2) if q2 else ""
+        tpl = urlunparse((p.scheme, p.netloc, path_tpl, "", query_tpl, ""))
+        if "{id}" in tpl:
+            templates.add(tpl)
+
+    def _synthesize_from_templates(
+        self,
+        ids: Set[str],
+        templates: Set[str],
+        *,
+        max_urls: int
+    ) -> List[str]:
+        out: List[str] = []
+        if not ids or not templates:
+            return out
+
+        ids_list = sorted(ids, key=lambda x: (len(x), x))[: max(200, min(len(ids), 200))]
+        tpl_list = sorted(templates)
+
+        for tpl in tpl_list:
+            if len(out) >= max_urls:
+                break
+            for fid in ids_list:
+                if len(out) >= max_urls:
+                    break
+                safe_id = quote(fid, safe="-_.~")
+                out.append(tpl.replace("{id}", safe_id))
+
+        return list(dict.fromkeys(out))
+
+    # -------------------- execute --------------------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        DEBUG_LOGGER.log_message("[MemorySourceMiner] starting execute()")
+
+        mem = Memory.load()
+        DEBUG_LOGGER.log_message("[MemorySourceMiner] memory loaded")
+
+        # Params
+        sources_raw = str(params.get("memory_sources", "")).strip()
+        keys_to_scan = [k.strip() for k in sources_raw.split(",") if k.strip()]
+
+        target_key = str(params.get("target_key", "mined_seeds")).strip() or "mined_seeds"
+        lexicon_key = str(params.get("lexicon_key", "mined_lexicon")).strip() or "mined_lexicon"
+        templates_key = str(params.get("templates_key", "mined_templates")).strip() or "mined_templates"
+
+        max_rounds = int(params.get("max_rounds", 3))
+        max_rounds = max(1, min(max_rounds, 20))
+
+        max_items = int(params.get("max_items", 50_000))
+        max_str_chars = int(params.get("max_str_chars", 25_000))
+
+        max_synth_urls = int(params.get("max_synth_urls", 5000))
+        max_synth_urls = max(0, min(max_synth_urls, 50_000))
+
+        goal_regex_raw = str(params.get("goal_regex", "")).strip()
+        goal_min_matches = int(params.get("goal_min_matches", 0))
+        goal_min_matches = max(0, goal_min_matches)
+        goal_re = re.compile(goal_regex_raw, re.I) if goal_regex_raw else None
+
+        max_seconds = float(params.get("max_seconds", 0.0))
+        start_t = time.time()
+
+        high_value_markers_raw = params.get("high_value_markers", None)
+        if isinstance(high_value_markers_raw, str) and high_value_markers_raw.strip():
+            high_markers = tuple(s.strip().lower() for s in high_value_markers_raw.split(",") if s.strip())
+        else:
+            high_markers = self._HIGH_VALUE_MARKERS_DEFAULT
+
+        DEBUG_LOGGER.log_message(
+            "[MemorySourceMiner] params: "
+            f"keys={keys_to_scan} target_key={target_key} lexicon_key={lexicon_key} templates_key={templates_key} "
+            f"max_rounds={max_rounds} max_items={max_items} max_str_chars={max_str_chars} "
+            f"max_synth_urls={max_synth_urls} goal_regex={'set' if goal_re else 'none'} goal_min_matches={goal_min_matches} "
+            f"max_seconds={max_seconds}"
+        )
+
+        found_ids: Set[str] = set()
+        found_urls: Set[str] = set()
+        learned_templates: Set[str] = set()
+        seen_hosts: Set[str] = set()
+        log: List[str] = []
+
+        scan_objects: List[Any] = [payload]
+        DEBUG_LOGGER.log_message("[MemorySourceMiner] added payload to scan set")
+
+        for k in keys_to_scan:
+            v = mem.get(k)
+            if v is not None:
+                scan_objects.append(v)
+                DEBUG_LOGGER.log_message(f"[MemorySourceMiner] added memory key to scan set: {k}")
+            else:
+                DEBUG_LOGGER.log_message(f"[MemorySourceMiner] memory key missing: {k}")
+
+        stop_reason = "max_rounds"
+        rounds_run = 0
+
+        for r in range(max_rounds):
+            rounds_run = r + 1
+            DEBUG_LOGGER.log_message(f"[MemorySourceMiner] round {rounds_run}/{max_rounds} begin")
+
+            before_ids = len(found_ids)
+            before_urls = len(found_urls)
+            before_tpl = len(learned_templates)
+
+            # Mine (bounded)
+            t0 = time.time()
+            for obj in scan_objects:
+                self._walk_and_mine(obj, found_ids, found_urls, max_items=max_items, max_str_chars=max_str_chars)
+            DEBUG_LOGGER.log_message(
+                f"[MemorySourceMiner] round {rounds_run}: mined in {time.time()-t0:.3f}s "
+                f"(ids={len(found_ids)}, urls={len(found_urls)})"
+            )
+
+            # Learn templates
+            t1 = time.time()
+            for u in list(found_urls):
+                self._learn_templates_from_url(u, learned_templates, seen_hosts)
+            DEBUG_LOGGER.log_message(
+                f"[MemorySourceMiner] round {rounds_run}: learned templates in {time.time()-t1:.3f}s "
+                f"(templates={len(learned_templates)}, hosts={len(seen_hosts)})"
+            )
+
+            # Synthesize from templates
+            t2 = time.time()
+            synthesized = self._synthesize_from_templates(found_ids, learned_templates, max_urls=max_synth_urls)
+            for u in synthesized:
+                found_urls.add(u)
+            DEBUG_LOGGER.log_message(
+                f"[MemorySourceMiner] round {rounds_run}: synthesized in {time.time()-t2:.3f}s "
+                f"(synthesized={len(synthesized)}, total_urls={len(found_urls)})"
+            )
+
+            # Stop conditions
+            if max_seconds and (time.time() - start_t) >= max_seconds:
+                stop_reason = "max_seconds"
+                DEBUG_LOGGER.log_message(f"[MemorySourceMiner] stop: time budget hit ({max_seconds}s)")
+                break
+
+            if goal_re and goal_min_matches > 0:
+                matches = sum(1 for u in found_urls if goal_re.search(u))
+                DEBUG_LOGGER.log_message(f"[MemorySourceMiner] round {rounds_run}: goal matches={matches}/{goal_min_matches}")
+                if matches >= goal_min_matches:
+                    stop_reason = f"goal_regex_met({matches})"
+                    DEBUG_LOGGER.log_message(f"[MemorySourceMiner] stop: goal met ({stop_reason})")
+                    break
+
+            grew = (len(found_ids) > before_ids) or (len(found_urls) > before_urls) or (len(learned_templates) > before_tpl)
+            DEBUG_LOGGER.log_message(
+                f"[MemorySourceMiner] round {rounds_run} delta: "
+                f"ids {before_ids}->{len(found_ids)}, urls {before_urls}->{len(found_urls)}, templates {before_tpl}->{len(learned_templates)}"
+            )
+
+            if not grew:
+                stop_reason = "converged"
+                DEBUG_LOGGER.log_message("[MemorySourceMiner] stop: converged (no growth)")
+                break
+
+            # Next round scans newly synthesized strings (bounded) to find embedded URLs/IDs
+            scan_objects = synthesized[:2000]
+            DEBUG_LOGGER.log_message(f"[MemorySourceMiner] round {rounds_run}: next scan_objects set to synthesized[:2000] ({len(scan_objects)})")
+
+            log.append(
+                f"Round {rounds_run}: ids {before_ids}->{len(found_ids)}, urls {before_urls}->{len(found_urls)}, templates {before_tpl}->{len(learned_templates)}"
+            )
+
+        all_seeds = list(dict.fromkeys([u for u in found_urls if u.lower().startswith("http")]))
+        hv = [u for u in all_seeds if any(m in u.lower() for m in high_markers)]
+
+        DEBUG_LOGGER.log_message(
+            "[MemorySourceMiner] final: "
+            f"rounds_run={rounds_run} stop_reason={stop_reason} "
+            f"hosts={len(seen_hosts)} templates={len(learned_templates)} ids={len(found_ids)} "
+            f"seeds={len(all_seeds)} high_value={len(hv)}"
+        )
+
+        # Save back into memory
+        mem[target_key] = all_seeds
+        mem[lexicon_key] = list(sorted(found_ids))[:200]
+        mem[templates_key] = list(sorted(learned_templates))[:2000]
+        Memory.save(mem)
+        DEBUG_LOGGER.log_message(f"[MemorySourceMiner] saved: {target_key}, {lexicon_key}, {templates_key}")
+
+        # Output formatting for tracker consumption
+        preview = hv[:10] if hv else all_seeds[:10]
+        res_lines = [
+            "### ⛏️ MemorySourceMinerBlock: Adaptive Deep Mine Complete",
+            f"_Rounds: {rounds_run}/{max_rounds} | Hosts: {len(seen_hosts)} | Templates: {len(learned_templates)} | IDs: {len(found_ids)} | Seeds: {len(all_seeds)} | Stop: {stop_reason}_",
+            "",
+            "**High-Value Seed Preview:**"
+        ]
+        for s in preview:
+            res_lines.append(f"- {s}")
+
+        out_text = (
+            "[context]\n" + "\n".join(all_seeds) +
+            "\n\n[lexicon]\n" + ",".join(list(sorted(found_ids))[:50])
+        )
+
+        meta = {
+            "rounds_run": rounds_run,
+            "stop_reason": stop_reason,
+            "hosts_seen": sorted(list(seen_hosts))[:200],
+            "templates_learned": len(learned_templates),
+            "ids_found": len(found_ids),
+            "total_seeds": len(all_seeds),
+            "high_value_seeds": len(hv),
+            "target_key": target_key,
+            "lexicon_key": lexicon_key,
+            "templates_key": templates_key,
+            "log": log[:200],
+        }
+
+        DEBUG_LOGGER.log_message("[MemorySourceMiner] execute() complete")
+        return out_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "memory_sources": "socketpipe_last_events,web_context,scraped_links",
+            "target_key": "mined_seeds",
+            "lexicon_key": "mined_lexicon",
+            "templates_key": "mined_templates",
+            "max_rounds": 3,
+            "max_synth_urls": 5000,
+            "goal_regex": r"\.m3u8|\.mp4",
+            "goal_min_matches": 10,
+            "max_seconds": 0,
+            "high_value_markers": "m3u8,mp4,manifest,playlist,/api/,/download,/stream"
+        }
+
+BLOCKS.register("memorysourceminer", MemorySourceMinerBlock)
+
+# ======================= TrendingMinerBlock (Popular + Just Released Aggregator) =======================
+
+@dataclass
+class TrendingMinerBlock(BaseBlock):
+    """
+    Trending miner for:
+      • art
+      • sports
+      • music beats
+      • streetwear
+      • fashion
+      • gaming
+      • tech/news
+
+    Approach:
+      1) Pull high-signal sources (Reddit RSS + HN API + GitHub Search + optional RSS feeds)
+      2) Normalize to a common item format
+      3) Score = recency + popularity + cross-source boost
+      4) Expand “frontier” terms from winning titles, then optionally fetch Reddit *search* RSS
+      5) Repeat until max_rounds or yield drops
+      6) (NEW) Mine top hit pages (HTML) for real terms/phrases → enrich lexicon
+      7) Output [context] URLs + [lexicon] keywords, and persist hits/seeds/lexicon to Memory
+
+    Outputs:
+      [context] -> URL seeds (best for trackers)
+      [lexicon] -> real mined terms/phrases (best for ChatBlock model=lexicon)
+    """
+
+    # -------------------- defaults --------------------
+    DEFAULT_CATEGORIES = ("art", "sports", "music", "streetwear", "fashion", "gaming", "tech")
+
+    DEFAULT_REDDIT = {
+        "art": [
+            "Art", "DigitalArt", "Illustration", "ConceptArt",
+            "blender", "ProCreate", "graphic_design", "Design",
+        ],
+        "sports": [
+            "sports", "nba", "nfl", "soccer", "baseball",
+            "MMA", "formula1", "tennis", "boxing",
+        ],
+        "music": [
+            "makinghiphop", "trapproduction", "WeAreTheMusicMakers",
+            "LoFiHipHop", "Drumkits", "hiphopheads",
+        ],
+        "streetwear": [
+            "streetwear", "Sneakers", "StreetwearStartup",
+            "FrugalMaleFashion", "malefashionadvice",
+        ],
+        "fashion": [
+            "fashion", "malefashionadvice", "femalefashionadvice",
+            "mensfashion", "WomensFashion", "SneakerFits",
+        ],
+        "gaming": [
+            "Games", "pcgaming", "gaming", "GameDeals", "NintendoSwitch",
+        ],
+        "tech": [
+            "technology", "programming", "MachineLearning", "gadgets", "cybersecurity",
+        ],
+    }
+
+    # Optional RSS feeds per category (you can override via params)
+    DEFAULT_RSS_FEEDS = {
+        # ---- ART / CULTURE NEWS ----
+        "art": [
+            # Hyperallergic (arts + culture reporting)
+            "https://hyperallergic.com/feed/",
+            # ARTnews (major art industry publication)
+            "https://www.artnews.com/feed/",
+        ],
+
+        # ---- SPORTS NEWS ----
+        "sports": [
+            # ESPN Top Headlines RSS
+            "https://www.espn.com/espn/rss/news",
+            # BBC Sport (broad global sports coverage)
+            "https://feeds.bbci.co.uk/sport/rss.xml",
+        ],
+
+        # ---- MUSIC NEWS / RELEASES ----
+        "music": [
+            # Pitchfork News RSS
+            "https://pitchfork.com/rss/news/",
+        ],
+
+        # ---- STREETWEAR / SNEAKERS / STYLE NEWS ----
+        "streetwear": [
+            # Vogue RSS (style + fashion news)
+            "https://www.vogue.com/feed/rss",
+
+            # FashionNetwork “All categories” (industry news stream; can catch drops/collabs via headlines)
+            # NOTE: this is the India edition; you can swap subdomain to us./uk./ww. etc if you prefer.
+            "https://in.fashionnetwork.com/rss/feed/in%2C1.xml",
+        ],
+
+        # ---- FASHION (INDUSTRY + RUNWAY + RETAIL) ----
+        "fashion": [
+            "https://www.vogue.com/feed/rss",
+
+            # FashionNetwork (category feeds)
+            "https://in.fashionnetwork.com/rss/feed/in%2C1.xml",  # All categories
+            "https://in.fashionnetwork.com/rss/feed/in%2C1%2C112.xml",  # Business
+            "https://in.fashionnetwork.com/rss/feed/in%2C1%2C15.xml",  # Retail
+        ],
+
+        # ---- GAMING NEWS ----
+        "gaming": [
+            # IGN (broad gaming/entertainment stream)
+            "https://feeds.ign.com/ign/all?format=xml",
+            # GamesIndustry.biz (industry-focused gaming news)
+            "https://www.gamesindustry.biz/rss/gamesindustry_news_feed.rss",
+            # Polygon (gaming + culture)
+            "https://www.polygon.com/rss/index.xml",
+        ],
+
+        # ---- TECH / NEWS ----
+        "tech": [
+            # The Verge (big tech/product/news)
+            "https://www.theverge.com/rss/index.xml",
+            # WIRED (top stories)
+            "https://www.wired.com/feed/rss",
+            # TechCrunch (startups + product + funding news)
+            "https://techcrunch.com/feed/",
+            # Ars Technica (deep tech + security)
+            "https://feeds.arstechnica.com/arstechnica/index",
+        ],
+    }
+
+    STOPWORDS = {
+        "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with",
+        "is", "are", "was", "were", "be", "been", "it", "this", "that", "these", "those",
+        "you", "your", "we", "our", "they", "their", "i", "me", "my",
+        "from", "at", "as", "by", "into", "about", "over", "under", "after", "before",
+        "new", "just", "release", "released", "drops", "drop", "official",
+        "vs", "v", "how", "what", "why", "when", "where",
+        "today", "tonight", "tomorrow", "yesterday",
+    }
+
+    TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-]{2,}")
+
+    # -------------------- Page mining (HTML → real terms/phrases) --------------------
+    PAGE_MINER_STOPWORDS = STOPWORDS | {
+        "cookies", "cookie", "privacy", "policy", "terms", "subscribe", "subscription",
+        "newsletter", "accept", "consent", "advertisement", "advertising", "sponsored",
+        "sign", "signin", "sign-in", "login", "log", "account", "register",
+        "menu", "search", "share", "follow", "click", "read", "more",
+        "home", "page", "pages", "site", "website",
+        "all", "any", "some", "most", "also", "can", "could", "should", "would",
+    }
+
+    _HTML_STRIP_TAG_RE = re.compile(r"<[^>]+>")
+    _HTML_SCRIPT_STYLE_RE = re.compile(r"(?is)<(script|style|noscript|svg|canvas|iframe|template)[^>]*>.*?</\1>")
+    _HTML_COMMENT_RE = re.compile(r"(?s)<!--.*?-->")
+    _HTML_TITLE_RE = re.compile(r"(?is)<title[^>]*>(.*?)</title>")
+    _HTML_H1_RE = re.compile(r"(?is)<h1[^>]*>(.*?)</h1>")
+    _HTML_META_DESC_RE = re.compile(
+        r'(?is)<meta[^>]+(?:name|property)\s*=\s*["\'](?:description|og:description|twitter:description)["\'][^>]*content\s*=\s*["\'](.*?)["\']'
+    )
+    _HTML_META_TITLE_RE = re.compile(
+        r'(?is)<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:title|twitter:title)["\'][^>]*content\s*=\s*["\'](.*?)["\']'
+    )
+
+    # -------------------- debug helper --------------------
+    def _dbg(self, msg: str):
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    # -------------------- fetch helpers --------------------
+    def _now(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _fetch_text(self, url: str, *, timeout: float, headers: Dict[str, str]) -> Optional[str]:
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers)
+            if r.status_code >= 400:
+                self._dbg(f"[TrendingMiner] fetch fail {r.status_code} url={url}")
+                return None
+            return r.text
+        except Exception as e:
+            self._dbg(f"[TrendingMiner] fetch error url={url} err={type(e).__name__}: {e}")
+            return None
+
+    def _fetch_limited_text(self, url: str, *, timeout: float, headers: Dict[str, str], max_bytes: int) -> Optional[str]:
+        """
+        Stream fetch up to max_bytes. Sniffs for HTML-ish content. Returns decoded text or None.
+        """
+        try:
+            r = requests.get(url, timeout=timeout, headers=headers, stream=True, allow_redirects=True)
+            if r.status_code >= 400:
+                self._dbg(f"[TrendingMiner] page mine fetch fail {r.status_code} url={url}")
+                return None
+
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            allow = ("text/html" in ctype) or ("application/xhtml" in ctype) or ("xml" in ctype)
+
+            buf = bytearray()
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) >= max_bytes:
+                    break
+
+            if not buf:
+                return None
+
+            head = bytes(buf[:512]).lower()
+            if not allow and (b"<html" not in head and b"<!doctype" not in head and b"<head" not in head):
+                self._dbg(f"[TrendingMiner] page mine skip non-html ctype={ctype} url={url}")
+                return None
+
+            enc = r.encoding or "utf-8"
+            try:
+                return bytes(buf).decode(enc, errors="ignore")
+            except Exception:
+                return bytes(buf).decode("utf-8", errors="ignore")
+
+        except Exception as e:
+            self._dbg(f"[TrendingMiner] page mine fetch error url={url} err={type(e).__name__}: {e}")
+            return None
+
+    # -------------------- parsing helpers --------------------
+    def _parse_dt(self, s: str) -> Optional[datetime]:
+        s = (s or "").strip()
+        if not s:
+            return None
+
+        try:
+            dt = parsedate_to_datetime(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+
+        try:
+            s2 = s.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(s2)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    def _canon_url(self, u: str) -> str:
+        try:
+            p = urlparse(u)
+            q = [
+                (k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True)
+                if not (k.lower().startswith("utm_") or k.lower() in ("fbclid", "gclid", "igshid"))
+            ]
+            query = urlencode(q, doseq=True) if q else ""
+            return urlunparse((p.scheme, p.netloc, p.path, p.params, query, ""))
+        except Exception:
+            return u
+
+    def _parse_rss_atom(self, xml_text: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        if not xml_text:
+            return out
+
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return out
+
+        # RSS
+        channel = root.find("channel")
+        if channel is not None:
+            items = channel.findall("item")
+            for it in items:
+                title = (it.findtext("title") or "").strip()
+                link = (it.findtext("link") or "").strip()
+                guid = (it.findtext("guid") or "").strip()
+                pub = (it.findtext("pubDate") or it.findtext("date") or "").strip()
+                dt = self._parse_dt(pub)
+
+                url = link or guid
+                if url:
+                    out.append({"title": title, "url": url, "published_dt": dt})
+            return out
+
+        # Atom
+        entries = root.findall("{http://www.w3.org/2005/Atom}entry")
+        if entries:
+            for e in entries:
+                title = (e.findtext("{http://www.w3.org/2005/Atom}title") or "").strip()
+
+                link = ""
+                for lk in e.findall("{http://www.w3.org/2005/Atom}link"):
+                    href = lk.attrib.get("href", "")
+                    rel = lk.attrib.get("rel", "")
+                    if rel in ("", "alternate") and href:
+                        link = href
+                        break
+
+                updated = (e.findtext("{http://www.w3.org/2005/Atom}updated") or "").strip()
+                published = (e.findtext("{http://www.w3.org/2005/Atom}published") or "").strip()
+                dt = self._parse_dt(published or updated)
+
+                if link:
+                    out.append({"title": title, "url": link, "published_dt": dt})
+            return out
+
+        return out
+
+    # -------------------- source adapters --------------------
+    def _reddit_rss_url(self, subreddit: str, sort: str) -> str:
+        sort = sort.lower().strip()
+        if sort not in ("hot", "new", "rising", "top"):
+            sort = "hot"
+        return f"https://www.reddit.com/r/{subreddit}/{sort}.rss"
+
+    def _reddit_search_rss_url(self, query: str, sort: str) -> str:
+        sort = sort.lower().strip()
+        if sort not in ("new", "relevance", "hot", "top"):
+            sort = "new"
+        from urllib.parse import quote_plus
+        return f"https://www.reddit.com/search.rss?q={quote_plus(query)}&sort={sort}"
+
+    def _pull_reddit_rss(
+        self,
+        *,
+        category: str,
+        subreddits: List[str],
+        sort: str,
+        timeout: float,
+        headers: Dict[str, str],
+        per_feed_cap: int
+    ) -> List[Dict[str, Any]]:
+        hits: List[Dict[str, Any]] = []
+        for sub in subreddits:
+            url = self._reddit_rss_url(sub, sort)
+            self._dbg(f"[TrendingMiner] reddit rss fetch category={category} sub={sub} sort={sort}")
+            txt = self._fetch_text(url, timeout=timeout, headers=headers)
+            items = self._parse_rss_atom(txt or "")
+            if not items:
+                continue
+
+            n = min(per_feed_cap, len(items))
+            for i, it in enumerate(items[:n]):
+                u = it.get("url") or ""
+                if not u:
+                    continue
+                hits.append({
+                    "category": category,
+                    "source": f"reddit:r/{sub}:{sort}",
+                    "title": it.get("title") or "",
+                    "url": self._canon_url(u),
+                    "published_dt": it.get("published_dt"),
+                    "popularity_raw": float(n - i),  # rank proxy
+                    "popularity_kind": "rank",
+                })
+        return hits
+
+    def _pull_generic_rss(
+        self,
+        *,
+        category: str,
+        feeds: List[str],
+        timeout: float,
+        headers: Dict[str, str],
+        per_feed_cap: int
+    ) -> List[Dict[str, Any]]:
+        hits: List[Dict[str, Any]] = []
+        for feed in feeds:
+            self._dbg(f"[TrendingMiner] rss fetch category={category} feed={feed}")
+            txt = self._fetch_text(feed, timeout=timeout, headers=headers)
+            items = self._parse_rss_atom(txt or "")
+            n = min(per_feed_cap, len(items))
+            for i, it in enumerate(items[:n]):
+                u = it.get("url") or ""
+                if not u:
+                    continue
+                hits.append({
+                    "category": category,
+                    "source": "rss",
+                    "title": it.get("title") or "",
+                    "url": self._canon_url(u),
+                    "published_dt": it.get("published_dt"),
+                    "popularity_raw": float(n - i),
+                    "popularity_kind": "rank",
+                })
+        return hits
+
+    def _pull_hackernews(
+        self,
+        *,
+        timeout: float,
+        headers: Dict[str, str],
+        per_feed_cap: int,
+        which: str
+    ) -> List[Dict[str, Any]]:
+        which = which.lower().strip()
+        if which not in ("top", "new", "best"):
+            which = "top"
+
+        base = "https://hacker-news.firebaseio.com/v0"
+        ids_url = f"{base}/{which}stories.json"
+        self._dbg(f"[TrendingMiner] hn fetch list which={which}")
+
+        try:
+            r = requests.get(ids_url, timeout=timeout, headers=headers)
+            if r.status_code >= 400:
+                self._dbg(f"[TrendingMiner] hn list fail {r.status_code}")
+                return []
+            ids = r.json()
+            if not isinstance(ids, list):
+                return []
+        except Exception as e:
+            self._dbg(f"[TrendingMiner] hn list error {type(e).__name__}: {e}")
+            return []
+
+        hits: List[Dict[str, Any]] = []
+        for story_id in ids[:per_feed_cap]:
+            item_url = f"{base}/item/{story_id}.json"
+            try:
+                rr = requests.get(item_url, timeout=timeout, headers=headers)
+                if rr.status_code >= 400:
+                    continue
+                obj = rr.json() or {}
+                if obj.get("type") != "story":
+                    continue
+                title = obj.get("title") or ""
+                url = obj.get("url") or f"https://news.ycombinator.com/item?id={story_id}"
+                score = float(obj.get("score") or 0.0)
+                ts = obj.get("time")
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc) if isinstance(ts, (int, float)) else None
+                hits.append({
+                    "category": "tech",
+                    "source": f"hn:{which}",
+                    "title": title,
+                    "url": self._canon_url(url),
+                    "published_dt": dt,
+                    "popularity_raw": score,
+                    "popularity_kind": "score",
+                })
+            except Exception:
+                continue
+
+        self._dbg(f"[TrendingMiner] hn fetched hits={len(hits)} which={which}")
+        return hits
+
+    def _pull_github_search(
+        self,
+        *,
+        timeout: float,
+        headers: Dict[str, str],
+        per_feed_cap: int,
+        query: str
+    ) -> List[Dict[str, Any]]:
+        api = "https://api.github.com/search/repositories"
+        params = {"q": query, "sort": "stars", "order": "desc", "per_page": min(100, per_feed_cap)}
+        self._dbg(f"[TrendingMiner] github search q={query}")
+
+        try:
+            r = requests.get(api, params=params, timeout=timeout, headers=headers)
+            if r.status_code >= 400:
+                self._dbg(f"[TrendingMiner] github fail {r.status_code} q={query}")
+                return []
+            data = r.json() or {}
+        except Exception as e:
+            self._dbg(f"[TrendingMiner] github error {type(e).__name__}: {e}")
+            return []
+
+        items = data.get("items") or []
+        hits: List[Dict[str, Any]] = []
+        for obj in items[:per_feed_cap]:
+            url = obj.get("html_url") or ""
+            if not url:
+                continue
+            title = obj.get("full_name") or obj.get("name") or ""
+            stars = float(obj.get("stargazers_count") or 0.0)
+            created_at = obj.get("created_at") or ""
+            pushed_at = obj.get("pushed_at") or ""
+            dt = self._parse_dt(pushed_at) or self._parse_dt(created_at)
+            hits.append({
+                "category": "tech",
+                "source": "github:search",
+                "title": title,
+                "url": self._canon_url(url),
+                "published_dt": dt,
+                "popularity_raw": stars,
+                "popularity_kind": "stars",
+            })
+
+        self._dbg(f"[TrendingMiner] github hits={len(hits)} q={query}")
+        return hits
+
+    # -------------------- scoring & expansion --------------------
+    def _recency_score(self, dt: Optional[datetime], *, half_life_hours: float, now: datetime) -> float:
+        if dt is None:
+            return 0.15
+        age_h = max(0.0, (now - dt).total_seconds() / 3600.0)
+        return math.exp(-age_h / max(1e-6, half_life_hours))
+
+    def _popularity_score(self, raw: float, kind: str) -> float:
+        raw = float(raw or 0.0)
+        kind = (kind or "").lower()
+        if raw <= 0:
+            return 0.0
+        if kind in ("score", "stars"):
+            return math.log1p(raw)
+        if kind == "rank":
+            return raw
+        return math.log1p(raw)
+
+    def _extract_terms(self, text: str, *, max_terms: int) -> List[str]:
+        toks = []
+        for m in self.TOKEN_RE.finditer((text or "").lower()):
+            t = m.group(0)
+            if t in self.STOPWORDS:
+                continue
+            if t.isdigit():
+                continue
+            # avoid obvious hex hashes
+            if len(t) > 24 and all(c in "0123456789abcdef" for c in t):
+                continue
+            toks.append(t)
+
+        freq: Dict[str, int] = {}
+        for t in toks:
+            freq[t] = freq.get(t, 0) + 1
+
+        ranked = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        return [t for (t, _) in ranked[:max_terms]]
+
+    def _score_and_dedupe(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        now: datetime,
+        half_life_hours: float,
+        w_pop: float,
+        w_fresh: float,
+        w_cross: float
+    ) -> List[Dict[str, Any]]:
+        counts: Dict[str, int] = {}
+        for it in items:
+            u = it.get("url") or ""
+            if u:
+                counts[u] = counts.get(u, 0) + 1
+
+        scored: List[Dict[str, Any]] = []
+        for it in items:
+            u = it.get("url") or ""
+            if not u:
+                continue
+
+            fresh = self._recency_score(it.get("published_dt"), half_life_hours=half_life_hours, now=now)
+            pop = self._popularity_score(it.get("popularity_raw", 0.0), it.get("popularity_kind", ""))
+            cross = float(max(0, counts.get(u, 1) - 1))
+
+            # normalize pop into ~[0..1)
+            pop_n = pop / max(1.0, pop + 5.0)
+            score = (w_pop * pop_n) + (w_fresh * fresh) + (w_cross * (cross / 3.0))
+
+            it2 = dict(it)
+            it2["score"] = float(score)
+            it2["fresh"] = float(fresh)
+            it2["pop"] = float(pop_n)
+            it2["cross"] = float(cross)
+            scored.append(it2)
+
+        # keep best per URL
+        best: Dict[str, Dict[str, Any]] = {}
+        for it in scored:
+            u = it["url"]
+            if u not in best or it["score"] > best[u]["score"]:
+                best[u] = it
+
+        return sorted(best.values(), key=lambda x: x["score"], reverse=True)
+
+    # -------------------- HTML → visible text → real lexicon terms --------------------
+    def _html_to_visible_text(self, html_text: str, *, max_chars: int) -> str:
+        s = html_text or ""
+        if not s:
+            return ""
+
+        s = self._HTML_COMMENT_RE.sub(" ", s)
+        s = self._HTML_SCRIPT_STYLE_RE.sub(" ", s)
+
+        # preserve some structure
+        s = re.sub(r"(?i)</(p|div|br|li|h1|h2|h3|h4|h5|h6|tr|section|article)>", "\n", s)
+        s = self._HTML_STRIP_TAG_RE.sub(" ", s)
+        s = html.unescape(s)
+
+        s = re.sub(r"[ \t\r\f\v]+", " ", s)
+        s = re.sub(r"\n\s*\n\s*\n+", "\n\n", s)
+        s = s.strip()
+
+        if len(s) > max_chars:
+            s = s[:max_chars].rstrip() + "…"
+        return s
+
+    def _extract_page_header_text(self, html_text: str) -> str:
+        s = html_text or ""
+        parts: List[str] = []
+
+        def grab(rx: re.Pattern) -> Optional[str]:
+            m = rx.search(s)
+            if not m:
+                return None
+            x = m.group(1) or ""
+            x = self._HTML_STRIP_TAG_RE.sub(" ", x)
+            x = html.unescape(x)
+            x = re.sub(r"\s+", " ", x).strip()
+            return x[:400].strip()
+
+        for rx in (self._HTML_META_TITLE_RE, self._HTML_TITLE_RE, self._HTML_H1_RE, self._HTML_META_DESC_RE):
+            v = grab(rx)
+            if v:
+                parts.append(v)
+
+        out = []
+        seen = set()
+        for p in parts:
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+        return " | ".join(out)
+
+    def _extract_phrases(self, words: List[str], *, max_phrases: int) -> List[str]:
+        if len(words) < 2:
+            return []
+        bigrams: List[str] = []
+        for i in range(len(words) - 1):
+            a, b = words[i], words[i + 1]
+            if a in self.PAGE_MINER_STOPWORDS or b in self.PAGE_MINER_STOPWORDS:
+                continue
+            if len(a) < 3 or len(b) < 3:
+                continue
+            if a == b:
+                continue
+            bigrams.append(f"{a} {b}")
+
+        c = collections.Counter(bigrams)
+        ranked = sorted(c.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        return [p for (p, _) in ranked[:max_phrases]]
+
+    def _mine_page_terms(
+        self,
+        url: str,
+        html_text: str,
+        *,
+        max_terms: int,
+        max_text_chars: int
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        header = self._extract_page_header_text(html_text)
+        visible = self._html_to_visible_text(html_text, max_chars=max_text_chars)
+
+        raw_words = [m.group(0).lower() for m in self.TOKEN_RE.finditer((header + "\n" + visible)[:max_text_chars])]
+        words = [
+            w for w in raw_words
+            if w not in self.PAGE_MINER_STOPWORDS
+            and not w.isdigit()
+            and not (len(w) > 24 and all(c in "0123456789abcdef" for c in w))
+        ]
+
+        uni = collections.Counter(words)
+        uni_ranked = sorted(uni.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        uni_terms = [t for (t, _) in uni_ranked[:max_terms]]
+
+        phrases = self._extract_phrases(words, max_phrases=max(10, max_terms // 2))
+        header_terms = self._extract_terms(header, max_terms=min(20, max_terms)) if header else []
+
+        out: List[str] = []
+        seen = set()
+        for t in header_terms + phrases + uni_terms:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+            if len(out) >= max_terms:
+                break
+
+        info = {
+            "header": header,
+            "visible_chars": len(visible),
+            "terms": len(out),
+        }
+        return out, info
+
+    def _select_urls_for_page_mining(self, final_scored: List[Dict[str, Any]], *, cap: int, per_host_cap: int) -> List[str]:
+        picked: List[str] = []
+        host_count: Dict[str, int] = {}
+
+        for it in final_scored:
+            u = it.get("url") or ""
+            if not u:
+                continue
+            try:
+                host = urlparse(u).netloc.lower()
+            except Exception:
+                host = ""
+            if host:
+                if host_count.get(host, 0) >= per_host_cap:
+                    continue
+                host_count[host] = host_count.get(host, 0) + 1
+
+            picked.append(u)
+            if len(picked) >= cap:
+                break
+
+        return picked
+
+    # -------------------- execute --------------------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        self._dbg("[TrendingMiner] execute start")
+        mem = Memory.load()
+        self._dbg("[TrendingMiner] memory loaded")
+
+        # ----- params -----
+        categories_raw = str(params.get("categories", ",".join(self.DEFAULT_CATEGORIES))).strip()
+        categories = [c.strip().lower() for c in categories_raw.split(",") if c.strip()]
+        categories = [c for c in categories if c in self.DEFAULT_CATEGORIES]
+        if not categories:
+            categories = list(self.DEFAULT_CATEGORIES)
+
+        reddit_sort = str(params.get("reddit_sort", "hot")).strip().lower()
+        reddit_search_sort = str(params.get("reddit_search_sort", "new")).strip().lower()
+        use_reddit_search_expansion = bool(params.get("use_reddit_search_expansion", True))
+
+        max_rounds = int(params.get("max_rounds", 3))
+        max_rounds = max(1, min(max_rounds, 10))
+
+        per_feed_cap = int(params.get("per_feed_cap", 30))
+        per_feed_cap = max(5, min(per_feed_cap, 100))
+
+        max_requests = int(params.get("max_requests", 60))
+        max_requests = max(10, min(max_requests, 500))
+
+        half_life_hours = float(params.get("half_life_hours", 18.0))
+        w_pop = float(params.get("w_pop", 0.45))
+        w_fresh = float(params.get("w_fresh", 0.50))
+        w_cross = float(params.get("w_cross", 0.05))
+
+        target_new_hits = int(params.get("target_new_hits", 120))
+        min_new_per_round = int(params.get("min_new_per_round", 10))
+
+        hits_key = str(params.get("hits_key", "trending_hits")).strip() or "trending_hits"
+        seeds_key = str(params.get("seeds_key", "trending_seeds")).strip() or "trending_seeds"
+        lexicon_key = str(params.get("lexicon_key", "trending_lexicon")).strip() or "trending_lexicon"
+        seen_key = str(params.get("seen_key", "trending_seen_urls")).strip() or "trending_seen_urls"
+
+        # NEW memory key for mined page terms
+        page_terms_key = str(params.get("page_terms_key", "trending_page_terms")).strip() or "trending_page_terms"
+
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+        memory_sources = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+        # category overrides
+        reddit_overrides: Dict[str, List[str]] = {}
+        rss_overrides: Dict[str, List[str]] = {}
+        for cat in self.DEFAULT_CATEGORIES:
+            rv = str(params.get(f"reddit_{cat}", "")).strip()
+            if rv:
+                reddit_overrides[cat] = [x.strip() for x in rv.split(",") if x.strip()]
+
+            fv = str(params.get(f"rss_{cat}", "")).strip()
+            if fv:
+                rss_overrides[cat] = [x.strip() for x in fv.split(",") if x.strip()]
+
+        github_token = str(params.get("github_token", "")).strip()
+        headers = {
+            "User-Agent": str(params.get("user_agent", "Mozilla/5.0 TrendingMiner/1.0")).strip() or "Mozilla/5.0",
+        }
+        if github_token:
+            headers["Authorization"] = f"Bearer {github_token}"
+
+        timeout = float(params.get("timeout", 10.0))
+        sleep_s = float(params.get("sleep_s", 0.0) or 0.0)
+
+        # NEW page mining params
+        mine_pages = bool(params.get("mine_pages", True))
+        page_mine_cap = int(params.get("page_mine_cap", 20))
+        page_mine_cap = max(0, min(page_mine_cap, 200))
+
+        page_mine_per_host_cap = int(params.get("page_mine_per_host_cap", 4))
+        page_mine_per_host_cap = max(1, min(page_mine_per_host_cap, 50))
+
+        page_mine_timeout = float(params.get("page_mine_timeout", timeout))
+        page_mine_max_bytes = int(params.get("page_mine_max_bytes", 600_000))
+        page_mine_max_bytes = max(50_000, min(page_mine_max_bytes, 5_000_000))
+
+        page_mine_max_text_chars = int(params.get("page_mine_max_text_chars", 25_000))
+        page_mine_max_text_chars = max(2_000, min(page_mine_max_text_chars, 200_000))
+
+        page_mine_terms_per_page = int(params.get("page_mine_terms_per_page", 24))
+        page_mine_terms_per_page = max(8, min(page_mine_terms_per_page, 120))
+
+        page_mine_counts_toward_max_requests = bool(params.get("page_mine_counts_toward_max_requests", True))
+
+        self._dbg(
+            "[TrendingMiner] params: "
+            f"categories={categories} max_rounds={max_rounds} per_feed_cap={per_feed_cap} max_requests={max_requests} "
+            f"half_life_hours={half_life_hours} target_new_hits={target_new_hits} min_new_per_round={min_new_per_round} "
+            f"reddit_sort={reddit_sort} reddit_search_expansion={use_reddit_search_expansion} mine_pages={mine_pages}"
+        )
+
+        seen_urls: Set[str] = set(mem.get(seen_key) or [])
+        self._dbg(f"[TrendingMiner] seen_urls loaded: {len(seen_urls)}")
+
+        # ----- frontier bootstrap -----
+        frontier_terms: Set[str] = set(categories)
+
+        if isinstance(payload, str) and payload.strip():
+            frontier_terms.update(self._extract_terms(payload, max_terms=30))
+
+        for k in memory_sources:
+            v = mem.get(k)
+            if isinstance(v, str):
+                frontier_terms.update(self._extract_terms(v, max_terms=20))
+            elif isinstance(v, list) and v and isinstance(v[0], str):
+                frontier_terms.update(self._extract_terms(" ".join(v[:75]), max_terms=30))
+
+        # ----- baseline phrases: helps discover things even on a cold start -----
+        baseline_phrases = {
+            "art": [
+                "digital art", "ai art", "illustration", "concept art", "fan art",
+                "3d art", "blender", "procreate", "photoshop", "after effects",
+                "graphic design", "typography", "poster design", "album cover",
+                "street art", "mural", "gallery opening", "exhibition", "art contest",
+            ],
+            "sports": [
+                "highlights", "trade rumors", "injury update", "playoffs", "season opener",
+                "nba", "nfl", "mlb", "nhl", "soccer", "premier league", "champions league",
+                "ufc", "mma", "boxing", "formula 1", "f1", "match recap",
+            ],
+            "music": [
+                "type beat", "free type beat", "lofi beat", "chill beat", "drill beat", "trap beat",
+                "melody loop", "guitar loop", "piano loop", "808", "drum kit", "sample pack",
+                "producer", "mixing", "mastering", "vocal preset", "sound design",
+            ],
+            "streetwear": [
+                "streetwear drop", "restock", "raffle", "capsule", "collab", "collection",
+                "lookbook", "fit pic", "outfit", "archive", "grailed", "depop",
+                "sneaker release", "sb dunk", "jordans", "yeezy", "new balance",
+            ],
+            "fashion": [
+                "runway", "menswear", "womenswear", "ss", "fw", "spring summer", "fall winter",
+                "designer", "collection", "lookbook", "campaign", "editorial",
+                "fashion week", "paris", "milan", "nyfw", "london fashion week",
+                "trends", "style guide", "styling", "tailoring",
+            ],
+            "gaming": [
+                "new game", "release date", "trailer", "patch notes", "update", "dlc",
+                "early access", "beta", "steam", "xbox", "playstation", "nintendo",
+                "metacritic", "review", "tier list", "speedrun", "esports",
+            ],
+            "tech": [
+                "product launch", "new feature", "security update", "data breach", "vulnerability",
+                "open source", "github release", "framework", "library", "sdk", "api",
+                "ai model", "llm", "chip", "gpu", "smartphone", "laptop",
+                "startup", "funding", "breaking news",
+            ],
+        }
+
+        for c in categories:
+            phrases = baseline_phrases.get(c, [])
+            frontier_terms.update(self._extract_terms(" ".join(phrases), max_terms=60))
+
+        # requests budgeting
+        request_count = 0
+
+        all_new_hits: List[Dict[str, Any]] = []
+        now = self._now()
+
+        def github_queries_from_terms(terms: List[str]) -> List[str]:
+            qs = []
+            # keep it small to avoid rate issues
+            for t in terms[:8]:
+                qs.append(f"{t} in:name,description,readme created:>={now.date().isoformat()}")
+            qs.append(f"created:>={now.date().isoformat()} stars:>50")
+            return list(dict.fromkeys(qs))
+
+        rounds_run = 0
+        stop_reason = "max_rounds"
+        newly_added_total = 0
+
+        # -------------------- main rounds loop --------------------
+        for r in range(max_rounds):
+            rounds_run = r + 1
+            self._dbg(f"[TrendingMiner] round {rounds_run}/{max_rounds} begin frontier_terms={len(frontier_terms)}")
+
+            before_seen = len(seen_urls)
+            round_candidates: List[Dict[str, Any]] = []
+
+            # ---- Reddit + optional RSS feeds per category ----
+            for cat in categories:
+                subs = reddit_overrides.get(cat) or self.DEFAULT_REDDIT.get(cat, [])
+                feeds = rss_overrides.get(cat) or self.DEFAULT_RSS_FEEDS.get(cat, [])
+
+                if subs:
+                    if request_count >= max_requests:
+                        break
+                    hits = self._pull_reddit_rss(
+                        category=cat,
+                        subreddits=subs,
+                        sort=reddit_sort,
+                        timeout=timeout,
+                        headers=headers,
+                        per_feed_cap=per_feed_cap
+                    )
+                    request_count += len(subs)
+                    round_candidates.extend(hits)
+
+                if feeds:
+                    if request_count >= max_requests:
+                        break
+                    hits = self._pull_generic_rss(
+                        category=cat,
+                        feeds=feeds,
+                        timeout=timeout,
+                        headers=headers,
+                        per_feed_cap=per_feed_cap
+                    )
+                    request_count += len(feeds)
+                    round_candidates.extend(hits)
+
+            # ---- HN + GitHub for tech ----
+            if "tech" in categories and request_count < max_requests:
+                round_candidates.extend(self._pull_hackernews(timeout=timeout, headers=headers, per_feed_cap=per_feed_cap, which="top"))
+                request_count += 1
+
+            if "tech" in categories and request_count < max_requests:
+                round_candidates.extend(self._pull_hackernews(timeout=timeout, headers=headers, per_feed_cap=per_feed_cap, which="new"))
+                request_count += 1
+
+            if "tech" in categories and request_count < max_requests:
+                terms_list = sorted(list(frontier_terms), key=lambda x: (len(x), x))
+                for q in github_queries_from_terms(terms_list):
+                    if request_count >= max_requests:
+                        break
+                    round_candidates.extend(self._pull_github_search(timeout=timeout, headers=headers, per_feed_cap=per_feed_cap, query=q))
+                    request_count += 1
+
+            # ---- Score + dedupe + pick NEW ----
+            scored = self._score_and_dedupe(
+                round_candidates,
+                now=now,
+                half_life_hours=half_life_hours,
+                w_pop=w_pop,
+                w_fresh=w_fresh,
+                w_cross=w_cross
+            )
+
+            new_hits: List[Dict[str, Any]] = []
+            for it in scored:
+                u = it.get("url") or ""
+                if not u:
+                    continue
+                if u in seen_urls:
+                    continue
+                seen_urls.add(u)
+                new_hits.append(it)
+
+            newly_added = len(new_hits)
+            newly_added_total += newly_added
+
+            self._dbg(
+                f"[TrendingMiner] round {rounds_run}: candidates={len(round_candidates)} "
+                f"scored={len(scored)} new_hits={newly_added} seen_total={len(seen_urls)} requests_used={request_count}/{max_requests}"
+            )
+
+            all_new_hits.extend(new_hits)
+
+            if newly_added_total >= target_new_hits:
+                stop_reason = "target_new_hits"
+                self._dbg(f"[TrendingMiner] stop: target_new_hits reached total_new={newly_added_total}")
+                break
+
+            if newly_added < min_new_per_round:
+                stop_reason = "yield_drop"
+                self._dbg(f"[TrendingMiner] stop: yield dropped new_hits={newly_added} < {min_new_per_round}")
+                break
+
+            # ---- Expand frontier from winners ----
+            added_terms = 0
+            for it in new_hits[:60]:
+                title = it.get("title") or ""
+                for t in self._extract_terms(title, max_terms=8):
+                    if t not in frontier_terms:
+                        frontier_terms.add(t)
+                        added_terms += 1
+            self._dbg(f"[TrendingMiner] round {rounds_run}: frontier expanded +{added_terms} terms")
+
+            # ---- Reddit Search expansion (category-aware) ----
+            if use_reddit_search_expansion and request_count < max_requests:
+                search_terms = sorted(list(frontier_terms))[:36]
+                queries: List[str] = []
+
+                if "music" in categories:
+                    queries += [f"{t} beat" for t in search_terms[:4]]
+                    queries += [f"{t} drum kit" for t in search_terms[4:6]]
+                if "streetwear" in categories:
+                    queries += [f"{t} drop" for t in search_terms[:4]]
+                    queries += [f"{t} sneakers" for t in search_terms[4:6]]
+                if "fashion" in categories:
+                    queries += [f"{t} runway" for t in search_terms[:4]]
+                    queries += [f"{t} collection" for t in search_terms[4:6]]
+                if "gaming" in categories:
+                    queries += [f"{t} patch" for t in search_terms[:4]]
+                    queries += [f"{t} release" for t in search_terms[4:6]]
+                if "tech" in categories:
+                    queries += [f"{t} launch" for t in search_terms[:4]]
+                    queries += [f"{t} vulnerability" for t in search_terms[4:6]]
+                if "art" in categories:
+                    queries += [f"{t} illustration" for t in search_terms[:4]]
+                    queries += [f"{t} digital art" for t in search_terms[4:6]]
+                if "sports" in categories:
+                    queries += [f"{t} highlights" for t in search_terms[:4]]
+                    queries += [f"{t} trade" for t in search_terms[4:6]]
+
+                queries = list(dict.fromkeys([q.strip() for q in queries if q.strip()]))[:12]
+
+                added_search = 0
+                for q in queries:
+                    if request_count >= max_requests:
+                        break
+
+                    rss_url = self._reddit_search_rss_url(q, reddit_search_sort)
+                    self._dbg(f"[TrendingMiner] reddit search rss fetch q={q}")
+                    txt = self._fetch_text(rss_url, timeout=timeout, headers=headers)
+                    request_count += 1
+                    added_search += 1
+
+                    items = self._parse_rss_atom(txt or "")
+                    n = min(per_feed_cap, len(items))
+                    for i, it in enumerate(items[:n]):
+                        u = it.get("url") or ""
+                        if not u:
+                            continue
+                        all_new_hits.append({
+                            "category": "mixed",
+                            "source": f"reddit:search:{reddit_search_sort}",
+                            "title": it.get("title") or "",
+                            "url": self._canon_url(u),
+                            "published_dt": it.get("published_dt"),
+                            "popularity_raw": float(n - i),
+                            "popularity_kind": "rank",
+                        })
+
+                self._dbg(f"[TrendingMiner] reddit search expansion done queries={len(queries)} requests+={added_search}")
+
+            now = self._now()
+
+            if len(seen_urls) == before_seen:
+                stop_reason = "converged"
+                self._dbg("[TrendingMiner] stop: converged (no seen growth)")
+                break
+
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+
+        # -------------------- final score pass --------------------
+        final_scored = self._score_and_dedupe(
+            all_new_hits,
+            now=self._now(),
+            half_life_hours=half_life_hours,
+            w_pop=w_pop,
+            w_fresh=w_fresh,
+            w_cross=w_cross
+        )
+
+        max_out = int(params.get("max_out", 300))
+        max_out = max(20, min(max_out, 2000))
+        final_scored = final_scored[:max_out]
+
+        # -------------------- seeds (context) --------------------
+        seeds = [it["url"] for it in final_scored if it.get("url")]
+        seeds = list(dict.fromkeys(seeds))
+
+        # -------------------- base lexicon from titles --------------------
+        lexicon_terms: List[str] = []
+        for it in final_scored[:160]:
+            lexicon_terms.extend(self._extract_terms(it.get("title") or "", max_terms=8))
+
+        # -------------------- NEW: Mine top pages for "genuine" lexicon terms --------------------
+        pages_mined = 0
+        page_terms_map: Dict[str, List[str]] = {}
+
+        if mine_pages and page_mine_cap > 0:
+            self._dbg(
+                "[TrendingMiner] page-mining enabled: "
+                f"cap={page_mine_cap} per_host_cap={page_mine_per_host_cap} "
+                f"timeout={page_mine_timeout} max_bytes={page_mine_max_bytes} "
+                f"counts_to_max_requests={page_mine_counts_toward_max_requests}"
+            )
+
+            mine_urls = self._select_urls_for_page_mining(
+                final_scored,
+                cap=page_mine_cap,
+                per_host_cap=page_mine_per_host_cap
+            )
+
+            for u in mine_urls:
+                if page_mine_counts_toward_max_requests and request_count >= max_requests:
+                    self._dbg("[TrendingMiner] page-mining stop: max_requests reached")
+                    break
+
+                self._dbg(f"[TrendingMiner] page-mining fetch url={u}")
+                txt = self._fetch_limited_text(u, timeout=page_mine_timeout, headers=headers, max_bytes=page_mine_max_bytes)
+                if page_mine_counts_toward_max_requests:
+                    request_count += 1
+
+                if not txt:
+                    continue
+
+                terms, info = self._mine_page_terms(
+                    u,
+                    txt,
+                    max_terms=page_mine_terms_per_page,
+                    max_text_chars=page_mine_max_text_chars,
+                )
+
+                if not terms:
+                    continue
+
+                # small host boost: host is often a meaningful anchor for chat
+                try:
+                    host = urlparse(u).netloc.lower().replace("www.", "")
+                    if host:
+                        lexicon_terms.append(host)
+                except Exception:
+                    pass
+
+                lexicon_terms.extend(terms)
+                page_terms_map[u] = terms
+                pages_mined += 1
+
+                self._dbg(f"[TrendingMiner] page-mined terms={len(terms)} url={u} header={info.get('header','')[:120]}")
+
+            if page_terms_map:
+                mem[page_terms_key] = page_terms_map
+
+            self._dbg(f"[TrendingMiner] page-mining done pages_mined={pages_mined}")
+
+        # -------------------- finalize lexicon (cap + dedupe) --------------------
+        lexicon = []
+        seen_t = set()
+        lexicon_cap = int(params.get("lexicon_cap", 160))
+        lexicon_cap = max(30, min(lexicon_cap, 800))
+
+        for t in lexicon_terms:
+            t = (t or "").strip().lower()
+            if not t:
+                continue
+            if t in self.STOPWORDS:
+                continue
+            if t in seen_t:
+                continue
+            seen_t.add(t)
+            lexicon.append(t)
+            if len(lexicon) >= lexicon_cap:
+                break
+
+        # -------------------- Persist to memory --------------------
+        mem[hits_key] = [
+            {
+                "category": it.get("category"),
+                "source": it.get("source"),
+                "title": it.get("title"),
+                "url": it.get("url"),
+                "score": it.get("score"),
+                "fresh": it.get("fresh"),
+                "pop": it.get("pop"),
+                "cross": it.get("cross"),
+                "published": it.get("published_dt").isoformat() if it.get("published_dt") else None,
+            }
+            for it in final_scored
+        ]
+        mem[seeds_key] = seeds
+        mem[lexicon_key] = lexicon
+        mem[seen_key] = list(seen_urls)[-20000:]
+        Memory.save(mem)
+
+        self._dbg(
+            "[TrendingMiner] saved memory: "
+            f"{hits_key}({len(final_scored)}), {seeds_key}({len(seeds)}), {lexicon_key}({len(lexicon)}), "
+            f"{seen_key}({len(mem[seen_key])}), pages_mined={pages_mined}, requests_used={request_count}/{max_requests}"
+        )
+
+        out_text = "[context]\n" + "\n".join(seeds) + "\n\n[lexicon]\n" + ",".join(lexicon)
+
+        meta = {
+            "categories": categories,
+            "rounds_run": rounds_run,
+            "stop_reason": stop_reason,
+            "requests_used": request_count,
+            "hits": len(final_scored),
+            "seeds": len(seeds),
+            "lexicon": len(lexicon),
+            "pages_mined": pages_mined,
+            "hits_key": hits_key,
+            "seeds_key": seeds_key,
+            "lexicon_key": lexicon_key,
+            "seen_key": seen_key,
+            "page_terms_key": page_terms_key,
+        }
+
+        self._dbg(f"[TrendingMiner] execute done meta={meta}")
+        return out_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "categories": "art,sports,music,streetwear,fashion,gaming,tech",
+            "memory_sources": "web_context,socketpipe_last_events",
+            "reddit_sort": "hot",
+            "use_reddit_search_expansion": True,
+            "reddit_search_sort": "new",
+            "max_rounds": 3,
+            "per_feed_cap": 30,
+            "max_requests": 60,
+            "timeout": 10,
+            "half_life_hours": 18,
+            "target_new_hits": 120,
+            "min_new_per_round": 10,
+            "max_out": 300,
+            "lexicon_cap": 160,
+
+            # override lists:
+            "reddit_art": "",
+            "reddit_sports": "",
+            "reddit_music": "",
+            "reddit_streetwear": "",
+            "reddit_fashion": "",
+            "reddit_gaming": "",
+            "reddit_tech": "",
+            "rss_art": "",
+            "rss_sports": "",
+            "rss_music": "",
+            "rss_streetwear": "",
+            "rss_fashion": "",
+            "rss_gaming": "",
+            "rss_tech": "",
+
+            # github:
+            "github_token": "",
+
+            # memory keys:
+            "hits_key": "trending_hits",
+            "seeds_key": "trending_seeds",
+            "lexicon_key": "trending_lexicon",
+            "seen_key": "trending_seen_urls",
+
+            # NEW: page mining to enrich lexicon with real page terms
+            "mine_pages": True,
+            "page_mine_cap": 20,
+            "page_mine_per_host_cap": 4,
+            "page_mine_timeout": 10,
+            "page_mine_max_bytes": 600000,
+            "page_mine_max_text_chars": 25000,
+            "page_mine_terms_per_page": 24,
+            "page_mine_counts_toward_max_requests": True,
+            "page_terms_key": "trending_page_terms",
+
+            # niceness:
+            "sleep_s": 0.0,
+            "user_agent": "Mozilla/5.0 TrendingMiner/1.0",
+        }
+
+
+BLOCKS.register("trendingminer", TrendingMinerBlock)
+# ======================= TextMiner =======================
+@dataclass
+class TextMinerBlock(BaseBlock):
+    """
+    TextMinerBlock: Advanced Semantic Distiller + Code Structure Mapper.
+
+    Goal:
+      Turn messy tracker output ([context] + [lexicon]) into a "Clean Room" context
+      that is:
+        • higher signal for the LLM
+        • structured for reasoning
+        • code-aware (APIs, types, call sites)
+        • noise-resistant (HTML junk, boilerplate, cookie banners, nav, etc.)
+
+    Major Improvements vs basic version:
+      1) Better Context/Lexicon parsing (handles missing tags, multi-line lexicon)
+      2) HTML/boilerplate stripping + line de-noising heuristics
+      3) Code-aware segmentation:
+         - fences ```...```
+         - import blocks
+         - def/class/type/interface signatures (Python/JS/TS/C#/Rust/Go-ish)
+      4) "Symbol Table" extraction:
+         - defs/classes/interfaces/enums/types
+         - function calls (best-effort)
+         - common public members (best-effort)
+      5) Lexicon-anchored ranking + diversity:
+         - keep top-k per "cluster" (code/prose/links)
+         - prevents one repeated phrase from dominating
+      6) Deterministic trimming: preserve best chunks while clamping output length
+
+    Output:
+      [context]
+        ### Clean Room Index
+        ### Code Map
+        ### Key Facts / Snippets
+        ### Links
+      [lexicon]
+        <deduped lexicon>
+    """
+
+    # ---- code signature patterns (broad but cheap) ----
+    _PY_DEF_RE = re.compile(r"^\s*(?:async\s+def|def)\s+([A-Za-z_]\w*)\s*\(", re.M)
+    _PY_CLASS_RE = re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*(?:\(|:)", re.M)
+
+    _JS_FN_RE = re.compile(
+        r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
+        re.M
+    )
+    _JS_CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b", re.M)
+    _TS_TYPE_RE = re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\s*=", re.M)
+    _TS_IFACE_RE = re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)\b", re.M)
+    _TS_ENUM_RE = re.compile(r"^\s*(?:export\s+)?enum\s+([A-Za-z_$][\w$]*)\b", re.M)
+
+    _CS_CLASS_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*(?:sealed\s+)?class\s+([A-Za-z_]\w*)\b", re.M)
+    _CS_IFACE_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*interface\s+([A-Za-z_]\w*)\b", re.M)
+    _CS_ENUM_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*enum\s+([A-Za-z_]\w*)\b", re.M)
+
+    _RUST_ITEM_RE = re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait|type|fn)\s+([A-Za-z_]\w*)\b", re.M)
+    _GO_ITEM_RE = re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+(?:struct|interface)\b", re.M)
+    _GO_FN_RE = re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\(", re.M)
+
+    # best-effort call detection (very heuristic)
+    _CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(", re.M)
+
+    # links
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
+
+    # html-ish noise patterns
+    _TAG_RE = re.compile(r"<[^>]+>")
+    _WS_RE = re.compile(r"[ \t]+")
+
+    # boilerplate lines frequently seen in web pages
+    _NOISE_LINE_RE = re.compile(
+        r"(cookie|consent|subscribe|newsletter|sign\s*up|log\s*in|accept\s+all|"
+        r"privacy\s+policy|terms\s+of\s+service|all\s+rights\s+reserved|"
+        r"advertis|sponsored|tracking|javascript\s+required|enable\s+javascript|"
+        r"skip\s+to\s+content|menu|nav|breadcrumb|share\s+this|follow\s+us)",
+        re.I
+    )
+
+    _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
+
+    # -------------------- debug helper --------------------
+    def _dbg(self, msg: str):
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    # -------------------- parsing helpers --------------------
+    def _split_tagged_payload(self, text: str) -> Tuple[str, List[str]]:
+        """
+        Robustly parse:
+          [context]\n...\n\n[lexicon]\n...
+        If tags missing, treat entire payload as context.
+        Lexicon can be comma-separated or newline separated.
+        """
+        raw = text or ""
+        ctx = raw
+        lex = []
+
+        if "[context]" in raw:
+            try:
+                ctx = raw.split("[context]\n", 1)[1]
+            except Exception:
+                ctx = raw
+
+        if "[lexicon]" in ctx:
+            ctx_part, lex_part = ctx.split("[lexicon]", 1)
+            ctx = ctx_part
+            # allow either "[lexicon]\n" or "[lexicon]" direct
+            lex_part = lex_part.lstrip("\n").strip()
+            if lex_part:
+                # commas OR newlines
+                lex_tokens = re.split(r"[,|\n]+", lex_part)
+                lex = [t.strip().lower() for t in lex_tokens if t.strip()]
+        else:
+            # maybe lexicon is elsewhere (original raw)
+            if "[lexicon]\n" in raw:
+                lex_part = raw.split("[lexicon]\n", 1)[1]
+                lex_tokens = re.split(r"[,|\n]+", lex_part)
+                lex = [t.strip().lower() for t in lex_tokens if t.strip()]
+
+        # dedupe preserve order
+        seen = set()
+        lex2 = []
+        for t in lex:
+            if t in seen:
+                continue
+            seen.add(t)
+            lex2.append(t)
+
+        return ctx.strip(), lex2
+
+    def _strip_html(self, s: str) -> str:
+        """
+        Fast HTML tag removal + entity-ish cleanup (cheap, not perfect).
+        """
+        if "<" not in s or ">" not in s:
+            return s
+        s2 = self._TAG_RE.sub(" ", s)
+        s2 = s2.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+        s2 = self._WS_RE.sub(" ", s2)
+        return s2.strip()
+
+    def _line_denoise(self, s: str) -> str:
+        """
+        Remove obvious boilerplate lines and collapse whitespace.
+        """
+        lines = []
+        for ln in (s or "").splitlines():
+            t = ln.strip()
+            if not t:
+                continue
+            if self._NOISE_LINE_RE.search(t) and len(t) < 200:
+                continue
+            # toss pure nav-ish separators
+            if len(t) <= 3 and all(ch in "-_=*•|" for ch in t):
+                continue
+            lines.append(t)
+        return "\n".join(lines)
+
+    # -------------------- code segmentation --------------------
+    def _extract_fenced_code(self, text: str) -> Tuple[str, List[str]]:
+        """
+        Extract ``` fenced code blocks, return (text_without_code, code_blocks).
+        Keeps code blocks as raw strings including fences.
+        """
+        code_blocks: List[str] = []
+        if "```" not in text:
+            return text, code_blocks
+
+        parts = text.split("```")
+        # odd indices are code contents
+        rebuilt = []
+        for i, p in enumerate(parts):
+            if i % 2 == 1:
+                # re-wrap to keep LLM-friendly
+                code_blocks.append("```" + p + "```")
+            else:
+                rebuilt.append(p)
+        return "".join(rebuilt), code_blocks
+
+    def _extract_import_blocks(self, text: str, *, cap: int = 50) -> List[str]:
+        """
+        Pull contiguous import-ish lines. This helps LLM understand module names quickly.
+        """
+        imports: List[str] = []
+        buf: List[str] = []
+
+        def flush():
+            nonlocal buf
+            if buf:
+                imports.append("\n".join(buf))
+                buf = []
+
+        for ln in (text or "").splitlines():
+            t = ln.rstrip()
+            if t.strip().startswith(("import ", "from ", "using ", "#include", "package ")):
+                buf.append(t)
+                if len(imports) >= cap:
+                    break
+            else:
+                flush()
+
+        flush()
+        return imports[:cap]
+
+    # -------------------- symbol mining --------------------
+    def _extract_signatures(self, code_text: str) -> Dict[str, List[str]]:
+        """
+        Extract symbols across languages.
+        """
+        out: Dict[str, List[str]] = {
+            "functions": [],
+            "classes": [],
+            "types": [],
+            "interfaces": [],
+            "enums": [],
+            "rust_items": [],
+            "go_items": [],
+        }
+
+        out["functions"].extend(self._PY_DEF_RE.findall(code_text))
+        out["classes"].extend(self._PY_CLASS_RE.findall(code_text))
+
+        out["functions"].extend(self._JS_FN_RE.findall(code_text))
+        out["classes"].extend(self._JS_CLASS_RE.findall(code_text))
+        out["types"].extend(self._TS_TYPE_RE.findall(code_text))
+        out["interfaces"].extend(self._TS_IFACE_RE.findall(code_text))
+        out["enums"].extend(self._TS_ENUM_RE.findall(code_text))
+
+        out["classes"].extend(self._CS_CLASS_RE.findall(code_text))
+        out["interfaces"].extend(self._CS_IFACE_RE.findall(code_text))
+        out["enums"].extend(self._CS_ENUM_RE.findall(code_text))
+
+        out["rust_items"].extend(self._RUST_ITEM_RE.findall(code_text))
+        out["go_items"].extend(self._GO_ITEM_RE.findall(code_text))
+        out["functions"].extend(self._GO_FN_RE.findall(code_text))
+
+        # dedupe preserve order
+        for k, v in out.items():
+            seen = set()
+            vv = []
+            for s in v:
+                if s in seen:
+                    continue
+                seen.add(s)
+                vv.append(s)
+            out[k] = vv
+
+        return out
+
+    def _extract_calls(self, code_text: str, *, max_calls: int = 120) -> List[str]:
+        """
+        Best-effort call extraction. We filter out keywords and short noise.
+        """
+        keywords = {
+            "if", "for", "while", "return", "switch", "catch", "try", "await",
+            "new", "class", "def", "function", "import", "from", "with", "using",
+            "print", "log", "len", "int", "str", "float", "bool", "dict", "list", "set",
+        }
+        calls = []
+        for name in self._CALL_RE.findall(code_text):
+            n = name.strip()
+            if n.lower() in keywords:
+                continue
+            if len(n) < 3:
+                continue
+            calls.append(n)
+
+        # freq rank
+        freq: Dict[str, int] = {}
+        for c in calls:
+            freq[c] = freq.get(c, 0) + 1
+        ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [k for (k, _) in ranked[:max_calls]]
+
+    # -------------------- semantic scoring --------------------
+    def _lexicon_set(self, lex: List[str]) -> Set[str]:
+        s = set()
+        for t in lex:
+            tt = t.strip().lower()
+            if tt:
+                s.add(tt)
+        return s
+
+    def _score_block(self, block: str, lex: Set[str]) -> float:
+        """
+        Score a chunk using:
+          • lexicon overlap density
+          • informative length curve (too short = bad; too long = diminishing returns)
+          • URL presence (small bonus)
+          • code presence (bonus)
+        """
+        b = (block or "").strip()
+        if len(b) < 30:
+            return 0.0
+
+        is_code = ("```" in b) or b.lstrip().startswith(("def ", "class ", "import ", "from ", "using ", "#include", "fn ", "pub "))
+        has_url = bool(self._URL_RE.search(b))
+
+        words = [w.lower() for w in self._WORD_RE.findall(b)]
+        if not words:
+            return 0.0
+
+        # lex hits
+        hits = 0
+        if lex:
+            wset = set(words)
+            hits = len(wset & lex)
+
+        # density normalized by log length
+        density = hits / (math.log(len(words) + 2.0) + 1.0)
+
+        # length curve: prefer medium blocks
+        L = len(b)
+        length_bonus = 1.0 - abs(min(1.0, L / 1800.0) - 0.55)  # peak around ~1000 chars
+
+        score = 0.55 * density + 0.35 * length_bonus
+        if has_url:
+            score += 0.05
+        if is_code:
+            score += 0.15
+
+        # slight penalty for super repetitive spammy lines
+        if b.count("  ") > 30:
+            score -= 0.05
+
+        return max(0.0, float(score))
+
+    def _cluster_key(self, block: str) -> str:
+        """
+        Bucket chunks so we can keep diversity.
+        """
+        b = (block or "").strip()
+        if "```" in b:
+            return "code:fenced"
+        if b.lstrip().startswith(("import ", "from ", "using ", "#include", "package ")):
+            return "code:imports"
+        if self._URL_RE.search(b):
+            return "links"
+        # short header-ish lines
+        if len(b) < 120 and b.endswith(":"):
+            return "headers"
+        return "prose"
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        raw_text = str(payload or "")
+        self._dbg("[TextMiner] execute start")
+
+        # ---- params ----
+        mine_code = bool(params.get("mine_code", True))
+        mine_calls = bool(params.get("mine_calls", True))
+        min_score = float(params.get("min_score", 0.12))
+        max_chars = int(params.get("max_chars", 8000))
+        max_blocks = int(params.get("max_blocks", 60))
+        max_blocks = max(10, min(max_blocks, 200))
+
+        keep_top_per_cluster = int(params.get("top_per_cluster", 16))
+        keep_top_per_cluster = max(4, min(keep_top_per_cluster, 50))
+
+        # ---- parse tags ----
+        context_raw, lexicon_list = self._split_tagged_payload(raw_text)
+        lex = self._lexicon_set(lexicon_list)
+        self._dbg(f"[TextMiner] parsed context_len={len(context_raw)} lexicon={len(lexicon_list)}")
+
+        # ---- strip html + boilerplate ----
+        ctx1 = self._strip_html(context_raw)
+        ctx1 = self._line_denoise(ctx1)
+        self._dbg(f"[TextMiner] denoise done len={len(ctx1)}")
+
+        # ---- extract fenced code blocks ----
+        ctx2, fenced_code = self._extract_fenced_code(ctx1)
+        self._dbg(f"[TextMiner] fenced_code blocks={len(fenced_code)}")
+
+        # ---- imports block (from remaining text + from code fences) ----
+        import_blocks: List[str] = []
+        if mine_code:
+            import_blocks.extend(self._extract_import_blocks(ctx2))
+            for cb in fenced_code[:12]:
+                import_blocks.extend(self._extract_import_blocks(cb))
+        import_blocks = import_blocks[:20]
+        self._dbg(f"[TextMiner] import_blocks={len(import_blocks)}")
+
+        # ---- build a combined "code_text" for symbol mining ----
+        code_text = ""
+        if mine_code:
+            # mix: fenced code + any lines that look like code left in ctx2
+            code_text = "\n\n".join(fenced_code[:30]) + "\n\n" + "\n".join(import_blocks)
+        self._dbg(f"[TextMiner] code_text_len={len(code_text)} mine_code={mine_code}")
+
+        symbols: Dict[str, List[str]] = {
+            "functions": [], "classes": [], "types": [], "interfaces": [], "enums": [], "rust_items": [], "go_items": []
+        }
+        calls: List[str] = []
+        if mine_code and code_text.strip():
+            symbols = self._extract_signatures(code_text)
+            self._dbg(
+                "[TextMiner] symbols: "
+                f"fn={len(symbols['functions'])} cls={len(symbols['classes'])} "
+                f"type={len(symbols['types'])} iface={len(symbols['interfaces'])} enum={len(symbols['enums'])}"
+            )
+            if mine_calls:
+                calls = self._extract_calls(code_text, max_calls=120)
+                self._dbg(f"[TextMiner] calls mined={len(calls)}")
+
+        # ---- semantic blocks ----
+        # Keep some structure: split by double newlines first; then sentence-ish as fallback
+        blocks: List[str] = []
+        for chunk in re.split(r"\n{2,}", ctx2):
+            c = chunk.strip()
+            if not c:
+                continue
+            # further split huge prose chunks
+            if len(c) > 2500 and "```" not in c:
+                parts = re.split(r"(?<=[.!?])\s+", c)
+                for p in parts:
+                    pp = p.strip()
+                    if pp:
+                        blocks.append(pp)
+            else:
+                blocks.append(c)
+
+        # include fenced code as blocks too (kept separate)
+        blocks.extend(fenced_code)
+        # include import blocks as blocks
+        blocks.extend(import_blocks)
+
+        self._dbg(f"[TextMiner] total candidate blocks={len(blocks)}")
+
+        scored_blocks: List[Tuple[float, str, str]] = []
+        for b in blocks:
+            bb = b.strip()
+            if not bb:
+                continue
+            s = self._score_block(bb, lex)
+            if s >= min_score or ("```" in bb) or bb.lstrip().startswith(("def ", "class ", "import ", "from ")):
+                scored_blocks.append((s, self._cluster_key(bb), bb))
+
+        self._dbg(f"[TextMiner] scored_blocks kept={len(scored_blocks)} min_score={min_score}")
+
+        # ---- diversify by cluster ----
+        by_cluster: Dict[str, List[Tuple[float, str]]] = {}
+        for s, ck, b in scored_blocks:
+            by_cluster.setdefault(ck, []).append((s, b))
+
+        chosen: List[Tuple[float, str]] = []
+        for ck, items in by_cluster.items():
+            items.sort(key=lambda x: x[0], reverse=True)
+            chosen.extend(items[:keep_top_per_cluster])
+
+        # global sort + cap
+        chosen.sort(key=lambda x: x[0], reverse=True)
+        chosen = chosen[:max_blocks]
+
+        # ---- collect links separately ----
+        link_set: Set[str] = set()
+        for _, b in chosen:
+            for m in self._URL_RE.finditer(b):
+                link_set.add(m.group(0))
+        links = list(link_set)[:60]
+
+        # ---- assemble clean room ----
+        parts: List[str] = []
+        parts.append("### Clean Room Index")
+        parts.append(f"- Blocks kept: {len(chosen)} / {len(blocks)}")
+        parts.append(f"- Links: {len(links)}")
+        if mine_code:
+            parts.append(f"- Symbols: fn={len(symbols['functions'])}, cls={len(symbols['classes'])}, types={len(symbols['types'])}, iface={len(symbols['interfaces'])}, enum={len(symbols['enums'])}")
+            if mine_calls:
+                parts.append(f"- Calls (top): {min(20, len(calls))}")
+        parts.append("")
+
+        if mine_code:
+            parts.append("### Code Map")
+            # symbols
+            if symbols["classes"]:
+                parts.append("**Classes:** " + ", ".join(symbols["classes"][:60]))
+            if symbols["interfaces"]:
+                parts.append("**Interfaces:** " + ", ".join(symbols["interfaces"][:60]))
+            if symbols["types"]:
+                parts.append("**Types:** " + ", ".join(symbols["types"][:60]))
+            if symbols["enums"]:
+                parts.append("**Enums:** " + ", ".join(symbols["enums"][:60]))
+            if symbols["functions"]:
+                parts.append("**Functions:** " + ", ".join(symbols["functions"][:80]))
+            if symbols["rust_items"]:
+                parts.append("**Rust Items:** " + ", ".join(symbols["rust_items"][:60]))
+            if symbols["go_items"]:
+                parts.append("**Go Types:** " + ", ".join(symbols["go_items"][:60]))
+            if mine_calls and calls:
+                parts.append("**Common Calls:** " + ", ".join(calls[:40]))
+            parts.append("")
+
+        parts.append("### Key Facts / Snippets")
+        for i, (s, b) in enumerate(chosen, start=1):
+            # keep short headings readable
+            parts.append(f"#### Chunk {i} (score={s:.3f})")
+            parts.append(b)
+            parts.append("")
+
+        if links:
+            parts.append("### Links")
+            for u in links:
+                parts.append(f"- {u}")
+            parts.append("")
+
+        refined_context = "\n".join(parts).strip()
+
+        # clamp deterministically
+        if len(refined_context) > max_chars:
+            refined_context = refined_context[:max_chars].rstrip() + "\n... [Distilled]"
+
+        out_text = f"[context]\n{refined_context}\n\n[lexicon]\n{','.join(lexicon_list)}"
+
+        meta = {
+            "original_len": len(context_raw),
+            "denoised_len": len(ctx2),
+            "distilled_len": len(refined_context),
+            "lexicon_count": len(lexicon_list),
+            "blocks_in": len(blocks),
+            "blocks_kept": len(chosen),
+            "links_kept": len(links),
+            "mine_code": mine_code,
+            "symbols_found": {
+                "functions": len(symbols.get("functions", [])),
+                "classes": len(symbols.get("classes", [])),
+                "types": len(symbols.get("types", [])),
+                "interfaces": len(symbols.get("interfaces", [])),
+                "enums": len(symbols.get("enums", [])),
+            },
+            "reduction_ratio": round(1 - (len(refined_context) / (len(context_raw) + 1)), 2),
+        }
+
+        self._dbg(f"[TextMiner] done meta={meta}")
+        return out_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "mine_code": True,
+            "mine_calls": True,
+            "min_score": 0.12,
+            "max_chars": 8000,
+            "max_blocks": 60,
+            "top_per_cluster": 16,
+        }
+
+
+BLOCKS.register("textminer", TextMinerBlock)
+
+# ======================= DisplayTextMiner ====================
+
+@dataclass
+class DisplayTextMinerBlock(BaseBlock):
+    """
+    DisplayTextMinerBlock: Rich Popup Reader (DISPLAY, NOT semantic) — PyQt5.
+
+    Features:
+      - Document-like rich view (HTML/CSS):
+          • 16pt font (configurable)
+          • clickable links
+          • optional inline images from <img src="..."> or markdown images
+          • fenced code rendered as monospace blocks
+      - Chooses best section:
+          1) under "### Key Facts / Snippets" (preferred)
+          2) else [context]
+          3) else full payload
+      - Optional “display metadata”:
+          • dissected_task / dissected_topics / style from params or Memory
+          • lexicon from payload + Memory lexicon-ish keys for optional highlighting
+      - Removes noisy headers, run logs, boilerplate.
+      - Thread-safe:
+          • dispatch to GUI thread if app exists
+          • fallback subprocess popup if called off main thread without a GUI app
+
+    Notes:
+      - If GUI is not available, safely no-ops.
+      - Remote images are fetched only when embedded; capped by bytes + timeout.
+    """
+
+    # -------------------- regex --------------------
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
+    _IMG_TAG_RE = re.compile(r"<img\b[^>]*?\bsrc\s*=\s*['\"]([^'\"]+)['\"][^>]*?>", re.I)
+    _MD_IMG_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)", re.I)
+
+    _RUNLOG_HINTS = (
+        "--- RUN LOG ---",
+        "# ── ",
+        "### NewsBlock",
+        "BLOCKS.register(",
+    )
+
+    _CHUNK_HEADER_RE = re.compile(r"^\s*####\s*Chunk\s*\d+.*$", re.M)
+
+    _EXPLANATORY_STRIP_RE = re.compile(
+        r"^\s*(here is|here's|below is|as requested|you asked for|the code you asked for)\b.*$",
+        re.I | re.M,
+    )
+
+    _BANNER_STRIP_RE = re.compile(
+        r"^\s*(={8,}|-{8,}|#{5,}\s*={0,}|/\*{2,}|\*{5,}).*$",
+        re.M,
+    )
+
+    # Source attribution patterns
+    _TITLE_DASH_URL_RE = re.compile(r"^\s*#\s*(.+?)\s*[—-]\s*(https?://\S+)\s*$")
+    _KIND_PIPE_TITLE_RE = re.compile(r"^\s*###\s*([A-Z][A-Za-z0-9 _-]{1,30})\s*\|\s*(.+?)\s*$")
+
+    # -------------------- memory key heuristics --------------------
+    _DEFAULT_LEXICON_KEYS = (
+        "web_lexicon",
+        "corpus_lexicon",
+        "code_lexicon",
+        "code_search_lexicon",
+        "intel_prose_concepts",
+        "intel_code_concepts",
+        "promptminer_lexicon",
+    )
+    _LEX_KEY_HINTS = ("lexicon", "keywords", "concepts", "entities", "terms")
+    _SKIP_KEY_HINTS = (
+        "raw", "blob", "cache", "binary", "bytes", "image", "audio", "video",
+        "frame", "samples", "tensor", "embedding", "vector", "weights", "checkpoint",
+    )
+
+    def _dbg(self, msg: str):
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    # -------------------- parsing helpers --------------------
+    def _split_tagged_payload(self, raw: str) -> Tuple[str, str]:
+        """
+        Returns (context, lexicon_raw). Both may be "".
+        """
+        text = raw or ""
+        ctx = ""
+        lex = ""
+
+        if "[context]" in text:
+            try:
+                ctx = text.split("[context]\n", 1)[1]
+            except Exception:
+                ctx = text
+        else:
+            ctx = text
+
+        if "[lexicon]" in ctx:
+            ctx_part, lex_part = ctx.split("[lexicon]", 1)
+            ctx = ctx_part.strip()
+            lex = lex_part.strip()
+        else:
+            if "[lexicon]" in text:
+                try:
+                    lex = text.split("[lexicon]", 1)[1].strip()
+                except Exception:
+                    lex = ""
+
+        return (ctx.strip(), lex.strip())
+
+    def _extract_key_snippets_section(self, ctx: str) -> str:
+        """
+        Prefer the section under "### Key Facts / Snippets".
+        Stop at next "### " heading if present.
+        """
+        marker = "### Key Facts / Snippets"
+        if marker not in (ctx or ""):
+            return ""
+        after = ctx.split(marker, 1)[1]
+        parts = re.split(r"\n(?=###\s+)", after, maxsplit=1)
+        return (parts[0] if parts else after).strip()
+
+    def _clean_display_text(self, s: str, *, strip_banners: bool, strip_explanatory: bool) -> str:
+        t = s or ""
+
+        if strip_explanatory:
+            t = self._EXPLANATORY_STRIP_RE.sub("", t)
+
+        lines: List[str] = []
+        for ln in t.splitlines():
+            x = ln.rstrip()
+            xs = x.strip()
+            if not xs:
+                continue
+
+            if xs.startswith("[context]") or xs.startswith("[lexicon]"):
+                continue
+
+            if any(h in xs for h in self._RUNLOG_HINTS):
+                continue
+
+            # drop boilerplate indexes (TextMiner-ish)
+            if xs.startswith("- Blocks kept:") or xs.startswith("- Links:") or xs.startswith("- Symbols:") or xs.startswith("- Calls"):
+                continue
+            if xs.startswith("### Clean Room Index") or xs.startswith("### Code Map") or xs.startswith("### Links"):
+                continue
+
+            if strip_banners and self._BANNER_STRIP_RE.match(xs):
+                continue
+
+            lines.append(x)
+
+        t = "\n".join(lines)
+        t = self._CHUNK_HEADER_RE.sub("", t)
+        t = html.unescape(t)
+        t = re.sub(r"\n{3,}", "\n\n", t).strip()
+        return t
+
+    def _parse_lexicon_raw(self, lex_raw: str) -> List[str]:
+        if not lex_raw:
+            return []
+        toks = re.split(r"[,|\n]+", lex_raw)
+        lex = []
+        for t in toks:
+            tt = t.strip().lower()
+            if tt:
+                lex.append(tt)
+        # dedupe preserve order
+        seen = set()
+        out = []
+        for t in lex:
+            if t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
+
+    def _should_scan_key(self, k: str) -> bool:
+        kk = (k or "").lower()
+        if not kk or kk.startswith("_"):
+            return False
+        if any(h in kk for h in self._SKIP_KEY_HINTS):
+            return False
+        return True
+
+    def _is_lexiconish_key(self, k: str) -> bool:
+        kk = (k or "").lower()
+        if kk in self._DEFAULT_LEXICON_KEYS:
+            return True
+        return any(h in kk for h in self._LEX_KEY_HINTS)
+
+    def _gather_highlight_terms(self, payload_lex_raw: str, *, use_memory_lexicons: bool) -> List[str]:
+        terms: List[str] = []
+        terms.extend(self._parse_lexicon_raw(payload_lex_raw))
+
+        if not use_memory_lexicons:
+            seen = set()
+            out = []
+            for t in terms:
+                if t in seen:
+                    continue
+                seen.add(t)
+                out.append(t)
+            return out[:400]
+
+        try:
+            mem = Memory.load()
+        except Exception:
+            mem = {}
+
+        # known keys first
+        for k in self._DEFAULT_LEXICON_KEYS:
+            v = mem.get(k)
+            if isinstance(v, list):
+                for x in v[:2000]:
+                    if isinstance(x, str) and x.strip():
+                        terms.append(x.strip().lower())
+            elif isinstance(v, str) and v.strip():
+                terms.extend(self._parse_lexicon_raw(v))
+
+        # auto-detect other keys
+        for k, v in list(mem.items()):
+            kk = str(k)
+            if not self._should_scan_key(kk):
+                continue
+            if not self._is_lexiconish_key(kk):
+                continue
+            if kk in self._DEFAULT_LEXICON_KEYS:
+                continue
+
+            if isinstance(v, list):
+                for x in v[:1000]:
+                    if isinstance(x, str) and x.strip():
+                        terms.append(x.strip().lower())
+            elif isinstance(v, str) and v.strip() and len(v) < 30000:
+                terms.extend(self._parse_lexicon_raw(v))
+
+        # dedupe + cap
+        seen = set()
+        out = []
+        for t in terms:
+            tt = (t or "").strip().lower()
+            if not tt:
+                continue
+            if tt in seen:
+                continue
+            seen.add(tt)
+            out.append(tt)
+            if len(out) >= 900:
+                break
+        return out
+
+    def _build_display_source_text(self, payload_text: str, *, mode: str) -> Tuple[str, str]:
+        ctx, lex_raw = self._split_tagged_payload(payload_text)
+        if mode == "snippets":
+            chosen = self._extract_key_snippets_section(ctx) or ctx or payload_text
+        elif mode == "context":
+            chosen = ctx or payload_text
+        else:
+            chosen = payload_text
+        return chosen, lex_raw
+
+    # -------------------- HTML document rendering --------------------
+    def _escape_and_linkify(self, text: str) -> str:
+        esc = html.escape(text, quote=False)
+
+        def repl(m: re.Match) -> str:
+            u = m.group(0)
+            uu = html.escape(u, quote=True)
+            return f'<a href="{uu}">{uu}</a>'
+
+        return self._URL_RE.sub(repl, esc)
+
+    def _highlight_terms_html(self, html_text: str, terms: List[str]) -> str:
+        if not terms:
+            return html_text
+
+        safe_terms = []
+        for t in terms:
+            if 3 <= len(t) <= 40 and re.match(r"^[a-z0-9_\-]+$", t):
+                safe_terms.append(t)
+            if len(safe_terms) >= 90:
+                break
+
+        if not safe_terms:
+            return html_text
+
+        # build bounded alternation
+        pat = re.compile(
+            r"(?i)(?<![A-Za-z0-9_\-])(" + "|".join(map(re.escape, safe_terms)) + r")(?![A-Za-z0-9_\-])"
+        )
+
+        def repl(m: re.Match) -> str:
+            w = m.group(1)
+            return f'<span style="font-weight:700; text-decoration: underline;">{w}</span>'
+
+        parts = re.split(r"(<[^>]+>)", html_text)
+        out_parts: List[str] = []
+        for p in parts:
+            if p.startswith("<") and p.endswith(">"):
+                out_parts.append(p)
+            else:
+                out_parts.append(pat.sub(repl, p))
+        return "".join(out_parts)
+
+    def _render_as_html(
+        self,
+        cleaned_text: str,
+        *,
+        title: str,
+        task: str,
+        topics: str,
+        style: str,
+        font_family: str,
+        font_pt: int,
+        highlight_terms: List[str],
+        include_images: bool,
+        max_images: int,
+    ) -> Tuple[str, List[str], List[str]]:
+        text = cleaned_text or ""
+        urls_found = list(dict.fromkeys(self._URL_RE.findall(text)))
+        img_urls: List[str] = []
+
+        if include_images:
+            img_urls.extend(self._IMG_TAG_RE.findall(text))
+            img_urls.extend(self._MD_IMG_RE.findall(text))
+            for u in urls_found:
+                if re.search(r"\.(png|jpg|jpeg|gif|webp)(\?.*)?$", u, re.I):
+                    img_urls.append(u)
+            img_urls = list(dict.fromkeys(img_urls))[: max(0, int(max_images))]
+
+        # split fenced code blocks
+        blocks: List[Tuple[str, str]] = []
+        if "```" in text:
+            parts = text.split("```")
+            for i, p in enumerate(parts):
+                if i % 2 == 1:
+                    blocks.append(("code", p))
+                else:
+                    blocks.append(("text", p))
+        else:
+            blocks.append(("text", text))
+
+        title_esc = html.escape(title, quote=False)
+        task_esc = html.escape(task or "", quote=False)
+        topics_esc = html.escape(topics or "", quote=False)
+
+        css = f"""
+        <style>
+          body {{
+            font-family: {html.escape(font_family)};
+            font-size: {int(font_pt)}pt;
+            line-height: 1.38;
+            margin: 18px;
+          }}
+          .doc-title {{
+            font-size: {int(font_pt) + 6}pt;
+            font-weight: 900;
+            margin-bottom: 6px;
+          }}
+          .doc-sub {{
+            margin-bottom: 14px;
+            color: #333;
+          }}
+          .meta {{
+            font-size: {max(9, int(font_pt) - 3)}pt;
+            color: #444;
+            margin-bottom: 12px;
+          }}
+          .hr {{
+            border-top: 1px solid #ddd;
+            margin: 14px 0 14px 0;
+          }}
+          .p {{
+            margin: 0 0 10px 0;
+            white-space: pre-wrap;
+          }}
+          pre {{
+            white-space: pre-wrap;
+            background: #f6f6f6;
+            border: 1px solid #e3e3e3;
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin: 10px 0;
+            font-family: "Consolas", "Menlo", "Monaco", monospace;
+            font-size: {max(9, int(font_pt) - 3)}pt;
+          }}
+          code {{
+            font-family: "Consolas", "Menlo", "Monaco", monospace;
+          }}
+          a {{ text-decoration: none; }}
+          a:hover {{ text-decoration: underline; }}
+          ul {{ margin-top: 6px; margin-bottom: 10px; }}
+          .img-title {{
+            font-weight: 900;
+            margin: 12px 0 6px 0;
+          }}
+          img {{
+            max-width: 100%;
+            border-radius: 12px;
+            border: 1px solid #e3e3e3;
+            margin: 0 0 14px 0;
+          }}
+        </style>
+        """
+
+        html_parts: List[str] = []
+        html_parts.append("<html><head>")
+        html_parts.append(css)
+        html_parts.append("</head><body>")
+        html_parts.append(f'<div class="doc-title">{title_esc}</div>')
+
+        sub_lines: List[str] = []
+        if task_esc:
+            sub_lines.append(f"<b>Task:</b> {task_esc}")
+        if topics_esc:
+            sub_lines.append(f"<b>Focusing on:</b> {topics_esc}")
+        if sub_lines:
+            html_parts.append(f'<div class="doc-sub">{" &nbsp; &nbsp; ".join(sub_lines)}</div>')
+
+        html_parts.append('<div class="hr"></div>')
+
+        if img_urls:
+            for i, u in enumerate(img_urls, start=1):
+                uu = html.escape(u, quote=True)
+                html_parts.append(f'<div class="img-title">Image {i}</div>')
+                html_parts.append(f'<img src="{uu}"/>')
+            html_parts.append('<div class="hr"></div>')
+
+        for kind, content in blocks:
+            c = (content or "").strip("\n")
+            if not c.strip():
+                continue
+
+            if kind == "code":
+                lines = c.splitlines()
+                lang = ""
+                if lines and re.match(r"^[A-Za-z0-9_+\-]{1,24}$", lines[0].strip()):
+                    lang = lines[0].strip()
+                    lines = lines[1:]
+                code_raw = "\n".join(lines).rstrip()
+                if lang:
+                    html_parts.append(f'<div class="meta"><b>Code:</b> {html.escape(lang)}</div>')
+                html_parts.append(f"<pre><code>{html.escape(code_raw, quote=False)}</code></pre>")
+                continue
+
+            rendered_lines: List[str] = []
+            for ln in c.splitlines():
+                t = ln.strip()
+                if not t:
+                    rendered_lines.append("")
+                    continue
+
+                m1 = self._TITLE_DASH_URL_RE.match(t)
+                if m1:
+                    ttl, u = m1.group(1).strip(), m1.group(2).strip()
+                    rendered_lines.append(
+                        f"<b>{html.escape(ttl)}</b> — "
+                        f"<a href=\"{html.escape(u, quote=True)}\">{html.escape(u)}</a>"
+                    )
+                    continue
+
+                m2 = self._KIND_PIPE_TITLE_RE.match(t)
+                if m2:
+                    kind2, ttl2 = m2.group(1).strip(), m2.group(2).strip()
+                    rendered_lines.append(f"<b>{html.escape(kind2)}</b> | {html.escape(ttl2)}")
+                    continue
+
+                rendered_lines.append(self._escape_and_linkify(t))
+
+            if style == "bullets":
+                items = [ln for ln in rendered_lines if ln and not ln.startswith("<b>")]
+                headers = [ln for ln in rendered_lines if ln.startswith("<b>")]
+                for h in headers:
+                    html_parts.append(f'<div class="p">{h}</div>')
+                if items:
+                    html_parts.append("<ul>")
+                    for it in items:
+                        html_parts.append(f"<li>{it}</li>")
+                    html_parts.append("</ul>")
+            elif style == "outline":
+                html_parts.append("<ul>")
+                for ln in rendered_lines:
+                    if not ln:
+                        continue
+                    if ln.startswith("<b>"):
+                        html_parts.append(f"</ul><div class=\"p\">{ln}</div><ul>")
+                    else:
+                        html_parts.append(f"<li>{ln}</li>")
+                html_parts.append("</ul>")
+            else:
+                para: List[str] = []
+
+                def flush_para():
+                    nonlocal para
+                    if para:
+                        html_parts.append(f'<div class="p">{"<br/>".join(para)}</div>')
+                        para = []
+
+                for ln in rendered_lines:
+                    if ln == "":
+                        flush_para()
+                    else:
+                        para.append(ln)
+                flush_para()
+
+        html_parts.append("</body></html>")
+        doc = "\n".join(html_parts)
+
+        if highlight_terms:
+            doc = self._highlight_terms_html(doc, highlight_terms)
+
+        return doc, urls_found, img_urls
+
+    # -------------------- GUI show (in-process) --------------------
+    def _show_popup_pyqt5_inproc(
+        self,
+        title: str,
+        html_doc: str,
+        *,
+        width: int,
+        height: int,
+        auto_close_s: float,
+        allow_pdf_export: bool,
+        allow_html_export: bool,
+        max_remote_image_bytes: int,
+        image_timeout_s: float,
+        dispatch_to_gui_thread: bool,
+        block_until_close: bool,
+        dispatch_timeout_s: float,
+    ) -> bool:
+        """
+        In-process viewer. If called off the Qt GUI thread and dispatch_to_gui_thread=True,
+        it will enqueue the dialog on the GUI thread (safe).
+
+        Returns True if shown (or scheduled), else False.
+        """
+        try:
+            import urllib.request
+            from PyQt5.QtCore import QTimer, QUrl, Qt, QMetaObject, QObject, pyqtSlot, QThread
+            from PyQt5.QtGui import QGuiApplication, QImage
+            from PyQt5.QtWidgets import (
+                QApplication, QDialog, QVBoxLayout, QHBoxLayout,
+                QPushButton, QFileDialog, QMessageBox, QTextBrowser
+            )
+            from PyQt5.QtGui import QTextDocument
+        except Exception as e:
+            self._dbg(f"[DisplayTextMiner] PyQt5 import failed: {type(e).__name__}: {e}")
+            return False
+
+        QPrinter = None
+        if allow_pdf_export:
+            try:
+                from PyQt5.QtPrintSupport import QPrinter as _QPrinter
+                QPrinter = _QPrinter
+            except Exception:
+                QPrinter = None
+
+        class _RichBrowser(QTextBrowser):
+            _img_cache: Dict[str, QImage] = {}
+
+            def loadResource(self, rtype: int, name: QUrl):
+                try:
+                    if rtype == QTextDocument.ImageResource and name.isValid():
+                        u = name.toString()
+                        if u.startswith("http://") or u.startswith("https://"):
+                            if u in self._img_cache:
+                                return self._img_cache[u]
+
+                            try:
+                                req = urllib.request.Request(
+                                    u,
+                                    headers={"User-Agent": "Mozilla/5.0 (DisplayTextMiner)"},
+                                )
+                                with urllib.request.urlopen(req, timeout=max(0.5, float(image_timeout_s))) as resp:
+                                    data = resp.read(max(1, int(max_remote_image_bytes) + 1))
+                                    if len(data) > int(max_remote_image_bytes):
+                                        return super().loadResource(rtype, name)
+
+                                img = QImage()
+                                if img.loadFromData(data):
+                                    self._img_cache[u] = img
+                                    return img
+                            except Exception:
+                                return super().loadResource(rtype, name)
+                except Exception:
+                    pass
+
+                return super().loadResource(rtype, name)
+
+        def _run_dialog() -> bool:
+            dlg = QDialog()
+            dlg.setWindowTitle(title)
+            dlg.resize(max(740, int(width)), max(560, int(height)))
+
+            layout = QVBoxLayout(dlg)
+            browser = _RichBrowser()
+            browser.setOpenExternalLinks(True)
+            browser.setReadOnly(True)
+            browser.setHtml(html_doc)
+            layout.addWidget(browser, stretch=1)
+
+            row = QHBoxLayout()
+
+            def do_copy_text():
+                try:
+                    QGuiApplication.clipboard().setText(browser.toPlainText())
+                except Exception:
+                    pass
+
+            def do_copy_html():
+                try:
+                    QGuiApplication.clipboard().setText(html_doc)
+                except Exception:
+                    pass
+
+            def do_save_html():
+                try:
+                    path, _ = QFileDialog.getSaveFileName(dlg, "Save HTML", "display_textminer.html", "HTML (*.html)")
+                    if not path:
+                        return
+                    with open(path, "w", encoding="utf-8") as f2:
+                        f2.write(html_doc)
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Save HTML failed", str(e))
+
+            def do_save_pdf():
+                if QPrinter is None:
+                    QMessageBox.information(dlg, "PDF Export", "QtPrintSupport unavailable; PDF export not supported.")
+                    return
+                try:
+                    path, _ = QFileDialog.getSaveFileName(dlg, "Save PDF", "display_textminer.pdf", "PDF (*.pdf)")
+                    if not path:
+                        return
+                    printer = QPrinter(QPrinter.HighResolution)
+                    printer.setOutputFormat(QPrinter.PdfFormat)
+                    printer.setOutputFileName(path)
+                    browser.document().print_(printer)
+                except Exception as e:
+                    QMessageBox.warning(dlg, "Save PDF failed", str(e))
+
+            def do_close():
+                try:
+                    dlg.accept()
+                except Exception:
+                    pass
+
+            b1 = QPushButton("Copy (Text)")
+            b1.clicked.connect(do_copy_text)
+            row.addWidget(b1)
+
+            b2 = QPushButton("Copy (HTML)")
+            b2.clicked.connect(do_copy_html)
+            row.addWidget(b2)
+
+            if allow_html_export:
+                b3 = QPushButton("Save HTML…")
+                b3.clicked.connect(do_save_html)
+                row.addWidget(b3)
+
+            if allow_pdf_export:
+                b4 = QPushButton("Save PDF…")
+                b4.clicked.connect(do_save_pdf)
+                row.addWidget(b4)
+
+            row.addStretch(1)
+
+            b5 = QPushButton("Close")
+            b5.clicked.connect(do_close)
+            row.addWidget(b5)
+
+            layout.addLayout(row)
+
+            if auto_close_s and auto_close_s > 0:
+                QTimer.singleShot(int(float(auto_close_s) * 1000), do_close)
+
+            dlg.setModal(True)
+            dlg.exec_()
+            return True
+
+        app = QApplication.instance()
+        # Creating QApplication must happen on main thread in most setups
+        if app is None:
+            if threading.current_thread() is not threading.main_thread():
+                self._dbg("[DisplayTextMiner] no QApplication and not on main thread; cannot safely create in-process app")
+                return False
+            try:
+                app = QApplication([])
+            except Exception as e:
+                self._dbg(f"[DisplayTextMiner] QApplication init failed: {type(e).__name__}: {e}")
+                return False
+
+        gui_thread = app.thread()
+        current_qt_thread = QThread.currentThread()
+
+        if current_qt_thread == gui_thread:
+            return _run_dialog()
+
+        if not dispatch_to_gui_thread:
+            self._dbg("[DisplayTextMiner] off GUI thread; dispatch_to_gui_thread=False")
+            return False
+
+        # enqueue to GUI thread
+        done_evt = threading.Event()
+        out_ok = {"shown": False}
+
+        class _Invoker(QObject):
+            @pyqtSlot()
+            def run(self):
+                try:
+                    out_ok["shown"] = _run_dialog()
+                finally:
+                    done_evt.set()
+
+        inv = _Invoker()
+        inv.moveToThread(gui_thread)
+        QMetaObject.invokeMethod(inv, "run", Qt.QueuedConnection)
+
+        if block_until_close:
+            # wait until dialog closes (or timeout if requested)
+            if dispatch_timeout_s and dispatch_timeout_s > 0:
+                done_evt.wait(timeout=float(dispatch_timeout_s))
+            else:
+                done_evt.wait()
+            return bool(out_ok["shown"])
+
+        # not blocking: scheduled
+        return True
+
+    # -------------------- GUI show (subprocess fallback) --------------------
+    def _show_popup_pyqt5_subprocess(
+        self,
+        title: str,
+        html_doc: str,
+        *,
+        width: int,
+        height: int,
+        auto_close_s: float,
+        allow_pdf_export: bool,
+        allow_html_export: bool,
+        max_remote_image_bytes: int,
+        image_timeout_s: float,
+        wait: bool,
+    ) -> bool:
+        """
+        Robust fallback when called from a worker thread and no GUI thread exists.
+        Uses a one-shot subprocess so Qt runs on that process' main thread.
+        """
+        try:
+            import os
+            import sys
+            import json
+            import tempfile
+            import subprocess
+        except Exception:
+            return False
+
+        payload = {
+            "title": title,
+            "html": html_doc,
+            "width": int(width),
+            "height": int(height),
+            "auto_close_s": float(auto_close_s),
+            "allow_pdf_export": bool(allow_pdf_export),
+            "allow_html_export": bool(allow_html_export),
+            "max_remote_image_bytes": int(max_remote_image_bytes),
+            "image_timeout_s": float(image_timeout_s),
+        }
+
+        try:
+            fd, path = tempfile.mkstemp(prefix="displaytextminer_", suffix=".json")
+            os.close(fd)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception as e:
+            self._dbg(f"[DisplayTextMiner] subprocess temp write failed: {type(e).__name__}: {e}")
+            return False
+
+        # Inline script (keeps this self-contained and copy/paste friendly)
+        script = r"""
+import json, sys, urllib.request
+from PyQt5.QtCore import QTimer, QUrl
+from PyQt5.QtGui import QGuiApplication, QImage, QTextDocument
+from PyQt5.QtWidgets import QApplication, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QFileDialog, QMessageBox, QTextBrowser
+
+try:
+    from PyQt5.QtPrintSupport import QPrinter
+except Exception:
+    QPrinter = None
+
+cfg_path = sys.argv[1]
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+title = cfg.get("title", "DisplayTextMiner")
+html_doc = cfg.get("html", "")
+width = int(cfg.get("width", 980))
+height = int(cfg.get("height", 760))
+auto_close_s = float(cfg.get("auto_close_s", 0.0))
+allow_pdf_export = bool(cfg.get("allow_pdf_export", True))
+allow_html_export = bool(cfg.get("allow_html_export", True))
+max_remote_image_bytes = int(cfg.get("max_remote_image_bytes", 2_000_000))
+image_timeout_s = float(cfg.get("image_timeout_s", 3.5))
+
+class RichBrowser(QTextBrowser):
+    _img_cache = {}
+    def loadResource(self, rtype, name):
+        try:
+            if rtype == QTextDocument.ImageResource and name.isValid():
+                u = name.toString()
+                if u.startswith("http://") or u.startswith("https://"):
+                    if u in self._img_cache:
+                        return self._img_cache[u]
+                    try:
+                        req = urllib.request.Request(u, headers={"User-Agent":"Mozilla/5.0 (DisplayTextMiner)"})
+                        with urllib.request.urlopen(req, timeout=max(0.5, float(image_timeout_s))) as resp:
+                            data = resp.read(max(1, int(max_remote_image_bytes) + 1))
+                            if len(data) > int(max_remote_image_bytes):
+                                return super().loadResource(rtype, name)
+                        img = QImage()
+                        if img.loadFromData(data):
+                            self._img_cache[u] = img
+                            return img
+                    except Exception:
+                        return super().loadResource(rtype, name)
+        except Exception:
+            pass
+        return super().loadResource(rtype, name)
+
+app = QApplication([])
+
+dlg = QDialog()
+dlg.setWindowTitle(title)
+dlg.resize(max(740, width), max(560, height))
+
+layout = QVBoxLayout(dlg)
+browser = RichBrowser()
+browser.setOpenExternalLinks(True)
+browser.setReadOnly(True)
+browser.setHtml(html_doc)
+layout.addWidget(browser, stretch=1)
+
+row = QHBoxLayout()
+
+def do_copy_text():
+    try:
+        QGuiApplication.clipboard().setText(browser.toPlainText())
+    except Exception:
+        pass
+
+def do_copy_html():
+    try:
+        QGuiApplication.clipboard().setText(html_doc)
+    except Exception:
+        pass
+
+def do_save_html():
+    try:
+        p, _ = QFileDialog.getSaveFileName(dlg, "Save HTML", "display_textminer.html", "HTML (*.html)")
+        if not p:
+            return
+        with open(p, "w", encoding="utf-8") as f2:
+            f2.write(html_doc)
+    except Exception as e:
+        QMessageBox.warning(dlg, "Save HTML failed", str(e))
+
+def do_save_pdf():
+    if QPrinter is None:
+        QMessageBox.information(dlg, "PDF Export", "QtPrintSupport unavailable; PDF export not supported.")
+        return
+    try:
+        p, _ = QFileDialog.getSaveFileName(dlg, "Save PDF", "display_textminer.pdf", "PDF (*.pdf)")
+        if not p:
+            return
+        pr = QPrinter(QPrinter.HighResolution)
+        pr.setOutputFormat(QPrinter.PdfFormat)
+        pr.setOutputFileName(p)
+        browser.document().print_(pr)
+    except Exception as e:
+        QMessageBox.warning(dlg, "Save PDF failed", str(e))
+
+def do_close():
+    try:
+        dlg.accept()
+    except Exception:
+        pass
+
+b1 = QPushButton("Copy (Text)")
+b1.clicked.connect(do_copy_text); row.addWidget(b1)
+
+b2 = QPushButton("Copy (HTML)")
+b2.clicked.connect(do_copy_html); row.addWidget(b2)
+
+if allow_html_export:
+    b3 = QPushButton("Save HTML…")
+    b3.clicked.connect(do_save_html); row.addWidget(b3)
+
+if allow_pdf_export:
+    b4 = QPushButton("Save PDF…")
+    b4.clicked.connect(do_save_pdf); row.addWidget(b4)
+
+row.addStretch(1)
+b5 = QPushButton("Close")
+b5.clicked.connect(do_close); row.addWidget(b5)
+
+layout.addLayout(row)
+
+if auto_close_s and auto_close_s > 0:
+    QTimer.singleShot(int(auto_close_s * 1000), do_close)
+
+dlg.setModal(True)
+dlg.exec_()
+"""
+
+        try:
+            cmd = [sys.executable, "-c", script, path]
+            p = subprocess.Popen(cmd)
+            if wait:
+                p.wait()
+            return True
+        except Exception as e:
+            self._dbg(f"[DisplayTextMiner] subprocess launch failed: {type(e).__name__}: {e}")
+            return False
+        finally:
+            # Best-effort cleanup (if the subprocess still needs it, it'll already have read it)
+            try:
+                import os
+                os.remove(path)
+            except Exception:
+                pass
+
+    # -------------------- execute --------------------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        text = str(payload or "")
+        self._dbg("[DisplayTextMiner] execute start")
+
+        # ---- core params ----
+        mode = str(params.get("mode", "snippets")).strip().lower()
+        if mode not in ("snippets", "context", "raw"):
+            mode = "snippets"
+
+        title = str(params.get("title", "DisplayTextMiner")).strip() or "DisplayTextMiner"
+
+        width = int(params.get("width", 980))
+        height = int(params.get("height", 760))
+        auto_close_s = float(params.get("auto_close_s", 0.0))
+
+        show_popup = bool(params.get("show_popup", True))
+        return_clean = bool(params.get("return_clean", False))
+
+        # safety
+        max_input_chars = int(params.get("max_input_chars", 250000))
+        max_input_chars = max(2000, min(max_input_chars, 2_000_000))
+
+        max_chars = int(params.get("max_chars", 45000))
+        max_chars = max(2000, min(max_chars, 350000))
+
+        min_doc_chars = int(params.get("min_doc_chars", 120))
+        min_doc_chars = max(0, min(min_doc_chars, 5000))
+
+        # dedupe
+        dedupe = bool(params.get("dedupe", True))
+        dedupe_key = str(params.get("dedupe_key", "display_textminer_last_hash")).strip() or "display_textminer_last_hash"
+
+        # aesthetics
+        font_family = str(params.get("font_family", "Georgia")).strip() or "Georgia"
+        font_pt = int(params.get("font_pt", 16))
+        font_pt = max(10, min(font_pt, 28))
+
+        style = str(params.get("style", "")).strip().lower()
+        use_memory_meta = bool(params.get("use_memory_meta", True))
+        task = str(params.get("dissected_task", "")).strip()
+        topics = str(params.get("dissected_topics", "")).strip()
+
+        highlight = bool(params.get("highlight_terms", True))
+        use_memory_lexicons = bool(params.get("use_memory_lexicons", True))
+
+        include_images = bool(params.get("include_images", True))
+        max_images = int(params.get("max_images", 6))
+        max_images = max(0, min(max_images, 30))
+
+        max_remote_image_bytes = int(params.get("max_remote_image_bytes", 2_000_000))
+        max_remote_image_bytes = max(50_000, min(max_remote_image_bytes, 10_000_000))
+        image_timeout_s = float(params.get("image_timeout_s", 3.5))
+        image_timeout_s = max(0.5, min(image_timeout_s, 15.0))
+
+        allow_pdf_export = bool(params.get("allow_pdf_export", True))
+        allow_html_export = bool(params.get("allow_html_export", True))
+
+        strip_banners = bool(params.get("strip_banners", True))
+        strip_explanatory = bool(params.get("strip_explanatory", True))
+
+        # thread behavior
+        dispatch_to_gui_thread = bool(params.get("dispatch_to_gui_thread", True))
+        block_until_close = bool(params.get("block_until_close", True))
+        dispatch_timeout_s = float(params.get("dispatch_timeout_s", 0.0))  # 0 => wait forever if blocking
+        subprocess_fallback = bool(params.get("subprocess_fallback", True))
+        subprocess_wait = bool(params.get("subprocess_wait", True))
+
+        # clamp input
+        if len(text) > max_input_chars:
+            text = text[:max_input_chars].rstrip() + "\n\n... [input clamped]"
+
+        # pull missing meta from Memory
+        if use_memory_meta:
+            try:
+                mem = Memory.load()
+            except Exception:
+                mem = {}
+            if not task:
+                task = str(mem.get("dissected_task", "") or "").strip()
+            if not topics:
+                topics = str(mem.get("dissected_topics", "") or "").strip()
+            if not style:
+                style = str(mem.get("style", "") or mem.get("display_style", "") or "").strip().lower()
+
+        if style not in ("plain", "bullets", "outline"):
+            style = "plain"
+
+        # choose source text
+        chosen, payload_lex_raw = self._build_display_source_text(text, mode=mode)
+
+        # clean
+        cleaned = self._clean_display_text(chosen, strip_banners=strip_banners, strip_explanatory=strip_explanatory)
+
+        # thin-doc guard
+        if len(cleaned.strip()) < min_doc_chars:
+            cleaned = cleaned.strip()
+            if cleaned:
+                cleaned = cleaned + "\n\n[displaytextminer] (content below min_doc_chars; shown anyway)"
+            else:
+                cleaned = "[displaytextminer] No usable content to display."
+
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[:max_chars].rstrip() + "\n\n... [clamped]"
+
+        highlight_terms = self._gather_highlight_terms(payload_lex_raw, use_memory_lexicons=use_memory_lexicons) if highlight else []
+
+        html_doc, urls_found, images_found = self._render_as_html(
+            cleaned,
+            title=title,
+            task=task,
+            topics=topics,
+            style=style,
+            font_family=font_family,
+            font_pt=font_pt,
+            highlight_terms=highlight_terms,
+            include_images=include_images,
+            max_images=max_images,
+        )
+
+        # dedupe on HTML (stable-ish)
+        skipped = False
+        h = hashlib.sha1(html_doc.encode("utf-8", errors="ignore")).hexdigest()
+        if dedupe:
+            try:
+                mem = Memory.load()
+                last = str(mem.get(dedupe_key, "") or "")
+                if last == h:
+                    skipped = True
+                    self._dbg("[DisplayTextMiner] dedupe hit: skipping popup (same content)")
+                else:
+                    mem[dedupe_key] = h
+                    Memory.save(mem)
+            except Exception:
+                pass
+
+        shown = False
+        if show_popup and not skipped:
+            # First try in-process (main thread or dispatch to GUI thread)
+            if threading.current_thread() is threading.main_thread():
+                shown = self._show_popup_pyqt5_inproc(
+                    title,
+                    html_doc,
+                    width=width,
+                    height=height,
+                    auto_close_s=auto_close_s,
+                    allow_pdf_export=allow_pdf_export,
+                    allow_html_export=allow_html_export,
+                    max_remote_image_bytes=max_remote_image_bytes,
+                    image_timeout_s=image_timeout_s,
+                    dispatch_to_gui_thread=dispatch_to_gui_thread,
+                    block_until_close=block_until_close,
+                    dispatch_timeout_s=dispatch_timeout_s,
+                )
+            else:
+                # Worker thread:
+                # Try dispatch if there is already a QApplication; otherwise fall back to subprocess.
+                shown = self._show_popup_pyqt5_inproc(
+                    title,
+                    html_doc,
+                    width=width,
+                    height=height,
+                    auto_close_s=auto_close_s,
+                    allow_pdf_export=allow_pdf_export,
+                    allow_html_export=allow_html_export,
+                    max_remote_image_bytes=max_remote_image_bytes,
+                    image_timeout_s=image_timeout_s,
+                    dispatch_to_gui_thread=dispatch_to_gui_thread,
+                    block_until_close=block_until_close,
+                    dispatch_timeout_s=dispatch_timeout_s if dispatch_timeout_s > 0 else 0.0,
+                )
+
+                if (not shown) and subprocess_fallback:
+                    self._dbg("[DisplayTextMiner] in-proc show failed from worker thread; using subprocess fallback")
+                    shown = self._show_popup_pyqt5_subprocess(
+                        title,
+                        html_doc,
+                        width=width,
+                        height=height,
+                        auto_close_s=auto_close_s,
+                        allow_pdf_export=allow_pdf_export,
+                        allow_html_export=allow_html_export,
+                        max_remote_image_bytes=max_remote_image_bytes,
+                        image_timeout_s=image_timeout_s,
+                        wait=subprocess_wait,
+                    )
+
+        out_text = cleaned if return_clean else str(payload or "")
+
+        meta = {
+            "mode": mode,
+            "popup_backend": "pyqt5",
+            "shown": bool(shown),
+            "auto_close_s": auto_close_s,
+            "display_len": len(cleaned),
+            "urls_found": len(urls_found),
+            "images_found": len(images_found),
+            "skipped_dedupe": bool(skipped),
+            "return_clean": bool(return_clean),
+            "show_popup": bool(show_popup),
+            "style": style,
+            "font_family": font_family,
+            "font_pt": font_pt,
+            "task": task,
+            "topics": topics,
+            "highlight_terms": bool(highlight),
+            "use_memory_lexicons": bool(use_memory_lexicons),
+            "include_images": bool(include_images),
+            "max_images": max_images,
+            "max_input_chars": max_input_chars,
+            "max_chars": max_chars,
+            "min_doc_chars": min_doc_chars,
+            "allow_pdf_export": bool(allow_pdf_export),
+            "allow_html_export": bool(allow_html_export),
+            "dispatch_to_gui_thread": bool(dispatch_to_gui_thread),
+            "block_until_close": bool(block_until_close),
+            "dispatch_timeout_s": float(dispatch_timeout_s),
+            "subprocess_fallback": bool(subprocess_fallback),
+            "subprocess_wait": bool(subprocess_wait),
+            "thread_is_main": bool(threading.current_thread() is threading.main_thread()),
+        }
+
+        self._dbg(f"[DisplayTextMiner] execute done meta={meta}")
+        return out_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "mode": "snippets",              # snippets | context | raw
+            "title": "DisplayTextMiner",
+            "width": 980,
+            "height": 760,
+            "auto_close_s": 0.0,
+            "show_popup": True,
+            "return_clean": False,
+
+            # looks / structure
+            "font_family": "Georgia",
+            "font_pt": 16,
+            "style": "plain",               # plain | bullets | outline (if empty, tries Memory keys: style/display_style)
+
+            # “beautiful metadata”
+            "use_memory_meta": True,
+            "dissected_task": "",
+            "dissected_topics": "",
+
+            # cleanup
+            "strip_banners": True,
+            "strip_explanatory": True,
+
+            # highlighting
+            "highlight_terms": True,
+            "use_memory_lexicons": True,
+
+            # images
+            "include_images": True,
+            "max_images": 6,
+            "max_remote_image_bytes": 2_000_000,
+            "image_timeout_s": 3.5,
+
+            # scaling / safety
+            "max_input_chars": 250000,
+            "max_chars": 45000,
+            "min_doc_chars": 120,
+
+            # dedupe
+            "dedupe": True,
+            "dedupe_key": "display_textminer_last_hash",
+
+            # exports
+            "allow_pdf_export": True,
+            "allow_html_export": True,
+
+            # thread safety
+            "dispatch_to_gui_thread": True,     # if QApplication exists, enqueue to GUI thread
+            "block_until_close": True,          # wait until the user closes dialog when dispatched
+            "dispatch_timeout_s": 0.0,          # 0 => wait forever if blocking
+            "subprocess_fallback": True,        # if worker thread + no GUI app, show via subprocess
+            "subprocess_wait": True,            # wait for subprocess window to close
+        }
+
+
+BLOCKS.register("displaytextminer", DisplayTextMinerBlock)
+
+
+# ======================= DisplayTextMiner ====================
+@dataclass
+class PromptMinerBlock(BaseBlock):
+    """
+    PromptChatBlock (QUERY-ONLY): Filter miner output so downstream sees ONLY what matches the query.
+
+    Key rule (per your request):
+      - NO static domain/category rules (no "news/fashion/shop" detection, no brand lists, no Published: heuristics)
+      - Relevance decisions come ONLY from the query via TF-IDF cosine similarity.
+
+    Inputs:
+      - payload: usually a PromptMiner/TextMiner output containing [context] and chunk headings
+      - params:
+          query (required): the user prompt to filter against
+
+    Output:
+      - [context] -> prompt + only the most relevant chunks
+      - [lexicon] -> query terms + top terms mined from kept chunks (fully data-driven)
+
+    Optional params (do NOT affect "domain rules"; only controls output size):
+      - max_chunks (default 18)
+      - keep_links (default True)
+      - save_outputs (default True)
+    """
+
+    _WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-]{1,}")
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
+
+    # structural markers produced by your miners
+    _CHUNK_HDR_RE = re.compile(r"^\s*####\s*Chunk\s*\d+.*$", re.M)
+
+    def _dbg(self, msg: str):
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    # -------------------- payload parsing --------------------
+    def _split_tagged_payload(self, raw: str) -> str:
+        """
+        Returns context-ish text. If [context] is present, use that. Else return full payload.
+        """
+        text = raw or ""
+        if "[context]" in text:
+            try:
+                after = text.split("[context]\n", 1)[1]
+                if "[lexicon]" in after:
+                    ctx, _ = after.split("[lexicon]", 1)
+                    return ctx.strip()
+                return after.strip()
+            except Exception:
+                return text.strip()
+        return text.strip()
+
+    def _extract_key_snippets_section(self, ctx: str) -> str:
+        """
+        If '### Key Facts / Snippets' exists, prefer it (structural, not semantic).
+        """
+        marker = "### Key Facts / Snippets"
+        if marker not in (ctx or ""):
+            return ""
+        after = ctx.split(marker, 1)[1]
+        # stop at next same-level heading
+        parts = re.split(r"\n(?=###\s+)", after, maxsplit=1)
+        return (parts[0] if parts else after).strip()
+
+    def _parse_chunks(self, ctx: str) -> List[str]:
+        """
+        If ctx has '#### Chunk N' headings, return each chunk body.
+        Else: split into paragraph-ish blocks.
+        """
+        t = (ctx or "").strip()
+        if not t:
+            return []
+
+        if "#### Chunk" not in t:
+            parts = re.split(r"\n{2,}", t)
+            blocks = [p.strip() for p in parts if p.strip()]
+            return blocks[:300]
+
+        lines = t.splitlines()
+        blocks: List[str] = []
+        buf: List[str] = []
+        in_chunk = False
+
+        for ln in lines:
+            if ln.strip().startswith("#### Chunk"):
+                if buf:
+                    b = "\n".join(buf).strip()
+                    if b:
+                        blocks.append(b)
+                buf = []
+                in_chunk = True
+                continue
+
+            if in_chunk:
+                buf.append(ln)
+
+        if buf:
+            b = "\n".join(buf).strip()
+            if b:
+                blocks.append(b)
+
+        return blocks[:400]
+
+    # -------------------- tokenization --------------------
+    def _tokens(self, s: str) -> List[str]:
+        """
+        Data-driven tokenization: lowercased word-ish tokens; drops tiny tokens + digits.
+        No static stopword list.
+        """
+        out: List[str] = []
+        for m in self._WORD_RE.finditer((s or "").lower()):
+            t = m.group(0)
+            if len(t) < 3:
+                continue
+            if t.isdigit():
+                continue
+            out.append(t)
+        return out
+
+    # -------------------- dynamic stopwording (corpus-driven) --------------------
+    def _build_dynamic_stopset(self, docs_tokens: List[List[str]], query_set: Set[str]) -> Set[str]:
+        """
+        Build a stop-set ONLY from the current corpus:
+          - terms that are extremely common across docs (high DF)
+          - plus top very frequent terms
+        Always keep query terms.
+        """
+        n = max(1, len(docs_tokens))
+        df: Dict[str, int] = {}
+        tf: Dict[str, int] = {}
+
+        for toks in docs_tokens:
+            seen = set()
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+                if t in seen:
+                    continue
+                seen.add(t)
+                df[t] = df.get(t, 0) + 1
+
+        stop: Set[str] = set()
+
+        # DF-based: appears in >= 70% of docs => too generic in THIS corpus
+        df_cut = max(3, int(math.ceil(0.70 * n)))
+        for t, c in df.items():
+            if c >= df_cut and t not in query_set:
+                stop.add(t)
+
+        # TF-based: top-K most frequent tokens (also corpus-generic)
+        # K scales with corpus size but bounded
+        K = min(60, max(20, int(10 + n * 0.8)))
+        top_tf = sorted(tf.items(), key=lambda kv: kv[1], reverse=True)[:K]
+        for t, _ in top_tf:
+            if t not in query_set:
+                stop.add(t)
+
+        return stop
+
+    # -------------------- TF-IDF similarity --------------------
+    def _tfidf_vectors(
+        self,
+        docs_tokens: List[List[str]],
+        query_tokens: List[str],
+        stop: Set[str],
+    ) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
+        """
+        Returns (q_vec, doc_vecs) using TF-IDF with log TF and smooth IDF.
+        """
+        # filter stop
+        q = [t for t in query_tokens if t not in stop]
+        docs = [[t for t in toks if t not in stop] for toks in docs_tokens]
+
+        # doc frequency
+        df: Dict[str, int] = {}
+        for toks in docs:
+            seen = set(toks)
+            for t in seen:
+                df[t] = df.get(t, 0) + 1
+
+        N = max(1, len(docs))
+
+        def idf(t: str) -> float:
+            # smooth idf
+            return math.log((N + 1.0) / (df.get(t, 0) + 1.0)) + 1.0
+
+        def vec_from_tokens(toks: List[str]) -> Dict[str, float]:
+            tf: Dict[str, int] = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+            v: Dict[str, float] = {}
+            for t, c in tf.items():
+                v[t] = (1.0 + math.log(1.0 + c)) * idf(t)
+            return v
+
+        q_vec = vec_from_tokens(q)
+        doc_vecs = [vec_from_tokens(toks) for toks in docs]
+        return q_vec, doc_vecs
+
+    def _cosine(self, a: Dict[str, float], b: Dict[str, float]) -> float:
+        if not a or not b:
+            return 0.0
+        # dot on intersection
+        dot = 0.0
+        if len(a) < len(b):
+            for k, av in a.items():
+                bv = b.get(k)
+                if bv is not None:
+                    dot += av * bv
+        else:
+            for k, bv in b.items():
+                av = a.get(k)
+                if av is not None:
+                    dot += av * bv
+
+        na = math.sqrt(sum(v * v for v in a.values()))
+        nb = math.sqrt(sum(v * v for v in b.values()))
+        if na <= 1e-12 or nb <= 1e-12:
+            return 0.0
+        return float(dot / (na * nb))
+
+    # -------------------- lexicon output (query + mined terms) --------------------
+    def _top_terms_from_kept(self, kept_docs_tokens: List[List[str]], query_set: Set[str], cap: int = 220) -> List[str]:
+        """
+        Fully data-driven: take high-frequency terms from kept chunks, excluding query terms.
+        """
+        freq: Dict[str, int] = {}
+        for toks in kept_docs_tokens:
+            for t in toks:
+                if t in query_set:
+                    continue
+                freq[t] = freq.get(t, 0) + 1
+
+        ranked = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        out: List[str] = []
+        for t, _ in ranked:
+            out.append(t)
+            if len(out) >= cap:
+                break
+        return out
+
+    # -------------------- execute --------------------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        self._dbg("[PromptChat] execute start")
+
+        raw = str(payload or "")
+        query = str(params.get("query", "") or "").strip()
+        if not query:
+            # query is REQUIRED for query-only behavior
+            meta = {"error": "PromptChat requires params.query (query-only mode).", "blocks_kept": 0}
+            self._dbg("[PromptChat] missing query; returning payload unchanged")
+            return raw, meta
+
+        max_chunks = int(params.get("max_chunks", 18))
+        max_chunks = max(3, min(max_chunks, 120))
+
+        keep_links = bool(params.get("keep_links", True))
+        save_outputs = bool(params.get("save_outputs", True))
+
+        # get best context source
+        ctx_full = self._split_tagged_payload(raw)
+        ctx_focus = self._extract_key_snippets_section(ctx_full) or ctx_full
+
+        blocks = self._parse_chunks(ctx_focus)
+        if not blocks:
+            meta = {"query": query, "blocks_in": 0, "blocks_kept": 0}
+            return f"[context]\n### Prompt Focus\n{query}\n\n### Key Facts / Snippets\n(no blocks found)\n\n[lexicon]\n", meta
+
+        # tokenize
+        q_toks = self._tokens(query)
+        q_set = set(q_toks)
+
+        docs_tokens = [self._tokens(b) for b in blocks]
+
+        # dynamic stop-set from corpus (keeps query terms)
+        stop = self._build_dynamic_stopset(docs_tokens, q_set)
+
+        # tf-idf vectors
+        q_vec, doc_vecs = self._tfidf_vectors(docs_tokens, q_toks, stop)
+
+        # score (cosine). Also add tiny phrase bonus (still query-only).
+        q_lower = query.lower()
+        scored: List[Tuple[float, int]] = []
+        for i, (b, dv) in enumerate(zip(blocks, doc_vecs)):
+            sim = self._cosine(q_vec, dv)
+            if q_lower and len(q_lower) >= 8 and q_lower in (b or "").lower():
+                sim += 0.08
+            scored.append((sim, i))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # dynamic threshold: keep things near the best match
+        best = scored[0][0] if scored else 0.0
+        # if best is weak, keep fewer and be stricter
+        if best >= 0.35:
+            thr = best * 0.40
+        elif best >= 0.18:
+            thr = best * 0.55
+        else:
+            thr = best * 0.70
+
+        # always have a floor so we don't keep garbage
+        thr = max(thr, 0.05)
+
+        kept_idx: List[int] = []
+        for sim, i in scored:
+            if sim < thr:
+                break
+            kept_idx.append(i)
+            if len(kept_idx) >= max_chunks:
+                break
+
+        # fallback: if nothing met threshold, keep top 5 (still query-only)
+        if not kept_idx:
+            kept_idx = [i for _, i in scored[: min(5, len(scored))]]
+
+        kept_blocks = [blocks[i] for i in kept_idx]
+        kept_tokens = [docs_tokens[i] for i in kept_idx]
+
+        # build links only from kept
+        links: List[str] = []
+        if keep_links:
+            for b in kept_blocks:
+                for u in self._URL_RE.findall(b or ""):
+                    links.append(u)
+            links = list(dict.fromkeys(links))[:80]
+
+        # build lexicon: query terms + mined terms from kept (data-driven)
+        lex_out: List[str] = []
+        seen = set()
+        for t in q_toks:
+            if t and t not in seen:
+                seen.add(t)
+                lex_out.append(t)
+            if len(lex_out) >= 90:
+                break
+
+        mined = self._top_terms_from_kept(kept_tokens, set(lex_out), cap=220)
+        for t in mined:
+            if t not in seen:
+                seen.add(t)
+                lex_out.append(t)
+            if len(lex_out) >= 240:
+                break
+
+        # output context
+        out_lines: List[str] = []
+        out_lines.append("### Prompt Focus")
+        out_lines.append(query)
+        out_lines.append("")
+        out_lines.append("### Key Facts / Snippets")
+        for n, i in enumerate(kept_idx, start=1):
+            sim = next((s for s, j in scored if j == i), 0.0)
+            out_lines.append(f"#### Chunk {n} (sim={sim:.3f})")
+            out_lines.append(blocks[i].strip())
+            out_lines.append("")
+
+        if links:
+            out_lines.append("### Links")
+            for u in links:
+                out_lines.append(f"- {u}")
+
+        out_ctx = "\n".join(out_lines).strip()
+        out_text = f"[context]\n{out_ctx}\n\n[lexicon]\n{','.join(lex_out)}"
+
+        # save
+        saved = False
+        if save_outputs:
+            try:
+                mem = Memory.load()
+                mem["promptchat_last_query"] = query
+                mem["promptchat_context"] = out_ctx
+                mem["promptchat_lexicon"] = lex_out
+                Memory.save(mem)
+                saved = True
+            except Exception:
+                saved = False
+
+        meta = {
+            "query": query,
+            "blocks_in": len(blocks),
+            "blocks_kept": len(kept_blocks),
+            "best_sim": float(best),
+            "threshold": float(thr),
+            "links_kept": len(links),
+            "saved": saved,
+            "saved_keys": ["promptchat_last_query", "promptchat_context", "promptchat_lexicon"] if saved else [],
+        }
+
+        self._dbg(f"[PromptChat] execute done meta={meta}")
+        return out_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "REQUIRED. Filtering decisions are based ONLY on query similarity.",
+            "max_chunks": 18,
+            "keep_links": True,
+            "save_outputs": True,
+        }
+
+
+BLOCKS.register("promptminer", PromptMinerBlock)
