@@ -10,7 +10,36 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Set, Callable, Cl
 from urllib.parse import urlparse
 import time
 from submanagers import DatabaseSubmanager
+import re
 
+def _tokenize_query(q: str) -> list[str]:
+    q = (q or "").lower().strip()
+    if not q:
+        return []
+    toks = re.findall(r"[a-z0-9]{2,}", q)
+    # de-dupe, keep order
+    seen = set()
+    out = []
+    for t in toks:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+def _build_like_any(tokens: list[str], cols: list[str]) -> tuple[str, list[str]]:
+    """
+    Returns (sql_fragment, params) for: (col1 LIKE ? OR col2 LIKE ? ...) OR ... per token
+    """
+    where = []
+    params: list[str] = []
+    for t in tokens:
+        pat = f"%{t}%"
+        parts = []
+        for c in cols:
+            parts.append(f"LOWER({c}) LIKE ?")
+            params.append(pat)
+        where.append("(" + " OR ".join(parts) + ")")
+    return ("(" + " OR ".join(where) + ")") if where else "1=1", params
 
 @dataclass
 class BaseStore:
@@ -340,6 +369,7 @@ class LinkTrackerStore(BaseStore):
             required_sites: List[str],
             keywords: List[str],
             min_term_overlap: int,
+            query_text: str = "",
     ) -> Tuple[List[str], List[str]]:
         candidate_pages: List[str] = []
         direct_asset_urls: List[str] = []
@@ -353,12 +383,16 @@ class LinkTrackerStore(BaseStore):
                 return False
             return any(req in d for req in required_sites)
 
+        q_tokens = _tokenize_query(query_text)
+        kw_tokens = [k.lower() for k in (keywords or []) if k]
+        all_terms = list(dict.fromkeys(q_tokens + kw_tokens))  # de-dupe, keep order
+
         def _term_ok(h: str) -> bool:
-            if not keywords:
+            if not all_terms:
                 return True
-            hlow = h.lower()
-            hits = sum(1 for k in keywords if k and k in hlow)
-            return hits >= min_term_overlap
+            hlow = (h or "").lower()
+            hits = sum(1 for k in all_terms if k in hlow)
+            return hits >= max(1, int(min_term_overlap))
 
         for row in db_assets:
             u = (row.get("url") or "").strip()
@@ -666,6 +700,8 @@ class VideoTrackerStore(BaseStore):
         max_age_days: int = 14,
         include_synthetic: bool = False,
         per_domain_cap: int = 8,
+        query_text: str = "",
+        min_term_overlap: int = 1,
     ) -> List[Dict[str, Any]]:
         sources = (sources or "pages").lower().strip()
         limit = max(1, min(int(limit), 10_000))
@@ -729,7 +765,22 @@ class VideoTrackerStore(BaseStore):
                 continue
             seen.add(u)
             deduped.append(s)
+        # ---------------- query filter / rank ----------------
+        toks = _tokenize_query(query_text)
+        if toks:
+            filtered: List[Dict[str, Any]] = []
+            for s in out:
+                blob = f"{s.get('url', '')} {s.get('source', '')}".lower()
+                hits = sum(1 for t in toks if t in blob)
+                if hits >= max(1, int(min_term_overlap)):
+                    s["q_hits"] = hits
+                    filtered.append(s)
 
+            # If query is provided but yields nothing, keep original out as fallback
+            if filtered:
+                # rank by q_hits then keep your existing recency ordering (out is already recency-sorted per source)
+                filtered.sort(key=lambda x: (-int(x.get("q_hits", 0))))
+                out = filtered
         # diversify domains
         by_domain = collections.defaultdict(list)
         for s in deduped:
@@ -1040,7 +1091,9 @@ class PageTrackerStore(BaseStore):
             limit: int = 200,
             required_sites: Optional[List[str]] = None,
             keywords: Optional[List[str]] = None,
-            min_score: int = 0
+            min_score: int = 0,
+            query_text: str = "",
+            min_term_overlap: int = 1,
     ) -> List[str]:
         """
         Intelligent fetch: Get pages that match site/keyword criteria,
@@ -1057,15 +1110,20 @@ class PageTrackerStore(BaseStore):
                 args.append(f"%{s}%")
             where_clauses.append(f"({' OR '.join(site_parts)})")
 
-        # Filter by keywords (in URL or Title)
-        if keywords:
+        # Filter by query/keywords (in URL or Title)
+        q_toks = _tokenize_query(query_text)
+        kw_toks = [k.lower() for k in (keywords or []) if k]
+        terms = list(dict.fromkeys(q_toks + kw_toks))
+
+        if terms:
+            # we do AND over overlap via a computed hit count in SQL-ish way by OR then re-rank in python
+            # simplest: broad SQL OR, then enforce min_term_overlap in python after fetch
             kw_parts = []
-            for k in keywords:
-                term = f"%{k}%"
-                kw_parts.append("(url LIKE ? OR title LIKE ?)")
+            for t in terms:
+                term = f"%{t}%"
+                kw_parts.append("(LOWER(url) LIKE ? OR LOWER(title) LIKE ?)")
                 args.extend([term, term])
             where_clauses.append(f"({' OR '.join(kw_parts)})")
-
         # Filter by score
         where_clauses.append("score >= ?")
         args.append(min_score)
@@ -1075,7 +1133,7 @@ class PageTrackerStore(BaseStore):
 
         # Order by: Score (High) -> Depth (Low) -> Random
         query = f"""
-            SELECT url 
+            SELECT url, title
             FROM discovered_pages
             {where_sql}
             ORDER BY score DESC, depth ASC
@@ -1084,8 +1142,27 @@ class PageTrackerStore(BaseStore):
         args.append(limit)
 
         rows = self.db.fetchall(query, args)
-        return [r["url"] for r in rows]
 
+        toks = _tokenize_query(query_text) + [k.lower() for k in (keywords or []) if k]
+        toks = list(dict.fromkeys(toks))
+
+        # If no query/keywords, keep original behavior
+        if not toks:
+            return [r["url"] for r in rows if r["url"]]
+
+        scored: list[tuple[int, str]] = []
+        for r in rows:
+            u = r["url"]
+            if not u:
+                continue
+            title = (r.get("title") or "") if isinstance(r, dict) else ""
+            blob = f"{u} {title}".lower()
+            hits = sum(1 for t in toks if t in blob)
+            if hits >= max(1, int(min_term_overlap)):
+                scored.append((hits, u))
+
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [u for _, u in scored[:limit]]
 # ======================================================================
 # WebCorpusStore  (place with your other Stores, e.g. in submanagers.py)
 # ======================================================================

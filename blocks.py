@@ -7969,6 +7969,7 @@ class LinkTrackerBlock(BaseBlock):
                         required_sites=required_sites,
                         keywords=keywords,
                         min_term_overlap=min_term_overlap,
+                        query_text=query,
                     )
 
                     candidate_pages.extend(cand_from_db)
@@ -12005,6 +12006,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                     max_age_days=db_seed_max_age_days,
                     include_synthetic=db_include_synthetic_seeds,
                     per_domain_cap=db_seed_per_domain_cap,
+                    query_text=query_raw,  # <-- NEW
+                    min_term_overlap=min_term_overlap
                 )
                 DEBUG_LOGGER.log_message(
                     f"[VideoLinkTracker][db] Loaded {len(seeds)} seed URLs "
@@ -17302,7 +17305,9 @@ class PageTrackerBlock(BaseBlock):
                         limit=db_seed_limit,
                         required_sites=required_sites,
                         keywords=keywords if strict_keywords else None,
-                        min_score=0
+                        min_score=0,
+                        query_text=query,
+                        min_term_overlap=min_term_overlap
                     )
 
                     candidate_pages.extend(db_pages)
