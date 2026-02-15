@@ -9198,7 +9198,7 @@ class LinkTrackerBlock(BaseBlock):
 
         hub_paths = [
             "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
-            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
+            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search","/search/"
         ]
         for s in norm_sites:
             added = 0
@@ -10692,7 +10692,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         hub_paths = [
             "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
             "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
-            "/videos/", "/player/", "/watch/", "/embed/",
+            "/videos/", "/player/", "/watch/", "/embed/","/search/"
         ]
         for s in norm_sites:
             added = 0
@@ -18491,6 +18491,7 @@ class PageTrackerBlock(BaseBlock):
             "/authors/",
             "/topics/",
             "/search",
+            "/search/"
         ]
         for s in norm_sites:
             added = 0
