@@ -25332,15 +25332,16 @@ class DisplayTextMinerBlock(BaseBlock):
     def _extract_key_snippets_section(self, ctx: str) -> str:
         """
         Prefer the section under "### Key Facts / Snippets".
-        Stop at next "### " heading if present.
+
+        IMPORTANT: TextMiner often nests additional "### ..." headings inside this
+        section (ex: "### Prompt Focus"). So we must NOT stop at the next "###".
         """
         marker = "### Key Facts / Snippets"
         if marker not in (ctx or ""):
             return ""
-        after = ctx.split(marker, 1)[1]
-        parts = re.split(r"\n(?=###\s+)", after, maxsplit=1)
-        return (parts[0] if parts else after).strip()
-
+        # Use the LAST occurrence because TextMiner can repeat the marker.
+        after = (ctx or "").rsplit(marker, 1)[1]
+        return after.strip()
     def _clean_display_text(self, s: str, *, strip_banners: bool, strip_explanatory: bool) -> str:
         t = s or ""
 
@@ -26243,7 +26244,18 @@ dlg.exec_()
 
         # clean
         cleaned = self._clean_display_text(chosen, strip_banners=strip_banners, strip_explanatory=strip_explanatory)
-
+        if mode == "snippets" and len(cleaned.strip()) < max(30, int(min_doc_chars)):
+            try:
+                ctx_full, _ = self._split_tagged_payload(text)
+                cleaned2 = self._clean_display_text(
+                    ctx_full,
+                    strip_banners=strip_banners,
+                    strip_explanatory=strip_explanatory,
+                )
+                if len(cleaned2.strip()) > len(cleaned.strip()):
+                    cleaned = cleaned2
+            except Exception:
+                pass
         # thin-doc guard
         if len(cleaned.strip()) < min_doc_chars:
             cleaned = cleaned.strip()

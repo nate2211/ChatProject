@@ -354,7 +354,7 @@ class Worker(QObject):
 
                 params['stop_event'] = self.stop_event
 
-                if block_name == "pipeline" or block_name == "concat":
+                if block_name == "pipeline" or block_name == "concat" or block_name == "qa":
                     params["_gui_extras_passthrough"] = extras
 
                 payload_source = params.pop("_payload_source", "chain")
