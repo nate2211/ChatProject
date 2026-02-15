@@ -282,30 +282,63 @@ class LinkTrackerStore(BaseStore):
             )
 
     def fetch_db_seed_assets(
-        self,
-        limit: int = 200,
-        require_keywords: Optional[List[str]] = None,
-        required_sites: Optional[List[str]] = None,
-        max_age_days: Optional[int] = None,
+            self,
+            *,
+            query: str = "",
+            limit: int = 200,
+            extra_keywords: Optional[List[str]] = None,
+            required_sites: Optional[List[str]] = None,
+            max_age_days: Optional[int] = None,
+            min_term_overlap: int = 1,
     ) -> List[Dict[str, Any]]:
-        require_keywords = [k.lower() for k in (require_keywords or []) if k]
-        required_sites = [s.lower() for s in (required_sites or []) if s]
+        """
+        Fetch DB seed assets using the *query text* as the primary filter.
 
-        where = []
+        - query: free text like "yeat unreleased"
+        - extra_keywords: optional additional terms (e.g. from lexicon)
+        - min_term_overlap: require at least N term matches (default 1)
+        """
+
+        # ---- build terms from query + extras ----
+        q_terms = [t.lower() for t in _tokenize_query(query or "") if t]
+        extra_terms = [k.lower() for k in (extra_keywords or []) if k]
+
+        # de-dupe while preserving order
+        terms: List[str] = []
+        seen = set()
+        for t in (q_terms + extra_terms):
+            if t and t not in seen:
+                seen.add(t)
+                terms.append(t)
+
+        required_sites = [s.lower() for s in (required_sites or []) if s]
+        min_term_overlap = max(1, int(min_term_overlap or 1))
+
+        where: List[str] = []
         args: list[Any] = []
 
+        # ---- age filter ----
         if max_age_days is not None:
             where.append("last_checked >= datetime('now', ?)")
             args.append(f"-{int(max_age_days)} days")
 
-        if require_keywords:
-            kw = []
-            for k in require_keywords:
-                like = f"%{k}%"
-                kw.append("(url LIKE ? OR text LIKE ? OR source LIKE ?)")
+        # ---- term overlap filter (query-driven) ----
+        if terms:
+            # Count how many distinct terms match url/text/source
+            # (term hit = 1 if any field matches that term)
+            hit_exprs: List[str] = []
+            for t in terms:
+                like = f"%{t}%"
+                # 3 placeholders per term
+                hit_exprs.append(
+                    "CASE WHEN (url LIKE ? OR text LIKE ? OR source LIKE ?) THEN 1 ELSE 0 END"
+                )
                 args.extend([like, like, like])
-            where.append("(" + " OR ".join(kw) + ")")
 
+            where.append(f"(({' + '.join(hit_exprs)}) >= ?)")
+            args.append(min_term_overlap)
+
+        # ---- site filter ----
         if required_sites:
             sc = []
             for s in required_sites:
@@ -314,6 +347,7 @@ class LinkTrackerStore(BaseStore):
             where.append("(" + " OR ".join(sc) + ")")
 
         where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
         q = f"""
             SELECT url, text, source, last_checked
             FROM assets
@@ -324,7 +358,7 @@ class LinkTrackerStore(BaseStore):
         args.append(int(limit))
 
         rows = self.db.fetchall(q, args)
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append({
                 "url": r["url"],
@@ -360,7 +394,12 @@ class LinkTrackerStore(BaseStore):
 
         rows = self.db.fetchall(q, args)
         return [r["source"] for r in rows if r["source"]]
-
+    def _archive_ident_to_downloads(self, ident: str) -> list[str]:
+        return [
+            f"https://archive.org/metadata/{ident}",
+            f"https://archive.org/download/{ident}/",
+            f"https://archive.org/details/{ident}",
+        ]
     def seed_pages_from_database(
             self,
             db_assets: List[Dict[str, Any]],

@@ -7927,11 +7927,13 @@ class LinkTrackerBlock(BaseBlock):
                     db_seed_max_age_days = params.get("db_seed_max_age_days", None)
 
                     db_assets = store.fetch_db_seed_assets(
-                        limit=db_seed_limit * 2,
-                        require_keywords=keywords,
-                        required_sites=required_sites,
-                        max_age_days=db_seed_max_age_days,
-                    )
+                            query=query,                        # <-- your chosen query string
+                            limit=db_seed_limit * 2,
+                            extra_keywords=None,                # or keywords if you want, but query is primary
+                            required_sites=required_sites,
+                            max_age_days=db_seed_max_age_days,
+                            min_term_overlap=min_term_overlap,  # reuse your block param
+                        )
 
                     proven_urls = [row["url"] for row in db_assets if row.get("url")]
                     predicted_urls = self._predict_next_in_sequence(proven_urls)
