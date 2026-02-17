@@ -1534,37 +1534,34 @@ class ChatBlock(BaseBlock):
 
         text = str(payload or "")
 
-        # --- [NEW] Robust parser ---
-        try:
-            # Get the *last* context block
-            inline_ctx = text.rsplit("[context]\n", 1)[1] if include_context else ""
-        except Exception:
-            inline_ctx = ""
+        # --- Robust section parsing (ctx only when enabled) ---
+        inline_ctx = ""
+        if "[context]\n" in text:
+            try:
+                inline_ctx = text.rsplit("[context]\n", 1)[1]
+                # stop at lexicon tag if present
+                if "[lexicon]\n" in inline_ctx:
+                    inline_ctx = inline_ctx.split("[lexicon]\n", 1)[0]
+                inline_ctx = inline_ctx.strip()
+            except Exception:
+                inline_ctx = ""
 
-        try:
-            # Get the *last* lexicon block
-            lex_part = text.rsplit("[lexicon]\n", 1)[1]
-            # Ensure we don't grab context that might follow
-            lex_part = lex_part.split("\n[", 1)[0]
-            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
-        except Exception:
-            inline_lex = []
-        # --- End new parser ---
+        if not include_context:
+            inline_ctx = ""  # hard rule: nowhere
 
-        if not inline_lex:
-            store = Memory.load()
-            raw = store.get(lexicon_key)
-            if isinstance(raw, list):
-                inline_lex = [str(w) for w in raw]
+        # --- Lexicon from memory (always list[str]) ---
+        inline_lex: List[str] = []
+        store = Memory.load()
+        raw = store.get(lexicon_key)
+        if isinstance(raw, list):
+            inline_lex = [str(w).strip().lower() for w in raw if str(w).strip()]
 
-        # remove blocks from user text
+        # --- core text should NEVER contain [context]/[lexicon] blocks ---
         core = text
-        # Clean up the payload for the "core" text
-        if inline_ctx:
-            core = core.rsplit("[context]\n", 1)[0]
-        if inline_lex:
-            # This is tricky; we just rsplit on the tag
-            core = core.rsplit("[lexicon]\n", 1)[0]
+        if "[context]\n" in core:
+            core = core.split("[context]\n", 1)[0]
+        if "[lexicon]\n" in core:
+            core = core.split("[lexicon]\n", 1)[0]
         core = core.strip()
 
         # --- Apply sub-pipeline to core text (grammar fix, etc.) ---
@@ -1578,7 +1575,7 @@ class ChatBlock(BaseBlock):
         # --- [END NEW] ---
 
         # very small summarizer over the context:
-        def summarize(ctx: str, k: int = 8) -> List[str]:  # k is max_bullets
+        def summarize_ctx(ctx: str, k: int = 8) -> List[str]:  # k is max_bullets
             import re
             sents_raw = re.split(r"(?<=[.!?])\s+|\n+|(?=\s*#\s)", ctx)
             good_sents = []
@@ -1595,8 +1592,9 @@ class ChatBlock(BaseBlock):
 
             # prefer sentences with lexicon overlap
             def score(s: str) -> int:
+                # fast token overlap for single-word lexicon entries
                 tok = set(s.lower().split())
-                return sum(1 for t in inline_lex if t in tok)
+                return sum(1 for t in inline_lex if (" " not in t and t in tok))
 
             ranked = sorted(((score(s), idx, s) for idx, s in enumerate(good_sents)), key=lambda x: (-x[0], x[1]))
 
@@ -1611,8 +1609,68 @@ class ChatBlock(BaseBlock):
                         break
             return final_bullets
 
+        def summarize_lex(lex: List[str], k: int = 8) -> List[str]:
+            """
+            Build readable bullets from lexicon only.
+            Prefers multi-word phrases and more "specific" looking terms.
+            """
+            import re
+
+            if not lex:
+                return []
+
+            stop = {
+                "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with",
+                "is", "are", "was", "were", "be", "been", "it", "this", "that", "these", "those",
+                "you", "your", "we", "our", "they", "their", "i", "me", "my",
+                "from", "at", "as", "by", "into", "about", "over", "under", "after", "before",
+                "new", "just", "release", "released", "drops", "drop", "official",
+                "today", "tonight", "tomorrow", "yesterday",
+            }
+
+            urlish = re.compile(r"^(https?://|www\.)", re.I)
+            domainish = re.compile(r"^[a-z0-9\-]+\.(com|net|org|io|co|gg|tv|ai|dev|app|edu|gov)(/|$)", re.I)
+            hexish = re.compile(r"^[0-9a-f]{24,}$", re.I)
+
+            cleaned = []
+            seen = set()
+            for t in lex:
+                t = (t or "").strip()
+                if not t:
+                    continue
+                tl = t.lower()
+                if tl in stop:
+                    continue
+                if urlish.match(tl) or domainish.match(tl):
+                    continue
+                if hexish.match(tl.replace("-", "").replace("_", "")):
+                    continue
+                if len(tl) < 3:
+                    continue
+                if tl in seen:
+                    continue
+                seen.add(tl)
+                cleaned.append(t)
+
+            def spec_score(t: str) -> float:
+                tl = t.lower()
+                words = tl.split()
+                sc = 0.0
+                if len(words) >= 2:
+                    sc += 2.0 + 0.25 * min(6, len(words))
+                if "-" in t or "_" in t:
+                    sc += 0.8
+                if any(ch.isdigit() for ch in t):
+                    sc += 0.5
+                return sc
+
+            cleaned.sort(key=spec_score, reverse=True)
+            return cleaned[:k]
         # --- Use new max_bullets param ---
-        bullets = summarize(inline_ctx, k=max_bullets) if inline_ctx else []
+        if include_context:
+            bullets = summarize_ctx(inline_ctx, k=max_bullets) if inline_ctx else []
+        else:
+            bullets = summarize_lex(inline_lex, k=max_bullets) if inline_lex else []
 
         # Get model (and pass max_terms to it)
         model_kwargs = {}
@@ -23562,7 +23620,62 @@ class TrendingMinerBlock(BaseBlock):
     _HTML_META_TITLE_RE = re.compile(
         r'(?is)<meta[^>]+(?:property|name)\s*=\s*["\'](?:og:title|twitter:title)["\'][^>]*content\s*=\s*["\'](.*?)["\']'
     )
+    _SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+    _URLISH_RE = re.compile(r"(https?://|www\.)", re.I)
 
+    def _extract_good_sentences(self, text: str, *, max_sents: int) -> List[str]:
+        """
+        Pull human-ish sentences from visible text (no boilerplate).
+        """
+        if not text:
+            return []
+
+        bad_phrases = (
+            "cookie", "cookies", "privacy", "terms", "subscribe", "newsletter", "sign up",
+            "accept", "consent", "advertis", "sponsored", "all rights reserved",
+        )
+
+        out: List[str] = []
+        seen = set()
+
+        for s in self._SENT_SPLIT_RE.split(text):
+            s = (s or "").strip()
+            if not s:
+                continue
+
+            sl = s.lower()
+
+            # basic filters
+            if self._URLISH_RE.search(sl):
+                continue
+            if any(bp in sl for bp in bad_phrases):
+                continue
+            if len(s) < 60 or len(s) > 320:
+                continue
+            if s.count(" ") < 8:
+                continue
+            if sl in seen:
+                continue
+
+            # avoid nav-ish junk
+            if s.count("|") >= 3 or s.count("/") >= 6:
+                continue
+
+            seen.add(sl)
+            out.append(s)
+            if len(out) >= max_sents:
+                break
+
+        return out
+
+    def _rank_sentence(self, s: str, *, title_terms: Set[str], global_terms: Set[str]) -> float:
+        """
+        Score sentence by overlap with title/global trending terms.
+        """
+        toks = set(m.group(0).lower() for m in self.TOKEN_RE.finditer(s))
+        if not toks:
+            return 0.0
+        return (2.0 * len(toks & title_terms)) + (1.0 * len(toks & global_terms))
     # -------------------- debug helper --------------------
     def _dbg(self, msg: str):
         try:
@@ -23724,20 +23837,28 @@ class TrendingMinerBlock(BaseBlock):
         return f"https://www.reddit.com/search.rss?q={quote_plus(query)}&sort={sort}"
 
     def _pull_reddit_rss(
-        self,
-        *,
-        category: str,
-        subreddits: List[str],
-        sort: str,
-        timeout: float,
-        headers: Dict[str, str],
-        per_feed_cap: int
-    ) -> List[Dict[str, Any]]:
+            self,
+            *,
+            category: str,
+            subreddits: List[str],
+            sort: str,
+            timeout: float,
+            headers: Dict[str, str],
+            per_feed_cap: int,
+            budget_left: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         hits: List[Dict[str, Any]] = []
+        used = 0
+
         for sub in subreddits:
+            if budget_left is not None and used >= budget_left:
+                break
+
             url = self._reddit_rss_url(sub, sort)
             self._dbg(f"[TrendingMiner] reddit rss fetch category={category} sub={sub} sort={sort}")
             txt = self._fetch_text(url, timeout=timeout, headers=headers)
+            used += 1
+
             items = self._parse_rss_atom(txt or "")
             if not items:
                 continue
@@ -23753,24 +23874,33 @@ class TrendingMinerBlock(BaseBlock):
                     "title": it.get("title") or "",
                     "url": self._canon_url(u),
                     "published_dt": it.get("published_dt"),
-                    "popularity_raw": float(n - i),  # rank proxy
+                    "popularity_raw": float(n - i),
                     "popularity_kind": "rank",
                 })
-        return hits
+
+        return hits, used
 
     def _pull_generic_rss(
-        self,
-        *,
-        category: str,
-        feeds: List[str],
-        timeout: float,
-        headers: Dict[str, str],
-        per_feed_cap: int
-    ) -> List[Dict[str, Any]]:
+            self,
+            *,
+            category: str,
+            feeds: List[str],
+            timeout: float,
+            headers: Dict[str, str],
+            per_feed_cap: int,
+            budget_left: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         hits: List[Dict[str, Any]] = []
+        used = 0
+
         for feed in feeds:
+            if budget_left is not None and used >= budget_left:
+                break
+
             self._dbg(f"[TrendingMiner] rss fetch category={category} feed={feed}")
             txt = self._fetch_text(feed, timeout=timeout, headers=headers)
+            used += 1
+
             items = self._parse_rss_atom(txt or "")
             n = min(per_feed_cap, len(items))
             for i, it in enumerate(items[:n]):
@@ -23786,7 +23916,8 @@ class TrendingMinerBlock(BaseBlock):
                     "popularity_raw": float(n - i),
                     "popularity_kind": "rank",
                 })
-        return hits
+
+        return hits, used
 
     def _pull_hackernews(
         self,
@@ -24152,8 +24283,23 @@ class TrendingMinerBlock(BaseBlock):
         # NEW memory key for mined page terms
         page_terms_key = str(params.get("page_terms_key", "trending_page_terms")).strip() or "trending_page_terms"
 
+        # NEW: store urls separately (for chat/pipelines)
+        urls_key = str(params.get("urls_key", "trending_urls")).strip() or "trending_urls"
+
+        # NEW: store mined sentences (and optionally per-page sentences)
+        context_key = str(params.get("context_key", "trending_context")).strip() or "trending_context"
+        page_sents_key = str(params.get("page_sents_key", "trending_page_sentences")).strip() or "trending_page_sentences"
+
+        # NEW: sentence caps
+        context_sent_cap = int(params.get("context_sent_cap", 40))
+        context_sent_cap = max(0, min(context_sent_cap, 400))
+
+        page_mine_sents_per_page = int(params.get("page_mine_sents_per_page", 6))
+        page_mine_sents_per_page = max(0, min(page_mine_sents_per_page, 40))
+
         memory_sources_raw = str(params.get("memory_sources", "")).strip()
         memory_sources = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
 
         # category overrides
         reddit_overrides: Dict[str, List[str]] = {}
@@ -24196,7 +24342,14 @@ class TrendingMinerBlock(BaseBlock):
         page_mine_terms_per_page = max(8, min(page_mine_terms_per_page, 120))
 
         page_mine_counts_toward_max_requests = bool(params.get("page_mine_counts_toward_max_requests", True))
+        max_requests_total = int(params.get("max_requests", 60))
+        max_requests_total = max(10, min(max_requests_total, 500))
 
+        reserve_for_pages = 0
+        if mine_pages and page_mine_cap > 0 and page_mine_counts_toward_max_requests:
+            reserve_for_pages = min(page_mine_cap, max_requests_total)
+
+        max_requests_feeds = max(0, max_requests_total - reserve_for_pages)
         self._dbg(
             "[TrendingMiner] params: "
             f"categories={categories} max_rounds={max_rounds} per_feed_cap={per_feed_cap} max_requests={max_requests} "
@@ -24300,40 +24453,50 @@ class TrendingMinerBlock(BaseBlock):
                 if subs:
                     if request_count >= max_requests:
                         break
-                    hits = self._pull_reddit_rss(
+                    budget_left = max(0, max_requests_feeds - request_count)
+                    hits, used = self._pull_reddit_rss(
                         category=cat,
                         subreddits=subs,
                         sort=reddit_sort,
                         timeout=timeout,
                         headers=headers,
-                        per_feed_cap=per_feed_cap
+                        per_feed_cap=per_feed_cap,
+                        budget_left=budget_left,
                     )
-                    request_count += len(subs)
+                    request_count += used
                     round_candidates.extend(hits)
 
                 if feeds:
                     if request_count >= max_requests:
                         break
-                    hits = self._pull_generic_rss(
+                    budget_left = max(0, max_requests_feeds - request_count)
+                    hits, used = self._pull_generic_rss(
                         category=cat,
                         feeds=feeds,
                         timeout=timeout,
                         headers=headers,
-                        per_feed_cap=per_feed_cap
+                        per_feed_cap=per_feed_cap,
+                        budget_left=budget_left,
                     )
-                    request_count += len(feeds)
+                    request_count += used
                     round_candidates.extend(hits)
 
             # ---- HN + GitHub for tech ----
             if "tech" in categories and request_count < max_requests:
+                if page_mine_counts_toward_max_requests and request_count >= max_requests_total:
+                    break
                 round_candidates.extend(self._pull_hackernews(timeout=timeout, headers=headers, per_feed_cap=per_feed_cap, which="top"))
                 request_count += 1
 
             if "tech" in categories and request_count < max_requests:
+                if page_mine_counts_toward_max_requests and request_count >= max_requests_total:
+                    break
                 round_candidates.extend(self._pull_hackernews(timeout=timeout, headers=headers, per_feed_cap=per_feed_cap, which="new"))
                 request_count += 1
 
             if "tech" in categories and request_count < max_requests:
+                if page_mine_counts_toward_max_requests and request_count >= max_requests_total:
+                    break
                 terms_list = sorted(list(frontier_terms), key=lambda x: (len(x), x))
                 for q in github_queries_from_terms(terms_list):
                     if request_count >= max_requests:
@@ -24485,6 +24648,7 @@ class TrendingMinerBlock(BaseBlock):
         # -------------------- NEW: Mine top pages for "genuine" lexicon terms --------------------
         pages_mined = 0
         page_terms_map: Dict[str, List[str]] = {}
+        page_sents_map: Dict[str, List[str]] = {}  # NEW
 
         if mine_pages and page_mine_cap > 0:
             self._dbg(
@@ -24512,7 +24676,11 @@ class TrendingMinerBlock(BaseBlock):
 
                 if not txt:
                     continue
-
+                if page_mine_sents_per_page > 0:
+                    vis_for_ctx = self._html_to_visible_text(txt, max_chars=min(page_mine_max_text_chars, 25_000))
+                    sents = self._extract_good_sentences(vis_for_ctx, max_sents=page_mine_sents_per_page)
+                    if sents:
+                        page_sents_map[u] = sents
                 terms, info = self._mine_page_terms(
                     u,
                     txt,
@@ -24539,7 +24707,8 @@ class TrendingMinerBlock(BaseBlock):
 
             if page_terms_map:
                 mem[page_terms_key] = page_terms_map
-
+            if page_sents_map:
+                mem[page_sents_key] = page_sents_map
             self._dbg(f"[TrendingMiner] page-mining done pages_mined={pages_mined}")
 
         # -------------------- finalize lexicon (cap + dedupe) --------------------
@@ -24560,7 +24729,44 @@ class TrendingMinerBlock(BaseBlock):
             lexicon.append(t)
             if len(lexicon) >= lexicon_cap:
                 break
+        # -------------------- NEW: build context sentences (ranked across pages) --------------------
+        context_sents: List[str] = []
 
+        if page_sents_map and context_sent_cap > 0:
+            # title terms per url (helps rank sentences from that page)
+            title_terms_by_url: Dict[str, Set[str]] = {}
+            global_title_terms: Set[str] = set()
+
+            for it in final_scored[:200]:
+                u = it.get("url") or ""
+                t = it.get("title") or ""
+                if not u:
+                    continue
+
+                terms_list = self._extract_terms(t, max_terms=16)  # keep order
+                title_terms_by_url[u] = set(terms_list)
+                global_title_terms.update(terms_list[:8])
+            cands: List[Tuple[float, int, str]] = []  # (score, idx, sentence)
+            idx = 0
+            for u, sents in page_sents_map.items():
+                title_terms = title_terms_by_url.get(u, set())
+                for s in sents:
+                    sc = self._rank_sentence(s, title_terms=title_terms, global_terms=global_title_terms)
+                    cands.append((sc, idx, s))
+                    idx += 1
+
+            # best first; stable tie-break by idx
+            cands.sort(key=lambda x: (-x[0], x[1]))
+
+            seen_norm = set()
+            for sc, _, s in cands:
+                sn = re.sub(r"\s+", " ", s.strip().lower())
+                if sn in seen_norm:
+                    continue
+                seen_norm.add(sn)
+                context_sents.append(s.strip())
+                if len(context_sents) >= context_sent_cap:
+                    break
         # -------------------- Persist to memory --------------------
         mem[hits_key] = [
             {
@@ -24579,6 +24785,8 @@ class TrendingMinerBlock(BaseBlock):
         mem[seeds_key] = seeds
         mem[lexicon_key] = lexicon
         mem[seen_key] = list(seen_urls)[-20000:]
+        mem[urls_key] = seeds
+        mem[context_key] = context_sents
         Memory.save(mem)
 
         self._dbg(
@@ -24587,7 +24795,10 @@ class TrendingMinerBlock(BaseBlock):
             f"{seen_key}({len(mem[seen_key])}), pages_mined={pages_mined}, requests_used={request_count}/{max_requests}"
         )
 
-        out_text = "[context]\n" + "\n".join(seeds) + "\n\n[lexicon]\n" + ",".join(lexicon)
+        # Context = mined sentences when available, else fallback to urls
+        ctx_lines = context_sents if context_sents else seeds
+        out_text = "[context]\n" + "\n".join(ctx_lines) + "\n\n[lexicon]\n" + ",".join(lexicon)
+
 
         meta = {
             "categories": categories,
@@ -24603,6 +24814,10 @@ class TrendingMinerBlock(BaseBlock):
             "lexicon_key": lexicon_key,
             "seen_key": seen_key,
             "page_terms_key": page_terms_key,
+            "context_sents": len(context_sents),
+            "urls_key": urls_key,
+            "context_key": context_key,
+            "page_sents_key": page_sents_key,
         }
 
         self._dbg(f"[TrendingMiner] execute done meta={meta}")
@@ -24660,6 +24875,12 @@ class TrendingMinerBlock(BaseBlock):
             "page_mine_terms_per_page": 24,
             "page_mine_counts_toward_max_requests": True,
             "page_terms_key": "trending_page_terms",
+
+            "urls_key": "trending_urls",
+            "context_key": "trending_context",
+            "page_sents_key": "trending_page_sentences",
+            "context_sent_cap": 40,
+            "page_mine_sents_per_page": 6,
 
             # niceness:
             "sleep_s": 0.0,
