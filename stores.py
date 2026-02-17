@@ -1564,6 +1564,52 @@ class CodeCorpusStore:
         )
 
 # ======================================================================
+# LocalCodeCorpusStore
+# ======================================================================
+
+@dataclass
+class LocalCodeCorpusStore:
+    """
+    Managed store for local file indexing.
+    Tracks mtimes to skip unchanged files and provides FTS5 searchable code blocks.
+    """
+    dbm: DatabaseSubmanager
+
+    def ensure_schema(self) -> None:
+        ddl = [
+            # Main searchable content
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS local_docs USING fts5(
+                url UNINDEXED, title, content, kind, tokenize = 'porter unicode61'
+            );
+            """,
+            # Modification time tracking
+            """
+            CREATE TABLE IF NOT EXISTS local_files_meta (
+                path TEXT PRIMARY KEY, 
+                last_mtime REAL NOT NULL
+            );
+            """
+        ]
+        self.dbm.ensure_schema(ddl)
+
+    def get_last_mtime(self, path: str) -> float:
+        val = self.dbm.scalar("SELECT last_mtime FROM local_files_meta WHERE path = ?", (path,))
+        return float(val) if val is not None else 0.0
+
+    def upsert_doc(self, url: str, title: str, content: str, kind: str, mtime: float):
+        # Update searchable content
+        self.dbm.execute(
+            "INSERT OR REPLACE INTO local_docs (url, title, content, kind) VALUES (?, ?, ?, ?)",
+            (url, title, content, kind)
+        )
+        # Update tracking meta
+        self.dbm.execute(
+            "INSERT OR REPLACE INTO local_files_meta (path, last_mtime) VALUES (?, ?)",
+            (url, mtime)
+        )
+
+# ======================================================================
 # LinkCrawler
 # ======================================================================
 

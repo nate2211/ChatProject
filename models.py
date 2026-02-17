@@ -28,14 +28,6 @@ class SmartMiningChatModel(BaseChatModel):
       - No dependence on TextMiner/PromptMiner formatting.
       - Designed so its output can be fed through miners later.
 
-    How it stays “smart” without an LLM:
-      - Parses the provided context into candidate “units” (news-like items, link items, paragraphs).
-      - Builds dynamic stopwords from the context itself (no big static lists).
-      - Scores units using TF-IDF cosine similarity to the prompt (and a smaller lexicon bias).
-      - Chooses ONE dominant topic cluster based on the prompt (news vs. links vs. prose vs. code),
-        so it doesn’t mix unrelated stuff (e.g., news + Raf Simons) unless the prompt asks for both.
-      - Generates a short coherent answer with optional “Sources” links.
-
     generate() supports:
       - user_text: str
       - context: str | None
@@ -154,7 +146,6 @@ class SmartMiningChatModel(BaseChatModel):
         elif published:
             kind = "news"
         elif has_url and (url or any(re.search(r"\b(poshmark|grailed|hypebeast|shop|store)\b", text, re.I) for _ in [0])):
-            # keep this as "link" (shopping-like)
             kind = "link"
         elif has_url:
             kind = "link"
@@ -201,7 +192,6 @@ class SmartMiningChatModel(BaseChatModel):
 
         idf: Dict[str, float] = {}
         for t, d in df.items():
-            # smooth
             idf[t] = math.log((N + 1.0) / (d + 1.0)) + 1.0
 
         doc_vecs: List[Dict[str, float]] = []
@@ -219,13 +209,11 @@ class SmartMiningChatModel(BaseChatModel):
     def _cosine(self, a: Dict[str, float], b: Dict[str, float]) -> float:
         if not a or not b:
             return 0.0
-        # dot
         dot = 0.0
         for k, va in a.items():
             vb = b.get(k)
             if vb is not None:
                 dot += va * vb
-        # norms
         na = math.sqrt(sum(v * v for v in a.values()))
         nb = math.sqrt(sum(v * v for v in b.values()))
         if na <= 0 or nb <= 0:
@@ -233,18 +221,15 @@ class SmartMiningChatModel(BaseChatModel):
         return float(dot / (na * nb))
 
     def _parse_datetime_best_effort(self, s: str) -> Optional[datetime]:
-        # We don't assume formats; we just try a few conservative parses.
         ss = (s or "").strip()
         if not ss:
             return None
-        # Common RSS style: "Sun, 15 Feb 2026 02:04:02 GMT"
         try:
             dt = datetime.strptime(ss, "%a, %d %b %Y %H:%M:%S %Z")
             return dt.replace(tzinfo=timezone.utc)
         except Exception:
             pass
         try:
-            # ISO-ish
             dt = datetime.fromisoformat(ss.replace("Z", "+00:00"))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
@@ -269,16 +254,11 @@ class SmartMiningChatModel(BaseChatModel):
         return 0.0
 
     def _choose_dominant_kind(self, user_text: str, units: List[Dict[str, Any]], sims: List[float]) -> str:
-        """
-        Pick ONE dominant kind based on the prompt + similarity mass,
-        to avoid mixing unrelated content.
-        """
         q = (user_text or "").lower()
         want_code = any(w in q for w in ("code", "bug", "fix", "error", "stack", "trace", "python", "c#", "c++", "js", "typescript", "regex"))
         want_news = any(w in q for w in ("news", "headline", "headlines", "world", "breaking", "latest", "politics", "war", "election"))
         want_links = any(w in q for w in ("links", "sources", "url", "website", "shop", "buy", "price", "grailed", "poshmark"))
 
-        # soft preference when the query is tiny/empty: prefer time-sensitive news if present
         q_tokens = self._tokens(user_text)
         weak_query = len(q_tokens) < 3
 
@@ -286,7 +266,6 @@ class SmartMiningChatModel(BaseChatModel):
         for u, sim in zip(units, sims):
             mass[u["kind"]] = mass.get(u["kind"], 0.0) + max(0.0, sim)
 
-        # hard-ish intent hints
         if want_code and mass.get("code", 0.0) > 0:
             return "code"
         if want_news and mass.get("news", 0.0) > 0:
@@ -297,7 +276,6 @@ class SmartMiningChatModel(BaseChatModel):
         if weak_query and mass.get("news", 0.0) > 0:
             return "news"
 
-        # otherwise choose by mass
         if not mass:
             return "prose"
         return max(mass.items(), key=lambda kv: kv[1])[0]
@@ -322,7 +300,6 @@ class SmartMiningChatModel(BaseChatModel):
         ctx = (context or "").strip()
         units = self._split_units(ctx)
 
-        # If there is no context, we can only echo the prompt safely.
         if not units:
             out = f"{query}" if query else "No context provided."
             return (out[:max_chars] + "...") if (max_chars > 0 and len(out) > max_chars) else out
@@ -332,7 +309,6 @@ class SmartMiningChatModel(BaseChatModel):
         docs_tokens = [self._tokens(u.get("text", "")) for u in units]
         doc_vecs, idf = self._tfidf_prepare(docs_tokens, stop)
 
-        # query vector
         q_tokens = [t for t in self._tokens(query) if t not in stop and len(t) >= 3 and not t.isdigit()]
         q_tf: Dict[str, int] = {}
         for t in q_tokens:
@@ -341,8 +317,7 @@ class SmartMiningChatModel(BaseChatModel):
         for t, c in q_tf.items():
             q_vec[t] = (1.0 + math.log(c)) * idf.get(t, 0.0)
 
-        # lexicon bias vector (smaller weight)
-        lex_toks = []
+        lex_toks: List[str] = []
         for s in (lexicon or [])[:2500]:
             if isinstance(s, str) and s.strip():
                 lex_toks.extend(self._tokens(s))
@@ -352,10 +327,8 @@ class SmartMiningChatModel(BaseChatModel):
             lex_tf[t] = lex_tf.get(t, 0) + 1
         lex_vec: Dict[str, float] = {}
         for t, c in lex_tf.items():
-            # lighter than query
             lex_vec[t] = 0.35 * (1.0 + math.log(c)) * idf.get(t, 0.0)
 
-        # similarity per unit
         sims: List[float] = []
         for dv, u in zip(doc_vecs, units):
             sim_q = self._cosine(dv, q_vec)
@@ -367,7 +340,6 @@ class SmartMiningChatModel(BaseChatModel):
 
         dominant_kind = self._choose_dominant_kind(query, units, sims)
 
-        # pick top items from that kind only
         ranked = sorted(
             [(s, i) for i, s in enumerate(sims) if units[i]["kind"] == dominant_kind],
             key=lambda x: x[0],
@@ -382,13 +354,11 @@ class SmartMiningChatModel(BaseChatModel):
                 break
             picked.append(units[i])
 
-        # fallback: if nothing meets threshold in dominant kind, take global top few
         if not picked:
             ranked_all = sorted([(s, i) for i, s in enumerate(sims)], key=lambda x: x[0], reverse=True)
             for s, i in ranked_all[:max_items]:
                 picked.append(units[i])
 
-        # write an actual “chat answer”
         out_lines: List[str] = []
 
         if dominant_kind == "news":
@@ -399,7 +369,6 @@ class SmartMiningChatModel(BaseChatModel):
                 summary = (u.get("summary") or "").strip()
                 published = (u.get("published") or "").strip()
 
-                # If our parser didn’t split title/summary well, just use the raw text
                 if not title:
                     raw = u.get("text", "")
                     out_lines.append(f"• {raw}")
@@ -419,7 +388,6 @@ class SmartMiningChatModel(BaseChatModel):
                 title = (u.get("title") or "").strip()
                 url = (u.get("url") or "").strip()
                 if not url:
-                    # fall back to any URL in text
                     urls = u.get("urls") or []
                     url = urls[0] if urls else ""
                 if title and url:
@@ -431,7 +399,6 @@ class SmartMiningChatModel(BaseChatModel):
             out_lines.append("")
             for u in picked:
                 txt = (u.get("text") or "").strip()
-                # keep compact
                 if len(txt) > 1200:
                     txt = txt[:1200].rstrip() + "…"
                 out_lines.append(txt)
@@ -439,18 +406,15 @@ class SmartMiningChatModel(BaseChatModel):
         else:
             out_lines.append("Based on the provided context:")
             out_lines.append("")
-            # concise synthesis: first 1–2 sentences from top blocks
             for u in picked:
                 raw = (u.get("text") or "").strip()
                 if not raw:
                     continue
-                # sentence-ish split
                 sents = re.split(r"(?<=[.!?])\s+", raw)
                 snippet = " ".join(sents[:2]).strip()
                 if snippet:
                     out_lines.append(f"- {snippet}")
 
-        # optional sources section (URLs only, dedup)
         if include_sources:
             urls: List[str] = []
             for u in picked:
@@ -476,16 +440,13 @@ class SmartMiningChatModel(BaseChatModel):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "max_items_default": self.max_items_default,
-            "generate_kwargs": {
-                "context": "context string to mine",
-                "lexicon": "list[str] (optional bias)",
-                "max_items": 6,
-                "min_sim": 0.08,
-                "include_sources": True,
-                "prefer_recency": True,
-                "max_chars": 0,
-            },
+            "max_chars": 0,
+            "max_items": self.max_items_default,
+            "min_sim": 0.08,
+            "include_sources": True,
+            "prefer_recency": True,
         }
+
 class LexiconFirstToyModel(BaseChatModel):
     """
     A tiny, deterministic model that tries to use lexicon terms in the reply.

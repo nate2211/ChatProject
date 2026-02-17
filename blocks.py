@@ -3,8 +3,9 @@
 # ========================================================
 from __future__ import annotations
 
-import ast
+
 import asyncio
+import base64
 import collections
 import fnmatch
 import functools
@@ -13,6 +14,7 @@ import hashlib
 import html
 import json
 import math
+import operator
 import os
 import re
 import sqlite3
@@ -47,8 +49,10 @@ from dotenv import load_dotenv
 from PIL import Image
 import submanagers
 from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusStore, PlaywrightCorpusStore, \
-    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore, DirectLinkTrackerStore
+    CodeCorpusStore, PageTrackerStore, LinkCrawlerStore, LinkContentCrawlerStore, CDNStore, DirectLinkTrackerStore, \
+    LocalCodeCorpusStore
 from loggers import DEBUG_LOGGER
+import ast
 
 def get_env_path():
     # If running as a PyInstaller bundle
@@ -332,6 +336,61 @@ def _get_hf_pipeline(task: str, model: str | None = None, *, device: str | int =
         print(f"[_get_hf_pipeline] ERROR: Failed to load pipeline (task={task}, model={model}): {e}")
         return None
 
+# --- term extraction for lexicon ---
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "on", "in", "to", "for", "from", "of", "at", "by", "with", "as", "is",
+    "are",
+    "was", "were", "be", "been", "being", "that", "this", "these", "those", "it", "its", "into", "about", "over",
+    "under",
+    "up", "down", "out", "so", "than", "then", "too", "very", "can", "cannot", "could", "should", "would", "will",
+    "may",
+    "might", "must", "do", "does", "did", "done", "doing", "have", "has", "had", "having", "not", "no", "yes", "you",
+    "your",
+    "yours", "we", "our", "ours", "they", "their", "theirs", "i", "me", "my", "mine", "he", "she", "him", "her", "his",
+    "hers",
+    "them", "there", "here", "also", "such", "via"
+}
+
+
+def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
+    counts: Dict[str, int] = {}
+    for raw in text.split():
+        w = "".join(ch.lower() for ch in raw if ch.isalnum() or ch in "-_")
+        if not w or len(w) < min_len or w in _STOPWORDS:
+            continue
+        counts[w] = counts.get(w, 0) + 1
+    terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return [t for t, _ in terms[:top_k]]
+
+def _merge_bounded(existing: List[str], incoming: List[str], *, max_total: int) -> Tuple[List[str], int, int, bool]:
+    """
+    Merge incoming terms into existing (order-preserving, de-dupe).
+    Returns: (merged, new_count, seen_count, changed)
+    If max_total > 0, keep only the last max_total items.
+    """
+    out = list(existing)
+    seen = set(existing)
+    new_count = 0
+    seen_count = 0
+    changed = False
+
+    for t in incoming:
+        t = (t or "").strip()
+        if not t:
+            continue
+        if t in seen:
+            seen_count += 1
+            continue
+        out.append(t)
+        seen.add(t)
+        new_count += 1
+        changed = True
+
+    if max_total and max_total > 0 and len(out) > max_total:
+        out = out[-max_total:]
+        changed = True
+
+    return out, new_count, seen_count, changed
 
 # ---------------- Base class ----------------
 @dataclass
@@ -552,79 +611,168 @@ class HistoryStore:
 # ---------------- Guard ----------------
 @dataclass
 class GuardBlock(BaseBlock):
+    """
+    Advanced GuardBlock: PII Scrubbing, Secret Detection, and Injection Protection.
+    """
+    # Patterns for A: Input/Output safety scrub
+    PII_PATTERNS = {
+        "email": r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+        "phone": r"\b(?:\+?1[-. ]?)?\(?([2-9][0-8][0-9])\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})\b",
+        "ipv4": r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b",
+        "api_key": r"(?i)(?:key|token|secret|auth|password|passwd)[\s:='\"]+[A-Za-z0-9/\+=_\-]{16,}",
+        "jwt": r"eyJ[A-Za-z0-9-_]+\.eyJ[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+"
+    }
+
+    # Patterns for C: Injection Guardrails
+    INJECTION_PATTERNS = [
+        r"(?i)ignore (?:all )?previous instructions",
+        r"(?i)reveal (?:your )?system prompt",
+        r"(?i)output (?:the )?memory\.json",
+        r"(?i)you are now an? (?:unfiltered|evil|jailbroken)",
+        r"(?i)stop being an? assistant"
+    ]
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        blocked = params.get("blocked", [])
-        if isinstance(blocked, str):
-            blocked = [blocked]
-        repl = str(params.get("replacement", "[redacted]"))
         text = str(payload)
-        for b in blocked or []:
-            text = text.replace(b, repl)
-        return text, {"blocked": len(blocked or [])}
+        mode = params.get("mode", "redact")  # redact | block | warn
+        aggressive = params.get("aggressive", False)
+        whole_word = params.get("whole_word", True)
+
+        findings = []
+
+        # B: Regex + Word Boundary matching for custom blocked list
+        blocked_list = params.get("blocked", [])
+        if isinstance(blocked_list, str): blocked_list = [blocked_list]
+
+        for word in blocked_list:
+            pattern = rf"\b{re.escape(word)}\b" if whole_word else re.escape(word)
+            if re.search(pattern, text, re.I):
+                findings.append(f"custom_word:{word}")
+                text = re.sub(pattern, "[redacted]", text, flags=re.I)
+
+        # A: PII / Secret Scrubbing
+        for name, pattern in self.PII_PATTERNS.items():
+            matches = re.findall(pattern, text)
+            if matches:
+                findings.append(f"pii:{name}")
+                text = re.sub(pattern, f"[{name.upper()}_REDACTED]", text)
+
+        # C: Injection Detection
+        injection_detected = False
+        for pattern in self.INJECTION_PATTERNS:
+            if re.search(pattern, text):
+                findings.append("injection_attempt")
+                injection_detected = True
+
+        # D: Halt Semantics
+        halt = False
+        if findings and mode == "block":
+            halt = True
+            text = "[System] Security Policy Violation: Request Blocked."
+
+        # E: Audit Trail (Save to Memory)
+        meta = {"halt": halt, "detectors": findings, "count": len(findings)}
+        try:
+            mem = Memory.load()
+            logs = mem.get("guard_audit", [])
+            logs.append({"ts": time.time(), "findings": findings, "halt": halt})
+            mem["guard_audit"] = logs[-20:]  # Keep last 20
+            Memory.save(mem)
+        except:
+            pass
+
+        return text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "blocked": "word1,word2",
-            "replacement": "[redacted]"
+            "mode": "redact (default), block, or warn",
+            "blocked": ["list", "of", "words"],
+            "aggressive": "bool: redact high-entropy tokens",
+            "whole_word": "bool (default True)"
         }
 
 
 BLOCKS.register("guard", GuardBlock)
 
 
-# ---------------- Tools (calc/time) ----------------
-def _safe_eval_expr(expr: str) -> float:
-    allowed = set("0123456789.+-*/() ")
-    if not set(expr) <= allowed:
-        raise ValueError("Unsupported characters in expression")
-    try:
-        return float(eval(expr, {"__builtins__": {}}, {}))  # noqa: S307
-    except Exception as e:
-        raise ValueError(f"Bad expression: {expr}") from e
-
-
 @dataclass
 class ToolRouterBlock(BaseBlock):
+    """
+    Deterministic Toolbox using AST for safe math and a registered utility set.
+    """
+    # B: Safe AST Evaluation
+    _SAFE_OPS = {
+        ast.Add: operator.add, ast.Sub: operator.sub,
+        ast.Mult: operator.mul, ast.Div: operator.truediv,
+        ast.Pow: operator.pow, ast.USub: operator.neg
+    }
+
+    def _safe_eval(self, node):
+        if isinstance(node, ast.Num): return node.n
+        if isinstance(node, ast.BinOp):
+            return self._SAFE_OPS[type(node.op)](self._safe_eval(node.left), self._safe_eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            return self._SAFE_OPS[type(node.op)](self._safe_eval(node.operand))
+        raise ValueError(f"Unsupported operation: {type(node)}")
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        text = str(payload).strip()
-        meta: Dict[str, Any] = {"routed": False}
+        raw = str(payload).strip()
+        meta = {"ok": False, "tool": None}
 
-        if text.lower().startswith("calc:"):
-            expr = text.split(":", 1)[1].strip()
-            val = _safe_eval_expr(expr)
-            meta.update({"tool": "calc", "expr": expr})
-            return str(val), meta
+        # A: Explicit Tool Call Detection
+        # Format: tool:name {"arg": "val"}
+        if not raw.startswith("tool:"):
+            return raw, meta
 
-        if text.lower().startswith("time"):
-            parts = text.split()
-            now = time.time()
-            if len(parts) > 1 and parts[1].startswith("+"):
-                try:
-                    now += float(parts[1][1:])
-                except Exception:
-                    pass
-            meta.update({"tool": "time", "epoch": now})
-            return str(int(now)), meta
+        try:
+            line = raw[5:].strip()
+            tool_name, json_args = line.split(" ", 1)
+            args = json.loads(json_args)
+            meta["tool"] = tool_name
+        except Exception:
+            return raw, {"error": "Invalid tool call format. Use 'tool:name {json}'"}
 
-        if any(op in text for op in ("+", "-", "*", "/")):
-            try:
-                val = _safe_eval_expr(text)
-                meta.update({"tool": "calc-inline"})
-                return str(val), meta
-            except Exception:
-                pass
+        # C: Tool Registry
+        try:
+            if tool_name == "calc":
+                expr = args.get("expr", "0")
+                tree = ast.parse(expr, mode='eval')
+                result = self._safe_eval(tree.body)
+                meta["ok"] = True
+                return str(result), meta
 
-        meta.update({"tool": None})
-        return text, meta
+            if tool_name == "time":
+                now = datetime.now(timezone.utc)
+                res = now.isoformat() if args.get("iso") else str(int(time.time()))
+                meta["ok"] = True
+                return res, meta
+
+            if tool_name == "base64":
+                data = str(args.get("data", ""))
+                if args.get("decode"):
+                    res = base64.b64decode(data).decode('utf-8', errors='ignore')
+                else:
+                    res = base64.b64encode(data.encode()).decode()
+                meta["ok"] = True
+                return res, meta
+
+            if tool_name == "url":
+                from urllib.parse import quote, unquote
+                data = args.get("data", "")
+                res = quote(data) if args.get("encode") else unquote(data)
+                meta["ok"] = True
+                return res, meta
+
+        except Exception as e:
+            meta["error"] = str(e)
+            return f"Error in {tool_name}: {e}", meta
+
+        return raw, {"error": f"Tool '{tool_name}' not found"}
 
     def get_params_info(self) -> Dict[str, Any]:
-        return {
-            "info": "Payload-driven. No parameters."
-        }
-
+        return {"info": "Call format: 'tool:calc {\"expr\": \"2+2\"}'"}
 
 BLOCKS.register("tools", ToolRouterBlock)
-
 
 # ---------------- History ----------------
 @dataclass
@@ -690,48 +838,78 @@ BLOCKS.register("memory", MemoryBlock)
 # ---------------- Self-check ----------------
 @dataclass
 class SelfCheckBlock(BaseBlock):
+    """
+    Contract enforcer: checks structure, duplicates, and performs auto-repairs.
+    """
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         text = str(payload).strip()
+        repair = params.get("repair", True)
+        checks = {"empty": False, "json_valid": True, "dupes_removed": 0, "repairs": []}
+
         if not text:
-            return "(no output) — consider re-running with more context)", {"fixed": True}
-        if len(text.split()) < 5:
-            return text + "\n\n(That was a short answer — want me to expand?)", {"short": True}
-        return text, {"short": False}
+            checks["empty"] = True
+            return "[Error] Pipeline produced no output.", checks
+
+        # A/B: Structural & Regression Checks
+        lines = text.splitlines()
+        unique_lines = []
+        seen = set()
+
+        for line in lines:
+            clean = line.strip().lower()
+            if clean and clean in seen:
+                checks["dupes_removed"] += 1
+                continue
+            seen.add(clean)
+            unique_lines.append(line)
+
+        if repair and checks["dupes_removed"] > 0:
+            text = "\n".join(unique_lines)
+            checks["repairs"].append("deduplication")
+
+        # JSON Validation
+        if params.get("expect_json"):
+            try:
+                json.loads(text)
+            except:
+                checks["json_valid"] = False
+                if repair:
+                    # Attempt simple repair: find first '{' and last '}'
+                    start = text.find('{')
+                    end = text.rfind('}') + 1
+                    if start != -1 and end != 0:
+                        text = text[start:end]
+                        checks["repairs"].append("json_crop")
+
+        # C: Enforce Max Length
+        max_chars = params.get("max_chars", 5000)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n\n[Truncated by SelfCheck]"
+            checks["repairs"].append("truncation")
+
+        # D: Memory Integrity
+        try:
+            mem = Memory.load()
+            mem["selfcheck_report"] = {
+                "last_run": time.time(),
+                "checks": checks
+            }
+            Memory.save(mem)
+        except:
+            pass
+
+        return text, {"checks": checks}
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "info": "No parameters."
+            "repair": "bool: auto-fix common issues",
+            "expect_json": "bool: validate and crop JSON`",
+            "max_chars": "int: hard limit for output"
         }
 
 
 BLOCKS.register("self_check", SelfCheckBlock)
-
-# --- term extraction for lexicon ---
-_STOPWORDS = {
-    "the", "a", "an", "and", "or", "but", "if", "on", "in", "to", "for", "from", "of", "at", "by", "with", "as", "is",
-    "are",
-    "was", "were", "be", "been", "being", "that", "this", "these", "those", "it", "its", "into", "about", "over",
-    "under",
-    "up", "down", "out", "so", "than", "then", "too", "very", "can", "cannot", "could", "should", "would", "will",
-    "may",
-    "might", "must", "do", "does", "did", "done", "doing", "have", "has", "had", "having", "not", "no", "yes", "you",
-    "your",
-    "yours", "we", "our", "ours", "they", "their", "theirs", "i", "me", "my", "mine", "he", "she", "him", "her", "his",
-    "hers",
-    "them", "there", "here", "also", "such", "via"
-}
-
-
-def _extract_terms(text: str, *, top_k: int = 50, min_len: int = 4) -> List[str]:
-    counts: Dict[str, int] = {}
-    for raw in text.split():
-        w = "".join(ch.lower() for ch in raw if ch.isalnum() or ch in "-_")
-        if not w or len(w) < min_len or w in _STOPWORDS:
-            continue
-        counts[w] = counts.get(w, 0) + 1
-    terms = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
-    return [t for t, _ in terms[:top_k]]
-
 
 # ================- Prompt Builder (Smart & Dissecting) ================
 @dataclass
@@ -1535,17 +1713,21 @@ class ChatBlock(BaseBlock):
         text = str(payload or "")
 
         # --- Robust section parsing (ctx only when enabled) ---
+        # --- Robust section parsing (ALL contexts) ---
         inline_ctx = ""
-        if "[context]\n" in text:
-            try:
-                inline_ctx = text.rsplit("[context]\n", 1)[1]
-                # stop at lexicon tag if present
-                if "[lexicon]\n" in inline_ctx:
-                    inline_ctx = inline_ctx.split("[lexicon]\n", 1)[0]
-                inline_ctx = inline_ctx.strip()
-            except Exception:
-                inline_ctx = ""
-
+        if include_context and "[context]\n" in text:
+            parts = text.split("[context]\n")
+            ctx_parts = []
+            for seg in parts[1:]:
+                # stop at lexicon tag if present inside this segment
+                if "[lexicon]\n" in seg:
+                    seg = seg.split("[lexicon]\n", 1)[0]
+                seg = seg.strip()
+                if seg:
+                    ctx_parts.append(seg)
+            inline_ctx = "\n\n".join(ctx_parts).strip()
+        else:
+            inline_ctx = ""
         if not include_context:
             inline_ctx = ""  # hard rule: nowhere
 
@@ -1576,37 +1758,50 @@ class ChatBlock(BaseBlock):
 
         # very small summarizer over the context:
         def summarize_ctx(ctx: str, k: int = 8) -> List[str]:  # k is max_bullets
-            import re
-            sents_raw = re.split(r"(?<=[.!?])\s+|\n+|(?=\s*#\s)", ctx)
-            good_sents = []
-            for s in sents_raw:
-                s = s.strip()
-                if not s: continue
-                if s.startswith("# "):  # Skip titles
-                    continue
-                if len(s) > 600:  # Skip massive "sentences"
-                    continue
-                if s.count(' ') < 4:  # Skip things that aren't real sentences
-                    continue
-                good_sents.append(s)
+            # Step 1: Split into distinct lines, preserving headlines
+            # We treat every line that looks like a report as a single unit
+            lines = [ln.strip() for ln in ctx.splitlines() if ln.strip()]
 
-            # prefer sentences with lexicon overlap
-            def score(s: str) -> int:
-                # fast token overlap for single-word lexicon entries
-                tok = set(s.lower().split())
-                return sum(1 for t in inline_lex if (" " not in t and t in tok))
+            structured_units = []
+            for line in lines:
+                # Calculate relevance for sorting
+                score = sum(1 for t in inline_lex if t.lower() in line.lower())
 
-            ranked = sorted(((score(s), idx, s) for idx, s in enumerate(good_sents)), key=lambda x: (-x[0], x[1]))
+                pub_date = datetime.min.replace(tzinfo=timezone.utc)
 
+                date_match = re.search(r"\(Published:\s*([^)]+)\)", line)
+                if date_match:
+                    try:
+                        dt = parsedate_to_datetime(date_match.group(1))
+                        # FIX: Ensure the parsed date is also aware
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        pub_date = dt
+                    except Exception:
+                        pass
+                structured_units.append({
+                    "text": line,
+                    "date": pub_date,
+                    "score": score
+                })
+
+            # Step 2: Sort by Recency FIRST, then by Keyword Overlap
+            structured_units.sort(key=lambda x: (x["date"], x["score"]), reverse=True)
+
+            # Step 3: Final assembly with strict newline separation
             final_bullets = []
             seen = set()
-            for _, _, s in ranked:
-                if s not in seen:
-                    final_bullets.append(s)
-                    seen.add(s)
-                    # Stop once we have k unique sentences
-                    if len(final_bullets) >= k:  # Use k (max_bullets)
-                        break
+            for unit in structured_units:
+                content = unit["text"]
+                if content.lower() in seen: continue
+
+                # Ensure the bullet feels like a distinct report
+                # If it doesn't already start with a source, we keep its raw format
+                final_bullets.append(content)
+                seen.add(content.lower())
+
+                if len(final_bullets) >= k:
+                    break
             return final_bullets
 
         def summarize_lex(lex: List[str], k: int = 8) -> List[str]:
@@ -2512,19 +2707,29 @@ class WebCorpusBlock(BaseBlock):
             phrase_top = [p for p, _ in sorted(pc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
             lexicon = list(dict.fromkeys(phrase_top + lexicon))[:lexicon_top_k]
 
-        # ---- store lexicon + context in Memory ----
-        if export_lexicon and lexicon:
-            store_mem = Memory.load()
-            store_mem[lexicon_key] = lexicon
-            Memory.save(store_mem)
+            # ---- PATCHED store lexicon + context in Memory (Merge Logic) ----
+            if export_lexicon and lexicon:
+                store_mem = Memory.load()
+                existing_lex = store_mem.get(lexicon_key, [])
+                if not isinstance(existing_lex, list): existing_lex = []
 
-        if export_context and context:
-            store_mem = Memory.load()
-            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
-                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
-            else:
-                store_mem[context_key] = context
-            Memory.save(store_mem)
+                # Combine and de-duplicate
+                combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+                store_mem[lexicon_key] = combined_lex[:800]  # Cap for stability
+                Memory.save(store_mem)
+
+            if export_context and context:
+                store_mem = Memory.load()
+                existing_ctx = store_mem.get(context_key, "")
+
+                # Append if data exists, otherwise initialize
+                if existing_ctx and isinstance(existing_ctx, str):
+                    # Only append if this specific context isn't already a substring
+                    if context[:50] not in existing_ctx:
+                        store_mem[context_key] = existing_ctx.rstrip() + "\n\n" + context
+                else:
+                    store_mem[context_key] = context
+                Memory.save(store_mem)
 
         # ---- compose output ----
         base = "" if payload is None else str(payload)
@@ -2735,7 +2940,7 @@ class PlaywrightBlock(BaseBlock):
         use_phrases = bool(params.get("lexicon_phrases", True))
         export_context = bool(params.get("export_context", True))
         context_key = str(params.get("context_key", "web_context"))
-        append_ctx = bool(params.get("append_context", False))
+        append_ctx = bool(params.get("append_context", True))
 
         timeout_ms = int(timeout_sec * 1000)
         meta: Dict[str, Any] = {
@@ -3244,22 +3449,29 @@ class PlaywrightBlock(BaseBlock):
             phrase_top = [p for p, _ in sorted(pc.items(), key=lambda kv: (-kv[1], kv[0]))[:10]]
             lexicon = list(dict.fromkeys(phrase_top + lexicon))[:lexicon_top_k]
 
-        if export_lexicon and lexicon:
-            store_mem = Memory.load()
-            store_mem[lexicon_key] = lexicon
-            Memory.save(store_mem)
-            if verbose:
-                print(f"[PlaywrightBlock] Exported {len(lexicon)} terms to memory[{lexicon_key}]", file=sys.stderr)
+            # ---- PATCHED Memory Save (Playwright Hybrid) ----
+            if export_lexicon and lexicon:
+                store_mem = Memory.load()
+                existing_lex = store_mem.get(lexicon_key, [])
+                if not isinstance(existing_lex, list): existing_lex = []
 
-        if export_context and context:
-            store_mem = Memory.load()
-            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
-                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
-            else:
-                store_mem[context_key] = context
-            Memory.save(store_mem)
-            if verbose:
-                print(f"[PlaywrightBlock] Exported {len(context)} chars to memory[{context_key}]", file=sys.stderr)
+                # Merge existing and newly scraped terms
+                combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+                store_mem[lexicon_key] = combined_lex[:1000]
+                Memory.save(store_mem)
+
+            if export_context and context:
+                store_mem = Memory.load()
+                existing_ctx = store_mem.get(context_key, "")
+
+                # Append logic with basic duplicate block protection
+                if existing_ctx and isinstance(existing_ctx, str):
+                    # Prevent appending the exact same search results twice
+                    if context[:100] not in existing_ctx:
+                        store_mem[context_key] = existing_ctx.rstrip() + "\n\n" + context
+                else:
+                    store_mem[context_key] = context
+                Memory.save(store_mem)
 
         base = "" if payload is None else str(payload)
         parts: List[str] = [base] if base else []
@@ -3321,7 +3533,7 @@ class PlaywrightBlock(BaseBlock):
 
 BLOCKS.register("playwright", PlaywrightBlock)
 
-
+# ================ Tensor ================
 @dataclass
 class TensorBlock(BaseBlock):
     """
@@ -3808,24 +4020,27 @@ class CodeBlock(BaseBlock):
         ctx = "\n\n".join(ctx_pieces)
 
         # context_chars: 0 = full combined context
-        context_chars = int(params.get("context_chars", params.get("code.context_chars", 0)))
+        context_chars = int(params.get("context_chars", 0))
         if ctx and context_chars > 0:
             ctx = ctx[:context_chars]
 
+        # --- REWRITTEN PROMPT FOR FUNCTIONAL OUTPUT ---
         if ctx:
-            final_prompt = f"""### Context
-            The following code snippets are provided for reference. Do not copy them blindly.
-
-            {ctx}
-
-            ### Instruction
-            You are an expert developer. {user_prompt}
-
-            ### Response
-            ```python
-            """
+            # We use "Instruction-Last" to prevent the model from getting lost in docs
+            final_prompt = (
+                f"### [ENGINEERING CONTEXT]\n{ctx}\n\n"
+                f"### [DEVELOPER ROLE]\n"
+                f"You are a lead developer. Your task is to write a functional, production-ready 'main.py' file.\n"
+                f"GOAL: {user_prompt}\n"
+                f"CONSTRAINTS:\n"
+                f"- Include all necessary imports.\n"
+                f"- Write the FULL logic inside functions and the entry point block.\n"
+                f"- DO NOT repeat the headers from the context above.\n"
+                f"- Return ONLY raw Python code.\n\n"
+                f"### [IMPLEMENTATION START]\n```python"
+            )
         else:
-            final_prompt = user_prompt
+            final_prompt = f"Write a complete, functional Python main.py script for: {user_prompt}\n\n```python"
 
         max_input_chars = int(params.get("max_input_chars", 8000))
         final_prompt = self._trim_to_chars(final_prompt, max_input_chars)
@@ -3917,7 +4132,13 @@ class CodeBlock(BaseBlock):
             code_out = code_raw
 
         result = f"{payload}\n\n[{inject_tag}]\n{code_out}"
-
+        # --- MODIFIED: Return ONLY the code, ignore the input payload ---
+        if wrap:
+            # Re-wrap in triple backticks for standard formatting
+            result = f"```{lang}\n{code_raw}\n```"
+        else:
+            # Return raw code (best for files or scripting)
+            result = code_raw
         meta = {
             "model": model_name,
             "lang": lang,
@@ -4188,7 +4409,7 @@ class CodeCorpusBlock(BaseBlock):
 
         export_context = bool(params.get("export_context", True))
         context_key = str(params.get("context_key", "code_context"))
-        append_ctx = bool(params.get("append_context", False))
+        append_ctx = bool(params.get("append_context", True))
         max_context_chars = int(params.get("max_context_chars", 8000))
 
         # Save onto self for helper usage
@@ -4655,19 +4876,28 @@ class CodeCorpusBlock(BaseBlock):
                 t for t, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
             ][:lexicon_top_k]
 
-        # --- store lexicon + context in Memory ---
-        if export_lexicon and lexicon:
-            store_mem = Memory.load()
-            store_mem[lexicon_key] = lexicon
-            Memory.save(store_mem)
+            # ---- PATCHED CodeCorpus Memory Save (Append Logic) ----
+            if export_lexicon and lexicon:
+                store_mem = Memory.load()
+                existing_lex = store_mem.get(lexicon_key, [])
+                if not isinstance(existing_lex, list): existing_lex = []
 
-        if export_context and context:
-            store_mem = Memory.load()
-            if append_ctx and isinstance(store_mem.get(context_key), str) and store_mem[context_key]:
-                store_mem[context_key] = store_mem[context_key].rstrip() + "\n\n" + context
-            else:
-                store_mem[context_key] = context
-            Memory.save(store_mem)
+                # Merge identifiers and keep most frequent unique ones
+                combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+                store_mem[lexicon_key] = combined_lex[:1000]  # Cap for stability
+                Memory.save(store_mem)
+
+            if export_context and context:
+                store_mem = Memory.load()
+                existing_ctx = store_mem.get(context_key, "")
+
+                if existing_ctx and isinstance(existing_ctx, str):
+                    # Only append if this specific code signature isn't already there
+                    if context[:60] not in existing_ctx:
+                        store_mem[context_key] = existing_ctx.rstrip() + "\n\n" + context
+                else:
+                    store_mem[context_key] = context
+                Memory.save(store_mem)
 
         # --- Compose output ---
         base = "" if payload is None else str(payload)
@@ -5232,9 +5462,24 @@ class CodeSearchBlock(BaseBlock):
         )
 
         # 6) export
+        # ---- PATCHED CodeSearch Memory Save (Step 6) ----
         store = Memory.load()
-        store[export_context_key] = full_context
-        store[export_lexicon_key] = lexicon
+
+        # 1. Append Context
+        existing_ctx = store.get(export_context_key, "")
+        if existing_ctx and isinstance(existing_ctx, str):
+            # Check for simple overlap to avoid double-pasting the same search
+            if full_context[:100] not in existing_ctx:
+                store[export_context_key] = existing_ctx.rstrip() + "\n\n" + full_context
+        else:
+            store[export_context_key] = full_context
+
+        # 2. Append Lexicon
+        existing_lex = store.get(export_lexicon_key, [])
+        if not isinstance(existing_lex, list): existing_lex = []
+        combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+        store[export_lexicon_key] = combined_lex[:800]
+
         Memory.save(store)
 
         out_text = "" if payload is None else str(payload)
@@ -5294,557 +5539,135 @@ BLOCKS.register("codesearch", CodeSearchBlock)
 @dataclass
 class LocalCodeCorpusBlock(BaseBlock):
     """
-    Scans a local directory for code files (.py, .js, etc.) and adds them
-    to the same SQLite FTS5 database used by CodeCorpusBlock and CodeSearchBlock.
-
-    This allows your RAG pipeline to have context on your local projects.
-    It tracks modification times and only updates new or changed files.
-
-    For .py files, it uses AST to index functions and classes individually
-    for much more accurate search results.
-
-    Enhanced:
-      • Language-aware 'kind' field (code:py, code:js, prose:md, ...)
-      • Markdown fences keep their language (```python vs ```js)
-      • Python chunks get more descriptive titles and lightweight headers
-      • max_class_lines param to avoid indexing giant classes as single blobs
+    Scans local directories using DatabaseSubmanager.
+    Features:
+      - Appends to existing 'code_lexicon' and 'code_context' in Memory.
+      - Uses AST for Python to index functional units.
+      - Language-aware tagging for FTS searches.
     """
 
-    # Map extensions to languages (for kind tagging)
-    LANG_BY_EXT = {
-        ".py": "python",
-        ".js": "javascript",
-        ".ts": "typescript",
-        ".md": "markdown",
-        ".txt": "text",
-        ".java": "java",
-        ".cpp": "cpp",
-        ".c": "c",
-        ".h": "c-header",
-        ".rs": "rust",
-        ".go": "go",
+    LANG_MAP = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".md": "markdown", ".cpp": "cpp", ".rs": "rust", ".go": "go"
     }
 
-    # Default maximum number of lines for a class before it's considered
-    # "too big" to index as a single chunk. Overridable via param.
-    MAX_CLASS_LINES = 140
-
-    _MD_FENCE_RE = re.compile(
-        r"""
-        ```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n   # opening fence + optional lang
-        (.*?)                                    # body
-        \n```                                    # closing fence
-        """,
-        re.MULTILINE | re.DOTALL | re.VERBOSE
-    )
-
-    def _extract_md_fences(self, text: str) -> Tuple[str, List[Tuple[str, str]]]:
-        """
-        Extract fenced code blocks from Markdown text.
-
-        Returns:
-          (prose_without_fences,
-           [(lang, code_block_1), (lang, code_block_2), ...])
-
-        'lang' is the raw fence language (e.g. 'python', 'js', 'sh').
-        """
-        if not text:
-            return "", []
-
-        code_blocks: List[Tuple[str, str]] = []
-
-        def _repl(match: re.Match) -> str:
-            lang = (match.group(1) or "").strip().lower()
-            body = (match.group(2) or "").strip()
-            if len(body) >= 8:
-                code_blocks.append((lang, body))
-            # Replace with a single blank line to keep some structure
-            return "\n"
-
-        without_fences = self._MD_FENCE_RE.sub(_repl, text)
-        # Normalize whitespace a bit
-        without_fences = re.sub(r"[ \t]+", " ", without_fences)
-        without_fences = re.sub(r"\n{3,}", "\n\n", without_fences)
-        return without_fences.strip(), code_blocks
-
-    def _init_fts_db(self, db_path: str):
-        """
-        Initializes the FTS5 table (same as CodeCorpusBlock).
-        """
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
-                url UNINDEXED,    -- File path or file_path::chunk_name
-                title,            -- File name or file :: chunk
-                content,          -- File content or chunk content
-                kind,             -- 'code', 'prose', or language-tagged variants
-                tokenize = 'porter unicode61'
-            );
-            """)
-
-    def _init_tracking_db(self, db_path: str):
-        """
-        Initializes a separate table to track file modification times.
-        """
-        with sqlite3.connect(db_path) as conn:
-            conn.execute("""
-                         CREATE TABLE IF NOT EXISTS indexed_files
-                         (
-                             path
-                             TEXT
-                             PRIMARY
-                             KEY,
-                             last_indexed_mtime
-                             REAL
-                             NOT
-                             NULL
-                         );
-                         """)
-
-    def _get_last_mtime(self, conn: sqlite3.Connection, file_path: str) -> float:
-        """Check the DB for the last indexed modification time of a file or chunk."""
-        try:
-            cur = conn.execute(
-                "SELECT last_indexed_mtime FROM indexed_files WHERE path = ?", (file_path,)
-            )
-            row = cur.fetchone()
-            return float(row[0]) if row else 0.0
-        except sqlite3.Error as e:
-            print(f"Error checking mtime for {file_path}: {e}")
-            return 0.0
-
-    # ---- helpers -------------------------------------------------
-    def _kind_for_file(self, file_name: str, is_prose: bool) -> str:
-        """
-        Build a language-aware kind string like 'code:py' or 'prose:md'.
-        """
-        ext = os.path.splitext(file_name)[1].lower()
-        lang = self.LANG_BY_EXT.get(ext, "")
-        base = "prose" if is_prose else "code"
-        if lang:
-            return f"{base}:{lang}"
-        return base
-
-    def _kind_for_lang(self, lang: str, base: str = "code") -> str:
-        """
-        Build a kind from an explicit language (e.g. from Markdown fences).
-        """
-        lang = (lang or "").strip().lower()
-        if not lang:
-            return base
-        return f"{base}:{lang}"
-
-    # --- AST-based Python file processor ---
-    def _process_python_file(
-            self,
-            conn: sqlite3.Connection,
-            file_path: str,
-            file_name: str,
-            current_mtime: float,
-            min_chars: int,
-            max_class_lines: int,
-    ) -> Tuple[int, int]:
-        """
-        Parse a .py file into functions/classes using AST and index them individually.
-        Returns (new_chunks_indexed, chunks_updated).
-
-        max_class_lines controls when we skip indexing a class as a single giant
-        chunk and instead rely on its methods (FunctionDef/AsyncFunctionDef) as
-        the primary units.
-        """
-        indexed = 0
-        updated = 0
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-
-            if len(content) < min_chars:
-                return 0, 0  # Skip small files
-
-            tree = ast.parse(content, filename=file_path)
-
-            # 1. Index the top-level file docstring as "prose:py" (narrative context)
-            file_docstring = ast.get_docstring(tree) or ""
-            if file_docstring and len(file_docstring) > min_chars:
-                last_mtime = self._get_last_mtime(conn, file_path)  # Use file_path as URL
-                if current_mtime > last_mtime:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
-                        "VALUES (?, ?, ?, ?)",
-                        (file_path, file_name, file_docstring, "prose:python")
-                    )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
-                        "VALUES (?, ?)",
-                        (file_path, current_mtime)
-                    )
-                    if last_mtime == 0.0:
-                        indexed += 1
-                    else:
-                        updated += 1
-
-            # 2. Index functions and classes as "code:python"
-            #
-            # Strategy:
-            #   • Always index functions / async functions as before.
-            #   • For classes:
-            #       - If the class is small, index the whole class as one chunk.
-            #       - If the class is huge (more than max_class_lines), SKIP the class chunk
-            #         and let its methods (FunctionDef nodes inside) be the primary snippets.
-            for node in ast.walk(tree):
-                # ----- Classes (maybe giant) -----
-                if isinstance(node, ast.ClassDef):
-                    # Try to get full class source
-                    try:
-                        class_src = ast.get_source_segment(content, node) or ""
-                    except Exception:
-                        class_src = ""
-
-                    if not class_src:
-                        continue
-
-                    class_lines = [ln for ln in class_src.splitlines() if ln.strip()]
-                    # If class is huge, don't index it as one giant blob.
-                    if len(class_lines) > max_class_lines:
-                        # Methods inside this class will still be indexed separately
-                        # as FunctionDef/AsyncFunctionDef nodes below.
-                        continue
-
-                    chunk_name = node.name
-                    chunk_content = class_src
-                    node_kind = "class"
-
-                # ----- Functions / async functions (including methods) -----
-                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    chunk_name = node.name
-                    try:
-                        chunk_content = ast.get_source_segment(content, node)
-                    except Exception:
-                        continue
-
-                    if not chunk_content or len(chunk_content) < min_chars:
-                        continue
-
-                    node_kind = "async_function" if isinstance(node, ast.AsyncFunctionDef) else "function"
-
-                else:
-                    continue  # other node types not indexed
-
-                if len(chunk_content) < min_chars:
-                    continue
-
-                # Add a small header to help search ("where did this come from?")
-                header_lines = [
-                    f"# file: {file_path}",
-                    f"# symbol: {chunk_name}",
-                    ""
-                ]
-                combined_content = "\n".join(header_lines) + chunk_content
-
-                # Use a unique URL/path for this chunk
-                chunk_url = f"{file_path}::{chunk_name}"
-                # Better titles for codesearch UI
-                chunk_title = f"{file_name} :: {node_kind} {chunk_name}"
-
-                # Check mtime for this *chunk*
-                last_mtime = self._get_last_mtime(conn, chunk_url)
-
-                if current_mtime > last_mtime:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
-                        "VALUES (?, ?, ?, ?)",
-                        (chunk_url, chunk_title, combined_content, "code:python")
-                    )
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
-                        "VALUES (?, ?)",
-                        (chunk_url, current_mtime)
-                    )
-                    if last_mtime == 0.0:
-                        indexed += 1
-                    else:
-                        updated += 1
-
-            # If we didn't index any chunks, at least update the main file's mtime
-            # to prevent re-parsing it every time if it hasn't changed.
-            if indexed == 0 and updated == 0:
-                last_mtime = self._get_last_mtime(conn, file_path)
-                if current_mtime > last_mtime:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
-                        "VALUES (?, ?)",
-                        (file_path, current_mtime)
-                    )
-
-            return indexed, updated
-
-        except (SyntaxError, ValueError) as e:
-            print(f"Skipping {file_path} (AST parsing failed): {e}")
-            return 0, 0
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
-            return 0, 0
-
-    # --- Generic file processor ---
-    def _process_generic_file(
-            self,
-            conn: sqlite3.Connection,
-            file_path: str,
-            file_name: str,
-            current_mtime: float,
-            last_mtime: float,
-            min_chars: int
-    ) -> Tuple[int, int]:
-        """
-        Indexes a non-Python file.
-
-        Smarter behavior for Markdown:
-          - Extract fenced code blocks → 'code:lang' kind with path::codeN URL.
-          - Store remaining prose (if sufficiently long) as 'prose:md'.
-        For other extensions:
-          - Store whole file as 'code:lang' or 'prose:lang' based on extension.
-        """
-        indexed, updated = 0, 0
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-
-            if len(content) < min_chars:
-                return 0, 0
-
-            # Markdown special handling
-            if file_name.endswith(".md"):
-                prose, code_blocks = self._extract_md_fences(content)
-
-                # 1) Index code blocks individually as 'code:<lang>'
-                chunk_idx = 0
-                for lang, block in code_blocks:
-                    block = (block or "").strip()
-                    if len(block) < min_chars:
-                        continue
-
-                    chunk_idx += 1
-                    chunk_url = f"{file_path}::code{chunk_idx}"
-                    chunk_title = f"{file_name} :: code{chunk_idx}"
-
-                    # Use fence language if present, else fall back to 'code'
-                    kind = self._kind_for_lang(lang, base="code")
-
-                    # Optional header so codesearch text queries can see origin/lang
-                    header = []
-                    header.append(f"# from_markdown_file: {file_name}")
-                    if lang:
-                        header.append(f"# fenced_lang: {lang}")
-                    header.append("")
-                    block_with_header = "\n".join(header) + block
-
-                    conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
-                        "VALUES (?, ?, ?, ?)",
-                        (chunk_url, chunk_title, block_with_header, kind)
-                    )
-
-                # 2) Index remaining prose as 'prose:markdown'
-                if prose and len(prose) >= min_chars:
-                    prose_kind = "prose:markdown"
-                    conn.execute(
-                        "INSERT OR REPLACE INTO docs (url, title, content, kind) "
-                        "VALUES (?, ?, ?, ?)",
-                        (file_path, file_name, prose, prose_kind)
-                    )
-
-                # 3) Update tracking table for the *file*
-                if chunk_idx > 0 or (prose and len(prose) >= min_chars):
-                    conn.execute(
-                        "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
-                        "VALUES (?, ?)",
-                        (file_path, current_mtime)
-                    )
-                    if last_mtime == 0.0:
-                        indexed = 1
-                    else:
-                        updated = 1
-
-                return indexed, updated
-
-            # Non-Markdown: single document as before, but with language-aware kind
-            ext = os.path.splitext(file_name)[1].lower()
-            is_prose = ext in (".md", ".txt")
-            kind = self._kind_for_file(file_name, is_prose=is_prose)
-
-            conn.execute(
-                "INSERT OR REPLACE INTO docs (url, title, content, kind) "
-                "VALUES (?, ?, ?, ?)",
-                (file_path, file_name, content, kind)
-            )
-
-            conn.execute(
-                "INSERT OR REPLACE INTO indexed_files (path, last_indexed_mtime) "
-                "VALUES (?, ?)",
-                (file_path, current_mtime)
-            )
-
-            if last_mtime == 0.0:
-                indexed = 1
-            else:
-                updated = 1
-
-        except Exception as e:
-            print(f"Error processing generic file {file_path}: {e}")
-
-        return indexed, updated
-
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        # ---------- Params ----------
-        db_path = str(params.get("db_path", "code_corpus.db"))
-
+        # 1. Setup Parameters & Store
         scan_path_raw = str(params.get("scan_path", "")).strip()
         if not scan_path_raw:
-            return str(payload), {"error": "LocalCodeCorpusBlock requires 'scan_path' param."}
+            return str(payload), {"error": "Missing scan_path"}
 
         scan_path = os.path.abspath(os.path.expanduser(scan_path_raw))
+        db_path = str(params.get("db_path", "code_corpus.db"))
+        min_chars = int(params.get("min_chars", 60))
 
-        extensions_raw = str(params.get("extensions", ".py,.js,.ts,.md,.txt,.java,.cpp,.c,.h,.rs,.go"))
-        extensions = tuple([e.strip() for e in extensions_raw.split(',') if e.strip()])
-        py_extensions = tuple([e for e in extensions if e == '.py'])  # Separate .py
-        other_extensions = tuple([e for e in extensions if e != '.py'])  # All others
+        # Memory Keys
+        lex_key = str(params.get("lexicon_key", "code_lexicon"))
+        ctx_key = str(params.get("context_key", "code_context"))
+        lex_cap = int(params.get("lexicon_top_k", 80))
 
-        min_chars = int(params.get("min_chars", 50))
-        verbose = bool(params.get("verbose", False))
+        # Init Database Submanager and Store
+        cfg = submanagers.DatabaseConfig(path=db_path)
+        dbm = submanagers.DatabaseSubmanager(cfg)
+        store = LocalCodeCorpusStore(dbm)
+        store.ensure_schema()
 
-        check_for_updates = bool(params.get("check_for_updates", False))
+        indexed_count = 0
+        updated_count = 0
+        local_idents: List[str] = []
+        local_snippets: List[str] = []
 
-        skip_default_dirs = bool(params.get("skip_default_dirs", True))
-        skip_venv_dirs = bool(params.get("skip_venv_dirs", True))
-        extra_skip_dirs_raw = str(params.get("extra_skip_dirs", ""))
+        # 2. Recursive Directory Scan
+        for root, dirs, files in os.walk(scan_path):
+            # Prune hidden/junk dirs
+            dirs[:] = [d for d in dirs if not d.startswith(('.', 'node_modules', '__pycache__', 'venv'))]
 
-        # NEW: configurable max_class_lines (overrides class default)
-        max_class_lines = int(params.get("max_class_lines", self.MAX_CLASS_LINES))
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext not in self.LANG_MAP:
+                    continue
 
-        skip_set = set()
-        if skip_default_dirs:
-            skip_set.update(('.git', 'node_modules', '__pycache__'))
-        if skip_venv_dirs:
-            skip_set.update(('venv', '.venv'))
-        if extra_skip_dirs_raw:
-            skip_set.update([d.strip() for d in extra_skip_dirs_raw.split(',') if d.strip()])
+                full_path = os.path.join(root, file)
+                try:
+                    mtime = os.path.getmtime(full_path)
+                    last_mtime = store.get_last_mtime(full_path)
 
-        if not os.path.isdir(scan_path):
-            return str(payload), {"error": f"Path not found or is not a directory: {scan_path}"}
+                    # Read content for indexing/lexicon
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
 
-        # --- Initialize DBs ---
-        try:
-            self._init_fts_db(db_path)
-            self._init_tracking_db(db_path)
-        except Exception as e:
-            return str(payload), {"error": f"Failed to initialize database: {e}"}
-
-        # --- Scan Files ---
-        total_indexed = 0
-        total_updated = 0
-        total_skipped = 0
-        total_errors = 0
-
-        try:
-            conn = sqlite3.connect(db_path)
-        except Exception as e:
-            return str(payload), {"error": f"Failed to open DB {db_path}: {e}"}
-
-        try:
-            for root, dirs, files in os.walk(scan_path, topdown=True):
-                if skip_set:
-                    dirs[:] = [d for d in dirs if d not in skip_set]
-
-                for file in files:
-                    # Decide which extensions list to check
-                    is_py = file.endswith(py_extensions)
-                    is_other = file.endswith(other_extensions)
-
-                    if not (is_py or is_other):
+                    if len(content) < min_chars:
                         continue
 
-                    file_path = os.path.join(root, file)
+                    # Lexicon: Extract words starting with letters (potential APIs/Variables)
+                    local_idents.extend(re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", content))
 
-                    try:
-                        current_mtime = os.path.getmtime(file_path)
-                        # For AST-parsed files, we check mtime per chunk inside _process_python_file
-                        # For generic files, we check here.
-                        last_mtime = self._get_last_mtime(conn, file_path)
+                    # Context: Grab a meaningful snippet (headers + first functional block)
+                    snippet_header = f"# Source: {file} ({full_path})"
+                    if ext == ".py":
+                        # Grab function/class definitions for context
+                        defs = re.findall(r"^(?:def|class)\s+\w+.*:", content, re.M)
+                        snippet_body = "\n".join(defs[:6])
+                    else:
+                        snippet_body = content[:400].strip()
 
-                        if not check_for_updates and last_mtime > 0.0 and not is_py:
-                            if verbose: print(f"Skipping (already indexed): {file_path}")
-                            total_skipped += 1
-                            continue
+                    if snippet_body:
+                        local_snippets.append(f"{snippet_header}\n{snippet_body}")
 
-                        if check_for_updates and current_mtime <= last_mtime and not is_py:
-                            if verbose: print(f"Skipping (up-to-date): {file_path}")
-                            total_skipped += 1
-                            continue
-
-                        # Route to specific processor
-                        if is_py:
-                            indexed, updated = self._process_python_file(
-                                conn, file_path, file, current_mtime, min_chars, max_class_lines
-                            )
+                    # 3. Database Sync
+                    if mtime > last_mtime:
+                        kind = f"code:{self.LANG_MAP[ext]}"
+                        store.upsert_doc(full_path, file, content, kind, mtime)
+                        if last_mtime == 0.0:
+                            indexed_count += 1
                         else:
-                            indexed, updated = self._process_generic_file(
-                                conn, file_path, file, current_mtime, last_mtime, min_chars
-                            )
+                            updated_count += 1
 
-                        total_indexed += indexed
-                        total_updated += updated
-                        if indexed == 0 and updated == 0:
-                            total_skipped += 1  # Skipped due to min_chars or other
+                except Exception:
+                    continue
 
-                    except (IOError, OSError) as e:
-                        if verbose: print(f"Error reading {file_path}: {e}")
-                        total_errors += 1
-                    except Exception as e:
-                        if verbose: print(f"Error processing {file_path}: {e}")
-                        total_errors += 1
+        # 4. Memory "Snowball" Logic (Merge with existing context/lexicon)
+        mem = Memory.load()
 
-            conn.commit()
+        # Merge Lexicon
+        existing_lex = mem.get(lex_key, [])
+        if not isinstance(existing_lex, list): existing_lex = []
+        # Calculate most frequent new terms
+        new_top_lex = [t for t, c in collections.Counter(local_idents).most_common(lex_cap)]
+        # Combine and dedupe
+        mem[lex_key] = list(dict.fromkeys(existing_lex + new_top_lex))[:1000]
 
-        except Exception as e:
-            total_errors += 1
-            print(f"A critical error occurred: {e}")
-        finally:
-            conn.close()
+        # Merge Context
+        existing_ctx = mem.get(ctx_key, "")
+        if not isinstance(existing_ctx, str): existing_ctx = ""
+        new_ctx_blob = "\n\n".join(local_snippets[:15])  # Cap per-run additions
 
-        # --- Compose output ---
-        base = "" if payload is None else str(payload)
-        out_msg = (
-            f"Local code scan complete for: {scan_path}\n"
-            f"  - New Chunks Indexed: {total_indexed}\n"
-            f"  - Chunks Updated:     {total_updated}\n"
-            f"  - Files/Chunks Skipped: {total_skipped}\n"
-            f"  - Errors:            {total_errors}"
-        )
+        if existing_ctx and new_ctx_blob:
+            mem[ctx_key] = existing_ctx.rstrip() + "\n\n--- LOCAL CODE ---\n" + new_ctx_blob
+        elif new_ctx_blob:
+            mem[ctx_key] = new_ctx_blob
+
+        Memory.save(mem)
+
+        # 5. Pipeline Output
+        base_text = str(payload or "")
+        out_text = f"{base_text}\n\n[context]\n{mem[ctx_key]}\n\n[lexicon]\n{','.join(mem[lex_key])}"
 
         meta = {
-            "db_path": db_path,
-            "scan_path": scan_path,
-            "files_indexed": total_indexed,  # actually chunks
-            "files_updated": total_updated,
-            "files_skipped": total_skipped,
-            "errors": total_errors,
-            "max_class_lines": max_class_lines,
+            "indexed": indexed_count,
+            "updated": updated_count,
+            "lexicon_total": len(mem[lex_key]),
+            "context_chars": len(mem[ctx_key])
         }
-        return f"{base}\n\n[local_corpus_update]\n{out_msg}", meta
+        return out_text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "scan_path": "REQUIRED: The local directory to scan (e.g., ~/PycharmProjects)",
+            "scan_path": "Local folder to index",
             "db_path": "code_corpus.db",
-            "extensions": ".py,.js,.ts,.md,.txt,.java,.cpp,.c,.h,.rs,.go",
-            "min_chars": 50,
-            "verbose": False,
-            "check_for_updates": False,
-            "skip_default_dirs": True,
-            "skip_venv_dirs": True,
-            "extra_skip_dirs": "",
-            # NEW:
-            "max_class_lines": self.MAX_CLASS_LINES,
+            "lexicon_key": "code_lexicon",
+            "context_key": "code_context",
+            "min_chars": 60
         }
 
 
@@ -5856,22 +5679,39 @@ BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
 class NewsBlock(BaseBlock):
     """
     Fetches public news/info sources without keys.
+
     Params:
-        url: (optional) direct URL to JSON/RSS/Atom/HTML feed
-        preset: one of NEWS_PRESETS keys (e.g., 'reuters_top', 'spaceflight_news')
-        limit: int (default 10) number of items to summarize
-        open_meteo: dict with latitude/longitude if you want a dynamic Open-Meteo call,
-                    e.g. {"latitude": 32.30, "longitude": -90.10, "current_weather": True}
-    Output: Markdown list + meta with count & source,
-            and a [context] block suitable for ChatBlock.
+      url: (optional) direct URL to JSON/RSS/Atom/HTML feed
+      preset: one of NEWS_PRESETS keys (e.g., 'bbc_world', 'spaceflight_news')
+      limit: int (default 10)
+      open_meteo: dict with latitude/longitude for Open-Meteo call
+
+      lexicon_key: (optional) Memory key to save extracted lexicon list
+      context_key: (optional) Memory key to save built context string
+
+    Behavior:
+      - Always emits [lexicon] and [context] (when available) to pass up the pipeline.
+      - If lexicon_key/context_key are provided (non-empty), also saves to Memory under those keys.
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        from urllib.parse import urlencode, urljoin
+
         limit = int(params.get("limit", 10))
         preset = params.get("preset")
         url = params.get("url")
+
+        lexicon_key = str(params.get("lexicon_key") or "").strip()
+        context_key = str(params.get("context_key") or "").strip()
+
         items: List[Dict[str, Any]] = []
-        meta: Dict[str, Any] = {"source": None, "count": 0, "kind": "news"}
+        meta: Dict[str, Any] = {
+            "source": None,
+            "count": 0,
+            "kind": "news",
+            "lexicon_key": lexicon_key or None,
+            "context_key": context_key or None,
+        }
 
         # Dynamic Open-Meteo builder
         if not url and "open_meteo" in params:
@@ -5889,13 +5729,15 @@ class NewsBlock(BaseBlock):
 
         meta["source"] = url
 
-        # Fetch and branch by content type
         resp = _http_get(url)
+
+        # -------- JSON --------
         if _is_json_content(resp):
             data = _safe_json(resp)
-            # Spaceflight News JSON shape: list of articles with 'title','url','summary'
             if isinstance(data, list):
                 for row in data[:limit]:
+                    if not isinstance(row, dict):
+                        continue
                     items.append({
                         "title": row.get("title") or row.get("name") or "(no title)",
                         "link": row.get("url") or row.get("link") or "",
@@ -5903,9 +5745,12 @@ class NewsBlock(BaseBlock):
                         "published": row.get("publishedAt") or row.get("published") or "",
                     })
             elif isinstance(data, dict):
-                # Wikipedia summary example
                 title = data.get("title") or data.get("displaytitle") or "(no title)"
-                link = data.get("content_urls", {}).get("desktop", {}).get("page") or data.get("extract_url") or ""
+                link = (
+                    (data.get("content_urls") or {}).get("desktop", {}).get("page")
+                    or data.get("extract_url")
+                    or ""
+                )
                 items.append({
                     "title": title,
                     "link": link,
@@ -5913,49 +5758,67 @@ class NewsBlock(BaseBlock):
                     "published": data.get("timestamp") or "",
                 })
             else:
-                items.append({"title": "(unrecognized JSON)", "link": "", "summary": str(type(data))})
+                items.append({
+                    "title": "(unrecognized JSON)",
+                    "link": "",
+                    "summary": str(type(data)),
+                    "published": "",
+                })
+
+        # -------- RSS/Atom or HTML --------
         else:
             ctype = (resp.headers.get("Content-Type") or "").lower()
-            text = resp.text
+            text = resp.text or ""
+
+            # RSS/Atom
             if "xml" in ctype or text.strip().startswith("<"):
-                # RSS/Atom
                 items = _parse_feed(url, limit=limit)
+
+            # HTML fallback
             else:
-                # Plain HTML: try to find <title> and main links as a fallback
-                tmatch = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
-                title = html.escape(tmatch.group(1).strip()) if tmatch else url
                 # Grab some prominent <a> links as items
-                links = re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
-                                   text,
-                                   flags=re.IGNORECASE | re.DOTALL)
+                links = re.findall(
+                    r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                    text,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
                 seen = set()
                 for href, anchor in links:
-                    if href.startswith("#") or href.startswith("javascript:"):
+                    if not href or href.startswith("#") or href.startswith("javascript:"):
                         continue
-                    key = (href, anchor.strip())
+
+                    abs_href = urljoin(url, href)
+                    anchor_txt = re.sub(r"\s+", " ", html.unescape(re.sub("<.*?>", "", anchor))).strip()
+
+                    key = (abs_href, anchor_txt)
                     if key in seen:
                         continue
                     seen.add(key)
-                    if len(items) >= limit:
-                        break
-                    clean_text = re.sub(r"\s+", " ", html.unescape(re.sub("<.*?>", "", anchor))).strip()
+
                     items.append({
-                        "title": clean_text or "(link)",
-                        "link": href,
+                        "title": anchor_txt or "(link)",
+                        "link": abs_href,
                         "summary": "",
                         "published": "",
                     })
+                    if len(items) >= limit:
+                        break
+
                 if not items:
+                    # last-resort single item
+                    m = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+                    title = html.escape(m.group(1).strip()) if m else url
                     items.append({"title": title, "link": url, "summary": "", "published": ""})
 
+        items = items[:limit]
         meta["count"] = len(items)
 
-        # Original markdown list for human reading
+        # Human-readable list
         body_markdown = _markdown_list(items, extra_keys=["published", "summary"], limit=limit)
 
-        # Build [context] block for ChatBlock: titles + summaries + published
+        # [context]
         context_lines: List[str] = []
-        for it in items[:limit]:
+        for it in items:
             t = str(it.get("title") or "(no title)")
             s = str(it.get("summary") or "")
             p = str(it.get("published") or "")
@@ -5965,24 +5828,65 @@ class NewsBlock(BaseBlock):
             if p:
                 line += f" (Published: {p})"
             context_lines.append(line)
-
         context_text = "\n".join(context_lines).strip()
 
-        body = f"### NewsBlock · {meta['source']}\n{body_markdown}"
-        if context_text:
-            body += "\n\n[context]\n" + context_text
+        # [lexicon] (use your module helper)
+        lexicon = _extract_terms(context_text, top_k=40, min_len=4) if context_text else []
+        # Save to Memory with APPEND logic
+        if lexicon_key and lexicon:
+            store_mem = Memory.load()
+            existing_lex = store_mem.get(lexicon_key, [])
+            if not isinstance(existing_lex, list): existing_lex = []
 
-        # Expose context in meta as well (optional, might be handy elsewhere)
-        meta["context_chars"] = len(context_text)
+            # Combine and de-dupe
+            combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+            store_mem[lexicon_key] = combined_lex[:500]  # Safety cap
+            Memory.save(store_mem)
 
-        return body, meta
+        if context_key and context_text:
+            store_mem = Memory.load()
+            existing_ctx = store_mem.get(context_key, "")
+
+            # Append with double newline if existing data exists
+            if existing_ctx and isinstance(existing_ctx, str):
+                new_ctx = existing_ctx + "\n\n" + context_text
+            else:
+                new_ctx = context_text
+
+            store_mem[context_key] = new_ctx
+            Memory.save(store_mem)
+
+        # Construct output from the COMBINED global context in Memory
+        # instead of just the local context_text
+        global_mem = Memory.load()
+        combined_context = global_mem.get(context_key, context_text)
+        combined_lexicon = global_mem.get(lexicon_key, lexicon)
+
+        # Emit up the pipeline with the full history
+        parts: List[str] = [f"### NewsBlock · {meta['source']}\n{body_markdown}"]
+
+        if combined_lexicon:
+            # If it's a list from memory, join it; if it's local, it's already a list
+            lex_str = ", ".join(combined_lexicon) if isinstance(combined_lexicon, list) else str(combined_lexicon)
+            parts.append("[lexicon]\n" + lex_str)
+
+        if combined_context:
+            parts.append("[context]\n" + str(combined_context))
+
+        meta["context_chars"] = len(str(combined_context))
+        meta["lexicon_size"] = len(combined_lexicon)
+
+        return "\n\n".join(parts).strip(), meta
+
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "limit": 10,
             "preset": "e.g., bbc_world, npr_news, nyt_tech",
             "url": None,
-            "open_meteo": "{'latitude': 32.3, 'longitude': -90.1}"
+            "open_meteo": "{'latitude': 32.3, 'longitude': -90.1}",
+            "lexicon_key": "",
+            "context_key": "",
         }
 
 
@@ -5994,136 +5898,160 @@ BLOCKS.register("news", NewsBlock)
 class NasaBlock(BaseBlock):
     """
     NASA feeds without keys.
+
     Params:
-        preset: one of NASA_PRESETS ('nasa_breaking','nasa_image_of_the_day','apod_html','nasa_images_api')
-        url: override to any NASA RSS/JSON/HTML endpoint
-        q: for nasa_images_api (e.g., 'earth' or 'jupiter aurora')
-        limit: max items (default 8)
+      preset: one of NASA_PRESETS ('nasa_breaking','nasa_image_of_the_day','apod_html','nasa_images_api')
+      url: override to any NASA RSS/JSON/HTML endpoint
+      q: for nasa_images_api (e.g., 'earth' or 'jupiter aurora')
+      limit: max items (default 8)
+
+      lexicon_key: (optional) Memory key to save extracted lexicon list
+      context_key: (optional) Memory key to save built context string
+
+    Behavior:
+      - Always emits [lexicon] and [context] (when available) to pass up the pipeline.
+      - If lexicon_key/context_key are provided (non-empty), also saves to Memory under those keys.
     """
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        from urllib.parse import urlencode, urljoin
+
         limit = int(params.get("limit", 8))
         preset = params.get("preset")
         url = params.get("url")
         q = params.get("q")
+
+        lexicon_key = str(params.get("lexicon_key") or "").strip()
+        context_key = str(params.get("context_key") or "").strip()
 
         if not url and preset:
             url = NASA_PRESETS.get(str(preset), None)
         if not url:
             return ("No URL or preset provided to NasaBlock.", {"error": "missing_url_or_preset"})
 
-        # Build NASA Images API query
         if preset == "nasa_images_api":
             query = {"q": q or "earth", "media_type": "image"}
             url = NASA_PRESETS["nasa_images_api"] + "?" + urlencode(query)
 
-        meta: Dict[str, Any] = {"source": url, "count": 0, "kind": "nasa"}
-        resp = _http_get(url)
+        meta: Dict[str, Any] = {
+            "source": url,
+            "count": 0,
+            "kind": "nasa",
+            "lexicon_key": lexicon_key or None,
+            "context_key": context_key or None,
+        }
 
-        # ---------- JSON branch (NASA Images API) ----------
+        resp = _http_get(url)
+        items: List[Dict[str, Any]] = []
+
+        # -------- JSON (NASA Images API) --------
         if _is_json_content(resp):
             data = _safe_json(resp)
-            items: List[Dict[str, Any]] = []
-            # NASA Images API JSON shape:
-            # { "collection": { "items": [ { "links":[{"href":...}], "data":[{"title":...,"description":...}] } ] } }
-            coll = (data or {}).get("collection", {})
-            for it in coll.get("items", [])[:limit]:
+            coll = (data or {}).get("collection", {}) if isinstance(data, dict) else {}
+            for it in (coll.get("items") or [])[:limit]:
+                if not isinstance(it, dict):
+                    continue
                 title = ""
                 desc = ""
                 link = ""
+                d0 = None
                 if isinstance(it.get("data"), list) and it["data"]:
-                    title = it["data"][0].get("title", "")
-                    desc = it["data"][0].get("description", "")
+                    d0 = it["data"][0]
+                if isinstance(d0, dict):
+                    title = d0.get("title", "") or ""
+                    desc = d0.get("description", "") or ""
                 if isinstance(it.get("links"), list) and it["links"]:
-                    link = it["links"][0].get("href", "")
-                items.append({"title": title or "(image)", "link": link, "summary": desc})
-            meta["count"] = len(items)
+                    l0 = it["links"][0]
+                    if isinstance(l0, dict):
+                        link = l0.get("href", "") or ""
+                items.append({"title": title or "(image)", "link": link, "summary": desc, "published": ""})
 
-            body_markdown = _markdown_list(items, extra_keys=["summary"], limit=limit)
+        # -------- RSS/Atom or HTML --------
+        else:
+            text = resp.text or ""
+            ctype = (resp.headers.get("Content-Type") or "").lower()
 
-            # Build [context] for ChatBlock
-            context_lines: List[str] = []
-            for it in items[:limit]:
-                t = str(it.get("title") or "(image)")
-                s = str(it.get("summary") or "")
-                line = t
-                if s:
-                    line += f" — {s}"
-                context_lines.append(line)
-            context_text = "\n".join(context_lines).strip()
+            # RSS/Atom
+            if "xml" in ctype or text.strip().startswith("<"):
+                items = _parse_feed(url, limit=limit)
 
-            body = f"### NasaBlock · {meta['source']}\n{body_markdown}"
-            if context_text:
-                body += "\n\n[context]\n" + context_text
-            meta["context_chars"] = len(context_text)
-            return (body, meta)
+            # APOD HTML fallback (no key)
+            elif preset == "apod_html":
+                img_src = _extract_first_img_src(text)
+                if img_src:
+                    img_src = urljoin("https://apod.nasa.gov/apod/", img_src)
+                m = re.search(r"<b>(.*?)</b>", text, flags=re.IGNORECASE | re.DOTALL)
+                caption = html.unescape(m.group(1)).strip() if m else "Astronomy Picture of the Day"
+                items = [{"title": caption, "link": img_src or url, "summary": "APOD (no key)", "published": ""}]
 
-        # ---------- Non-JSON content ----------
-        text = resp.text
-        ctype = (resp.headers.get("Content-Type") or "").lower()
+            else:
+                items = [{"title": "(unrecognized content)", "link": url, "summary": "", "published": ""}]
 
-        # RSS/Atom
-        if "xml" in ctype or text.strip().startswith("<"):
-            items = _parse_feed(url, limit=limit)
-            meta["count"] = len(items)
+        items = items[:limit]
+        meta["count"] = len(items)
 
-            body_markdown = _markdown_list(items, extra_keys=["published", "summary"], limit=limit)
+        # Human-readable list
+        body_markdown = _markdown_list(items, extra_keys=["published", "summary"], limit=limit)
 
-            # Build [context] block
-            context_lines: List[str] = []
-            for it in items[:limit]:
-                t = str(it.get("title") or "(no title)")
-                s = str(it.get("summary") or "")
-                p = str(it.get("published") or "")
-                line = t
-                if s:
-                    line += f" — {s}"
-                if p:
-                    line += f" (Published: {p})"
-                context_lines.append(line)
-            context_text = "\n".join(context_lines).strip()
+        # [context]
+        context_lines: List[str] = []
+        for it in items:
+            t = str(it.get("title") or "(no title)")
+            s = str(it.get("summary") or "")
+            p = str(it.get("published") or "")
+            line = t
+            if s:
+                line += f" — {s}"
+            if p:
+                line += f" (Published: {p})"
+            context_lines.append(line)
+        context_text = "\n".join(context_lines).strip()
 
-            body = f"### NasaBlock · {meta['source']}\n{body_markdown}"
-            if context_text:
-                body += "\n\n[context]\n" + context_text
-            meta["context_chars"] = len(context_text)
-            return (body, meta)
+        # [lexicon] (use your module helper)
+        lexicon = _extract_terms(context_text, top_k=40, min_len=4) if context_text else []
 
-        # APOD HTML fallback (no key)
-        if preset == "apod_html":
-            img_src = _extract_first_img_src(text)  # often relative like "image/YY/foobar.jpg"
-            if img_src and img_src.startswith("image/"):
-                base = "https://apod.nasa.gov/apod/"
-                img_src = base + img_src
-            # Try to pull a caption
-            caption_match = re.search(r"<b>(.*?)</b>", text, flags=re.IGNORECASE | re.DOTALL)
-            caption = html.unescape(caption_match.group(1)).strip() if caption_match else "Astronomy Picture of the Day"
-            items = [{"title": caption, "link": img_src or url, "summary": "APOD (no key)"}]
-            meta["count"] = len(items)
+        # Save to Memory with APPEND logic
+        if lexicon_key and lexicon:
+            store_mem = Memory.load()
+            existing_lex = store_mem.get(lexicon_key, [])
+            if not isinstance(existing_lex, list): existing_lex = []
 
-            body_markdown = _markdown_list(items, extra_keys=["summary"], limit=limit)
+            combined_lex = list(dict.fromkeys(existing_lex + lexicon))
+            store_mem[lexicon_key] = combined_lex[:500]
+            Memory.save(store_mem)
 
-            # Build [context]
-            context_lines = [f"{caption} — APOD (no key)"]
-            context_text = "\n".join(context_lines).strip()
+        if context_key and context_text:
+            store_mem = Memory.load()
+            existing_ctx = store_mem.get(context_key, "")
 
-            body = f"### NasaBlock · {meta['source']}\n{body_markdown}"
-            if context_text:
-                body += "\n\n[context]\n" + context_text
-            meta["context_chars"] = len(context_text)
-            return (body, meta)
+            if existing_ctx and isinstance(existing_ctx, str):
+                new_ctx = existing_ctx + "\n\n" + context_text
+            else:
+                new_ctx = context_text
 
-        # Unknown HTML; provide a single item back (no real context to summarize)
-        body = f"### NasaBlock · {meta['source']}\n- (unrecognized content) {url}"
-        meta["context_chars"] = 0
-        return (body, meta)
+            store_mem[context_key] = new_ctx
+            Memory.save(store_mem)
+
+        # Emit up the pipeline
+        parts: List[str] = [f"### NasaBlock · {meta['source']}\n{body_markdown}"]
+        if lexicon:
+            parts.append("[lexicon]\n" + ", ".join(lexicon))
+        if context_text:
+            parts.append("[context]\n" + context_text)
+
+        meta["context_chars"] = len(context_text)
+        meta["lexicon_size"] = len(lexicon)
+
+        return "\n\n".join(parts).strip(), meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "limit": 8,
-            "preset": "e.g., nasa_breaking, apod_html",
+            "preset": "e.g., nasa_breaking, nasa_image_of_the_day, apod_html, nasa_images_api",
             "url": None,
-            "q": "e.g., earth, jupiter aurora"
+            "q": "e.g., earth, jupiter aurora",
+            "lexicon_key": "",
+            "context_key": "",
         }
 
 
@@ -6163,78 +6091,126 @@ class IntelligenceBlock(BaseBlock):
         inject_analysis = bool(params.get("inject_analysis", False))
         inject_tag = str(params.get("inject_tag", "intel_analysis"))
 
+        # NEW: safety/latency caps (prevents “no output” stalls)
+        scan_chars = int(params.get("scan_chars", 250_000))  # scan only first N chars for term extraction
+        max_total_prose = int(params.get("max_total_prose", 800))
+        max_total_code = int(params.get("max_total_code", 800))
+
         meta = {
             "prose_new": 0, "prose_seen": 0, "prose_total": 0,
-            "code_new": 0, "code_seen": 0, "code_total": 0
+            "code_new": 0, "code_seen": 0, "code_total": 0,
+            "scan_chars": scan_chars,
+            "max_total_prose": max_total_prose,
+            "max_total_code": max_total_code,
         }
 
-        # --- 1. Analyze Prose (Text outside code blocks) ---
-        prose_text = _FENCE_RE.sub(" ", text)  # Remove fenced code
+        # Use a truncated copy for extraction only (but keep original output)
+        scan_text = text if (scan_chars <= 0 or len(text) <= scan_chars) else text[:scan_chars]
+        meta["scanned_len"] = len(scan_text)
+        meta["payload_len"] = len(text)
+
+        # --- 1) Analyze Prose (outside code blocks) ---
+        try:
+            prose_text = _FENCE_RE.sub(" ", scan_text)
+        except Exception as e:
+            # If regex ever blows up, don't break output
+            meta["regex_error"] = f"_FENCE_RE.sub failed: {e}"
+            prose_text = scan_text
+
         found_prose = _extract_prose_terms(
             prose_text, top_k=top_k, min_len=min_len_prose
         )
 
-        # --- 2. Analyze Code (Text inside code blocks) ---
-        found_code = []
-        for match in _FENCE_RE.finditer(text):
-            code_block = match.group(2)
-            found_code.extend(
-                _extract_code_identifiers(
-                    code_block, top_k=top_k, min_len=min_len_code
+        # --- 2) Analyze Code (inside code blocks) ---
+        found_code: List[str] = []
+        try:
+            for match in _FENCE_RE.finditer(scan_text):
+                code_block = match.group(2)
+                found_code.extend(
+                    _extract_code_identifiers(
+                        code_block, top_k=top_k, min_len=min_len_code
+                    )
                 )
-            )
-        # Dedup code terms
+        except Exception as e:
+            meta["regex_error"] = meta.get("regex_error", "") + f" | _FENCE_RE.finditer failed: {e}"
+
+        # Dedup code terms (order preserving)
         found_code = list(dict.fromkeys(found_code))
 
-        # --- 3. Update Memory (Track similarities/differences) ---
-        store = Memory.load()
+        # --- 3) Update Memory (FAIL-OPEN) ---
+        try:
+            ensure_app_dirs()
+            store = Memory.load()
+            if not isinstance(store, dict):
+                store = {}
+        except Exception as e:
+            # Critical: do NOT crash pipeline; always return output
+            meta["memory_error"] = f"Memory.load failed: {e}"
 
-        # Update Prose Concepts
-        existing_prose = set(store.get(prose_concepts_key, []))
-        new_prose_count = 0
-        seen_prose_count = 0
-        for term in found_prose:
-            if term not in existing_prose:
-                new_prose_count += 1
-                existing_prose.add(term)
-            else:
-                seen_prose_count += 1
+            if inject_analysis:
+                analysis = (
+                    f"[{inject_tag}]\n"
+                    f"Memory error (load): {e}\n"
+                    f"Prose: {len(found_prose)} extracted (not saved)\n"
+                    f"Code: {len(found_code)} extracted (not saved)"
+                )
+                return f"{text}\n\n{analysis}", meta
 
-        store[prose_concepts_key] = sorted(list(existing_prose))
-        meta["prose_new"] = new_prose_count
-        meta["prose_seen"] = seen_prose_count
-        meta["prose_total"] = len(existing_prose)
+            return text, meta
+
+        changed_any = False
+
+        # Prose concepts
+        existing_prose = store.get(prose_concepts_key, [])
+        if not isinstance(existing_prose, list):
+            existing_prose = []
+
+        merged_prose, new_prose, seen_prose, changed = _merge_bounded(
+            existing_prose, found_prose, max_total=max_total_prose
+        )
+        store[prose_concepts_key] = merged_prose
+        changed_any = changed_any or changed
+
+        meta["prose_new"] = new_prose
+        meta["prose_seen"] = seen_prose
+        meta["prose_total"] = len(merged_prose)
         meta["prose_key"] = prose_concepts_key
 
-        # Update Code Concepts
-        existing_code = set(store.get(code_concepts_key, []))
-        new_code_count = 0
-        seen_code_count = 0
-        for ident in found_code:
-            if ident not in existing_code:
-                new_code_count += 1
-                existing_code.add(ident)
-            else:
-                seen_code_count += 1
+        # Code concepts
+        existing_code = store.get(code_concepts_key, [])
+        if not isinstance(existing_code, list):
+            existing_code = []
 
-        store[code_concepts_key] = sorted(list(existing_code))
-        meta["code_new"] = new_code_count
-        meta["code_seen"] = seen_code_count
-        meta["code_total"] = len(existing_code)
+        merged_code, new_code, seen_code, changed = _merge_bounded(
+            existing_code, found_code, max_total=max_total_code
+        )
+        store[code_concepts_key] = merged_code
+        changed_any = changed_any or changed
+
+        meta["code_new"] = new_code
+        meta["code_seen"] = seen_code
+        meta["code_total"] = len(merged_code)
         meta["code_key"] = code_concepts_key
 
-        Memory.save(store)
+        # Save only if something changed
+        if changed_any:
+            try:
+                Memory.save(store)
+            except Exception as e:
+                # Still fail-open: return output even if save fails
+                meta["memory_error"] = f"Memory.save failed: {e}"
+        else:
+            meta["memory_skipped_save"] = True
 
-        # --- 4. (Optional) Inject analysis into payload ---
+        # --- 4) (Optional) Inject analysis into payload ---
         if inject_analysis:
             analysis = (
                 f"[{inject_tag}]\n"
-                f"Prose: {new_prose_count} new, {seen_prose_count} seen (Total: {meta['prose_total']})\n"
-                f"Code: {new_code_count} new, {seen_code_count} seen (Total: {meta['code_total']})"
+                f"Prose: {new_prose} new, {seen_prose} seen (Total: {meta['prose_total']})\n"
+                f"Code: {new_code} new, {seen_code} seen (Total: {meta['code_total']})"
             )
             return f"{text}\n\n{analysis}", meta
 
-        # By default, this block is silent and just passes the payload through
         return text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
@@ -6245,7 +6221,12 @@ class IntelligenceBlock(BaseBlock):
             "min_len_prose": 4,
             "top_k": 50,
             "inject_analysis": False,
-            "inject_tag": "intel_analysis"
+            "inject_tag": "intel_analysis",
+
+            # NEW safety defaults
+            "scan_chars": 250000,
+            "max_total_prose": 800,
+            "max_total_code": 800,
         }
 
 
@@ -24360,11 +24341,32 @@ class TrendingMinerBlock(BaseBlock):
         seen_urls: Set[str] = set(mem.get(seen_key) or [])
         self._dbg(f"[TrendingMiner] seen_urls loaded: {len(seen_urls)}")
 
-        # ----- frontier bootstrap -----
+        # -------------------- PATCHED frontier bootstrap --------------------
+        # 1. Start with categories and payload
         frontier_terms: Set[str] = set(categories)
-
         if isinstance(payload, str) and payload.strip():
             frontier_terms.update(self._extract_terms(payload, max_terms=30))
+
+        # 2. LOAD EXISTING DATA (The Patch)
+        # Pull existing lexicon to use as seeds for the new round
+        existing_lexicon = mem.get(lexicon_key)
+        if isinstance(existing_lexicon, list):
+            self._dbg(f"[TrendingMiner] Bootstrapping with {len(existing_lexicon)} existing lexicon terms")
+            # We add existing terms to frontier_terms so the search finds related new items
+            frontier_terms.update([str(t).lower() for t in existing_lexicon if t])
+
+        # Pull existing context to extract even more frontier terms
+        existing_context = mem.get(context_key)
+        if existing_context:
+            ctx_str = ""
+            if isinstance(existing_context, list):
+                ctx_str = " ".join([str(s) for s in existing_context])
+            elif isinstance(existing_context, str):
+                ctx_str = existing_context
+
+            if ctx_str:
+                # Mine terms from existing context to expand search horizon
+                frontier_terms.update(self._extract_terms(ctx_str, max_terms=50))
 
         for k in memory_sources:
             v = mem.get(k)
@@ -24782,11 +24784,65 @@ class TrendingMinerBlock(BaseBlock):
             }
             for it in final_scored
         ]
-        mem[seeds_key] = seeds
-        mem[lexicon_key] = lexicon
+        # 1. Update Hits (Trending specific metadata)
+        new_hits_data = [
+            {
+                "category": it.get("category"),
+                "source": it.get("source"),
+                "title": it.get("title"),
+                "url": it.get("url"),
+                "score": it.get("score"),
+                "published": it.get("published_dt").isoformat() if it.get("published_dt") else None,
+            }
+            for it in final_scored
+        ]
+        # Merge with existing hits if present
+        existing_hits = mem.get(hits_key, [])
+        if isinstance(existing_hits, list):
+            # Combine and keep unique by URL
+            combined_hits = {h['url']: h for h in (existing_hits + new_hits_data)}.values()
+            mem[hits_key] = list(combined_hits)
+        else:
+            mem[hits_key] = new_hits_data
+
+        # 2. Update Context (The crucial part for your large context)
+        existing_context = mem.get(context_key, [])
+        if not isinstance(existing_context, list):
+            existing_context = [str(existing_context)] if existing_context else []
+
+        # Merge new sentences with old ones, maintaining order and uniqueness
+        combined_context = existing_context + context_sents
+        # Quick de-dupe while preserving order
+        unique_context = []
+        ctx_seen = set()
+        for line in combined_context:
+            norm = line.strip().lower()
+            if norm and norm not in ctx_seen:
+                unique_context.append(line)
+                ctx_seen.add(norm)
+
+        # Apply a final safety cap to prevent Memory bloat
+        mem[context_key] = unique_context[-500:]  # Keep latest 500 lines
+
+        # 3. Update Lexicon (Merge keywords)
+        existing_lexicon = mem.get(lexicon_key, [])
+        if not isinstance(existing_lexicon, list):
+            existing_lexicon = [str(existing_lexicon)] if existing_lexicon else []
+
+        # Combine, lowercase, and de-dupe
+        combined_lex = list(dict.fromkeys([str(t).lower() for t in (existing_lexicon + lexicon)]))
+        mem[lexicon_key] = combined_lex[:800]  # Cap lexicon size
+
+        # 4. Save seen URLs and general URL list
         mem[seen_key] = list(seen_urls)[-20000:]
-        mem[urls_key] = seeds
-        mem[context_key] = context_sents
+
+        existing_urls = mem.get(urls_key, [])
+        if isinstance(existing_urls, list):
+            mem[urls_key] = list(dict.fromkeys(existing_urls + seeds))[:1000]
+        else:
+            mem[urls_key] = seeds
+
+        # Final write to disk/state
         Memory.save(mem)
 
         self._dbg(
@@ -24796,9 +24852,27 @@ class TrendingMinerBlock(BaseBlock):
         )
 
         # Context = mined sentences when available, else fallback to urls
-        ctx_lines = context_sents if context_sents else seeds
-        out_text = "[context]\n" + "\n".join(ctx_lines) + "\n\n[lexicon]\n" + ",".join(lexicon)
+        # Construct final output from the FULL merged memory snowball
+        # This ensures NASA + NEWS + TRENDING are all visible in the GUI
+        full_ctx = mem.get(context_key, [])
+        full_lex = mem.get(lexicon_key, [])
 
+        # Format context (handle list or string)
+        if isinstance(full_ctx, list):
+            ctx_display = "\n".join(full_ctx)
+        else:
+            ctx_display = str(full_ctx)
+
+        # Format lexicon
+        lex_display = ",".join(full_lex) if isinstance(full_lex, list) else str(full_lex)
+
+        out_text = f"[context]\n{ctx_display}\n\n[lexicon]\n{lex_display}"
+
+        # Keep your existing meta construction
+        meta = {...}
+
+        self._dbg(f"[TrendingMiner] execute done meta={meta}")
+        return out_text, meta
 
         meta = {
             "categories": categories,
@@ -24889,6 +24963,7 @@ class TrendingMinerBlock(BaseBlock):
 
 
 BLOCKS.register("trendingminer", TrendingMinerBlock)
+
 # ======================= TextMiner =======================
 @dataclass
 class TextMinerBlock(BaseBlock):
@@ -25320,13 +25395,25 @@ class TextMinerBlock(BaseBlock):
 
         self._dbg(f"[TextMiner] total candidate blocks={len(blocks)}")
 
+        # --- PATCHED SCORING LOGIC ---
         scored_blocks: List[Tuple[float, str, str]] = []
         for b in blocks:
             bb = b.strip()
-            if not bb:
-                continue
+            if not bb: continue
+
+            # 1. Detect if this is code (either fenced or starting with logic)
+            is_functional_code = ("```" in bb) or bb.lstrip().startswith(
+                ("import ", "from ", "def ", "class ", "if __name__"))
+
+            # 2. Calculate semantic score
             s = self._score_block(bb, lex)
-            if s >= min_score or ("```" in bb) or bb.lstrip().startswith(("def ", "class ", "import ", "from ")):
+
+            # 3. FIX: If it's code, we assign it a PERFECT score (1.0)
+            # to ensure it's never deleted by the distiller
+            if is_functional_code:
+                s = 1.0  # Force it to the top of the Clean Room
+
+            if s >= min_score or is_functional_code:
                 scored_blocks.append((s, self._cluster_key(bb), bb))
 
         self._dbg(f"[TextMiner] scored_blocks kept={len(scored_blocks)} min_score={min_score}")
