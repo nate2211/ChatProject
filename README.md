@@ -1,4 +1,5 @@
 # PromptChat
+<img width="1189" height="821" alt="Screenshot 2026-02-16 220956" src="https://github.com/user-attachments/assets/8d2ac626-3d98-439a-9769-b75b212fd29a" />
 
 PromptChat is a modular, pipeline-based data ingestion and AI processing engine. It allows users to chain together discrete functional "blocks" to perform advanced web scraping, local code analysis, network packet ingestion, and RAG (Retrieval-Augmented Generation) using both local and remote AI models.
 
