@@ -694,6 +694,7 @@ class GuardBlock(BaseBlock):
 
 BLOCKS.register("guard", GuardBlock)
 
+# ---------------- Tool ----------------
 
 @dataclass
 class ToolRouterBlock(BaseBlock):
@@ -1814,14 +1815,6 @@ class ChatBlock(BaseBlock):
             if not lex:
                 return []
 
-            stop = {
-                "the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "for", "with",
-                "is", "are", "was", "were", "be", "been", "it", "this", "that", "these", "those",
-                "you", "your", "we", "our", "they", "their", "i", "me", "my",
-                "from", "at", "as", "by", "into", "about", "over", "under", "after", "before",
-                "new", "just", "release", "released", "drops", "drop", "official",
-                "today", "tonight", "tomorrow", "yesterday",
-            }
 
             urlish = re.compile(r"^(https?://|www\.)", re.I)
             domainish = re.compile(r"^[a-z0-9\-]+\.(com|net|org|io|co|gg|tv|ai|dev|app|edu|gov)(/|$)", re.I)
@@ -1834,7 +1827,7 @@ class ChatBlock(BaseBlock):
                 if not t:
                     continue
                 tl = t.lower()
-                if tl in stop:
+                if tl in _STOPWORDS:
                     continue
                 if urlish.match(tl) or domainish.match(tl):
                     continue
@@ -5544,6 +5537,11 @@ class LocalCodeCorpusBlock(BaseBlock):
       - Appends to existing 'code_lexicon' and 'code_context' in Memory.
       - Uses AST for Python to index functional units.
       - Language-aware tagging for FTS searches.
+
+    scan_path now supports MULTIPLE directories:
+      - Comma-separated:  "C:\\proj1, C:\\proj2"
+      - Space-separated:  C:\\proj1 C:\\proj2
+      - Quotes supported for paths with spaces:  "C:\\My Proj" "D:\\Other"
     """
 
     LANG_MAP = {
@@ -5551,13 +5549,69 @@ class LocalCodeCorpusBlock(BaseBlock):
         ".md": "markdown", ".cpp": "cpp", ".rs": "rust", ".go": "go"
     }
 
+    def extract_functional_units(self, content):
+        try:
+            tree = ast.parse(content)
+            units = []
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    # This gets the exact source segment for the whole block
+                    units.append(ast.get_source_segment(content, node))
+            return units
+        except:
+            return []
+
+    def _parse_scan_paths(self, raw: str) -> List[str]:
+        raw = (raw or "").strip()
+        if not raw:
+            return []
+
+        # allow semicolon too (common on Windows), but primary separators are comma/space
+        raw2 = raw.replace(";", ",")
+
+        parts: List[str] = []
+        if "," in raw2:
+            # comma-separated: keep spaces inside each item (so "C:\My Proj, D:\X" works)
+            parts = [p.strip() for p in raw2.split(",") if p.strip()]
+        else:
+            # space-separated with quote support
+            try:
+                import shlex
+                parts = shlex.split(raw2, posix=False)
+            except Exception:
+                parts = raw2.split()
+
+        out: List[str] = []
+        seen = set()
+        for p in parts:
+            p = (p or "").strip()
+            if not p:
+                continue
+            # trim surrounding quotes if any
+            if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+                p = p[1:-1].strip()
+            if not p:
+                continue
+
+            full = os.path.abspath(os.path.expanduser(p))
+            norm = os.path.normcase(os.path.normpath(full))
+            if norm in seen:
+                continue
+            seen.add(norm)
+            out.append(full)
+
+        return out
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         # 1. Setup Parameters & Store
         scan_path_raw = str(params.get("scan_path", "")).strip()
         if not scan_path_raw:
             return str(payload), {"error": "Missing scan_path"}
 
-        scan_path = os.path.abspath(os.path.expanduser(scan_path_raw))
+        scan_paths = self._parse_scan_paths(scan_path_raw)
+        if not scan_paths:
+            return str(payload), {"error": "No valid scan paths parsed from scan_path"}
+
         db_path = str(params.get("db_path", "code_corpus.db"))
         min_chars = int(params.get("min_chars", 60))
 
@@ -5577,61 +5631,71 @@ class LocalCodeCorpusBlock(BaseBlock):
         local_idents: List[str] = []
         local_snippets: List[str] = []
 
-        # 2. Recursive Directory Scan
-        for root, dirs, files in os.walk(scan_path):
-            # Prune hidden/junk dirs
-            dirs[:] = [d for d in dirs if not d.startswith(('.', 'node_modules', '__pycache__', 'venv'))]
+        used_paths: List[str] = []
+        skipped_paths: List[str] = []
 
-            for file in files:
-                ext = os.path.splitext(file)[1].lower()
-                if ext not in self.LANG_MAP:
-                    continue
+        # 2. Recursive Directory Scan (ALL provided roots)
+        for scan_root in scan_paths:
+            if not os.path.isdir(scan_root):
+                skipped_paths.append(scan_root)
+                continue
 
-                full_path = os.path.join(root, file)
-                try:
-                    mtime = os.path.getmtime(full_path)
-                    last_mtime = store.get_last_mtime(full_path)
+            used_paths.append(scan_root)
 
-                    # Read content for indexing/lexicon
-                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+            for root, dirs, files in os.walk(scan_root):
+                # Prune hidden/junk dirs
+                dirs[:] = [d for d in dirs if not d.startswith(('.', 'node_modules', '__pycache__', 'venv'))]
 
-                    if len(content) < min_chars:
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext not in self.LANG_MAP:
                         continue
 
-                    # Lexicon: Extract words starting with letters (potential APIs/Variables)
-                    local_idents.extend(re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", content))
+                    full_path = os.path.join(root, file)
+                    try:
+                        mtime = os.path.getmtime(full_path)
+                        last_mtime = store.get_last_mtime(full_path)
 
-                    # Context: Grab a meaningful snippet (headers + first functional block)
-                    snippet_header = f"# Source: {file} ({full_path})"
-                    if ext == ".py":
-                        # Grab function/class definitions for context
-                        defs = re.findall(r"^(?:def|class)\s+\w+.*:", content, re.M)
-                        snippet_body = "\n".join(defs[:6])
-                    else:
-                        snippet_body = content[:400].strip()
+                        # Read content for indexing/lexicon
+                        with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
 
-                    if snippet_body:
-                        local_snippets.append(f"{snippet_header}\n{snippet_body}")
+                        if len(content) < min_chars:
+                            continue
 
-                    # 3. Database Sync
-                    if mtime > last_mtime:
-                        kind = f"code:{self.LANG_MAP[ext]}"
-                        store.upsert_doc(full_path, file, content, kind, mtime)
-                        if last_mtime == 0.0:
-                            indexed_count += 1
+                        # Lexicon: Extract words starting with letters (potential APIs/Variables)
+                        local_idents.extend(re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", content))
+
+                        # Context: Grab a meaningful snippet (headers + first functional block)
+                        snippet_header = f"# Source: {file} ({full_path})"
+                        if ext == ".py":
+                            units = self.extract_functional_units(content)
+                            snippet_body = "\n\n".join(units[:3])
                         else:
-                            updated_count += 1
+                            snippet_body = content[:400].strip()
 
-                except Exception:
-                    continue
+                        if snippet_body:
+                            local_snippets.append(f"{snippet_header}\n{snippet_body}")
+
+                        # 3. Database Sync
+                        if mtime > last_mtime:
+                            kind = f"code:{self.LANG_MAP[ext]}"
+                            store.upsert_doc(full_path, file, content, kind, mtime)
+                            if last_mtime == 0.0:
+                                indexed_count += 1
+                            else:
+                                updated_count += 1
+
+                    except Exception:
+                        continue
 
         # 4. Memory "Snowball" Logic (Merge with existing context/lexicon)
         mem = Memory.load()
 
         # Merge Lexicon
         existing_lex = mem.get(lex_key, [])
-        if not isinstance(existing_lex, list): existing_lex = []
+        if not isinstance(existing_lex, list):
+            existing_lex = []
         # Calculate most frequent new terms
         new_top_lex = [t for t, c in collections.Counter(local_idents).most_common(lex_cap)]
         # Combine and dedupe
@@ -5639,7 +5703,8 @@ class LocalCodeCorpusBlock(BaseBlock):
 
         # Merge Context
         existing_ctx = mem.get(ctx_key, "")
-        if not isinstance(existing_ctx, str): existing_ctx = ""
+        if not isinstance(existing_ctx, str):
+            existing_ctx = ""
         new_ctx_blob = "\n\n".join(local_snippets[:15])  # Cap per-run additions
 
         if existing_ctx and new_ctx_blob:
@@ -5654,16 +5719,19 @@ class LocalCodeCorpusBlock(BaseBlock):
         out_text = f"{base_text}\n\n[context]\n{mem[ctx_key]}\n\n[lexicon]\n{','.join(mem[lex_key])}"
 
         meta = {
+            "scan_paths_in": len(scan_paths),
+            "scan_paths_used": len(used_paths),
+            "scan_paths_skipped": len(skipped_paths),
             "indexed": indexed_count,
             "updated": updated_count,
             "lexicon_total": len(mem[lex_key]),
-            "context_chars": len(mem[ctx_key])
+            "context_chars": len(mem[ctx_key]),
         }
         return out_text, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "scan_path": "Local folder to index",
+            "scan_path": 'One or more folders (comma or space separated). Example: "C:\\\\proj1, C:\\\\proj2" or "C:\\\\proj1 C:\\\\proj2"',
             "db_path": "code_corpus.db",
             "lexicon_key": "code_lexicon",
             "context_key": "code_context",
@@ -5672,7 +5740,6 @@ class LocalCodeCorpusBlock(BaseBlock):
 
 
 BLOCKS.register("localcodecorpus", LocalCodeCorpusBlock)
-
 
 # ======================= NewsBlock =========================================
 @dataclass
@@ -24964,569 +25031,6 @@ class TrendingMinerBlock(BaseBlock):
 
 BLOCKS.register("trendingminer", TrendingMinerBlock)
 
-# ======================= TextMiner =======================
-@dataclass
-class TextMinerBlock(BaseBlock):
-    """
-    TextMinerBlock: Advanced Semantic Distiller + Code Structure Mapper.
-
-    Goal:
-      Turn messy tracker output ([context] + [lexicon]) into a "Clean Room" context
-      that is:
-        • higher signal for the LLM
-        • structured for reasoning
-        • code-aware (APIs, types, call sites)
-        • noise-resistant (HTML junk, boilerplate, cookie banners, nav, etc.)
-
-    Major Improvements vs basic version:
-      1) Better Context/Lexicon parsing (handles missing tags, multi-line lexicon)
-      2) HTML/boilerplate stripping + line de-noising heuristics
-      3) Code-aware segmentation:
-         - fences ```...```
-         - import blocks
-         - def/class/type/interface signatures (Python/JS/TS/C#/Rust/Go-ish)
-      4) "Symbol Table" extraction:
-         - defs/classes/interfaces/enums/types
-         - function calls (best-effort)
-         - common public members (best-effort)
-      5) Lexicon-anchored ranking + diversity:
-         - keep top-k per "cluster" (code/prose/links)
-         - prevents one repeated phrase from dominating
-      6) Deterministic trimming: preserve best chunks while clamping output length
-
-    Output:
-      [context]
-        ### Clean Room Index
-        ### Code Map
-        ### Key Facts / Snippets
-        ### Links
-      [lexicon]
-        <deduped lexicon>
-    """
-
-    # ---- code signature patterns (broad but cheap) ----
-    _PY_DEF_RE = re.compile(r"^\s*(?:async\s+def|def)\s+([A-Za-z_]\w*)\s*\(", re.M)
-    _PY_CLASS_RE = re.compile(r"^\s*class\s+([A-Za-z_]\w*)\s*(?:\(|:)", re.M)
-
-    _JS_FN_RE = re.compile(
-        r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(",
-        re.M
-    )
-    _JS_CLASS_RE = re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)\b", re.M)
-    _TS_TYPE_RE = re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\s*=", re.M)
-    _TS_IFACE_RE = re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)\b", re.M)
-    _TS_ENUM_RE = re.compile(r"^\s*(?:export\s+)?enum\s+([A-Za-z_$][\w$]*)\b", re.M)
-
-    _CS_CLASS_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*(?:sealed\s+)?class\s+([A-Za-z_]\w*)\b", re.M)
-    _CS_IFACE_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*interface\s+([A-Za-z_]\w*)\b", re.M)
-    _CS_ENUM_RE = re.compile(r"^\s*(?:public|internal|private|protected)?\s*enum\s+([A-Za-z_]\w*)\b", re.M)
-
-    _RUST_ITEM_RE = re.compile(r"^\s*(?:pub\s+)?(?:struct|enum|trait|type|fn)\s+([A-Za-z_]\w*)\b", re.M)
-    _GO_ITEM_RE = re.compile(r"^\s*type\s+([A-Za-z_]\w*)\s+(?:struct|interface)\b", re.M)
-    _GO_FN_RE = re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)\s*\(", re.M)
-
-    # best-effort call detection (very heuristic)
-    _CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(", re.M)
-
-    # links
-    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
-
-    # html-ish noise patterns
-    _TAG_RE = re.compile(r"<[^>]+>")
-    _WS_RE = re.compile(r"[ \t]+")
-
-    # boilerplate lines frequently seen in web pages
-    _NOISE_LINE_RE = re.compile(
-        r"(cookie|consent|subscribe|newsletter|sign\s*up|log\s*in|accept\s+all|"
-        r"privacy\s+policy|terms\s+of\s+service|all\s+rights\s+reserved|"
-        r"advertis|sponsored|tracking|javascript\s+required|enable\s+javascript|"
-        r"skip\s+to\s+content|menu|nav|breadcrumb|share\s+this|follow\s+us)",
-        re.I
-    )
-
-    _WORD_RE = re.compile(r"[A-Za-z0-9_]+")
-
-    # -------------------- debug helper --------------------
-    def _dbg(self, msg: str):
-        try:
-            DEBUG_LOGGER.log_message(msg)
-        except Exception:
-            pass
-
-    # -------------------- parsing helpers --------------------
-    def _split_tagged_payload(self, text: str) -> Tuple[str, List[str]]:
-        """
-        Robustly parse:
-          [context]\n...\n\n[lexicon]\n...
-        If tags missing, treat entire payload as context.
-        Lexicon can be comma-separated or newline separated.
-        """
-        raw = text or ""
-        ctx = raw
-        lex = []
-
-        if "[context]" in raw:
-            try:
-                ctx = raw.split("[context]\n", 1)[1]
-            except Exception:
-                ctx = raw
-
-        if "[lexicon]" in ctx:
-            ctx_part, lex_part = ctx.split("[lexicon]", 1)
-            ctx = ctx_part
-            # allow either "[lexicon]\n" or "[lexicon]" direct
-            lex_part = lex_part.lstrip("\n").strip()
-            if lex_part:
-                # commas OR newlines
-                lex_tokens = re.split(r"[,|\n]+", lex_part)
-                lex = [t.strip().lower() for t in lex_tokens if t.strip()]
-        else:
-            # maybe lexicon is elsewhere (original raw)
-            if "[lexicon]\n" in raw:
-                lex_part = raw.split("[lexicon]\n", 1)[1]
-                lex_tokens = re.split(r"[,|\n]+", lex_part)
-                lex = [t.strip().lower() for t in lex_tokens if t.strip()]
-
-        # dedupe preserve order
-        seen = set()
-        lex2 = []
-        for t in lex:
-            if t in seen:
-                continue
-            seen.add(t)
-            lex2.append(t)
-
-        return ctx.strip(), lex2
-
-    def _strip_html(self, s: str) -> str:
-        """
-        Fast HTML tag removal + entity-ish cleanup (cheap, not perfect).
-        """
-        if "<" not in s or ">" not in s:
-            return s
-        s2 = self._TAG_RE.sub(" ", s)
-        s2 = s2.replace("&nbsp;", " ").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
-        s2 = self._WS_RE.sub(" ", s2)
-        return s2.strip()
-
-    def _line_denoise(self, s: str) -> str:
-        """
-        Remove obvious boilerplate lines and collapse whitespace.
-        """
-        lines = []
-        for ln in (s or "").splitlines():
-            t = ln.strip()
-            if not t:
-                continue
-            if self._NOISE_LINE_RE.search(t) and len(t) < 200:
-                continue
-            # toss pure nav-ish separators
-            if len(t) <= 3 and all(ch in "-_=*•|" for ch in t):
-                continue
-            lines.append(t)
-        return "\n".join(lines)
-
-    # -------------------- code segmentation --------------------
-    def _extract_fenced_code(self, text: str) -> Tuple[str, List[str]]:
-        """
-        Extract ``` fenced code blocks, return (text_without_code, code_blocks).
-        Keeps code blocks as raw strings including fences.
-        """
-        code_blocks: List[str] = []
-        if "```" not in text:
-            return text, code_blocks
-
-        parts = text.split("```")
-        # odd indices are code contents
-        rebuilt = []
-        for i, p in enumerate(parts):
-            if i % 2 == 1:
-                # re-wrap to keep LLM-friendly
-                code_blocks.append("```" + p + "```")
-            else:
-                rebuilt.append(p)
-        return "".join(rebuilt), code_blocks
-
-    def _extract_import_blocks(self, text: str, *, cap: int = 50) -> List[str]:
-        """
-        Pull contiguous import-ish lines. This helps LLM understand module names quickly.
-        """
-        imports: List[str] = []
-        buf: List[str] = []
-
-        def flush():
-            nonlocal buf
-            if buf:
-                imports.append("\n".join(buf))
-                buf = []
-
-        for ln in (text or "").splitlines():
-            t = ln.rstrip()
-            if t.strip().startswith(("import ", "from ", "using ", "#include", "package ")):
-                buf.append(t)
-                if len(imports) >= cap:
-                    break
-            else:
-                flush()
-
-        flush()
-        return imports[:cap]
-
-    # -------------------- symbol mining --------------------
-    def _extract_signatures(self, code_text: str) -> Dict[str, List[str]]:
-        """
-        Extract symbols across languages.
-        """
-        out: Dict[str, List[str]] = {
-            "functions": [],
-            "classes": [],
-            "types": [],
-            "interfaces": [],
-            "enums": [],
-            "rust_items": [],
-            "go_items": [],
-        }
-
-        out["functions"].extend(self._PY_DEF_RE.findall(code_text))
-        out["classes"].extend(self._PY_CLASS_RE.findall(code_text))
-
-        out["functions"].extend(self._JS_FN_RE.findall(code_text))
-        out["classes"].extend(self._JS_CLASS_RE.findall(code_text))
-        out["types"].extend(self._TS_TYPE_RE.findall(code_text))
-        out["interfaces"].extend(self._TS_IFACE_RE.findall(code_text))
-        out["enums"].extend(self._TS_ENUM_RE.findall(code_text))
-
-        out["classes"].extend(self._CS_CLASS_RE.findall(code_text))
-        out["interfaces"].extend(self._CS_IFACE_RE.findall(code_text))
-        out["enums"].extend(self._CS_ENUM_RE.findall(code_text))
-
-        out["rust_items"].extend(self._RUST_ITEM_RE.findall(code_text))
-        out["go_items"].extend(self._GO_ITEM_RE.findall(code_text))
-        out["functions"].extend(self._GO_FN_RE.findall(code_text))
-
-        # dedupe preserve order
-        for k, v in out.items():
-            seen = set()
-            vv = []
-            for s in v:
-                if s in seen:
-                    continue
-                seen.add(s)
-                vv.append(s)
-            out[k] = vv
-
-        return out
-
-    def _extract_calls(self, code_text: str, *, max_calls: int = 120) -> List[str]:
-        """
-        Best-effort call extraction. We filter out keywords and short noise.
-        """
-        keywords = {
-            "if", "for", "while", "return", "switch", "catch", "try", "await",
-            "new", "class", "def", "function", "import", "from", "with", "using",
-            "print", "log", "len", "int", "str", "float", "bool", "dict", "list", "set",
-        }
-        calls = []
-        for name in self._CALL_RE.findall(code_text):
-            n = name.strip()
-            if n.lower() in keywords:
-                continue
-            if len(n) < 3:
-                continue
-            calls.append(n)
-
-        # freq rank
-        freq: Dict[str, int] = {}
-        for c in calls:
-            freq[c] = freq.get(c, 0) + 1
-        ranked = sorted(freq.items(), key=lambda kv: (-kv[1], kv[0]))
-        return [k for (k, _) in ranked[:max_calls]]
-
-    # -------------------- semantic scoring --------------------
-    def _lexicon_set(self, lex: List[str]) -> Set[str]:
-        s = set()
-        for t in lex:
-            tt = t.strip().lower()
-            if tt:
-                s.add(tt)
-        return s
-
-    def _score_block(self, block: str, lex: Set[str]) -> float:
-        """
-        Score a chunk using:
-          • lexicon overlap density
-          • informative length curve (too short = bad; too long = diminishing returns)
-          • URL presence (small bonus)
-          • code presence (bonus)
-        """
-        b = (block or "").strip()
-        if len(b) < 30:
-            return 0.0
-
-        is_code = ("```" in b) or b.lstrip().startswith(("def ", "class ", "import ", "from ", "using ", "#include", "fn ", "pub "))
-        has_url = bool(self._URL_RE.search(b))
-
-        words = [w.lower() for w in self._WORD_RE.findall(b)]
-        if not words:
-            return 0.0
-
-        # lex hits
-        hits = 0
-        if lex:
-            wset = set(words)
-            hits = len(wset & lex)
-
-        # density normalized by log length
-        density = hits / (math.log(len(words) + 2.0) + 1.0)
-
-        # length curve: prefer medium blocks
-        L = len(b)
-        length_bonus = 1.0 - abs(min(1.0, L / 1800.0) - 0.55)  # peak around ~1000 chars
-
-        score = 0.55 * density + 0.35 * length_bonus
-        if has_url:
-            score += 0.05
-        if is_code:
-            score += 0.15
-
-        # slight penalty for super repetitive spammy lines
-        if b.count("  ") > 30:
-            score -= 0.05
-
-        return max(0.0, float(score))
-
-    def _cluster_key(self, block: str) -> str:
-        """
-        Bucket chunks so we can keep diversity.
-        """
-        b = (block or "").strip()
-        if "```" in b:
-            return "code:fenced"
-        if b.lstrip().startswith(("import ", "from ", "using ", "#include", "package ")):
-            return "code:imports"
-        if self._URL_RE.search(b):
-            return "links"
-        # short header-ish lines
-        if len(b) < 120 and b.endswith(":"):
-            return "headers"
-        return "prose"
-
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        raw_text = str(payload or "")
-        self._dbg("[TextMiner] execute start")
-
-        # ---- params ----
-        mine_code = bool(params.get("mine_code", True))
-        mine_calls = bool(params.get("mine_calls", True))
-        min_score = float(params.get("min_score", 0.12))
-        max_chars = int(params.get("max_chars", 8000))
-        max_blocks = int(params.get("max_blocks", 60))
-        max_blocks = max(10, min(max_blocks, 200))
-
-        keep_top_per_cluster = int(params.get("top_per_cluster", 16))
-        keep_top_per_cluster = max(4, min(keep_top_per_cluster, 50))
-
-        # ---- parse tags ----
-        context_raw, lexicon_list = self._split_tagged_payload(raw_text)
-        lex = self._lexicon_set(lexicon_list)
-        self._dbg(f"[TextMiner] parsed context_len={len(context_raw)} lexicon={len(lexicon_list)}")
-
-        # ---- strip html + boilerplate ----
-        ctx1 = self._strip_html(context_raw)
-        ctx1 = self._line_denoise(ctx1)
-        self._dbg(f"[TextMiner] denoise done len={len(ctx1)}")
-
-        # ---- extract fenced code blocks ----
-        ctx2, fenced_code = self._extract_fenced_code(ctx1)
-        self._dbg(f"[TextMiner] fenced_code blocks={len(fenced_code)}")
-
-        # ---- imports block (from remaining text + from code fences) ----
-        import_blocks: List[str] = []
-        if mine_code:
-            import_blocks.extend(self._extract_import_blocks(ctx2))
-            for cb in fenced_code[:12]:
-                import_blocks.extend(self._extract_import_blocks(cb))
-        import_blocks = import_blocks[:20]
-        self._dbg(f"[TextMiner] import_blocks={len(import_blocks)}")
-
-        # ---- build a combined "code_text" for symbol mining ----
-        code_text = ""
-        if mine_code:
-            # mix: fenced code + any lines that look like code left in ctx2
-            code_text = "\n\n".join(fenced_code[:30]) + "\n\n" + "\n".join(import_blocks)
-        self._dbg(f"[TextMiner] code_text_len={len(code_text)} mine_code={mine_code}")
-
-        symbols: Dict[str, List[str]] = {
-            "functions": [], "classes": [], "types": [], "interfaces": [], "enums": [], "rust_items": [], "go_items": []
-        }
-        calls: List[str] = []
-        if mine_code and code_text.strip():
-            symbols = self._extract_signatures(code_text)
-            self._dbg(
-                "[TextMiner] symbols: "
-                f"fn={len(symbols['functions'])} cls={len(symbols['classes'])} "
-                f"type={len(symbols['types'])} iface={len(symbols['interfaces'])} enum={len(symbols['enums'])}"
-            )
-            if mine_calls:
-                calls = self._extract_calls(code_text, max_calls=120)
-                self._dbg(f"[TextMiner] calls mined={len(calls)}")
-
-        # ---- semantic blocks ----
-        # Keep some structure: split by double newlines first; then sentence-ish as fallback
-        blocks: List[str] = []
-        for chunk in re.split(r"\n{2,}", ctx2):
-            c = chunk.strip()
-            if not c:
-                continue
-            # further split huge prose chunks
-            if len(c) > 2500 and "```" not in c:
-                parts = re.split(r"(?<=[.!?])\s+", c)
-                for p in parts:
-                    pp = p.strip()
-                    if pp:
-                        blocks.append(pp)
-            else:
-                blocks.append(c)
-
-        # include fenced code as blocks too (kept separate)
-        blocks.extend(fenced_code)
-        # include import blocks as blocks
-        blocks.extend(import_blocks)
-
-        self._dbg(f"[TextMiner] total candidate blocks={len(blocks)}")
-
-        # --- PATCHED SCORING LOGIC ---
-        scored_blocks: List[Tuple[float, str, str]] = []
-        for b in blocks:
-            bb = b.strip()
-            if not bb: continue
-
-            # 1. Detect if this is code (either fenced or starting with logic)
-            is_functional_code = ("```" in bb) or bb.lstrip().startswith(
-                ("import ", "from ", "def ", "class ", "if __name__"))
-
-            # 2. Calculate semantic score
-            s = self._score_block(bb, lex)
-
-            # 3. FIX: If it's code, we assign it a PERFECT score (1.0)
-            # to ensure it's never deleted by the distiller
-            if is_functional_code:
-                s = 1.0  # Force it to the top of the Clean Room
-
-            if s >= min_score or is_functional_code:
-                scored_blocks.append((s, self._cluster_key(bb), bb))
-
-        self._dbg(f"[TextMiner] scored_blocks kept={len(scored_blocks)} min_score={min_score}")
-
-        # ---- diversify by cluster ----
-        by_cluster: Dict[str, List[Tuple[float, str]]] = {}
-        for s, ck, b in scored_blocks:
-            by_cluster.setdefault(ck, []).append((s, b))
-
-        chosen: List[Tuple[float, str]] = []
-        for ck, items in by_cluster.items():
-            items.sort(key=lambda x: x[0], reverse=True)
-            chosen.extend(items[:keep_top_per_cluster])
-
-        # global sort + cap
-        chosen.sort(key=lambda x: x[0], reverse=True)
-        chosen = chosen[:max_blocks]
-
-        # ---- collect links separately ----
-        link_set: Set[str] = set()
-        for _, b in chosen:
-            for m in self._URL_RE.finditer(b):
-                link_set.add(m.group(0))
-        links = list(link_set)[:60]
-
-        # ---- assemble clean room ----
-        parts: List[str] = []
-        parts.append("### Clean Room Index")
-        parts.append(f"- Blocks kept: {len(chosen)} / {len(blocks)}")
-        parts.append(f"- Links: {len(links)}")
-        if mine_code:
-            parts.append(f"- Symbols: fn={len(symbols['functions'])}, cls={len(symbols['classes'])}, types={len(symbols['types'])}, iface={len(symbols['interfaces'])}, enum={len(symbols['enums'])}")
-            if mine_calls:
-                parts.append(f"- Calls (top): {min(20, len(calls))}")
-        parts.append("")
-
-        if mine_code:
-            parts.append("### Code Map")
-            # symbols
-            if symbols["classes"]:
-                parts.append("**Classes:** " + ", ".join(symbols["classes"][:60]))
-            if symbols["interfaces"]:
-                parts.append("**Interfaces:** " + ", ".join(symbols["interfaces"][:60]))
-            if symbols["types"]:
-                parts.append("**Types:** " + ", ".join(symbols["types"][:60]))
-            if symbols["enums"]:
-                parts.append("**Enums:** " + ", ".join(symbols["enums"][:60]))
-            if symbols["functions"]:
-                parts.append("**Functions:** " + ", ".join(symbols["functions"][:80]))
-            if symbols["rust_items"]:
-                parts.append("**Rust Items:** " + ", ".join(symbols["rust_items"][:60]))
-            if symbols["go_items"]:
-                parts.append("**Go Types:** " + ", ".join(symbols["go_items"][:60]))
-            if mine_calls and calls:
-                parts.append("**Common Calls:** " + ", ".join(calls[:40]))
-            parts.append("")
-
-        parts.append("### Key Facts / Snippets")
-        for i, (s, b) in enumerate(chosen, start=1):
-            # keep short headings readable
-            parts.append(f"#### Chunk {i} (score={s:.3f})")
-            parts.append(b)
-            parts.append("")
-
-        if links:
-            parts.append("### Links")
-            for u in links:
-                parts.append(f"- {u}")
-            parts.append("")
-
-        refined_context = "\n".join(parts).strip()
-
-        # clamp deterministically
-        if len(refined_context) > max_chars:
-            refined_context = refined_context[:max_chars].rstrip() + "\n... [Distilled]"
-
-        out_text = f"[context]\n{refined_context}\n\n[lexicon]\n{','.join(lexicon_list)}"
-
-        meta = {
-            "original_len": len(context_raw),
-            "denoised_len": len(ctx2),
-            "distilled_len": len(refined_context),
-            "lexicon_count": len(lexicon_list),
-            "blocks_in": len(blocks),
-            "blocks_kept": len(chosen),
-            "links_kept": len(links),
-            "mine_code": mine_code,
-            "symbols_found": {
-                "functions": len(symbols.get("functions", [])),
-                "classes": len(symbols.get("classes", [])),
-                "types": len(symbols.get("types", [])),
-                "interfaces": len(symbols.get("interfaces", [])),
-                "enums": len(symbols.get("enums", [])),
-            },
-            "reduction_ratio": round(1 - (len(refined_context) / (len(context_raw) + 1)), 2),
-        }
-
-        self._dbg(f"[TextMiner] done meta={meta}")
-        return out_text, meta
-
-    def get_params_info(self) -> Dict[str, Any]:
-        return {
-            "mine_code": True,
-            "mine_calls": True,
-            "min_score": 0.12,
-            "max_chars": 8000,
-            "max_blocks": 60,
-            "top_per_cluster": 16,
-        }
-
-
-BLOCKS.register("textminer", TextMinerBlock)
-
 # ======================= DisplayTextMiner ====================
 
 @dataclass
@@ -25647,10 +25151,11 @@ class DisplayTextMinerBlock(BaseBlock):
         marker = "### Key Facts / Snippets"
         if marker not in (ctx or ""):
             return ""
-        # Use the LAST occurrence because TextMiner can repeat the marker.
         after = (ctx or "").rsplit(marker, 1)[1]
         return after.strip()
+
     def _clean_display_text(self, s: str, *, strip_banners: bool, strip_explanatory: bool) -> str:
+        # Preserve formatting: keep blank lines + indentation (only remove noise lines).
         t = s or ""
 
         if strip_explanatory:
@@ -25658,9 +25163,12 @@ class DisplayTextMinerBlock(BaseBlock):
 
         lines: List[str] = []
         for ln in t.splitlines():
-            x = ln.rstrip()
+            x = ln.rstrip("\n")  # keep leading/trailing spaces for formatting
             xs = x.strip()
+
+            # preserve blank lines (for markdown spacing)
             if not xs:
+                lines.append("")
                 continue
 
             if xs.startswith("[context]") or xs.startswith("[lexicon]"):
@@ -25683,6 +25191,8 @@ class DisplayTextMinerBlock(BaseBlock):
         t = "\n".join(lines)
         t = self._CHUNK_HEADER_RE.sub("", t)
         t = html.unescape(t)
+        # keep up to 2 blank lines
+        t = re.sub(r"\n{4,}", "\n\n\n", t)
         t = re.sub(r"\n{3,}", "\n\n", t).strip()
         return t
 
@@ -25815,7 +25325,6 @@ class DisplayTextMinerBlock(BaseBlock):
         if not safe_terms:
             return html_text
 
-        # build bounded alternation
         pat = re.compile(
             r"(?i)(?<![A-Za-z0-9_\-])(" + "|".join(map(re.escape, safe_terms)) + r")(?![A-Za-z0-9_\-])"
         )
@@ -25905,6 +25414,9 @@ class DisplayTextMinerBlock(BaseBlock):
             margin: 0 0 10px 0;
             white-space: pre-wrap;
           }}
+          ul, li {{
+            white-space: pre-wrap;
+          }}
           pre {{
             white-space: pre-wrap;
             background: #f6f6f6;
@@ -25968,7 +25480,7 @@ class DisplayTextMinerBlock(BaseBlock):
                 if lines and re.match(r"^[A-Za-z0-9_+\-]{1,24}$", lines[0].strip()):
                     lang = lines[0].strip()
                     lines = lines[1:]
-                code_raw = "\n".join(lines).rstrip()
+                code_raw = "\n".join(lines).rstrip("\n")
                 if lang:
                     html_parts.append(f'<div class="meta"><b>Code:</b> {html.escape(lang)}</div>')
                 html_parts.append(f"<pre><code>{html.escape(code_raw, quote=False)}</code></pre>")
@@ -25976,7 +25488,9 @@ class DisplayTextMinerBlock(BaseBlock):
 
             rendered_lines: List[str] = []
             for ln in c.splitlines():
-                t = ln.strip()
+                raw_ln = ln.rstrip("\n")
+                t = raw_ln.strip()
+
                 if not t:
                     rendered_lines.append("")
                     continue
@@ -25996,7 +25510,7 @@ class DisplayTextMinerBlock(BaseBlock):
                     rendered_lines.append(f"<b>{html.escape(kind2)}</b> | {html.escape(ttl2)}")
                     continue
 
-                rendered_lines.append(self._escape_and_linkify(t))
+                rendered_lines.append(self._escape_and_linkify(raw_ln))
 
             if style == "bullets":
                 items = [ln for ln in rendered_lines if ln and not ln.startswith("<b>")]
@@ -26209,7 +25723,6 @@ class DisplayTextMinerBlock(BaseBlock):
             return True
 
         app = QApplication.instance()
-        # Creating QApplication must happen on main thread in most setups
         if app is None:
             if threading.current_thread() is not threading.main_thread():
                 self._dbg("[DisplayTextMiner] no QApplication and not on main thread; cannot safely create in-process app")
@@ -26230,7 +25743,6 @@ class DisplayTextMinerBlock(BaseBlock):
             self._dbg("[DisplayTextMiner] off GUI thread; dispatch_to_gui_thread=False")
             return False
 
-        # enqueue to GUI thread
         done_evt = threading.Event()
         out_ok = {"shown": False}
 
@@ -26247,14 +25759,12 @@ class DisplayTextMinerBlock(BaseBlock):
         QMetaObject.invokeMethod(inv, "run", Qt.QueuedConnection)
 
         if block_until_close:
-            # wait until dialog closes (or timeout if requested)
             if dispatch_timeout_s and dispatch_timeout_s > 0:
                 done_evt.wait(timeout=float(dispatch_timeout_s))
             else:
                 done_evt.wait()
             return bool(out_ok["shown"])
 
-        # not blocking: scheduled
         return True
 
     # -------------------- GUI show (subprocess fallback) --------------------
@@ -26306,7 +25816,6 @@ class DisplayTextMinerBlock(BaseBlock):
             self._dbg(f"[DisplayTextMiner] subprocess temp write failed: {type(e).__name__}: {e}")
             return False
 
-        # Inline script (keeps this self-contained and copy/paste friendly)
         script = r"""
 import json, sys, urllib.request
 from PyQt5.QtCore import QTimer, QUrl
@@ -26452,7 +25961,6 @@ dlg.exec_()
             self._dbg(f"[DisplayTextMiner] subprocess launch failed: {type(e).__name__}: {e}")
             return False
         finally:
-            # Best-effort cleanup (if the subprocess still needs it, it'll already have read it)
             try:
                 import os
                 os.remove(path)
@@ -26464,7 +25972,6 @@ dlg.exec_()
         text = str(payload or "")
         self._dbg("[DisplayTextMiner] execute start")
 
-        # ---- core params ----
         mode = str(params.get("mode", "snippets")).strip().lower()
         if mode not in ("snippets", "context", "raw"):
             mode = "snippets"
@@ -26478,7 +25985,6 @@ dlg.exec_()
         show_popup = bool(params.get("show_popup", True))
         return_clean = bool(params.get("return_clean", False))
 
-        # safety
         max_input_chars = int(params.get("max_input_chars", 250000))
         max_input_chars = max(2000, min(max_input_chars, 2_000_000))
 
@@ -26488,11 +25994,9 @@ dlg.exec_()
         min_doc_chars = int(params.get("min_doc_chars", 120))
         min_doc_chars = max(0, min(min_doc_chars, 5000))
 
-        # dedupe
         dedupe = bool(params.get("dedupe", True))
         dedupe_key = str(params.get("dedupe_key", "display_textminer_last_hash")).strip() or "display_textminer_last_hash"
 
-        # aesthetics
         font_family = str(params.get("font_family", "Georgia")).strip() or "Georgia"
         font_pt = int(params.get("font_pt", 16))
         font_pt = max(10, min(font_pt, 28))
@@ -26520,18 +26024,15 @@ dlg.exec_()
         strip_banners = bool(params.get("strip_banners", True))
         strip_explanatory = bool(params.get("strip_explanatory", True))
 
-        # thread behavior
         dispatch_to_gui_thread = bool(params.get("dispatch_to_gui_thread", True))
         block_until_close = bool(params.get("block_until_close", True))
-        dispatch_timeout_s = float(params.get("dispatch_timeout_s", 0.0))  # 0 => wait forever if blocking
+        dispatch_timeout_s = float(params.get("dispatch_timeout_s", 0.0))
         subprocess_fallback = bool(params.get("subprocess_fallback", True))
         subprocess_wait = bool(params.get("subprocess_wait", True))
 
-        # clamp input
         if len(text) > max_input_chars:
             text = text[:max_input_chars].rstrip() + "\n\n... [input clamped]"
 
-        # pull missing meta from Memory
         if use_memory_meta:
             try:
                 mem = Memory.load()
@@ -26547,10 +26048,8 @@ dlg.exec_()
         if style not in ("plain", "bullets", "outline"):
             style = "plain"
 
-        # choose source text
         chosen, payload_lex_raw = self._build_display_source_text(text, mode=mode)
 
-        # clean
         cleaned = self._clean_display_text(chosen, strip_banners=strip_banners, strip_explanatory=strip_explanatory)
         if mode == "snippets" and len(cleaned.strip()) < max(30, int(min_doc_chars)):
             try:
@@ -26564,7 +26063,7 @@ dlg.exec_()
                     cleaned = cleaned2
             except Exception:
                 pass
-        # thin-doc guard
+
         if len(cleaned.strip()) < min_doc_chars:
             cleaned = cleaned.strip()
             if cleaned:
@@ -26590,7 +26089,6 @@ dlg.exec_()
             max_images=max_images,
         )
 
-        # dedupe on HTML (stable-ish)
         skipped = False
         h = hashlib.sha1(html_doc.encode("utf-8", errors="ignore")).hexdigest()
         if dedupe:
@@ -26608,7 +26106,6 @@ dlg.exec_()
 
         shown = False
         if show_popup and not skipped:
-            # First try in-process (main thread or dispatch to GUI thread)
             if threading.current_thread() is threading.main_thread():
                 shown = self._show_popup_pyqt5_inproc(
                     title,
@@ -26625,8 +26122,6 @@ dlg.exec_()
                     dispatch_timeout_s=dispatch_timeout_s,
                 )
             else:
-                # Worker thread:
-                # Try dispatch if there is already a QApplication; otherwise fall back to subprocess.
                 shown = self._show_popup_pyqt5_inproc(
                     title,
                     html_doc,
@@ -26705,455 +26200,831 @@ dlg.exec_()
             "show_popup": True,
             "return_clean": False,
 
-            # looks / structure
             "font_family": "Georgia",
             "font_pt": 16,
             "style": "plain",               # plain | bullets | outline (if empty, tries Memory keys: style/display_style)
 
-            # “beautiful metadata”
             "use_memory_meta": True,
             "dissected_task": "",
             "dissected_topics": "",
 
-            # cleanup
             "strip_banners": True,
             "strip_explanatory": True,
 
-            # highlighting
             "highlight_terms": True,
             "use_memory_lexicons": True,
 
-            # images
             "include_images": True,
             "max_images": 6,
             "max_remote_image_bytes": 2_000_000,
             "image_timeout_s": 3.5,
 
-            # scaling / safety
             "max_input_chars": 250000,
             "max_chars": 45000,
             "min_doc_chars": 120,
 
-            # dedupe
             "dedupe": True,
             "dedupe_key": "display_textminer_last_hash",
 
-            # exports
             "allow_pdf_export": True,
             "allow_html_export": True,
 
-            # thread safety
-            "dispatch_to_gui_thread": True,     # if QApplication exists, enqueue to GUI thread
-            "block_until_close": True,          # wait until the user closes dialog when dispatched
-            "dispatch_timeout_s": 0.0,          # 0 => wait forever if blocking
-            "subprocess_fallback": True,        # if worker thread + no GUI app, show via subprocess
-            "subprocess_wait": True,            # wait for subprocess window to close
+            "dispatch_to_gui_thread": True,
+            "block_until_close": True,
+            "dispatch_timeout_s": 0.0,
+            "subprocess_fallback": True,
+            "subprocess_wait": True,
         }
 
 
 BLOCKS.register("displaytextminer", DisplayTextMinerBlock)
 
 
-# ======================= DisplayTextMiner ====================
+# ======================= Tokenizer ====================
 @dataclass
-class PromptMinerBlock(BaseBlock):
+class TokenizerBlock(BaseBlock):
     """
-    PromptChatBlock (QUERY-ONLY): Filter miner output so downstream sees ONLY what matches the query.
+    Tokenizes inline [context]/[lexicon] (and optional Memory sources),
+    writes tokens to Memory[token_key], and passes payload through unchanged.
 
-    Key rule (per your request):
-      - NO static domain/category rules (no "news/fashion/shop" detection, no brand lists, no Published: heuristics)
-      - Relevance decisions come ONLY from the query via TF-IDF cosine similarity.
-
-    Inputs:
-      - payload: usually a PromptMiner/TextMiner output containing [context] and chunk headings
-      - params:
-          query (required): the user prompt to filter against
-
-    Output:
-      - [context] -> prompt + only the most relevant chunks
-      - [lexicon] -> query terms + top terms mined from kept chunks (fully data-driven)
-
-    Optional params (do NOT affect "domain rules"; only controls output size):
-      - max_chunks (default 18)
-      - keep_links (default True)
-      - save_outputs (default True)
+    Params (NEW):
+      - context_keys: list[str]   -> Memory keys containing extra context strings
+      - lexicon_keys: list[str]   -> Memory keys containing extra lexicon lists
     """
 
-    _WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_\-]{1,}")
-    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)\]]+", re.I)
+    # fairly safe "word/ident" tokenization (works for prose + code-ish text)
+    _TOK_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+    _DOTTED_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
 
-    # structural markers produced by your miners
-    _CHUNK_HDR_RE = re.compile(r"^\s*####\s*Chunk\s*\d+.*$", re.M)
+    _STOP = {
+        "the","a","an","and","or","but","if","then","else","when","while","to","of","in","on","for","with","as","by",
+        "is","are","was","were","be","been","being","it","this","that","these","those","i","you","we","they","he","she",
+        "my","your","our","their","me","him","her","them","us",
+        "do","does","did","doing","done","can","could","should","would","will","just","only","also","very",
+        "from","at","into","about","over","under","after","before","via"
+    }
 
-    def _dbg(self, msg: str):
-        try:
-            DEBUG_LOGGER.log_message(msg)
-        except Exception:
-            pass
-
-    # -------------------- payload parsing --------------------
-    def _split_tagged_payload(self, raw: str) -> str:
+    def _parse_all_sections(self, text: str, tag: str) -> List[str]:
         """
-        Returns context-ish text. If [context] is present, use that. Else return full payload.
+        Extract all occurrences of:
+          [tag]\n ... (until next [xxx]\n or end)
         """
-        text = raw or ""
-        if "[context]" in text:
-            try:
-                after = text.split("[context]\n", 1)[1]
-                if "[lexicon]" in after:
-                    ctx, _ = after.split("[lexicon]", 1)
-                    return ctx.strip()
-                return after.strip()
-            except Exception:
-                return text.strip()
-        return text.strip()
-
-    def _extract_key_snippets_section(self, ctx: str) -> str:
-        """
-        If '### Key Facts / Snippets' exists, prefer it (structural, not semantic).
-        """
-        marker = "### Key Facts / Snippets"
-        if marker not in (ctx or ""):
-            return ""
-        after = ctx.split(marker, 1)[1]
-        # stop at next same-level heading
-        parts = re.split(r"\n(?=###\s+)", after, maxsplit=1)
-        return (parts[0] if parts else after).strip()
-
-    def _parse_chunks(self, ctx: str) -> List[str]:
-        """
-        If ctx has '#### Chunk N' headings, return each chunk body.
-        Else: split into paragraph-ish blocks.
-        """
-        t = (ctx or "").strip()
-        if not t:
+        if not text:
             return []
-
-        if "#### Chunk" not in t:
-            parts = re.split(r"\n{2,}", t)
-            blocks = [p.strip() for p in parts if p.strip()]
-            return blocks[:300]
-
-        lines = t.splitlines()
-        blocks: List[str] = []
-        buf: List[str] = []
-        in_chunk = False
-
-        for ln in lines:
-            if ln.strip().startswith("#### Chunk"):
-                if buf:
-                    b = "\n".join(buf).strip()
-                    if b:
-                        blocks.append(b)
-                buf = []
-                in_chunk = True
-                continue
-
-            if in_chunk:
-                buf.append(ln)
-
-        if buf:
-            b = "\n".join(buf).strip()
-            if b:
-                blocks.append(b)
-
-        return blocks[:400]
-
-    # -------------------- tokenization --------------------
-    def _tokens(self, s: str) -> List[str]:
-        """
-        Data-driven tokenization: lowercased word-ish tokens; drops tiny tokens + digits.
-        No static stopword list.
-        """
-        out: List[str] = []
-        for m in self._WORD_RE.finditer((s or "").lower()):
-            t = m.group(0)
-            if len(t) < 3:
-                continue
-            if t.isdigit():
-                continue
-            out.append(t)
+        needle = f"[{tag}]\n"
+        if needle not in text:
+            return []
+        parts = text.split(needle)
+        out = []
+        for seg in parts[1:]:
+            m = re.search(r"\n\[[A-Za-z0-9_\-]+\]\n", seg)
+            body = seg[:m.start()] if m else seg
+            body = body.strip()
+            if body:
+                out.append(body)
         return out
 
-    # -------------------- dynamic stopwording (corpus-driven) --------------------
-    def _build_dynamic_stopset(self, docs_tokens: List[List[str]], query_set: Set[str]) -> Set[str]:
-        """
-        Build a stop-set ONLY from the current corpus:
-          - terms that are extremely common across docs (high DF)
-          - plus top very frequent terms
-        Always keep query terms.
-        """
-        n = max(1, len(docs_tokens))
-        df: Dict[str, int] = {}
-        tf: Dict[str, int] = {}
-
-        for toks in docs_tokens:
-            seen = set()
-            for t in toks:
-                tf[t] = tf.get(t, 0) + 1
-                if t in seen:
-                    continue
-                seen.add(t)
-                df[t] = df.get(t, 0) + 1
-
-        stop: Set[str] = set()
-
-        # DF-based: appears in >= 70% of docs => too generic in THIS corpus
-        df_cut = max(3, int(math.ceil(0.70 * n)))
-        for t, c in df.items():
-            if c >= df_cut and t not in query_set:
-                stop.add(t)
-
-        # TF-based: top-K most frequent tokens (also corpus-generic)
-        # K scales with corpus size but bounded
-        K = min(60, max(20, int(10 + n * 0.8)))
-        top_tf = sorted(tf.items(), key=lambda kv: kv[1], reverse=True)[:K]
-        for t, _ in top_tf:
-            if t not in query_set:
-                stop.add(t)
-
-        return stop
-
-    # -------------------- TF-IDF similarity --------------------
-    def _tfidf_vectors(
-        self,
-        docs_tokens: List[List[str]],
-        query_tokens: List[str],
-        stop: Set[str],
-    ) -> Tuple[Dict[str, float], List[Dict[str, float]]]:
-        """
-        Returns (q_vec, doc_vecs) using TF-IDF with log TF and smooth IDF.
-        """
-        # filter stop
-        q = [t for t in query_tokens if t not in stop]
-        docs = [[t for t in toks if t not in stop] for toks in docs_tokens]
-
-        # doc frequency
-        df: Dict[str, int] = {}
-        for toks in docs:
-            seen = set(toks)
-            for t in seen:
-                df[t] = df.get(t, 0) + 1
-
-        N = max(1, len(docs))
-
-        def idf(t: str) -> float:
-            # smooth idf
-            return math.log((N + 1.0) / (df.get(t, 0) + 1.0)) + 1.0
-
-        def vec_from_tokens(toks: List[str]) -> Dict[str, float]:
-            tf: Dict[str, int] = {}
-            for t in toks:
-                tf[t] = tf.get(t, 0) + 1
-            v: Dict[str, float] = {}
-            for t, c in tf.items():
-                v[t] = (1.0 + math.log(1.0 + c)) * idf(t)
-            return v
-
-        q_vec = vec_from_tokens(q)
-        doc_vecs = [vec_from_tokens(toks) for toks in docs]
-        return q_vec, doc_vecs
-
-    def _cosine(self, a: Dict[str, float], b: Dict[str, float]) -> float:
-        if not a or not b:
-            return 0.0
-        # dot on intersection
-        dot = 0.0
-        if len(a) < len(b):
-            for k, av in a.items():
-                bv = b.get(k)
-                if bv is not None:
-                    dot += av * bv
-        else:
-            for k, bv in b.items():
-                av = a.get(k)
-                if av is not None:
-                    dot += av * bv
-
-        na = math.sqrt(sum(v * v for v in a.values()))
-        nb = math.sqrt(sum(v * v for v in b.values()))
-        if na <= 1e-12 or nb <= 1e-12:
-            return 0.0
-        return float(dot / (na * nb))
-
-    # -------------------- lexicon output (query + mined terms) --------------------
-    def _top_terms_from_kept(self, kept_docs_tokens: List[List[str]], query_set: Set[str], cap: int = 220) -> List[str]:
-        """
-        Fully data-driven: take high-frequency terms from kept chunks, excluding query terms.
-        """
-        freq: Dict[str, int] = {}
-        for toks in kept_docs_tokens:
-            for t in toks:
-                if t in query_set:
-                    continue
-                freq[t] = freq.get(t, 0) + 1
-
-        ranked = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
-        out: List[str] = []
-        for t, _ in ranked:
-            out.append(t)
-            if len(out) >= cap:
-                break
-        return out
-
-    # -------------------- execute --------------------
-    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        self._dbg("[PromptChat] execute start")
-
-        raw = str(payload or "")
-        query = str(params.get("query", "") or "").strip()
-        if not query:
-            # query is REQUIRED for query-only behavior
-            meta = {"error": "PromptChat requires params.query (query-only mode).", "blocks_kept": 0}
-            self._dbg("[PromptChat] missing query; returning payload unchanged")
-            return raw, meta
-
-        max_chunks = int(params.get("max_chunks", 18))
-        max_chunks = max(3, min(max_chunks, 120))
-
-        keep_links = bool(params.get("keep_links", True))
-        save_outputs = bool(params.get("save_outputs", True))
-
-        # get best context source
-        ctx_full = self._split_tagged_payload(raw)
-        ctx_focus = self._extract_key_snippets_section(ctx_full) or ctx_full
-
-        blocks = self._parse_chunks(ctx_focus)
-        if not blocks:
-            meta = {"query": query, "blocks_in": 0, "blocks_kept": 0}
-            return f"[context]\n### Prompt Focus\n{query}\n\n### Key Facts / Snippets\n(no blocks found)\n\n[lexicon]\n", meta
-
-        # tokenize
-        q_toks = self._tokens(query)
-        q_set = set(q_toks)
-
-        docs_tokens = [self._tokens(b) for b in blocks]
-
-        # dynamic stop-set from corpus (keeps query terms)
-        stop = self._build_dynamic_stopset(docs_tokens, q_set)
-
-        # tf-idf vectors
-        q_vec, doc_vecs = self._tfidf_vectors(docs_tokens, q_toks, stop)
-
-        # score (cosine). Also add tiny phrase bonus (still query-only).
-        q_lower = query.lower()
-        scored: List[Tuple[float, int]] = []
-        for i, (b, dv) in enumerate(zip(blocks, doc_vecs)):
-            sim = self._cosine(q_vec, dv)
-            if q_lower and len(q_lower) >= 8 and q_lower in (b or "").lower():
-                sim += 0.08
-            scored.append((sim, i))
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-
-        # dynamic threshold: keep things near the best match
-        best = scored[0][0] if scored else 0.0
-        # if best is weak, keep fewer and be stricter
-        if best >= 0.35:
-            thr = best * 0.40
-        elif best >= 0.18:
-            thr = best * 0.55
-        else:
-            thr = best * 0.70
-
-        # always have a floor so we don't keep garbage
-        thr = max(thr, 0.05)
-
-        kept_idx: List[int] = []
-        for sim, i in scored:
-            if sim < thr:
-                break
-            kept_idx.append(i)
-            if len(kept_idx) >= max_chunks:
-                break
-
-        # fallback: if nothing met threshold, keep top 5 (still query-only)
-        if not kept_idx:
-            kept_idx = [i for _, i in scored[: min(5, len(scored))]]
-
-        kept_blocks = [blocks[i] for i in kept_idx]
-        kept_tokens = [docs_tokens[i] for i in kept_idx]
-
-        # build links only from kept
-        links: List[str] = []
-        if keep_links:
-            for b in kept_blocks:
-                for u in self._URL_RE.findall(b or ""):
-                    links.append(u)
-            links = list(dict.fromkeys(links))[:80]
-
-        # build lexicon: query terms + mined terms from kept (data-driven)
-        lex_out: List[str] = []
+    def _parse_inline_lexicon(self, text: str) -> List[str]:
+        chunks = self._parse_all_sections(text, "lexicon")
+        if not chunks:
+            return []
+        terms: List[str] = []
+        for c in chunks:
+            c = c.replace("\n", ",")
+            for t in c.split(","):
+                tt = (t or "").strip()
+                if tt:
+                    terms.append(tt)
+        # stable de-dupe
         seen = set()
-        for t in q_toks:
-            if t and t not in seen:
-                seen.add(t)
-                lex_out.append(t)
-            if len(lex_out) >= 90:
-                break
+        out = []
+        for t in terms:
+            tl = t.lower()
+            if tl in seen:
+                continue
+            seen.add(tl)
+            out.append(t)
+        return out
 
-        mined = self._top_terms_from_kept(kept_tokens, set(lex_out), cap=220)
-        for t in mined:
-            if t not in seen:
-                seen.add(t)
-                lex_out.append(t)
-            if len(lex_out) >= 240:
-                break
+    def _tokenize(self, text: str, *, include_dotted: bool = True) -> List[str]:
+        if not text:
+            return []
+        s = text.lower()
 
-        # output context
-        out_lines: List[str] = []
-        out_lines.append("### Prompt Focus")
-        out_lines.append(query)
-        out_lines.append("")
-        out_lines.append("### Key Facts / Snippets")
-        for n, i in enumerate(kept_idx, start=1):
-            sim = next((s for s, j in scored if j == i), 0.0)
-            out_lines.append(f"#### Chunk {n} (sim={sim:.3f})")
-            out_lines.append(blocks[i].strip())
-            out_lines.append("")
+        toks: List[str] = []
+        if include_dotted:
+            toks.extend([m.group(0) for m in self._DOTTED_RE.finditer(s)])
+        toks.extend(self._TOK_RE.findall(s))
 
-        if links:
-            out_lines.append("### Links")
-            for u in links:
-                out_lines.append(f"- {u}")
+        out: List[str] = []
+        for w in toks:
+            w = (w or "").strip().lower().strip("_")
+            if not w:
+                continue
+            if w in self._STOP:
+                continue
+            if w.isdigit():
+                continue
+            # break up dotted tokens into parts too (best of both worlds)
+            if "." in w:
+                parts = [p for p in w.split(".") if p and p not in self._STOP]
+                out.extend(parts)
+            out.append(w)
+        return out
 
-        out_ctx = "\n".join(out_lines).strip()
-        out_text = f"[context]\n{out_ctx}\n\n[lexicon]\n{','.join(lex_out)}"
+    def _normalize_key_list(self, v: Any) -> List[str]:
+        """
+        Accepts list[str] (preferred). Also tolerates CSV strings for CLI compatibility.
+        """
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return []
 
-        # save
-        saved = False
-        if save_outputs:
-            try:
-                mem = Memory.load()
-                mem["promptchat_last_query"] = query
-                mem["promptchat_context"] = out_ctx
-                mem["promptchat_lexicon"] = lex_out
-                Memory.save(mem)
-                saved = True
-            except Exception:
-                saved = False
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        text = "" if payload is None else str(payload)
 
-        meta = {
-            "query": query,
-            "blocks_in": len(blocks),
-            "blocks_kept": len(kept_blocks),
-            "best_sim": float(best),
-            "threshold": float(thr),
-            "links_kept": len(links),
-            "saved": saved,
-            "saved_keys": ["promptchat_last_query", "promptchat_context", "promptchat_lexicon"] if saved else [],
+        token_key = str(params.get("token_key", "tokens")).strip() or "tokens"
+
+        # NEW: list[str] (tolerates CSV string for CLI)
+        context_keys = self._normalize_key_list(params.get("context_keys", []))
+        lexicon_keys = self._normalize_key_list(params.get("lexicon_keys", []))
+
+        include_dotted = bool(params.get("include_dotted", True))
+        max_tokens = int(params.get("max_tokens", 8000))  # safety cap
+
+        # ---- collect inline sources (payload) ----
+        inline_ctx_parts = self._parse_all_sections(text, "context")
+        inline_ctx = "\n\n".join(inline_ctx_parts).strip() if inline_ctx_parts else ""
+        inline_lex_terms = self._parse_inline_lexicon(text)
+
+        # ---- collect optional memory sources ----
+        store = Memory.load()
+
+        mem_ctx_parts: List[str] = []
+        for k in context_keys:
+            v = store.get(k)
+            if isinstance(v, str) and v.strip():
+                mem_ctx_parts.append(v.strip())
+
+        mem_lex_terms: List[str] = []
+        for k in lexicon_keys:
+            v = store.get(k)
+            if isinstance(v, list):
+                mem_lex_terms.extend([str(x) for x in v if str(x).strip()])
+            elif isinstance(v, str) and v.strip():
+                # tolerate a stored CSV/newline lexicon string
+                vv = v.replace("\n", ",")
+                mem_lex_terms.extend([x.strip() for x in vv.split(",") if x.strip()])
+
+        # ---- tokenize ----
+        context_blob = "\n\n".join([p for p in [inline_ctx] + mem_ctx_parts if p]).strip()
+        all_lex_terms = inline_lex_terms + mem_lex_terms
+
+        ctx_tokens = self._tokenize(context_blob, include_dotted=include_dotted) if context_blob else []
+        lex_tokens: List[str] = []
+        for t in all_lex_terms:
+            lex_tokens.extend(self._tokenize(str(t), include_dotted=include_dotted))
+
+        # unique (preserve order)
+        def _uniq(seq: List[str]) -> List[str]:
+            seen = set()
+            out = []
+            for s in seq:
+                if s in seen:
+                    continue
+                seen.add(s)
+                out.append(s)
+            return out
+
+        ctx_u = _uniq(ctx_tokens)
+        lex_u = _uniq(lex_tokens)
+        all_u = _uniq(ctx_u + lex_u)
+
+        # cap
+        if max_tokens > 0:
+            ctx_u = ctx_u[:max_tokens]
+            lex_u = lex_u[:max_tokens]
+            all_u = all_u[:max_tokens]
+
+        token_obj = {
+            "ts": time.time(),
+            "token_key": token_key,
+            "context_tokens": ctx_u,
+            "lexicon_tokens": lex_u,
+            "all_tokens": all_u,
+            "counts": {
+                "context": len(ctx_u),
+                "lexicon": len(lex_u),
+                "all": len(all_u),
+            },
+            "sources": {
+                "inline_context_blocks": len(inline_ctx_parts),
+                "inline_lexicon_terms": len(inline_lex_terms),
+                "memory_context_parts": len(mem_ctx_parts),
+                "memory_lexicon_terms": len(mem_lex_terms),
+            },
+            "memory_keys": {
+                "context_keys": context_keys,
+                "lexicon_keys": lexicon_keys,
+            },
         }
 
-        self._dbg(f"[PromptChat] execute done meta={meta}")
-        return out_text, meta
+        store[token_key] = token_obj
+        Memory.save(store)
+
+        # pass payload through unchanged
+        return text, {
+            "token_key": token_key,
+            "ctx_tokens": len(ctx_u),
+            "lex_tokens": len(lex_u),
+            "all_tokens": len(all_u),
+            "context_keys": context_keys,
+            "lexicon_keys": lexicon_keys,
+        }
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            "query": "REQUIRED. Filtering decisions are based ONLY on query similarity.",
-            "max_chunks": 18,
-            "keep_links": True,
-            "save_outputs": True,
+            "token_key": "tokens",
+            "context_keys": [],    # list[str] Memory keys with extra context str
+            "lexicon_keys": [],    # list[str] Memory keys with extra lexicon list[str]
+            "include_dotted": True,
+            "max_tokens": 8000,
         }
 
 
-BLOCKS.register("promptminer", PromptMinerBlock)
+BLOCKS.register("tokenizer", TokenizerBlock)
+
+# ======================= IDFBlock ====================
+@dataclass
+class IDFBlock(BaseBlock):
+    """
+    Reads Memory[token_key] and updates Memory[idf_key] with DF/IDF statistics.
+
+    Expected token object (from TokenizerBlock):
+      {
+        "context_tokens": [...],
+        "lexicon_tokens": [...],
+        "all_tokens": [...],
+        ...
+      }
+
+    Writes:
+      Memory[idf_key] = {
+        "ts": <last_update_ts>,
+        "token_key": <last_token_key>,
+        "context": {"N": int, "df": {token: df_count}},
+        "lexicon": {"N": int, "df": {...}},
+        "all":     {"N": int, "df": {...}},
+      }
+    """
+
+    def _empty_stats(self) -> Dict[str, Any]:
+        return {"N": 0, "df": {}}
+
+    def _ensure_stats(self, root: Dict[str, Any], name: str) -> Dict[str, Any]:
+        obj = root.get(name)
+        if not isinstance(obj, dict):
+            obj = self._empty_stats()
+            root[name] = obj
+        if "N" not in obj or not isinstance(obj.get("N"), int):
+            try:
+                obj["N"] = int(obj.get("N", 0) or 0)
+            except Exception:
+                obj["N"] = 0
+        if "df" not in obj or not isinstance(obj.get("df"), dict):
+            obj["df"] = {}
+        return obj
+
+    def _update_df(self, stats: Dict[str, Any], tokens: Set[str], *, max_df_size: int = 12000) -> int:
+        """
+        Treat this run as ONE document: increment N by 1 and bump DF for tokens present.
+        Returns number of unique tokens added to df (not counts).
+        """
+        if not tokens:
+            return 0
+
+        df: Dict[str, int] = stats["df"]
+        stats["N"] = int(stats.get("N", 0) or 0) + 1
+
+        before_keys = len(df)
+        for t in tokens:
+            df[t] = int(df.get(t, 0) or 0) + 1
+
+        # clamp df map size (keep most frequent)
+        if max_df_size and len(df) > max_df_size:
+            items = sorted(df.items(), key=lambda kv: kv[1], reverse=True)[:max_df_size]
+            stats["df"] = dict(items)
+
+        return max(0, len(stats["df"]) - before_keys)
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        import time
+
+        token_key = str(params.get("token_key", "tokens")).strip() or "tokens"
+        idf_key = str(params.get("idf_key", "idf_stats")).strip() or "idf_stats"
+
+        op = str(params.get("op", "update")).lower().strip()   # update | reset | get
+        scope = str(params.get("scope", "all")).lower().strip()
+        # scope: "all" (default) | "context" | "lexicon" | "both" | "triple"
+        # - "all"    -> update only "all"
+        # - "context"-> update only "context"
+        # - "lexicon"-> update only "lexicon"
+        # - "both"   -> update "context" + "lexicon"
+        # - "triple" -> update "context" + "lexicon" + "all"
+
+        max_df_size = int(params.get("max_df_size", 12000))
+        max_tokens_in_doc = int(params.get("max_tokens_in_doc", 5000))  # safety per-update cap
+
+        store = Memory.load()
+
+        # --- reset ---
+        if op == "reset":
+            store[idf_key] = {
+                "ts": time.time(),
+                "token_key": token_key,
+                "context": self._empty_stats(),
+                "lexicon": self._empty_stats(),
+                "all": self._empty_stats(),
+            }
+            Memory.save(store)
+            return payload, {"op": "reset", "idf_key": idf_key}
+
+        # --- get (no changes) ---
+        if op == "get":
+            obj = store.get(idf_key)
+            return payload, {
+                "op": "get",
+                "idf_key": idf_key,
+                "exists": isinstance(obj, dict),
+                "N_all": (obj.get("all", {}) or {}).get("N") if isinstance(obj, dict) else None,
+            }
+
+        # --- update ---
+        token_obj = store.get(token_key)
+        if not isinstance(token_obj, dict):
+            return payload, {
+                "op": "update",
+                "error": f"Memory[{token_key}] missing or not a dict. Run tokenizer first.",
+                "token_key": token_key,
+                "idf_key": idf_key,
+            }
+
+        ctx_list = token_obj.get("context_tokens", []) or []
+        lex_list = token_obj.get("lexicon_tokens", []) or []
+        all_list = token_obj.get("all_tokens", []) or []
+
+        # safety cap: keep update bounded
+        if max_tokens_in_doc > 0:
+            ctx_list = list(ctx_list)[:max_tokens_in_doc]
+            lex_list = list(lex_list)[:max_tokens_in_doc]
+            all_list = list(all_list)[:max_tokens_in_doc]
+
+        ctx_set = {str(x).strip() for x in ctx_list if str(x).strip()}
+        lex_set = {str(x).strip() for x in lex_list if str(x).strip()}
+        all_set = {str(x).strip() for x in all_list if str(x).strip()}
+
+        # load/create idf root
+        idf_obj = store.get(idf_key)
+        if not isinstance(idf_obj, dict):
+            idf_obj = {}
+            store[idf_key] = idf_obj
+
+        # ensure sub-stats exist
+        st_ctx = self._ensure_stats(idf_obj, "context")
+        st_lex = self._ensure_stats(idf_obj, "lexicon")
+        st_all = self._ensure_stats(idf_obj, "all")
+
+        updated = {"context": False, "lexicon": False, "all": False}
+        df_added = {"context": 0, "lexicon": 0, "all": 0}
+        N_before = {
+            "context": int(st_ctx.get("N", 0) or 0),
+            "lexicon": int(st_lex.get("N", 0) or 0),
+            "all": int(st_all.get("N", 0) or 0),
+        }
+
+        def do_ctx():
+            df_added["context"] = self._update_df(st_ctx, ctx_set, max_df_size=max_df_size)
+            updated["context"] = True
+
+        def do_lex():
+            df_added["lexicon"] = self._update_df(st_lex, lex_set, max_df_size=max_df_size)
+            updated["lexicon"] = True
+
+        def do_all():
+            df_added["all"] = self._update_df(st_all, all_set, max_df_size=max_df_size)
+            updated["all"] = True
+
+        if scope == "context":
+            do_ctx()
+        elif scope == "lexicon":
+            do_lex()
+        elif scope == "both":
+            do_ctx()
+            do_lex()
+        elif scope == "triple":
+            do_ctx()
+            do_lex()
+            do_all()
+        else:
+            # default "all"
+            do_all()
+
+        idf_obj["ts"] = time.time()
+        idf_obj["token_key"] = token_key
+
+        store[idf_key] = idf_obj
+        Memory.save(store)
+
+        N_after = {
+            "context": int(st_ctx.get("N", 0) or 0),
+            "lexicon": int(st_lex.get("N", 0) or 0),
+            "all": int(st_all.get("N", 0) or 0),
+        }
+
+        return payload, {
+            "op": "update",
+            "token_key": token_key,
+            "idf_key": idf_key,
+            "scope": scope,
+            "updated": updated,
+            "docs_added": {
+                "context": max(0, N_after["context"] - N_before["context"]),
+                "lexicon": max(0, N_after["lexicon"] - N_before["lexicon"]),
+                "all": max(0, N_after["all"] - N_before["all"]),
+            },
+            "df_sizes": {
+                "context": len(st_ctx.get("df", {}) or {}),
+                "lexicon": len(st_lex.get("df", {}) or {}),
+                "all": len(st_all.get("df", {}) or {}),
+            },
+            "df_new_keys_added": df_added,
+        }
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "token_key": "tokens",
+            "idf_key": "idf_stats",
+            "op": "update",          # update | reset | get
+            "scope": "all",          # all | context | lexicon | both | triple
+            "max_df_size": 12000,    # clamp df dict size
+            "max_tokens_in_doc": 5000,
+        }
+
+
+BLOCKS.register("idf", IDFBlock)
+
+# ======================= IDFRefine ====================
+@dataclass
+class IDFRefineBlock(BaseBlock):
+    """
+    Uses Memory[token_key] + Memory[idf_key] to build a "refined" lexicon and context snippet,
+    designed to run right before PromptBlock and/or ChatBlock/CodeBlock.
+
+    Writes:
+      Memory[lexicon_out_key] = list[str]   (top IDF-weighted tokens)
+      Memory[context_out_key] = str         (top scored lines/sentences from payload context)
+
+    Optionally injects into payload:
+      [lexicon]\n...
+      [context]\n...
+
+    Typical pipeline:
+      ... -> tokenizer -> idf -> idfrefine -> prompt -> chat
+      ... -> tokenizer -> idf -> idfrefine -> prompt -> code
+    """
+
+    # tokenization similar to TokenizerBlock (safe for prose + code-ish)
+    _TOK_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+    _DOTTED_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+")
+    _TAG_HDR_RE = re.compile(r"^\[[A-Za-z0-9_\-]+\]\s*$")
+
+    # filters to avoid junk in refined lexicon
+    _URLISH = re.compile(r"^(https?://|www\.)", re.I)
+    _DOMAINISH = re.compile(r"^[a-z0-9\-]+\.(com|net|org|io|co|gg|tv|ai|dev|app|edu|gov)(/|$)", re.I)
+    _HEXISH = re.compile(r"^[0-9a-f]{20,}$", re.I)
+
+    # you already have _STOPWORDS global; this block uses it + a small local stop
+    _STOP_LOCAL = {
+        "http", "https", "www", "com", "net", "org", "html", "json", "xml",
+        "true", "false", "none", "null",
+    }
+
+    def _parse_all_sections(self, text: str, tag: str) -> List[str]:
+        """
+        Extract all occurrences of:
+          [tag]\n ... (until next [xxx]\n or end)
+        """
+        if not text:
+            return []
+        needle = f"[{tag}]\n"
+        if needle not in text:
+            return []
+        parts = text.split(needle)
+        out: List[str] = []
+        for seg in parts[1:]:
+            m = re.search(r"\n\[[A-Za-z0-9_\-]+\]\n", seg)
+            body = seg[:m.start()] if m else seg
+            body = body.strip()
+            if body:
+                out.append(body)
+        return out
+
+    def _tokenize_line(self, text: str, *, include_dotted: bool = True) -> List[str]:
+        if not text:
+            return []
+        s = text.lower()
+
+        toks: List[str] = []
+        if include_dotted:
+            toks.extend([m.group(0) for m in self._DOTTED_RE.finditer(s)])
+        toks.extend(self._TOK_RE.findall(s))
+
+        out: List[str] = []
+        for w in toks:
+            w = (w or "").strip().lower().strip("_")
+            if not w:
+                continue
+            if w.isdigit():
+                continue
+            if w in _STOPWORDS or w in self._STOP_LOCAL:
+                continue
+            # split dotted into parts too
+            if "." in w:
+                parts = [p for p in w.split(".") if p and p not in _STOPWORDS and p not in self._STOP_LOCAL]
+                out.extend(parts)
+            out.append(w)
+        return out
+
+    def _uniq(self, seq: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for s in seq:
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    def _idf(self, N: int, df: int) -> float:
+        # classic smooth IDF: log((N+1)/(df+1)) + 1
+        # (stable even when N is small)
+        try:
+            return math.log((N + 1.0) / (df + 1.0)) + 1.0
+        except Exception:
+            return 0.0
+
+    def _clean_term(self, t: str, *, min_len: int, max_len: int) -> Optional[str]:
+        tt = (t or "").strip()
+        if not tt:
+            return None
+        tl = tt.lower()
+        if len(tl) < min_len or (max_len > 0 and len(tl) > max_len):
+            return None
+        if tl in _STOPWORDS or tl in self._STOP_LOCAL:
+            return None
+        if self._URLISH.match(tl) or self._DOMAINISH.match(tl):
+            return None
+        if self._HEXISH.match(tl.replace("-", "").replace("_", "")):
+            return None
+        return tt
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        text = "" if payload is None else str(payload)
+
+        token_key = str(params.get("token_key", "tokens")).strip() or "tokens"
+        idf_key = str(params.get("idf_key", "idf_stats")).strip() or "idf_stats"
+
+        scope = str(params.get("scope", "all")).lower().strip()  # context|lexicon|all (choose which df map)
+        if scope not in ("context", "lexicon", "all"):
+            scope = "all"
+
+        lexicon_out_key = str(params.get("lexicon_out_key", "idfrefine_lexicon")).strip() or "idfrefine_lexicon"
+        context_out_key = str(params.get("context_out_key", "idfrefine_context")).strip() or "idfrefine_context"
+
+        include_dotted = bool(params.get("include_dotted", True))
+
+        # selection knobs
+        top_terms = int(params.get("top_terms", 40))
+        top_lines = int(params.get("top_lines", 18))
+        min_term_len = int(params.get("min_term_len", 3))
+        max_term_len = int(params.get("max_term_len", 48))
+        min_idf = float(params.get("min_idf", 0.0))  # optional threshold
+
+        # context scoring knobs
+        line_mode = str(params.get("line_mode", "auto")).lower().strip()  # auto|lines|sentences
+        sent_split = bool(params.get("sent_split", True))
+        max_context_chars = int(params.get("max_context_chars", 3500))
+
+        # injection
+        inject = bool(params.get("inject", True))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        inject_format = str(params.get("inject_format", "tags")).lower().strip()  # tags|md|both
+        if inject_format not in ("tags", "md", "both"):
+            inject_format = "tags"
+
+        store = Memory.load()
+        token_obj = store.get(token_key)
+        idf_obj = store.get(idf_key)
+
+        if not isinstance(token_obj, dict):
+            return text, {
+                "error": f"Memory[{token_key}] missing/not a dict. Run tokenizer first.",
+                "token_key": token_key,
+                "idf_key": idf_key,
+            }
+
+        # pull token lists from tokenizer output
+        ctx_tokens = token_obj.get("context_tokens", []) or []
+        lex_tokens = token_obj.get("lexicon_tokens", []) or []
+        all_tokens = token_obj.get("all_tokens", []) or []
+
+        # choose which token list to rank (usually "all" is best)
+        rank_tokens = all_tokens
+        if scope == "context":
+            rank_tokens = ctx_tokens
+        elif scope == "lexicon":
+            rank_tokens = lex_tokens
+
+        # get df map + N for the chosen scope
+        df_map: Dict[str, int] = {}
+        N = 0
+        if isinstance(idf_obj, dict):
+            st = idf_obj.get(scope)
+            if isinstance(st, dict):
+                N = int(st.get("N", 0) or 0)
+                df_map = st.get("df", {}) if isinstance(st.get("df"), dict) else {}
+
+        # compute idf for tokens present in this run
+        scored_terms: List[Tuple[float, str]] = []
+        for t in self._uniq([str(x).strip() for x in rank_tokens if str(x).strip()]):
+            cleaned = self._clean_term(t, min_len=min_term_len, max_len=max_term_len)
+            if not cleaned:
+                continue
+            tl = cleaned.lower()
+            df = int(df_map.get(tl, df_map.get(cleaned, 0)) or 0)
+            sc = self._idf(N, df) if N > 0 else 1.0  # fallback if no history
+            if sc < min_idf:
+                continue
+            scored_terms.append((sc, tl))
+
+        scored_terms.sort(key=lambda x: x[0], reverse=True)
+
+        refined_terms = [t for _, t in scored_terms[: max(0, top_terms)]]
+        refined_terms = self._uniq(refined_terms)
+
+        # ---- build refined context from payload [context] blocks ----
+        ctx_blocks = self._parse_all_sections(text, "context")
+        inline_ctx = "\n\n".join(ctx_blocks).strip() if ctx_blocks else ""
+
+        refined_ctx = ""
+        ctx_meta = {
+            "inline_context_blocks": len(ctx_blocks),
+            "scored_units": 0,
+            "used_units": 0,
+        }
+
+        if inline_ctx and top_lines != 0:
+            # turn context into "units"
+            units: List[str] = []
+            if line_mode == "sentences" or (line_mode == "auto" and sent_split):
+                # sentence-ish split (keeps newlines as boundaries too)
+                parts = re.split(r"(?<=[.!?])\s+|\n{2,}|\n+", inline_ctx.strip())
+                units = [p.strip() for p in parts if p.strip()]
+            else:
+                units = [ln.strip() for ln in inline_ctx.splitlines() if ln.strip()]
+
+            # score each unit by sum(IDF(term)) for terms present
+            # (use only refined_terms as the signal vocabulary)
+            ref_set = set(refined_terms)
+
+            scored_units: List[Tuple[float, int, str]] = []
+            for i, u in enumerate(units):
+                if self._TAG_HDR_RE.match(u):
+                    # don't treat tag-like headers as content units
+                    continue
+                toks = set(self._tokenize_line(u, include_dotted=include_dotted))
+                hit = toks & ref_set
+                if not hit:
+                    continue
+                score = 0.0
+                for ht in hit:
+                    df = int(df_map.get(ht, 0) or 0)
+                    score += self._idf(N, df) if N > 0 else 1.0
+                # slight bonus for multiple hits
+                score += 0.15 * min(12, len(hit))
+                scored_units.append((score, i, u))
+
+            ctx_meta["scored_units"] = len(scored_units)
+
+            scored_units.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+
+            picked: List[str] = []
+            seen = set()
+            k = abs(int(top_lines)) if top_lines != 0 else 0
+            for score, i, u in scored_units:
+                ul = u.lower()
+                if ul in seen:
+                    continue
+                seen.add(ul)
+                picked.append(u)
+                if k > 0 and len(picked) >= k:
+                    break
+
+            ctx_meta["used_units"] = len(picked)
+            refined_ctx = "\n".join(picked).strip()
+
+        # clamp refined context
+        if max_context_chars > 0 and refined_ctx and len(refined_ctx) > max_context_chars:
+            refined_ctx = refined_ctx[:max_context_chars].rstrip() + "\n\n… [clamped]"
+
+        # ---- write outputs to memory ----
+        store = Memory.load()
+        store[lexicon_out_key] = refined_terms
+        store[context_out_key] = refined_ctx
+        Memory.save(store)
+
+        # ---- optionally inject into payload (for direct use before chat/code) ----
+        injected_parts: List[str] = []
+        if inject_lexicon and refined_terms:
+            injected_parts.append("[lexicon]\n" + ", ".join(refined_terms))
+        if inject_context and refined_ctx:
+            injected_parts.append("[context]\n" + refined_ctx)
+
+        # markdown injection variant
+        injected_md_parts: List[str] = []
+        if inject_lexicon and refined_terms:
+            injected_md_parts.append("### Key Terms\n" + ", ".join(refined_terms))
+        if inject_context and refined_ctx:
+            injected_md_parts.append("### Context\n" + refined_ctx)
+
+        out = text
+        if inject:
+            if inject_format == "tags":
+                if injected_parts:
+                    out = (out.rstrip() + "\n\n" + "\n\n".join(injected_parts)).strip()
+            elif inject_format == "md":
+                if injected_md_parts:
+                    out = (out.rstrip() + "\n\n" + "\n\n".join(injected_md_parts)).strip()
+            else:  # both
+                both = []
+                if injected_md_parts:
+                    both.append("\n\n".join(injected_md_parts))
+                if injected_parts:
+                    both.append("\n\n".join(injected_parts))
+                if both:
+                    out = (out.rstrip() + "\n\n" + "\n\n".join(both)).strip()
+
+        meta = {
+            "token_key": token_key,
+            "idf_key": idf_key,
+            "scope": scope,
+            "N": N,
+            "df_size": len(df_map),
+            "lexicon_out_key": lexicon_out_key,
+            "context_out_key": context_out_key,
+            "refined_terms": len(refined_terms),
+            "context": ctx_meta,
+            "inject": inject,
+            "inject_format": inject_format,
+            "injected_lexicon": bool(inject_lexicon and refined_terms),
+            "injected_context": bool(inject_context and refined_ctx),
+        }
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "token_key": "tokens",
+            "idf_key": "idf_stats",
+            "scope": "all",  # context | lexicon | all
+
+            "lexicon_out_key": "idfrefine_lexicon",
+            "context_out_key": "idfrefine_context",
+
+            "include_dotted": True,
+
+            "top_terms": 40,
+            "top_lines": 18,
+            "min_term_len": 3,
+            "max_term_len": 48,
+            "min_idf": 0.0,
+
+            "line_mode": "auto",   # auto | lines | sentences
+            "sent_split": True,
+            "max_context_chars": 3500,
+
+            "inject": True,
+            "inject_lexicon": True,
+            "inject_context": True,
+            "inject_format": "tags",  # tags | md | both
+        }
+
+
+BLOCKS.register("idfrefine", IDFRefineBlock)
