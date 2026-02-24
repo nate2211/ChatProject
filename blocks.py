@@ -12,6 +12,7 @@ import functools
 import gzip
 import hashlib
 import html
+import inspect
 import json
 import math
 import operator
@@ -53,7 +54,7 @@ from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusSt
     LocalCodeCorpusStore
 from loggers import DEBUG_LOGGER
 import ast
-
+from blocknet_client import BlockNetClient
 def get_env_path():
     # If running as a PyInstaller bundle
     if hasattr(sys, '_MEIPASS'):
@@ -27028,3 +27029,670 @@ class IDFRefineBlock(BaseBlock):
 
 
 BLOCKS.register("idfrefine", IDFRefineBlock)
+
+@dataclass
+class BlockNetPutBlock(BaseBlock):
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38887"))
+        token = str(params.get("token", ""))
+        key = str(params.get("key", ""))
+        mime = str(params.get("mime", "application/octet-stream"))
+
+        data = payload if isinstance(payload, (bytes, bytearray)) else str(payload).encode("utf-8", errors="replace")
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.put(bytes(data), key=key, mime=mime)
+
+        # output the ref (best for pipelines)
+        ref = j.get("ref", "")
+        return ref, {"ok": bool(j.get("ok", False)), "response": j}
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38887",
+            "token": "",
+            "key": "",
+            "mime": "application/octet-stream",
+        }
+BLOCKS.register("blocknet_put", BlockNetPutBlock)
+
+@dataclass
+class BlockNetGetBlock(BaseBlock):
+    """
+    Params:
+      relay, token
+      mode: "auto" | "ref" | "key"
+      as: "auto" | "text" | "bytes"
+    Payload: ref string OR key string (depending on mode)
+    """
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38887"))
+        token = str(params.get("token", ""))
+        mode = str(params.get("mode", "auto")).lower()
+        as_mode = str(params.get("as", "auto")).lower()
+
+        enc = str(params.get("text_encoding", "utf-8"))
+        derr = str(params.get("text_errors", "replace"))
+        prefixes = str(params.get("auto_text_prefixes", "text/,application/json"))
+        auto_prefixes = [p.strip().lower() for p in prefixes.split(",") if p.strip()]
+
+        s = str(params.get("key", "") or payload).strip()
+        if not s:
+            return "", {"ok": False, "error": "empty payload"}
+
+        cli = BlockNetClient(relay=relay, token=token)
+
+        if mode == "ref" or (mode == "auto" and s.startswith("obj_")):
+            status, hdrs, data = cli.get_ref(s)
+            used = {"mode": "ref", "ref": s}
+        else:
+            status, hdrs, data = cli.get_key(s)
+            used = {"mode": "key", "key": s}
+
+        ok = (status == 200)
+
+        if as_mode == "bytes":
+            out: Any = data
+        elif as_mode == "text":
+            out = data.decode(enc, errors=derr)
+        else:
+            ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+            is_text = any(ctype.startswith(p) for p in auto_prefixes) or ("json" in ctype)
+            out = data.decode(enc, errors=derr) if is_text else data
+
+        meta = {"ok": ok, "status": status, "headers": hdrs, **used}
+        if not ok:
+            try:
+                meta["error_body"] = data.decode(enc, errors=derr)
+            except Exception:
+                pass
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38887",
+            "key":"",
+            "token": "",
+            "mode": "auto",  # "auto" | "ref" | "key"
+            "as": "auto",  # "auto" | "text" | "bytes"
+        }
+
+BLOCKS.register("blocknet_get", BlockNetGetBlock)
+
+@dataclass
+class BlockNetStatsBlock(BaseBlock):
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38887"))
+        token = str(params.get("token", ""))
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.stats()
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38887",
+            "token": "",
+        }
+
+BLOCKS.register("blocknet_stats", BlockNetStatsBlock)
+
+
+@dataclass
+class BlockNetHeartbeatBlock(BaseBlock):
+    """
+    Params:
+      relay, token, id
+    Payload:
+      optional json string/dict for stats
+    """
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38887"))
+        token = str(params.get("token", ""))
+        cid = str(params.get("id", "client1"))
+
+        stats: Dict[str, Any] = {}
+        if isinstance(payload, dict):
+            stats = payload
+        elif payload:
+            try:
+                stats = json.loads(str(payload))
+            except Exception:
+                stats = {"payload": str(payload)}
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.heartbeat(cid, stats)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38887",
+            "token": "",
+            "id": "client1",
+        }
+
+BLOCKS.register("blocknet_heartbeat", BlockNetHeartbeatBlock)
+
+@dataclass
+class BlockNetVectorFeaturesBlock(BaseBlock):
+    """
+    Fetch from BlockNet (like BlockNetGetBlock), parse JSON {meta,features},
+    then *enhance the query payload* using the vector-derived token weights.
+
+    Key idea: instead of only appending tokens, this can:
+      - inject a [lexicon] section for your downstream Tokenizer/Chat blocks
+      - prepend a short "focus/context" hint built from top+matched tokens (+weights)
+      - optionally "focus" the payload by keeping only the most relevant lines
+
+    Fetch params (mirrors BlockNetGetBlock):
+      relay, token
+      mode: "auto" | "ref" | "key"
+      as:   "auto" | "text" | "bytes"
+      key:  override; if empty uses payload as fetch target
+      text_encoding, text_errors
+      auto_text_prefixes
+
+    Request headers (optional):
+      accept_mime, headers
+
+    Analysis / enhancement params:
+      query: override the text to enhance (default: payload)
+      out: "append" | "prepend" | "dict" | "tokens"
+      enhance: "lexicon" | "instruction" | "expand_query" | "both"
+      lexicon_format: "inline" | "block"
+      include_weights: bool, weight_precision: int
+      max_tokens, lowercase
+      drop_numbers, drop_hexbytes, drop_stopwords
+      match_k, top_k, expand_k
+      min_abs_weight: float (filter weak terms)
+      focus_lines: int (0 = off) keep only top N relevant lines of the query
+      compute_cosine: bool (hashed-style only)
+      seed, dim, signed, tf_log, normalize (fallbacks if stored meta missing)
+    """
+
+    _WORD_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+    _HEXBYTE_RE = re.compile(r"^x[0-9a-f]{2}$", re.IGNORECASE)
+    _STOP = {
+        "the","a","an","and","or","but","if","then","else","to","of","in","on","for","with","as","by",
+        "is","are","was","were","be","been","being","it","this","that","these","those","i","you","we",
+        "they","he","she","them","his","her","their","our","at","from","into","over","under","than",
+    }
+
+    # ---- hashing + tokenization -------------------------------------------------
+    def _stable_hash64(self, s: str, *, seed: str) -> int:
+        h = hashlib.blake2b((seed + "|" + s).encode("utf-8", errors="replace"), digest_size=8).digest()
+        return int.from_bytes(h, "little", signed=False)
+
+    def _tokenize(self, s: str, *, lowercase: bool = True, max_tokens: int = 0) -> List[str]:
+        s = (s or "").strip()
+        if lowercase:
+            s = s.lower()
+        toks = self._WORD_RE.findall(s)
+        if max_tokens and max_tokens > 0:
+            toks = toks[: int(max_tokens)]
+        return toks
+
+    def _decode_maybe_bytes_repr(self, text: str, *, enc: str, errors: str) -> str:
+        t = (text or "").strip()
+        if (t.startswith("b'") and t.endswith("'")) or (t.startswith('b"') and t.endswith('"')):
+            try:
+                b = ast.literal_eval(t)
+                if isinstance(b, (bytes, bytearray)):
+                    return bytes(b).decode(enc, errors=errors)
+            except Exception:
+                pass
+        return t
+
+    def _topk(self, items: List[Tuple[str, float]], k: int) -> List[Tuple[str, float]]:
+        if k <= 0:
+            return items
+        items.sort(key=lambda x: abs(x[1]), reverse=True)
+        return items[:k]
+
+    def _safe_float(self, x: Any, default: float = 0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _format_weight(self, v: float, prec: int) -> str:
+        try:
+            return f"{float(v):.{int(prec)}f}"
+        except Exception:
+            return str(v)
+
+    def _format_lexicon(
+        self,
+        items: List[Tuple[str, float]],
+        *,
+        fmt: str,
+        include_weights: bool,
+        weight_prec: int,
+        tag: str = "lexicon",
+    ) -> str:
+        if include_weights:
+            toks = [f"{t}:{self._format_weight(v, weight_prec)}" for t, v in items]
+        else:
+            toks = [t for t, _ in items]
+
+        if fmt == "block":
+            # nice for long lexicons
+            body = "\n".join(toks)
+            return f"[{tag}]\n{body}\n[/{tag}]"
+        # inline (best for compact prompts)
+        return f"[{tag}] " + ", ".join(toks)
+
+    def _focus_text(self, text: str, tokens: List[str], *, keep_lines: int) -> str:
+        """
+        Keep only the most relevant lines (by token hits). Preserves original order.
+        """
+        if keep_lines <= 0:
+            return text
+
+        lines = (text or "").splitlines()
+        if not lines:
+            return text
+
+        tokset = set(tokens)
+        scored: List[Tuple[int, int]] = []  # (score, idx)
+        for i, ln in enumerate(lines):
+            ltoks = set(self._WORD_RE.findall(ln.lower()))
+            score = sum(1 for t in ltoks if t in tokset)
+            if score > 0:
+                scored.append((score, i))
+
+        if not scored:
+            return text
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        chosen_idx = sorted([i for _, i in scored[:keep_lines]])
+        return "\n".join(lines[i] for i in chosen_idx)
+
+    # ---- best-effort "headers" support for BlockNetClient -----------------------
+    def _bn_get(self, cli, *, mode: str, target: str, headers: Dict[str, str]):
+        fn = cli.get_ref if mode == "ref" else cli.get_key
+        try:
+            sig = inspect.signature(fn)
+            if "headers" in sig.parameters:
+                return fn(target, headers=headers)
+            if "hdrs" in sig.parameters:
+                return fn(target, hdrs=headers)
+            if "extra_headers" in sig.parameters:
+                return fn(target, extra_headers=headers)
+        except Exception:
+            pass
+        return fn(target)
+
+    # ---- main -------------------------------------------------------------------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38887"))
+        token = str(params.get("token", ""))
+
+        mode = str(params.get("mode", params.get("get_mode", "auto"))).lower()  # auto|ref|key
+        as_mode = str(params.get("as", "auto")).lower()  # auto|text|bytes
+
+        enc = str(params.get("text_encoding", params.get("encoding", "utf-8")))
+        derr = str(params.get("text_errors", params.get("errors", "replace")))
+
+        prefixes = str(params.get("auto_text_prefixes", "text/,application/json"))
+        auto_prefixes = [p.strip().lower() for p in prefixes.split(",") if p.strip()]
+
+        # fetch target: like blocknet_get
+        fetch_target = str(params.get("key", "") or payload).strip()
+        if not fetch_target:
+            return payload, {"ok": False, "error": "empty payload/key"}
+
+        # optional request headers
+        req_headers: Dict[str, str] = {}
+        raw_hdrs = params.get("headers", None)
+        if raw_hdrs is not None:
+            if isinstance(raw_hdrs, dict):
+                req_headers.update({str(k): str(v) for k, v in raw_hdrs.items()})
+            else:
+                try:
+                    d = ast.literal_eval(str(raw_hdrs))
+                    if isinstance(d, dict):
+                        req_headers.update({str(k): str(v) for k, v in d.items()})
+                except Exception:
+                    pass
+
+        accept_mime = str(params.get("accept_mime", "") or "").strip()
+        if accept_mime:
+            req_headers["Accept"] = accept_mime
+
+        cli = BlockNetClient(relay=relay, token=token)
+
+        # fetch
+        if mode == "ref" or (mode == "auto" and fetch_target.startswith("obj_")):
+            status, hdrs, data = self._bn_get(cli, mode="ref", target=fetch_target, headers=req_headers)
+            used = {"mode": "ref", "ref": fetch_target}
+        else:
+            status, hdrs, data = self._bn_get(cli, mode="key", target=fetch_target, headers=req_headers)
+            used = {"mode": "key", "key": fetch_target}
+
+        ok = (status == 200)
+        ctype = (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
+
+        # decide fetched output type (like blocknet_get)
+        if as_mode == "bytes":
+            fetched_out: Any = data
+            fetched_kind = "bytes"
+        elif as_mode == "text":
+            fetched_out = bytes(data).decode(enc, errors=derr)
+            fetched_kind = "text"
+        else:
+            is_text = any(ctype.startswith(p) for p in auto_prefixes) or ("json" in ctype)
+            if is_text:
+                fetched_out = bytes(data).decode(enc, errors=derr)
+                fetched_kind = "text"
+            else:
+                fetched_out = data
+                fetched_kind = "bytes"
+
+        meta: Dict[str, Any] = {
+            "ok": ok,
+            "status": status,
+            "headers": hdrs,
+            "content_type": ctype,
+            "request_headers": req_headers,
+            "fetched_as": fetched_kind,
+            **used,
+        }
+        if not ok:
+            try:
+                meta["error_body"] = bytes(data).decode(enc, errors=derr)
+            except Exception:
+                pass
+            return payload, meta
+
+        # ---- parse JSON for features (best-effort even if bytes) ----
+        if isinstance(fetched_out, str):
+            text = fetched_out
+        else:
+            try:
+                text = bytes(data).decode(enc, errors=derr)
+            except Exception:
+                text = bytes(data).decode("utf-8", errors="replace")
+
+        text = self._decode_maybe_bytes_repr(text, enc=enc, errors=derr)
+
+        try:
+            obj = json.loads(text)
+        except Exception as e:
+            meta["analysis_ok"] = False
+            meta["error"] = f"stored value is not JSON: {e}"
+            meta["preview"] = text[:2000]
+            if as_mode in ("bytes", "text"):
+                return fetched_out, meta
+            return payload, meta
+
+        features = obj.get("features") if isinstance(obj, dict) else None
+        stored_meta = obj.get("meta") if isinstance(obj, dict) else None
+        if not isinstance(features, dict):
+            meta["analysis_ok"] = False
+            meta["error"] = "JSON missing `features` dict"
+            meta["keys"] = list(obj.keys()) if isinstance(obj, dict) else None
+            if as_mode in ("bytes", "text"):
+                return fetched_out, meta
+            return payload, meta
+
+        # ---- enhancement knobs ----
+        out_mode = str(params.get("out", "append")).lower()  # append|prepend|dict|tokens
+        enhance = str(params.get("enhance", "both")).lower()  # lexicon|instruction|expand_query|both
+        lex_fmt = str(params.get("lexicon_format", "inline")).lower()  # inline|block
+        include_weights = bool(params.get("include_weights", False))
+        weight_prec = int(params.get("weight_precision", 3))
+
+        lowercase = bool(params.get("lowercase", True))
+        max_tokens = int(params.get("max_tokens", 0) or 0)
+
+        drop_hexbytes = bool(params.get("drop_hexbytes", True))
+        drop_numbers = bool(params.get("drop_numbers", True))
+        drop_stopwords = bool(params.get("drop_stopwords", True))
+
+        match_k = int(params.get("match_k", 24) or 0)
+        top_k = int(params.get("top_k", 24) or 0)
+        expand_k = int(params.get("expand_k", 12) or 0)
+        min_abs_weight = float(params.get("min_abs_weight", 0.0) or 0.0)
+
+        focus_lines = int(params.get("focus_lines", 0) or 0)
+        compute_cosine = bool(params.get("compute_cosine", False))
+
+        # hashing fallbacks (overridden by stored meta if present)
+        seed = str(params.get("seed", "textv1"))
+        dim = int(params.get("dim", 384))
+        signed = bool(params.get("signed", True))
+        tf_log = bool(params.get("tf_log", True))
+        normalize = bool(params.get("normalize", True))
+
+        if isinstance(stored_meta, dict):
+            seed = str(stored_meta.get("seed", seed))
+            dim = int(stored_meta.get("dim", dim))
+            signed = bool(stored_meta.get("signed", signed))
+            tf_log = bool(stored_meta.get("tf_log", tf_log))
+            normalize = bool(stored_meta.get("normalize", normalize))
+
+        # query text (what we enhance) can be overridden
+        query_text = str(params.get("query", params.get("payload_text", payload)) or "")
+        query_text = self._decode_maybe_bytes_repr(query_text, enc=enc, errors=derr)
+
+        def _filter_tok(t: str) -> bool:
+            if drop_numbers and t.isdigit():
+                return False
+            if drop_hexbytes and self._HEXBYTE_RE.match(t or ""):
+                return False
+            if drop_stopwords and t in self._STOP:
+                return False
+            return True
+
+        q_tokens = [t for t in self._tokenize(query_text, lowercase=lowercase, max_tokens=max_tokens) if _filter_tok(t)]
+
+        # detect feature style
+        hashed_style = False
+        sample_v = next(iter(features.values()), None)
+        if isinstance(sample_v, dict) and "i" in sample_v and "v" in sample_v:
+            hashed_style = True
+
+        # matched + top global (weights)
+        matched: List[Tuple[str, float]] = []
+        for t in q_tokens:
+            fv = features.get(t)
+            if fv is None:
+                continue
+            v = self._safe_float(fv.get("v", 0.0)) if (hashed_style and isinstance(fv, dict)) else self._safe_float(fv)
+            if abs(v) >= min_abs_weight:
+                matched.append((t, v))
+
+        top_global: List[Tuple[str, float]] = []
+        for t, fv in features.items():
+            if not isinstance(t, str) or not _filter_tok(t):
+                continue
+            v = self._safe_float(fv.get("v", 0.0)) if (hashed_style and isinstance(fv, dict)) else self._safe_float(fv)
+            if abs(v) >= min_abs_weight:
+                top_global.append((t, v))
+
+        matched = self._topk(matched, match_k if match_k > 0 else 0)
+        top_global = self._topk(top_global, top_k if top_k > 0 else 0)
+
+        # build a single ranked list (dedup) using weights (better than plain lex list)
+        ranked: List[Tuple[str, float]] = []
+        seen = set()
+        for t, v in matched + top_global:
+            if t in seen:
+                continue
+            seen.add(t)
+            ranked.append((t, v))
+
+        score = float(sum(abs(v) for _, v in matched))
+
+        # optional cosine (hashed-style only)
+        cosine: Optional[float] = None
+        if compute_cosine and hashed_style:
+            v_store = np.zeros(dim, dtype=np.float32)
+            for fv in features.values():
+                if isinstance(fv, dict):
+                    i = int(fv.get("i", 0))
+                    v = self._safe_float(fv.get("v", 0.0))
+                    if 0 <= i < dim:
+                        v_store[i] += float(v)
+            if normalize:
+                n = float(np.linalg.norm(v_store))
+                if n > 1e-12:
+                    v_store /= n
+
+            counts: Dict[str, int] = {}
+            for t in q_tokens:
+                counts[t] = counts.get(t, 0) + 1
+
+            v_q = np.zeros(dim, dtype=np.float32)
+            for t, c in counts.items():
+                h = self._stable_hash64(t, seed=seed)
+                idx = int(h % dim)
+                sgn = 1.0 if (not signed or ((h >> 63) & 1) == 0) else -1.0
+                w = (1.0 + math.log(float(c))) if tf_log else float(c)
+                v_q[idx] += float(sgn * w)
+
+            if normalize:
+                n = float(np.linalg.norm(v_q))
+                if n > 1e-12:
+                    v_q /= n
+
+            denom = float(np.linalg.norm(v_store) * np.linalg.norm(v_q))
+            cosine = float(np.dot(v_store, v_q)) if denom > 1e-12 else 0.0
+
+        # ---- actually improve the payload ----
+        # 1) optional focusing (keeps only the most relevant lines)
+        improved_query = self._focus_text(query_text, [t for t, _ in ranked], keep_lines=focus_lines)
+
+        # 2) build enhancement snippets
+        lex_snip = self._format_lexicon(
+            ranked,
+            fmt=lex_fmt,
+            include_weights=include_weights,
+            weight_prec=weight_prec,
+            tag="lexicon",
+        )
+
+        # "instruction" hint is small + direct (good for chat blocks)
+        instr_items = ranked[: max(0, match_k + top_k) if (match_k or top_k) else len(ranked)]
+        if include_weights:
+            instr_terms = ", ".join(f"{t}:{self._format_weight(v, weight_prec)}" for t, v in instr_items)
+        else:
+            instr_terms = ", ".join(t for t, _ in instr_items)
+
+        instr_snip = (
+            "[context] Use these high-signal terms and topics when answering; prioritize matched terms first.\n"
+            f"score={score:.3f}"
+            + (f", cosine={float(cosine):.3f}" if cosine is not None else "")
+            + f"\nterms: {instr_terms}\n[/context]"
+        )
+
+        # "expand_query" adds missing top terms into a new query line
+        qset = set(q_tokens)
+        extra = [t for t, _ in ranked if t not in qset][: max(0, expand_k)]
+        expand_snip = ""
+        if extra:
+            expand_snip = "[expanded_query] " + improved_query.strip() + " ; include: " + " ".join(extra)
+
+        # choose enhancement strategy
+        chunks: List[str] = []
+        if enhance in ("instruction", "both"):
+            chunks.append(instr_snip)
+        if enhance in ("lexicon", "both"):
+            chunks.append(lex_snip)
+        if enhance in ("expand_query", "both") and expand_snip:
+            chunks.append(expand_snip)
+
+        enhancer = "\n\n".join([c for c in chunks if c.strip()])
+
+        # meta
+        meta.update({
+            "analysis_ok": True,
+            "score": score,
+            "cosine": cosine,
+            "matched_tokens": [t for t, _ in matched],
+            "top_tokens": [t for t, _ in top_global],
+            "ranked_tokens": [t for t, _ in ranked],
+            "ranked_weights": {t: float(v) for t, v in ranked},
+            "dim": dim,
+            "seed": seed,
+            "signed": signed,
+            "tf_log": tf_log,
+            "normalize": normalize,
+            "enhance": enhance,
+            "lexicon_format": lex_fmt,
+            "focus_lines": focus_lines,
+        })
+
+        # output modes
+        if out_mode == "dict":
+            return {
+                "query": improved_query,
+                "enhancer": enhancer,
+                "lexicon": [t for t, _ in ranked],
+                "ranked": ranked,
+                "matched": matched,
+                "top": top_global,
+                "score": score,
+                "cosine": cosine,
+                "source_meta": stored_meta,
+            }, meta
+
+        if out_mode == "tokens":
+            return [t for t, _ in ranked], meta
+
+        # append/prepend enhancer around improved query
+        if out_mode == "prepend":
+            out = (enhancer + "\n\n" + improved_query).strip()
+        else:
+            out = (improved_query + "\n\n" + enhancer).strip()
+
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38887",
+            "token": "",
+            "key": "",
+            "mode": "auto",             # auto|ref|key
+            "as": "auto",               # auto|text|bytes
+            "text_encoding": "utf-8",
+            "text_errors": "replace",
+            "auto_text_prefixes": "text/,application/json",
+
+            # request headers
+            "accept_mime": "",          # e.g. "application/json"
+            "headers": {},
+
+            # enhancement
+            "query": "",                # what to enhance (if empty uses payload)
+            "out": "append",            # append|prepend|dict|tokens
+            "enhance": "both",          # lexicon|instruction|expand_query|both
+            "lexicon_format": "inline", # inline|block
+            "include_weights": False,
+            "weight_precision": 3,
+            "expand_k": 12,
+            "min_abs_weight": 0.0,
+            "focus_lines": 0,
+
+            # tokenization filters
+            "lowercase": True,
+            "max_tokens": 0,
+            "drop_hexbytes": True,
+            "drop_numbers": True,
+            "drop_stopwords": True,
+
+            # feature selection
+            "match_k": 24,
+            "top_k": 24,
+            "compute_cosine": False,
+
+            # hashing fallbacks (overridden by stored meta)
+            "seed": "textv1",
+            "dim": 384,
+            "signed": True,
+            "tf_log": True,
+            "normalize": True,
+        }
+
+
+BLOCKS.register("blocknet_vector_features", BlockNetVectorFeaturesBlock)
