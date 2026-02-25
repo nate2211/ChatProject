@@ -9,7 +9,7 @@ block_cipher = None
 cert_path = certifi.where()
 
 datas = [
-    ('blocknet_client.py', '.')
+    ('blocknet_client.py', '.'),
     ('gui_presets.json', '.'),
     ('.env', '.'),
     ('blocks.py', '.'),
