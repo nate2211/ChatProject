@@ -7456,9 +7456,63 @@ class LinkTrackerBlock(BaseBlock):
 
         p = await async_playwright().start()
 
+        DEFAULT_CHROMIUM_ARGS = [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--metrics-recording-only",
+            "--mute-audio",
+            "--js-flags=--max_old_space_size=512"
+        ]
+
+        def _merge_args(*arg_lists: list[str]) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for lst in arg_lists:
+                for a in lst:
+                    if a and a not in seen:
+                        seen.add(a)
+                        out.append(a)
+            return out
+        DEFAULT_CHROMIUM_ARGS = [
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            "--disable-default-apps",
+            "--disable-component-update",
+            "--disable-sync",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--metrics-recording-only",
+            "--mute-audio",
+            "--js-flags=--max_old_space_size=512"
+        ]
+
+        def _merge_args(*arg_lists: list[str]) -> list[str]:
+            seen = set()
+            out: list[str] = []
+            for lst in arg_lists:
+                for a in lst:
+                    if a and a not in seen:
+                        seen.add(a)
+                        out.append(a)
+            return out
         launch_opts = {
             "headless": pw_headless,
-            "args": list(pw_launch_args or []),
+            "args": _merge_args(DEFAULT_CHROMIUM_ARGS, list(pw_launch_args or [])),
         }
         if pw_channel:
             launch_opts["channel"] = pw_channel
@@ -10977,6 +11031,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "--disable-renderer-backgrounding",
             "--metrics-recording-only",
             "--mute-audio",
+            "--js-flags=--max_old_space_size=512"
         ]
 
         def _merge_args(*arg_lists: list[str]) -> list[str]:
