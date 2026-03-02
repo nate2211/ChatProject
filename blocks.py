@@ -27777,3 +27777,613 @@ class BlockNetVectorFeaturesBlock(BaseBlock):
 
 
 BLOCKS.register("blocknet_vector_features", BlockNetVectorFeaturesBlock)
+
+# ---------------- NEW: API blocks (core/media/randomx/web/p2pool) ----------------
+# ---------------- helpers ----------------
+
+def _api_prefix(params: Dict[str, Any]) -> str:
+    pfx = str(params.get("api_prefix", "/v1") or "/v1").strip()
+    if not pfx.startswith("/"):
+        pfx = "/" + pfx
+    return pfx.rstrip("/")
+
+
+def _b64_bytes(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _put_if_missing(body: Dict[str, Any], params: Dict[str, Any], key: str, cast=None) -> None:
+    if key in params and key not in body:
+        v = params.get(key)
+        if cast is not None and v is not None:
+            try:
+                v = cast(v)
+            except Exception:
+                pass
+        body[key] = v
+
+
+def _put_many_if_missing(body: Dict[str, Any], params: Dict[str, Any], keys: Tuple[str, ...]) -> None:
+    for k in keys:
+        _put_if_missing(body, params, k)
+@dataclass
+class BlockNetPingBlock(BaseBlock):
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token (leave empty if auth is off)"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix, e.g. /v1"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_ping(prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_ping", BlockNetPingBlock)
+
+
+@dataclass
+class BlockNetTextToVecBlock(BaseBlock):
+    """
+    Payload: text (string)
+    Params: relay, token, api_prefix, dim, normalize, output
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token (leave empty if auth is off)"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
+            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
+            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding: b64f32/list/etc"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "dim": 1024,
+            "normalize": True,
+            "output": "b64f32",
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        text = "" if payload is None else str(payload)
+        dim = int(params.get("dim", 1024))
+        normalize = bool(params.get("normalize", True))
+        output = str(params.get("output", "b64f32"))
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_texttovec(text, dim=dim, normalize=normalize, output=output, prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
+
+
+@dataclass
+class BlockNetImageToVecBlock(BaseBlock):
+    """
+    Payload:
+      - bytes: raw image bytes
+      - str: treated as already-base64 (unless params.base64=false, then it becomes utf8 bytes)
+      - dict: sent as-is (advanced)
+    Params:
+      relay, token, api_prefix, dim, normalize, output, base64 (default True)
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
+            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
+            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding"},
+            {"key": "base64", "type": "bool", "default": True, "help": "If payload is str, treat it as base64"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "dim": 1024,
+            "normalize": True,
+            "output": "b64f32",
+            "base64": True,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        dim = int(params.get("dim", 1024))
+        normalize = bool(params.get("normalize", True))
+        output = str(params.get("output", "b64f32"))
+        treat_str_as_b64 = bool(params.get("base64", True))
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            if isinstance(payload, (bytes, bytearray)):
+                b64 = _b64_bytes(bytes(payload))
+            else:
+                s = "" if payload is None else str(payload)
+                b64 = s if treat_str_as_b64 else _b64_bytes(s.encode("utf-8", errors="replace"))
+
+            body = {"image_b64": b64, "dim": dim, "normalize": normalize, "output": output}
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_imagetovec(body, prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_imagetovec", BlockNetImageToVecBlock)
+
+
+@dataclass
+class BlockNetVideoToVecBlock(BaseBlock):
+    """
+    Same conventions as imagetovec, but uses video_b64.
+    Params additionally: max_frames (optional)
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
+            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
+            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding"},
+            {"key": "max_frames", "type": "int", "default": 256, "help": "Max frames to sample/server-side decode cap"},
+            {"key": "base64", "type": "bool", "default": True, "help": "If payload is str, treat it as base64"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "dim": 1024,
+            "normalize": True,
+            "output": "b64f32",
+            "max_frames": 256,
+            "base64": True,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        dim = int(params.get("dim", 1024))
+        normalize = bool(params.get("normalize", True))
+        output = str(params.get("output", "b64f32"))
+        max_frames = int(params.get("max_frames", 256))
+        treat_str_as_b64 = bool(params.get("base64", True))
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            if isinstance(payload, (bytes, bytearray)):
+                b64 = _b64_bytes(bytes(payload))
+            else:
+                s = "" if payload is None else str(payload)
+                b64 = s if treat_str_as_b64 else _b64_bytes(s.encode("utf-8", errors="replace"))
+
+            body = {
+                "video_b64": b64,
+                "dim": dim,
+                "normalize": normalize,
+                "output": output,
+                "max_frames": max_frames,
+            }
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_videotovec(body, prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_videotovec", BlockNetVideoToVecBlock)
+
+
+@dataclass
+class BlockNetVectorTextBlock(BaseBlock):
+    """
+    POST /vectortext
+
+    Payload:
+      - dict: full body for vectortext (recommended)
+      - str: becomes prompt; params.payload supplies payload string
+    """
+    @classmethod
+    def param_specs(cls):
+        # Big surface area on purpose (matches your “dict of all parameters” style)
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+
+            # core request
+            {"key": "payload", "type": "str", "default": "", "help": "Payload string if payload arg is just prompt"},
+            {"key": "key", "type": "str", "default": "", "help": "Optional routing key"},
+            {"key": "lexicon_key", "type": "str", "default": "", "help": "Stored lexicon key"},
+            {"key": "context_key", "type": "str", "default": "", "help": "Stored context key"},
+            {"key": "idf_key", "type": "str", "default": "", "help": "Stored IDF key"},
+            {"key": "tokens_key", "type": "str", "default": "", "help": "Stored tokens key"},
+
+            # optional inline blocks
+            {"key": "lexicon", "type": "json", "default": None, "help": "Inline lexicon (dict/list/str)"},
+            {"key": "context", "type": "json", "default": None, "help": "Inline context (dict/list/str)"},
+
+            # generation knobs
+            {"key": "max_tokens", "type": "int", "default": 256, "help": "Max tokens to generate"},
+            {"key": "topk", "type": "int", "default": 24, "help": "TopK retrieval/selection"},
+            {"key": "seed", "type": "str", "default": "", "help": "Optional seed"},
+
+            # optional “enhancement” / tokenization / weighting knobs (server may ignore if unsupported)
+            {"key": "query", "type": "str", "default": "", "help": "What to enhance (empty uses payload/prompt)"},
+            {"key": "out", "type": "str", "default": "append", "help": "append|prepend|dict|tokens"},
+            {"key": "enhance", "type": "str", "default": "both", "help": "lexicon|instruction|expand_query|both"},
+            {"key": "lexicon_format", "type": "str", "default": "inline", "help": "inline|block"},
+            {"key": "include_weights", "type": "bool", "default": False, "help": "Include token weights"},
+            {"key": "weight_precision", "type": "int", "default": 3, "help": "Weight formatting precision"},
+            {"key": "expand_k", "type": "int", "default": 12, "help": "Query expansion K"},
+            {"key": "min_abs_weight", "type": "float", "default": 0.0, "help": "Min abs weight"},
+            {"key": "focus_lines", "type": "int", "default": 0, "help": "Focus N lines (0=off)"},
+
+            {"key": "lowercase", "type": "bool", "default": True, "help": "Lowercase tokens"},
+            {"key": "drop_hexbytes", "type": "bool", "default": True, "help": "Drop hexbyte tokens"},
+            {"key": "drop_numbers", "type": "bool", "default": True, "help": "Drop numeric tokens"},
+            {"key": "drop_stopwords", "type": "bool", "default": True, "help": "Drop stopwords"},
+            {"key": "max_tokens_in", "type": "int", "default": 0, "help": "Max input tokens (0=off)"},
+
+            {"key": "match_k", "type": "int", "default": 24, "help": "Match K"},
+            {"key": "top_k", "type": "int", "default": 24, "help": "Top K features"},
+            {"key": "compute_cosine", "type": "bool", "default": False, "help": "Compute cosine similarity"},
+            {"key": "dim", "type": "int", "default": 384, "help": "Fallback dim if needed"},
+            {"key": "signed", "type": "bool", "default": True, "help": "Signed hashing fallback"},
+            {"key": "tf_log", "type": "bool", "default": True, "help": "TF-log weighting fallback"},
+            {"key": "normalize", "type": "bool", "default": True, "help": "Normalize fallback"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        # This mirrors the “big dict” idea you showed (trimmed to what this block can plausibly carry)
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+
+            "payload": "",
+            "key": "",
+            "lexicon_key": "",
+            "context_key": "",
+            "idf_key": "",
+            "tokens_key": "",
+
+            "lexicon": None,
+            "context": None,
+
+            "max_tokens": 256,
+            "topk": 24,
+            "seed": "",
+
+            "query": "",
+            "out": "append",
+            "enhance": "both",
+            "lexicon_format": "inline",
+            "include_weights": False,
+            "weight_precision": 3,
+            "expand_k": 12,
+            "min_abs_weight": 0.0,
+            "focus_lines": 0,
+
+            "lowercase": True,
+            "max_tokens_in": 0,
+            "drop_hexbytes": True,
+            "drop_numbers": True,
+            "drop_stopwords": True,
+
+            "match_k": 24,
+            "top_k": 24,
+            "compute_cosine": False,
+
+            "dim": 384,
+            "signed": True,
+            "tf_log": True,
+            "normalize": True,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            body = {
+                "prompt": "" if payload is None else str(payload),
+                "payload": str(params.get("payload", "")),
+            }
+
+        # routing keys / stored components
+        _put_many_if_missing(body, params, ("key", "lexicon_key", "context_key", "idf_key", "tokens_key"))
+
+        # inline lexicon/context
+        if "lexicon" in params and "lexicon" not in body:
+            body["lexicon"] = params.get("lexicon")
+        if "context" in params and "context" not in body:
+            body["context"] = params.get("context")
+
+        # generation controls
+        _put_if_missing(body, params, "max_tokens", cast=int)
+        _put_if_missing(body, params, "topk", cast=int)
+        _put_if_missing(body, params, "seed")
+
+        # optional enhancement knobs (server may ignore if not supported)
+        passthru_keys = (
+            "query", "out", "enhance", "lexicon_format",
+            "include_weights", "weight_precision", "expand_k",
+            "min_abs_weight", "focus_lines",
+            "lowercase", "max_tokens_in",
+            "drop_hexbytes", "drop_numbers", "drop_stopwords",
+            "match_k", "top_k", "compute_cosine",
+            "dim", "signed", "tf_log", "normalize",
+        )
+        for k in passthru_keys:
+            _put_if_missing(body, params, k)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_vectortext(body, prefix=pfx)
+
+        out = j.get("generated", j)
+        return out, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_vectortext", BlockNetVectorTextBlock)
+
+
+@dataclass
+class BlockNetWebFetchBlock(BaseBlock):
+    """
+    Payload:
+      - str: url
+      - dict: request body for /web/fetch
+    Params:
+      relay, token, api_prefix, mode, include_js, max_bytes, max_scripts
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "mode", "type": "str", "default": "auto", "help": "Server fetch mode"},
+            {"key": "include_js", "type": "bool", "default": False, "help": "Include JS assets/scripts"},
+            {"key": "max_bytes", "type": "int", "default": 2_000_000, "help": "Max bytes to download"},
+            {"key": "max_scripts", "type": "int", "default": 64, "help": "Max scripts to include/analyze"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "mode": "auto",
+            "include_js": False,
+            "max_bytes": 2_000_000,
+            "max_scripts": 64,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            body = {"url": str(payload or "")}
+
+        if not body.get("url"):
+            return "", {"ok": False, "error": "missing url"}
+
+        _put_if_missing(body, params, "mode")
+        _put_if_missing(body, params, "include_js", cast=bool)
+        _put_if_missing(body, params, "max_bytes", cast=int)
+        _put_if_missing(body, params, "max_scripts", cast=int)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_web_fetch(body, prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_web_fetch", BlockNetWebFetchBlock)
+
+
+@dataclass
+class BlockNetWebJsBlock(BaseBlock):
+    """
+    Payload:
+      - str: url
+      - dict: request body for /web/js
+    Params:
+      relay, token, api_prefix, fetch_bodies, max_scripts
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "fetch_bodies", "type": "bool", "default": False, "help": "Fetch script bodies (if server supports)"},
+            {"key": "max_scripts", "type": "int", "default": 64, "help": "Max scripts"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "fetch_bodies": False,
+            "max_scripts": 64,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            body = {"url": str(payload or "")}
+
+        if not body.get("url"):
+            return "", {"ok": False, "error": "missing url"}
+
+        _put_if_missing(body, params, "fetch_bodies", cast=bool)
+        _put_if_missing(body, params, "max_scripts", cast=int)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_web_js(body, prefix=pfx)
+        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_web_js", BlockNetWebJsBlock)
+
+
+@dataclass
+class BlockNetWebLinksBlock(BaseBlock):
+    """
+    POST /web/links
+
+    Payload:
+      - str: url
+      - dict: request body for /web/links
+    Params:
+      relay, token, api_prefix, same_origin, external_only, max_links
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "same_origin", "type": "bool", "default": False, "help": "Only same-origin links"},
+            {"key": "external_only", "type": "bool", "default": False, "help": "Only external links"},
+            {"key": "max_links", "type": "int", "default": 256, "help": "Max links"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "same_origin": False,
+            "external_only": False,
+            "max_links": 256,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            body = {"url": str(payload or "")}
+
+        if not body.get("url"):
+            return "", {"ok": False, "error": "missing url"}
+
+        _put_if_missing(body, params, "same_origin", cast=bool)
+        _put_if_missing(body, params, "external_only", cast=bool)
+        _put_if_missing(body, params, "max_links", cast=int)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_web_links(body, prefix=pfx)
+
+        out = j.get("links", j.get("urls", j))
+        return out, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_web_links", BlockNetWebLinksBlock)
+
+
+@dataclass
+class BlockNetWebRssFindBlock(BaseBlock):
+    """
+    POST /web/rss_find
+
+    Payload:
+      - str: url
+      - dict: request body for /web/rss_find
+    Params:
+      relay, token, api_prefix, max_feeds
+    """
+    @classmethod
+    def param_specs(cls):
+        return [
+            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
+            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
+            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
+            {"key": "max_feeds", "type": "int", "default": 32, "help": "Max feeds to return"},
+        ]
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+            "max_feeds": 32,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888"))
+        token = str(params.get("token", ""))
+        pfx = _api_prefix(params)
+
+        if isinstance(payload, dict):
+            body = dict(payload)
+        else:
+            body = {"url": str(payload or "")}
+
+        if not body.get("url"):
+            return "", {"ok": False, "error": "missing url"}
+
+        _put_if_missing(body, params, "max_feeds", cast=int)
+
+        cli = BlockNetClient(relay=relay, token=token)
+        j = cli.api_web_rss_find(body, prefix=pfx)
+
+        out = j.get("feeds", j.get("urls", j))
+        return out, {"ok": bool(j.get("ok", False)), "response": j}
+
+
+BLOCKS.register("blocknet_web_rss_find", BlockNetWebRssFindBlock)
