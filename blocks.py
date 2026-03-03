@@ -32,7 +32,8 @@ from typing import Any, Dict, Tuple, List, Optional, Set
 import json as _json
 import os as _os
 import time
-from urllib.parse import urlencode, urlparse, urljoin, unquote, quote_plus, parse_qsl, urlunparse, quote
+from urllib.parse import urlencode, urlparse, urljoin, unquote, quote_plus, parse_qsl, urlunparse, quote, urlsplit, \
+    urlunsplit
 
 import aiohttp
 import feedparser
@@ -27806,21 +27807,1247 @@ def _put_if_missing(body: Dict[str, Any], params: Dict[str, Any], key: str, cast
 def _put_many_if_missing(body: Dict[str, Any], params: Dict[str, Any], keys: Tuple[str, ...]) -> None:
     for k in keys:
         _put_if_missing(body, params, k)
+
+
+# ---------------- BlockNet memory-aware API blocks ----------------
+#
+# These blocks can:
+#   • Pull inputs from Memory (mem_in_keys / mem_*_keys), in addition to payload.
+#   • Coerce "wrong-shaped" payloads into the request bodies BlockNet expects.
+#   • Export results back into Memory and report the exported keys in meta.
+#
+# Notes:
+#   - Memory values are loaded from Memory.load() (JSON-backed).
+#   - mem_in_mode controls how Memory is combined with payload.
+#   - mem_out_prefix and/or mem_out_*_key control what gets saved.
+
+_URL_RE = re.compile(r"https?://[^\s\)\]\}\>\"']+")
+
+def _bn_parse_keys(v: Any) -> List[str]:
+    if v is None:
+        return []
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        parts = re.split(r"[,\|\n]+", s)
+        return [p.strip() for p in parts if p.strip()]
+    if isinstance(v, (list, tuple, set)):
+        out: List[str] = []
+        for x in v:
+            out.extend(_bn_parse_keys(x))
+        return out
+    return [str(v).strip()] if str(v).strip() else []
+
+def _bn_dedupe_strs(items: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for s in items:
+        s = (s or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _bn_param(params: Dict[str, Any], key: str, *aliases: str, default: Any = None) -> Any:
+    """
+    Return params[key] if present and non-empty-ish, otherwise try aliases.
+    Helpful for backward-compatible param names (e.g. memory_sources -> mem_in_keys).
+    """
+    if key in params:
+        v = params.get(key)
+        if v is not None and v != "":
+            return v
+    for a in aliases:
+        if a in params:
+            v = params.get(a)
+            if v is not None and v != "":
+                return v
+    return default
+
+def _bn_any_to_text(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, bytes):
+        return v.decode("utf-8", errors="replace")
+    if isinstance(v, (list, tuple)):
+        return "\n".join(_bn_any_to_text(x) for x in v if _bn_any_to_text(x).strip()).strip()
+    if isinstance(v, dict):
+        # common text-ish fields
+        for k in ("text", "prompt", "payload", "content", "body", "markdown"):
+            if k in v and v[k] is not None:
+                return _bn_any_to_text(v[k])
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
+
+def _bn_extract_urls(text: str) -> List[str]:
+    if not text:
+        return []
+    return _bn_dedupe_strs(_URL_RE.findall(text))
+
+def _bn_mem_get(keys: List[str]) -> Tuple[Any, List[str]]:
+    """
+    Returns (value, used_keys).
+      - If 0 hits: (None, [])
+      - If 1 hit: (<value>, [key])
+      - If >1 hits: ([v1, v2, ...], [k1, k2, ...])
+    """
+    if not keys:
+        return None, []
+    store = Memory.load()
+    hits: List[Any] = []
+    used: List[str] = []
+    for k in keys:
+        if k in store:
+            v = store.get(k)
+            if v is None or v == "" or v == [] or v == {}:
+                continue
+            hits.append(v)
+            used.append(k)
+    if not hits:
+        return None, []
+    if len(hits) == 1:
+        return hits[0], used
+    return hits, used
+
+def _bn_mem_set(
+    key: str,
+    value: Any,
+    *,
+    merge: bool = False,
+    max_items: int = 0,
+) -> None:
+    key = (key or "").strip()
+    if not key:
+        return
+    store = Memory.load()
+    if merge and key in store:
+        existing = store.get(key)
+        # list merge (append + de-dupe)
+        if isinstance(existing, list) and isinstance(value, list):
+            merged = _bn_dedupe_strs([str(x) for x in existing] + [str(x) for x in value])
+            if max_items and max_items > 0:
+                merged = merged[-max_items:]
+            store[key] = merged
+        # dict merge
+        elif isinstance(existing, dict) and isinstance(value, dict):
+            merged = dict(existing)
+            merged.update(value)
+            store[key] = merged
+        # string append
+        elif isinstance(existing, str) and isinstance(value, str):
+            store[key] = (existing + "\n\n" + value).strip() if existing else value
+        else:
+            store[key] = value
+    else:
+        store[key] = value
+
+    # cap plain list writes too
+    if isinstance(store.get(key), list) and max_items and max_items > 0:
+        store[key] = store[key][-max_items:]
+
+    Memory.save(store)
+
+def _bn_apply_mem_in_mode(payload_v: Any, mem_v: Any, *, mode: str, joiner: str) -> Tuple[Any, List[str]]:
+    """
+    Applies mem_in_mode combining payload and memory values.
+    Returns (combined, coercions).
+    """
+    coercions: List[str] = []
+    mode = (mode or "auto").strip().lower()
+
+    # auto: only use memory if payload is empty-ish
+    if mode == "auto":
+        if payload_v is None or payload_v == "" or payload_v == [] or payload_v == {}:
+            coercions.append("mem:auto->used_memory")
+            return mem_v, coercions
+        return payload_v, coercions
+
+    if mode == "replace":
+        coercions.append("mem:replace")
+        return mem_v if mem_v is not None else payload_v, coercions
+
+    if mode in ("append", "prepend"):
+        # strings
+        if isinstance(payload_v, str) or isinstance(mem_v, str):
+            p = _bn_any_to_text(payload_v)
+            m = _bn_any_to_text(mem_v)
+            if mode == "append":
+                coercions.append("mem:append_text")
+                return (p + (joiner if p and m else "") + m).strip(), coercions
+            coercions.append("mem:prepend_text")
+            return (m + (joiner if p and m else "") + p).strip(), coercions
+
+        # lists
+        if isinstance(payload_v, list) or isinstance(mem_v, list):
+            p_list = payload_v if isinstance(payload_v, list) else ([payload_v] if payload_v is not None else [])
+            m_list = mem_v if isinstance(mem_v, list) else ([mem_v] if mem_v is not None else [])
+            coercions.append(f"mem:{mode}_list")
+            return (p_list + m_list) if mode == "append" else (m_list + p_list), coercions
+
+        # fallback -> text
+        p = _bn_any_to_text(payload_v)
+        m = _bn_any_to_text(mem_v)
+        coercions.append(f"mem:{mode}_fallback_text")
+        if mode == "append":
+            return (p + (joiner if p and m else "") + m).strip(), coercions
+        return (m + (joiner if p and m else "") + p).strip(), coercions
+
+    if mode == "merge":
+        # dict merge: payload wins
+        if isinstance(payload_v, dict) or isinstance(mem_v, dict):
+            p_dict = payload_v if isinstance(payload_v, dict) else {}
+            m_dict = mem_v if isinstance(mem_v, dict) else {}
+            out = dict(m_dict)
+            out.update(p_dict)
+            coercions.append("mem:merge_dict")
+            return out, coercions
+
+        # list concat
+        if isinstance(payload_v, list) or isinstance(mem_v, list):
+            p_list = payload_v if isinstance(payload_v, list) else ([payload_v] if payload_v is not None else [])
+            m_list = mem_v if isinstance(mem_v, list) else ([mem_v] if mem_v is not None else [])
+            coercions.append("mem:merge_list_concat")
+            return p_list + m_list, coercions
+
+        # fallback -> prefer payload
+        coercions.append("mem:merge_fallback_payload")
+        return payload_v, coercions
+
+    if mode == "list":
+        p_list = payload_v if isinstance(payload_v, list) else ([payload_v] if payload_v is not None else [])
+        m_list = mem_v if isinstance(mem_v, list) else ([mem_v] if mem_v is not None else [])
+        coercions.append("mem:list")
+        return p_list + m_list, coercions
+
+    coercions.append(f"mem:unknown_mode:{mode}")
+    return payload_v, coercions
+
+def _bn_export_to_memory(
+    *,
+    out_value: Any,
+    response_json: Any,
+    ok: bool,
+    params: Dict[str, Any],
+    links: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """
+    Saves configured outputs to Memory and returns a dict describing exported keys.
+    """
+    exports: Dict[str, str] = {}
+
+    only_on_ok = bool(params.get("mem_out_on_ok", True))
+    if only_on_ok and not ok:
+        return exports
+
+    merge = bool(params.get("mem_out_merge", False))
+    max_items = int(params.get("mem_out_max_items", 0) or 0)
+
+    out_key = str(params.get("mem_out_key", "") or "").strip()
+    resp_key = str(params.get("mem_out_response_key", "") or "").strip()
+    links_key = str(params.get("mem_out_links_key", "") or "").strip()
+
+    prefix = str(_bn_param(params, "mem_out_prefix", "memory_export_prefix", default="") or "").strip()
+    if prefix:
+        # normalized to not end with dot
+        prefix = prefix.rstrip(".")
+        if not out_key:
+            out_key = f"{prefix}.out"
+        if not resp_key:
+            resp_key = f"{prefix}.response"
+        if not links_key and links:
+            links_key = f"{prefix}.links"
+        ok_key = f"{prefix}.ok"
+        _bn_mem_set(ok_key, bool(ok), merge=False)
+        exports["ok"] = ok_key
+
+    if out_key:
+        _bn_mem_set(out_key, out_value, merge=merge, max_items=max_items)
+        exports["out"] = out_key
+    if resp_key:
+        _bn_mem_set(resp_key, response_json, merge=False)
+        exports["response"] = resp_key
+    if links_key and links is not None:
+        _bn_mem_set(links_key, _bn_dedupe_strs([str(x) for x in links]), merge=merge, max_items=max_items)
+        exports["links"] = links_key
+
+    return exports
+
+def _bn_resolve_text_input(payload: Any, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Resolve a text input from payload + Memory keys, coercing common shapes.
+    """
+    meta: Dict[str, Any] = {"input_kind": "text", "coercions": []}
+
+    # Base payload to text (handles dict/list/bytes)
+    payload_text = _bn_any_to_text(payload).strip()
+    if payload_text and not isinstance(payload, str):
+        meta["coercions"].append(f"payload:{type(payload).__name__}->text")
+
+    # Memory
+    mem_keys = _bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None))
+    mem_v, used = _bn_mem_get(mem_keys)
+    meta["mem_in_keys_used"] = used
+
+    joiner = str(params.get("mem_in_join", "\n\n"))
+    mode = str(params.get("mem_in_mode", "auto"))
+
+    combined, mem_coercions = _bn_apply_mem_in_mode(payload_text, mem_v, mode=mode, joiner=joiner)
+    meta["coercions"].extend(mem_coercions)
+
+    # Final coercion to text
+    out_text = _bn_any_to_text(combined).strip()
+    if combined is not None and not isinstance(combined, str):
+        meta["coercions"].append(f"combined:{type(combined).__name__}->text")
+
+    max_chars = int(params.get("mem_in_max_chars", 0) or 0)
+    if max_chars and max_chars > 0 and len(out_text) > max_chars:
+        meta["coercions"].append(f"cap_text:{max_chars}")
+        out_text = out_text[:max_chars]
+
+    return out_text, meta
+
+def _bn_resolve_url_list(payload: Any, params: Dict[str, Any]) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Resolve 1..N URLs from payload + Memory keys.
+    """
+    meta: Dict[str, Any] = {"input_kind": "url_list", "coercions": []}
+    urls: List[str] = []
+
+    def _add(u: Any) -> None:
+        s = str(u or "").strip()
+        if not s:
+            return
+        # allow raw text containing URLs (optional)
+        if s.startswith("http://") or s.startswith("https://"):
+            urls.append(s)
+            return
+        if bool(params.get("extract_urls", True)):
+            found = _bn_extract_urls(s)
+            if found:
+                meta["coercions"].append("payload:extract_urls")
+                urls.extend(found)
+
+    # payload parsing
+    if isinstance(payload, dict):
+        if isinstance(payload.get("urls"), list):
+            meta["coercions"].append("payload:dict.urls")
+            for u in payload.get("urls") or []:
+                _add(u)
+        elif payload.get("url") is not None:
+            meta["coercions"].append("payload:dict.url")
+            _add(payload.get("url"))
+        elif isinstance(payload.get("links"), list):
+            meta["coercions"].append("payload:dict.links")
+            for u in payload.get("links") or []:
+                _add(u)
+        else:
+            # last resort: treat dict as text and extract URLs
+            _add(_bn_any_to_text(payload))
+    elif isinstance(payload, (list, tuple, set)):
+        meta["coercions"].append(f"payload:{type(payload).__name__}")
+        for item in payload:
+            if isinstance(item, dict):
+                if item.get("url") is not None:
+                    _add(item.get("url"))
+                elif isinstance(item.get("urls"), list):
+                    for u in item.get("urls") or []:
+                        _add(u)
+                else:
+                    _add(_bn_any_to_text(item))
+            else:
+                _add(item)
+    else:
+        _add(payload)
+
+    # memory URLs
+    mem_keys = _bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None))
+    mem_v, used = _bn_mem_get(mem_keys)
+    meta["mem_in_keys_used"] = used
+
+    mode = str(params.get("mem_in_mode", "auto")).strip().lower()
+    # For URLs we interpret modes as:
+    #   auto: use memory only if payload yielded no URLs
+    #   replace: ignore payload and only use memory
+    #   append/prepend/list/merge: combine both lists
+    mem_urls: List[str] = []
+    if mem_v is not None:
+        if isinstance(mem_v, (list, tuple, set)):
+            for x in mem_v:
+                _add(x)
+            # the above adds into urls; copy out what came from mem is hard;
+            # but we just re-parse for mem_urls below for mode handling.
+            mem_urls = _bn_dedupe_strs([str(x).strip() for x in mem_v if str(x).strip()])
+        elif isinstance(mem_v, dict):
+            if isinstance(mem_v.get("urls"), list):
+                mem_urls = _bn_dedupe_strs([str(x).strip() for x in mem_v.get("urls") or [] if str(x).strip()])
+            elif mem_v.get("url") is not None:
+                mem_urls = [str(mem_v.get("url")).strip()]
+            elif isinstance(mem_v.get("links"), list):
+                mem_urls = _bn_dedupe_strs([str(x).strip() for x in mem_v.get("links") or [] if str(x).strip()])
+            else:
+                mem_urls = _bn_extract_urls(_bn_any_to_text(mem_v))
+        else:
+            mem_urls = _bn_extract_urls(_bn_any_to_text(mem_v))
+
+    payload_urls = _bn_dedupe_strs([u for u in urls if u.startswith("http")])
+
+    if mode == "replace":
+        meta["coercions"].append("mem:replace_urls")
+        urls = mem_urls
+    elif mode == "auto":
+        if not payload_urls and mem_urls:
+            meta["coercions"].append("mem:auto->used_memory_urls")
+            urls = mem_urls
+        else:
+            urls = payload_urls
+    elif mode == "prepend":
+        meta["coercions"].append("mem:prepend_urls")
+        urls = _bn_dedupe_strs(mem_urls + payload_urls)
+    else:
+        # append / merge / list / unknown -> append
+        if mode not in ("append", "merge", "list"):
+            meta["coercions"].append(f"mem:unknown_mode:{mode}->append_urls")
+        else:
+            meta["coercions"].append(f"mem:{mode}_urls")
+        urls = _bn_dedupe_strs(payload_urls + mem_urls)
+
+    max_items = int(params.get("mem_in_max_items", 0) or 0)
+    if max_items and max_items > 0 and len(urls) > max_items:
+        meta["coercions"].append(f"cap_urls:{max_items}")
+        urls = urls[:max_items]
+
+    return urls, meta
+
+def _bn_read_file_to_b64(
+    path: str,
+    *,
+    max_bytes: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return None, "file_not_found"
+        data = p.read_bytes()
+        if max_bytes and max_bytes > 0 and len(data) > max_bytes:
+            return None, "file_too_large"
+        return _b64_bytes(data), None
+    except Exception:
+        return None, "file_read_error"
+
+def _bn_resolve_media_body(
+    payload: Any,
+    params: Dict[str, Any],
+    *,
+    b64_field: str,
+    extra_fields: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Build a request body for imagetovec/videotovec using payload + Memory.
+    Accepts:
+      - dict: used as body (then backfilled with dims/etc)
+      - bytes/bytearray: base64 encoded into <b64_field>
+      - str: base64 by default, OR file path if path_mode=True, OR text->b64 (base64=False)
+    Also supports mem_in_keys for base64 or paths (string).
+    """
+    meta: Dict[str, Any] = {"input_kind": b64_field, "coercions": []}
+
+    # If caller passed full dict body, keep it (still allow memory merge if requested).
+    if isinstance(payload, dict):
+        body = dict(payload)
+        meta["coercions"].append("payload:dict->body")
+    else:
+        body = {}
+
+    dim = int(params.get("dim", 1024))
+    normalize = bool(params.get("normalize", True))
+    output = str(params.get("output", "b64f32"))
+    body.setdefault("dim", dim)
+    body.setdefault("normalize", normalize)
+    body.setdefault("output", output)
+
+    if extra_fields:
+        for k, v in extra_fields.items():
+            body.setdefault(k, v)
+
+    # Resolve raw input from payload + memory
+    if not isinstance(payload, dict):
+        mem_keys = _bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None))
+        mem_v, used = _bn_mem_get(mem_keys)
+        meta["mem_in_keys_used"] = used
+
+        joiner = str(params.get("mem_in_join", "\n\n"))
+        mode = str(params.get("mem_in_mode", "auto"))
+        combined, mem_coercions = _bn_apply_mem_in_mode(payload, mem_v, mode=mode, joiner=joiner)
+        meta["coercions"].extend(mem_coercions)
+    else:
+        combined = payload
+
+    treat_str_as_b64 = bool(params.get("base64", True))
+    path_mode = bool(params.get("path_mode", False))
+    max_file_bytes = int(params.get("max_file_bytes", 25_000_000))
+
+    if b64_field not in body:
+        if isinstance(combined, (bytes, bytearray)):
+            meta["coercions"].append("payload:bytes->b64")
+            body[b64_field] = _b64_bytes(bytes(combined))
+        elif isinstance(combined, str):
+            s = combined.strip()
+            if path_mode and s and not treat_str_as_b64:
+                # In "path_mode", treat string as file path first
+                b64, err = _bn_read_file_to_b64(s, max_bytes=max_file_bytes)
+                if b64:
+                    meta["coercions"].append("payload:str_path->b64")
+                    body[b64_field] = b64
+                else:
+                    meta["coercions"].append(f"payload:str_path_failed:{err}")
+                    body[b64_field] = _b64_bytes(s.encode("utf-8", errors="replace"))
+            else:
+                if treat_str_as_b64:
+                    meta["coercions"].append("payload:str->assume_b64")
+                    body[b64_field] = s
+                else:
+                    meta["coercions"].append("payload:str->utf8->b64")
+                    body[b64_field] = _b64_bytes(s.encode("utf-8", errors="replace"))
+        elif combined is None:
+            body[b64_field] = ""
+        else:
+            # last resort: stringify then base64
+            meta["coercions"].append(f"payload:{type(combined).__name__}->str->b64")
+            s = _bn_any_to_text(combined)
+            body[b64_field] = _b64_bytes(s.encode("utf-8", errors="replace"))
+
+    return body, meta
+
+
+# --- NEW helpers (drop near your other _bn_* helpers) ----------------------
+
+def _bn_body_take_url_payload(body: Dict[str, Any]) -> Tuple[Any, List[str]]:
+    """
+    Pull URL input out of a dict body, supporting:
+      - body["list"] : list[str] / str
+      - body["urls"] : list[str] / str
+      - body["url"]  : str / list[str]
+
+    Returns (url_payload, coercions). url_payload is passed straight into _bn_resolve_url_list().
+    """
+    for k in ("list", "urls", "url"):
+        if k in body:
+            v = body.pop(k)
+            return v, [f"payload:dict.{k}->urls"]
+    return None, []
+
+
+def _bn_as_str_list(x: Any) -> List[str]:
+    if x is None:
+        return []
+    if isinstance(x, list):
+        out: List[str] = []
+        for it in x:
+            if it is None:
+                continue
+            if isinstance(it, dict):
+                # common shapes: {"url": "..."} / {"href": "..."} / {"link": "..."}
+                for kk in ("url", "href", "link"):
+                    if kk in it and it[kk]:
+                        out.append(str(it[kk]))
+                        break
+                else:
+                    out.append(_bn_any_to_text(it))
+            else:
+                out.append(str(it))
+        return [s for s in (s.strip() for s in out) if s]
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return []
+        # if it's not a URL, treat as text and extract URLs
+        if s.startswith("http://") or s.startswith("https://"):
+            return [s]
+        return _bn_extract_urls(s)
+    # fallback: stringify then extract
+    return _bn_extract_urls(_bn_any_to_text(x))
+
+
+def _bn_response_take_list(j: Any, *, keys: List[str]) -> List[str]:
+    """
+    Ensure we always return list[str] of URLs from responses that may use:
+      - j[key] where key in keys, OR
+      - j["list"], OR
+      - j["urls"], OR
+      - a raw list / raw string / raw object
+    """
+    candidate: Any = j
+    if isinstance(j, dict):
+        for k in (keys or []):
+            if k in j:
+                candidate = j.get(k)
+                break
+        else:
+            # extra safety: honor "list" if server uses it
+            if "list" in j:
+                candidate = j.get("list")
+            elif "urls" in j:
+                candidate = j.get("urls")
+    out = _bn_as_str_list(candidate)
+    return _bn_dedupe_strs(out)
+
+def _bn_found_links_from_response(
+    resp: Any,
+    *,
+    base_url: str = "",
+    mode: str = "page",          # "page" (default) or "all" (also accepts "js")
+    same_host_only: bool = False,
+    drop_fragments: bool = True,
+) -> List[str]:
+    """
+    BeautifulSoup-first link extractor for BlockNet web responses.
+
+    - mode="page": parse HTML tags/attrs only (a/link/meta/etc.) + scripts list if present.
+    - mode="all": parse tags + also regex-mine raw HTML/text/bytes.
+    - mode="js": prefer script URLs (scripts list and <script src=...>).
+    """
+
+    BAD_SCHEMES = {"javascript", "mailto", "tel", "data", "vbscript", "file", "about"}
+    STRIP_TRAIL = " \t\r\n'\"<>[](){}.,;"
+
+    mode = (mode or "page").strip().lower()
+    if mode not in ("page", "all", "js"):
+        mode = "page"
+
+    # -------------------- small utilities --------------------
+
+    def _to_text(x: Any) -> str:
+        if x is None:
+            return ""
+        if isinstance(x, str):
+            return x
+        if isinstance(x, (bytes, bytearray)):
+            try:
+                return x.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(x)
+        return str(x)
+
+    # conservative URL regex for "all" mode fallback mining
+    _URL_RE = re.compile(r"""(?xi)
+        \b(
+            https?://[^\s'"<>]+
+          | //[^ \s'"<>]+
+        )
+    """)
+
+    def _extract_urls_regex(text: str) -> List[str]:
+        if not text:
+            return []
+        return [m.group(1) for m in _URL_RE.finditer(text)]
+
+    def _dedupe_keep_order(items: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for s in items:
+            if not s:
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    def _norm(u: str, base: str) -> Optional[str]:
+        if not u:
+            return None
+        u = html.unescape(str(u)).strip().strip(STRIP_TRAIL)
+        if not u or u.startswith("#"):
+            return None
+
+        low = u.lower()
+        for s in BAD_SCHEMES:
+            if low.startswith(s + ":"):
+                return None
+
+        # resolve scheme-relative + relative
+        if base:
+            u = urljoin(base, u)
+
+        parts = urlsplit(u)
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            return None
+
+        if drop_fragments:
+            parts = parts._replace(fragment="")  # type: ignore[attr-defined]
+
+        out = urlunsplit(parts).strip().strip(STRIP_TRAIL)
+        return out or None
+
+    def _host(u: str) -> str:
+        try:
+            return (urlsplit(u).netloc or "").lower()
+        except Exception:
+            return ""
+
+    def _pick_base(resp_obj: Any) -> str:
+        # prefer resp["url"], else explicit base_url, else build from host if possible
+        if isinstance(resp_obj, dict):
+            u = resp_obj.get("url")
+            if isinstance(u, str) and u.strip():
+                return u.strip()
+            h = resp_obj.get("host")
+            if isinstance(h, str) and h.strip():
+                # best-effort default scheme
+                return "https://" + h.strip().lstrip("/")
+        return (base_url or "").strip()
+
+    # -------------------- BeautifulSoup extraction --------------------
+
+    def _extract_from_html_bs4(html_text: str, base: str) -> List[str]:
+        try:
+            from bs4 import BeautifulSoup  # pip install beautifulsoup4
+        except Exception:
+            # If bs4 isn't installed, we still do a minimal regex fallback.
+            out: List[str] = []
+            if mode in ("all",):
+                for u in _extract_urls_regex(html_text):
+                    nu = _norm(u, base)
+                    if nu:
+                        out.append(nu)
+            return out
+
+        soup = BeautifulSoup(html_text or "", "html.parser")
+
+        # respect <base href="..."> if present
+        bt = soup.find("base", href=True)
+        if bt and bt.get("href"):
+            base = urljoin(base or "", str(bt.get("href")).strip())
+
+        base_host = _host(base) if base else ""
+        out: List[str] = []
+
+        def _add(u: str) -> None:
+            nu = _norm(u, base)
+            if not nu:
+                return
+            if same_host_only and base_host and _host(nu) != base_host:
+                return
+            out.append(nu)
+
+        # Primary navigation/product links
+        for a in soup.find_all("a", href=True):
+            _add(a.get("href", ""))
+
+        # Canonical/pagination/alternates
+        for ln in soup.find_all("link", href=True):
+            rel = ln.get("rel") or []
+            rel_str = " ".join(rel).lower() if isinstance(rel, (list, tuple)) else str(rel).lower()
+            if any(r in rel_str for r in ("canonical", "prev", "next", "alternate")):
+                _add(ln.get("href", ""))
+
+        # Sometimes pages include important URLs in meta tags
+        for meta in soup.find_all("meta"):
+            # og:url, twitter:url, etc.
+            prop = (meta.get("property") or meta.get("name") or "").lower()
+            if prop in ("og:url", "twitter:url"):
+                c = meta.get("content")
+                if c:
+                    _add(str(c))
+
+        # If user wants JS focus, collect <script src=...>
+        if mode in ("all", "js"):
+            for sc in soup.find_all("script", src=True):
+                _add(sc.get("src", ""))
+
+        # If you want richer extraction in all-mode, also scan common URL-ish attrs
+        if mode == "all":
+            URL_ATTRS = ("href", "src", "data-src", "data-href", "poster", "action", "formaction")
+            for tag in soup.find_all(True):
+                for k in URL_ATTRS:
+                    v = tag.get(k)
+                    if isinstance(v, str) and v.strip():
+                        _add(v)
+                # srcset can contain multiple
+                ss = tag.get("srcset")
+                if isinstance(ss, str) and ss.strip():
+                    for part in ss.split(","):
+                        candidate = (part.strip().split(" ", 1)[0] or "").strip()
+                        if candidate:
+                            _add(candidate)
+
+            # And finally regex mine raw HTML too (catches //cdn... strings in scripts)
+            for u in _extract_urls_regex(html_text):
+                _add(u)
+
+        return out
+
+    # -------------------- response walker --------------------
+
+    acc: List[str] = []
+
+    def _walk(v: Any, base_hint: str) -> None:
+        if v is None:
+            return
+
+        # dict: likely BlockNet response object
+        if isinstance(v, dict):
+            base_here = _pick_base(v) or base_hint
+
+            body = v.get("body")
+            scripts = v.get("scripts")
+
+            # scripts list: BlockNet /web/js-ish
+            if isinstance(scripts, list) and mode in ("page", "all", "js"):
+                for s in scripts:
+                    if isinstance(s, dict):
+                        su = s.get("url") or s.get("src")
+                        if isinstance(su, str) and su.strip():
+                            nu = _norm(su, base_here)
+                            if nu:
+                                acc.append(nu)
+
+            # body HTML/text
+            if isinstance(body, (str, bytes, bytearray)):
+                html_text = _to_text(body)
+                # only treat as HTML if it looks like markup; otherwise regex-mine in all-mode
+                if html_text.lstrip().startswith("<"):
+                    acc.extend(_extract_from_html_bs4(html_text, base_here))
+                elif mode == "all":
+                    for u in _extract_urls_regex(html_text):
+                        nu = _norm(u, base_here)
+                        if nu:
+                            acc.append(nu)
+
+            # explicit lists/keys that may already contain links
+            for k in ("found_links", "out_links", "links", "urls", "hrefs", "list"):
+                if k in v:
+                    _walk(v.get(k), base_here)
+
+            # leaf URL-ish keys
+            for k in ("url", "href", "link", "canonical", "prev", "next"):
+                if k in v:
+                    _walk(v.get(k), base_here)
+
+            # only recurse deeper in all-mode (avoid crawling giant dict trees in page mode)
+            if mode == "all":
+                for kk, vv in v.items():
+                    if kk in ("body", "scripts", "found_links", "out_links", "links", "urls", "hrefs", "list",
+                              "url", "href", "link", "canonical", "prev", "next"):
+                        continue
+                    _walk(vv, base_here)
+            return
+
+        # list/tuple/set
+        if isinstance(v, (list, tuple, set)):
+            for it in v:
+                _walk(it, base_hint)
+            return
+
+        # raw bytes/string leaf
+        if isinstance(v, (bytes, bytearray, str)):
+            txt = _to_text(v)
+            base_here = base_hint
+            if txt.lstrip().startswith("<"):
+                acc.extend(_extract_from_html_bs4(txt, base_here))
+            else:
+                # in page mode, only accept direct URL-like strings
+                nu = _norm(txt, base_here)
+                if nu:
+                    acc.append(nu)
+                elif mode == "all":
+                    for u in _extract_urls_regex(txt):
+                        nu2 = _norm(u, base_here)
+                        if nu2:
+                            acc.append(nu2)
+            return
+
+        # fallback: stringify + mine only in all-mode
+        if mode == "all":
+            txt = _to_text(v)
+            for u in _extract_urls_regex(txt):
+                nu = _norm(u, base_hint)
+                if nu:
+                    acc.append(nu)
+
+    base0 = _pick_base(resp) or (base_url or "").strip()
+    _walk(resp, base0)
+
+    # final clean/dedupe
+    cleaned = [str(s).strip() for s in acc if str(s).strip()]
+    return _dedupe_keep_order(cleaned)
+
+
+def _bn_playwright_render_one(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Smarter renderer:
+      - extracts links from DOM (incl shadow roots) + frames
+      - captures network request/response URLs
+      - optionally mines small response bodies (html/json/js) for URLs
+      - optionally scrolls to reveal lazy content
+    """
+    try:
+        from playwright.sync_api import sync_playwright  # type: ignore
+    except Exception as e:
+        return {"url": url, "ok": False, "error": f"playwright_not_available: {e}"}
+
+    timeout_ms = int(params.get("timeout_ms", 20_000) or 20_000)
+    wait_until = str(params.get("wait_until", "domcontentloaded") or "domcontentloaded")
+    wait_after_ms = int(params.get("wait_after_ms", 500) or 500)
+    user_agent = str(params.get("user_agent", "") or "").strip()
+    headless = bool(params.get("headless", True))
+
+    block_resources = bool(params.get("block_resources", True))
+    blocked_types = set(params.get("blocked_resource_types", []) or ["image", "font", "media"])
+
+    # --- NEW smart knobs ---
+    include_frames = bool(params.get("include_frames", True))
+    include_shadow_dom = bool(params.get("include_shadow_dom", True))
+    include_perf_resources = bool(params.get("include_perf_resources", True))
+    include_attr_mining = bool(params.get("include_attr_mining", True))
+    include_inline_scripts = bool(params.get("include_inline_scripts", True))
+    inline_script_max_chars = int(params.get("inline_script_max_chars", 200_000) or 200_000)
+
+    capture_network = bool(params.get("capture_network", True))
+    mine_response_bodies = bool(params.get("mine_response_bodies", True))
+    max_mine_bytes = int(params.get("max_mine_bytes", 250_000) or 250_000)
+    mine_content_types = tuple((params.get("mine_content_types") or [
+        "text/html",
+        "application/json",
+        "text/plain",
+        "application/javascript",
+        "text/javascript",
+        "application/x-javascript",
+    ]))
+
+    # basic interaction to reveal lazy content
+    auto_scroll = bool(params.get("auto_scroll", True))
+    scroll_steps = int(params.get("scroll_steps", 6) or 6)
+    scroll_wait_ms = int(params.get("scroll_wait_ms", 350) or 350)
+    expand_details = bool(params.get("expand_details", True))
+
+    # network quiet wait
+    wait_network_quiet = bool(params.get("wait_network_quiet", True))
+    network_quiet_ms = int(params.get("network_quiet_ms", 800) or 800)
+    network_quiet_timeout_ms = int(params.get("network_quiet_timeout_ms", 7_000) or 7_000)
+
+    out: Dict[str, Any] = {
+        "url": url,
+        "ok": False,
+        "html": "",
+        "text": "",
+        "links": [],
+        "links_dom": [],
+        "links_net": [],
+        "links_mined": [],
+        "resources": [],
+        "requests": [],
+        "responses": [],
+    }
+
+    base_host = (urlsplit(url).netloc or "").lower()
+
+    def _same_host(u: str) -> bool:
+        try:
+            return (urlsplit(u).netloc or "").lower() == base_host
+        except Exception:
+            return False
+
+    # ---- collectors ----
+    net_links: List[str] = []
+    mined_links: List[str] = []
+    requests: List[Dict[str, Any]] = []
+    responses: List[Dict[str, Any]] = []
+    last_net_t = time.time()
+
+    def _note_net() -> None:
+        nonlocal last_net_t
+        last_net_t = time.time()
+
+    def _ct_ok(ct: str) -> bool:
+        ct = (ct or "").lower()
+        return any(x in ct for x in mine_content_types)
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        ctx_kwargs: Dict[str, Any] = {}
+        if user_agent:
+            ctx_kwargs["user_agent"] = user_agent
+        context = browser.new_context(**ctx_kwargs)
+        page = context.new_page()
+
+        # block heavy resources but DO NOT block scripts (we want links)
+        if block_resources:
+            def _route(route, request):
+                try:
+                    rt = (request.resource_type or "").lower()
+                    if rt in blocked_types:
+                        return route.abort()
+                except Exception:
+                    pass
+                return route.continue_()
+            try:
+                page.route("**/*", _route)
+            except Exception:
+                pass
+
+        if capture_network:
+            def on_request(req):
+                try:
+                    _note_net()
+                    u = req.url or ""
+                    m = req.method or ""
+                    requests.append({"url": u, "method": m, "type": req.resource_type})
+                    if u:
+                        net_links.append(u)
+                except Exception:
+                    pass
+
+            def on_response(resp):
+                try:
+                    _note_net()
+                    u = resp.url or ""
+                    st = resp.status
+                    hdrs = resp.headers or {}
+                    ct = (hdrs.get("content-type") or "").lower()
+                    responses.append({"url": u, "status": st, "content_type": ct})
+
+                    if u:
+                        net_links.append(u)
+
+                    if mine_response_bodies and u and _ct_ok(ct):
+                        # best-effort size cap; response.body() can be expensive
+                        b = resp.body()
+                        if b and len(b) <= max_mine_bytes:
+                            txt = ""
+                            try:
+                                txt = b.decode("utf-8", errors="ignore")
+                            except Exception:
+                                txt = str(b)
+                            # mine for URLs (aggressive)
+                            mined = _bn_found_links_from_response(
+                                txt,
+                                base_url=u,
+                                mode="all",
+                                same_host_only=False,  # we filter later if needed
+                            )
+                            mined_links.extend(mined)
+                except Exception:
+                    pass
+
+            try:
+                page.on("request", on_request)
+                page.on("response", on_response)
+            except Exception:
+                pass
+
+        def _wait_quiet() -> None:
+            if not wait_network_quiet:
+                return
+            t0 = time.time()
+            while True:
+                if (time.time() - last_net_t) * 1000.0 >= network_quiet_ms:
+                    return
+                if (time.time() - t0) * 1000.0 >= network_quiet_timeout_ms:
+                    return
+                page.wait_for_timeout(50)
+
+        def _extract_dom_links_from_page(pg) -> List[str]:
+            # returns absolute-ish urls; we still run through _bn_found_links_from_response for normalization
+            js = """
+(() => {
+  const out = [];
+  const push = (u) => { if (u && typeof u === 'string') out.push(u); };
+
+  const URL_ATTRS = ["href","src","data-src","data-href","data-url","poster","action","formaction"];
+  const walkRoot = (root) => {
+    try {
+      // anchors / link / script first
+      root.querySelectorAll("a[href]").forEach(a => push(a.href));
+      root.querySelectorAll("link[href]").forEach(l => push(l.href));
+      root.querySelectorAll("script[src]").forEach(s => push(s.src));
+
+      // attribute mining
+      root.querySelectorAll("*").forEach(el => {
+        try {
+          for (const k of URL_ATTRS) {
+            const v = el.getAttribute && el.getAttribute(k);
+            if (v) push(v);
+          }
+          const ss = el.getAttribute && el.getAttribute("srcset");
+          if (ss) {
+            ss.split(",").forEach(part => {
+              const u = (part.trim().split(" ", 1)[0] || "").trim();
+              if (u) push(u);
+            });
+          }
+          const oc = el.getAttribute && el.getAttribute("onclick");
+          if (oc) push(oc); // may contain urls; mined later
+        } catch (e) {}
+      });
+
+      // meta refresh / og:url / twitter:url
+      root.querySelectorAll("meta[http-equiv='refresh']").forEach(m => push(m.content || ""));
+      root.querySelectorAll("meta[property='og:url'], meta[name='twitter:url']").forEach(m => push(m.content || ""));
+
+      // inline scripts / json blobs (bounded; mined later)
+      root.querySelectorAll("script").forEach(s => {
+        try {
+          const t = (s.type || "").toLowerCase();
+          if (!t || t.includes("json") || t.includes("ld+json")) {
+            const txt = s.textContent || "";
+            if (txt) push(txt);
+          }
+        } catch (e) {}
+      });
+
+    } catch (e) {}
+  };
+
+  // shadow DOM traversal
+  const walkNode = (node) => {
+    if (!node) return;
+    // Document or ShadowRoot
+    if (node.querySelectorAll) walkRoot(node);
+
+    // descend into shadow roots
+    if (node.querySelectorAll) {
+      node.querySelectorAll("*").forEach(el => {
+        try {
+          if (el.shadowRoot) walkNode(el.shadowRoot);
+        } catch (e) {}
+      });
+    }
+  };
+
+  walkNode(document);
+
+  // performance resources
+  try {
+    (performance.getEntriesByType("resource") || []).forEach(e => push(e.name || ""));
+  } catch (e) {}
+
+  return out;
+})();
+"""
+            try:
+                return pg.evaluate(js) or []
+            except Exception:
+                return []
+
+        try:
+            page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+            if wait_after_ms > 0:
+                page.wait_for_timeout(wait_after_ms)
+            _wait_quiet()
+
+            if expand_details:
+                try:
+                    page.evaluate("() => document.querySelectorAll('details').forEach(d => d.open = true)")
+                except Exception:
+                    pass
+
+            if auto_scroll:
+                for _ in range(max(0, scroll_steps)):
+                    try:
+                        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(max(0, scroll_wait_ms))
+                    _wait_quiet()
+
+            # final snapshot
+            out["html"] = page.content() or ""
+            try:
+                out["text"] = (page.inner_text("body") or "").strip()
+            except Exception:
+                out["text"] = ""
+
+            # DOM links from main page
+            raw_dom = _extract_dom_links_from_page(page)
+
+            # include frames (iframes)
+            if include_frames:
+                try:
+                    for fr in page.frames:
+                        if fr == page.main_frame:
+                            continue
+                        raw_dom.extend(_extract_dom_links_from_page(fr))
+                except Exception:
+                    pass
+
+            # If user wants to avoid mining inline scripts (noise), we can strip them after eval.
+            # (We already bounded script text by later mining caps anyway.)
+            raw_dom = [str(x) for x in (raw_dom or []) if str(x).strip()]
+
+            # Normalize/mine URLs from DOM outputs
+            dom_links = _bn_found_links_from_response(
+                raw_dom,
+                base_url=url,
+                mode="all" if include_attr_mining else "page",
+                same_host_only=False,  # filter later if desired
+            )
+
+            # Inline scripts can be huge; cap by params
+            if not include_inline_scripts:
+                # remove obvious non-URL giant strings (heuristic)
+                dom_links = [u for u in dom_links if u.startswith("http://") or u.startswith("https://")]
+
+            # performance resources
+            resources = []
+            if include_perf_resources:
+                resources = _bn_found_links_from_response(raw_dom, base_url=url, mode="all", same_host_only=False)
+                # (resources are included in dom_links already, but we expose separately too)
+            out["resources"] = _bn_dedupe_strs(resources)
+
+            # Network links (req/resp URLs)
+            net_links2 = _bn_dedupe_strs([u for u in net_links if u])
+            mined_links2 = _bn_dedupe_strs([u for u in mined_links if u])
+
+            out["links_dom"] = _bn_dedupe_strs(dom_links)
+            out["links_net"] = net_links2
+            out["links_mined"] = mined_links2
+            out["requests"] = requests
+            out["responses"] = responses
+
+            # Merge all
+            merged = _bn_dedupe_strs(out["links_dom"] + out["links_net"] + out["links_mined"])
+
+            # Optional same-host filter (your block already supports same_host_only)
+            if bool(params.get("same_host_only", True)):
+                merged = [u for u in merged if _same_host(u)]
+
+            out["links"] = merged
+            out["ok"] = True
+
+        except Exception as e:
+            out["error"] = str(e)
+        finally:
+            try:
+                context.close()
+            except Exception:
+                pass
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    return out
+
+
 @dataclass
 class BlockNetPingBlock(BaseBlock):
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token (leave empty if auth is off)"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix, e.g. /v1"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "relay": "127.0.0.1:38888",
             "token": "",
             "api_prefix": "/v1",
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -27830,7 +29057,13 @@ class BlockNetPingBlock(BaseBlock):
 
         cli = BlockNetClient(relay=relay, token=token)
         j = cli.api_ping(prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+        ok = bool(j.get("ok", False))
+
+        exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+        meta = {"ok": ok, "response": j}
+        if exports:
+            meta["memory_exports"] = exports
+        return j, meta
 
 
 BLOCKS.register("blocknet_ping", BlockNetPingBlock)
@@ -27839,19 +29072,10 @@ BLOCKS.register("blocknet_ping", BlockNetPingBlock)
 @dataclass
 class BlockNetTextToVecBlock(BaseBlock):
     """
-    Payload: text (string)
-    Params: relay, token, api_prefix, dim, normalize, output
+    Payload: text (string-ish)
+    Also supports reading input text from Memory via mem_in_keys.
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token (leave empty if auth is off)"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
-            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
-            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding: b64f32/list/etc"},
-        ]
+
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -27861,6 +29085,21 @@ class BlockNetTextToVecBlock(BaseBlock):
             "dim": 1024,
             "normalize": True,
             "output": "b64f32",
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_join": "\n\n",
+            "mem_in_max_chars": 0,
+
+            "batch": False,
+            "batch_max_items": 16,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -27868,14 +29107,41 @@ class BlockNetTextToVecBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
-        text = "" if payload is None else str(payload)
         dim = int(params.get("dim", 1024))
         normalize = bool(params.get("normalize", True))
         output = str(params.get("output", "b64f32"))
 
+        # Resolve input
+        text_in, in_meta = _bn_resolve_text_input(payload, params)
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_texttovec(text, dim=dim, normalize=normalize, output=output, prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+        # Batch mode: if memory produced a list and user asked to batch, embed each item
+        if bool(params.get("batch", False)):
+            mem_v, _used = _bn_mem_get(_bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None)))
+            if isinstance(mem_v, (list, tuple)) and len(mem_v) > 1:
+                out_items: List[Any] = []
+                max_items = int(params.get("batch_max_items", 16))
+                for t in [str(x) for x in mem_v][:max_items]:
+                    j = cli.api_texttovec(t, dim=dim, normalize=normalize, output=output, prefix=pfx)
+                    out_items.append(j)
+                ok = all(bool(x.get("ok", False)) for x in out_items if isinstance(x, dict))
+                exports = _bn_export_to_memory(out_value=out_items, response_json=out_items, ok=ok, params=params, links=None)
+                meta = {"ok": ok, "response": out_items, "batch_count": len(out_items)}
+                meta.update(in_meta)
+                if exports:
+                    meta["memory_exports"] = exports
+                return out_items, meta
+
+        # Single
+        j = cli.api_texttovec(text_in, dim=dim, normalize=normalize, output=output, prefix=pfx)
+        ok = bool(j.get("ok", False))
+        exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+
+        meta = {"ok": ok, "response": j}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return j, meta
 
 
 BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
@@ -27885,23 +29151,12 @@ BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
 class BlockNetImageToVecBlock(BaseBlock):
     """
     Payload:
-      - bytes: raw image bytes
-      - str: treated as already-base64 (unless params.base64=false, then it becomes utf8 bytes)
+      - bytes/bytearray: raw image bytes
+      - str: base64 by default (base64=True), or utf8->b64 (base64=False),
+             or file path if path_mode=True and base64=False.
       - dict: sent as-is (advanced)
-    Params:
-      relay, token, api_prefix, dim, normalize, output, base64 (default True)
+    Supports Memory input via mem_in_keys (b64 string or file path).
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
-            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
-            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding"},
-            {"key": "base64", "type": "bool", "default": True, "help": "If payload is str, treat it as base64"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -27912,6 +29167,20 @@ class BlockNetImageToVecBlock(BaseBlock):
             "normalize": True,
             "output": "b64f32",
             "base64": True,
+            "path_mode": False,
+            "max_file_bytes": 25_000_000,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_join": "\n\n",
+            "mem_in_max_items": 0,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -27919,25 +29188,18 @@ class BlockNetImageToVecBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
-        dim = int(params.get("dim", 1024))
-        normalize = bool(params.get("normalize", True))
-        output = str(params.get("output", "b64f32"))
-        treat_str_as_b64 = bool(params.get("base64", True))
-
-        if isinstance(payload, dict):
-            body = dict(payload)
-        else:
-            if isinstance(payload, (bytes, bytearray)):
-                b64 = _b64_bytes(bytes(payload))
-            else:
-                s = "" if payload is None else str(payload)
-                b64 = s if treat_str_as_b64 else _b64_bytes(s.encode("utf-8", errors="replace"))
-
-            body = {"image_b64": b64, "dim": dim, "normalize": normalize, "output": output}
-
+        body, in_meta = _bn_resolve_media_body(payload, params, b64_field="image_b64")
         cli = BlockNetClient(relay=relay, token=token)
         j = cli.api_imagetovec(body, prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+        ok = bool(j.get("ok", False))
+
+        exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+
+        meta = {"ok": ok, "response": j}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return j, meta
 
 
 BLOCKS.register("blocknet_imagetovec", BlockNetImageToVecBlock)
@@ -27947,20 +29209,9 @@ BLOCKS.register("blocknet_imagetovec", BlockNetImageToVecBlock)
 class BlockNetVideoToVecBlock(BaseBlock):
     """
     Same conventions as imagetovec, but uses video_b64.
-    Params additionally: max_frames (optional)
+    Params additionally: max_frames (optional).
+    Supports Memory input via mem_in_keys (b64 string or file path).
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "dim", "type": "int", "default": 1024, "help": "Embedding dimension requested"},
-            {"key": "normalize", "type": "bool", "default": True, "help": "L2 normalize embedding"},
-            {"key": "output", "type": "str", "default": "b64f32", "help": "Server output encoding"},
-            {"key": "max_frames", "type": "int", "default": 256, "help": "Max frames to sample/server-side decode cap"},
-            {"key": "base64", "type": "bool", "default": True, "help": "If payload is str, treat it as base64"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -27972,6 +29223,20 @@ class BlockNetVideoToVecBlock(BaseBlock):
             "output": "b64f32",
             "max_frames": 256,
             "base64": True,
+            "path_mode": False,
+            "max_file_bytes": 200_000_000,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_join": "\n\n",
+            "mem_in_max_items": 0,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -27979,32 +29244,20 @@ class BlockNetVideoToVecBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
-        dim = int(params.get("dim", 1024))
-        normalize = bool(params.get("normalize", True))
-        output = str(params.get("output", "b64f32"))
-        max_frames = int(params.get("max_frames", 256))
-        treat_str_as_b64 = bool(params.get("base64", True))
-
-        if isinstance(payload, dict):
-            body = dict(payload)
-        else:
-            if isinstance(payload, (bytes, bytearray)):
-                b64 = _b64_bytes(bytes(payload))
-            else:
-                s = "" if payload is None else str(payload)
-                b64 = s if treat_str_as_b64 else _b64_bytes(s.encode("utf-8", errors="replace"))
-
-            body = {
-                "video_b64": b64,
-                "dim": dim,
-                "normalize": normalize,
-                "output": output,
-                "max_frames": max_frames,
-            }
+        extra = {"max_frames": int(params.get("max_frames", 256))}
+        body, in_meta = _bn_resolve_media_body(payload, params, b64_field="video_b64", extra_fields=extra)
 
         cli = BlockNetClient(relay=relay, token=token)
         j = cli.api_videotovec(body, prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+        ok = bool(j.get("ok", False))
+
+        exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+
+        meta = {"ok": ok, "response": j}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return j, meta
 
 
 BLOCKS.register("blocknet_videotovec", BlockNetVideoToVecBlock)
@@ -28015,82 +29268,44 @@ class BlockNetVectorTextBlock(BaseBlock):
     """
     POST /vectortext
 
-    Payload:
-      - dict: full body for vectortext (recommended)
-      - str: becomes prompt; params.payload supplies payload string
+    Payload accepted:
+      - dict: treated as full request body (prompt/payload/vector/etc)
+      - str: treated as prompt (payload can come from params/memory)
+      - list[float]/tuple[float]: treated as vector; prompt comes from mem_in/params
     """
-    @classmethod
-    def param_specs(cls):
-        # Big surface area on purpose (matches your “dict of all parameters” style)
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "BlockNet relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-
-            # core request
-            {"key": "payload", "type": "str", "default": "", "help": "Payload string if payload arg is just prompt"},
-            {"key": "key", "type": "str", "default": "", "help": "Optional routing key"},
-            {"key": "lexicon_key", "type": "str", "default": "", "help": "Stored lexicon key"},
-            {"key": "context_key", "type": "str", "default": "", "help": "Stored context key"},
-            {"key": "idf_key", "type": "str", "default": "", "help": "Stored IDF key"},
-            {"key": "tokens_key", "type": "str", "default": "", "help": "Stored tokens key"},
-
-            # optional inline blocks
-            {"key": "lexicon", "type": "json", "default": None, "help": "Inline lexicon (dict/list/str)"},
-            {"key": "context", "type": "json", "default": None, "help": "Inline context (dict/list/str)"},
-
-            # generation knobs
-            {"key": "max_tokens", "type": "int", "default": 256, "help": "Max tokens to generate"},
-            {"key": "topk", "type": "int", "default": 24, "help": "TopK retrieval/selection"},
-            {"key": "seed", "type": "str", "default": "", "help": "Optional seed"},
-
-            # optional “enhancement” / tokenization / weighting knobs (server may ignore if unsupported)
-            {"key": "query", "type": "str", "default": "", "help": "What to enhance (empty uses payload/prompt)"},
-            {"key": "out", "type": "str", "default": "append", "help": "append|prepend|dict|tokens"},
-            {"key": "enhance", "type": "str", "default": "both", "help": "lexicon|instruction|expand_query|both"},
-            {"key": "lexicon_format", "type": "str", "default": "inline", "help": "inline|block"},
-            {"key": "include_weights", "type": "bool", "default": False, "help": "Include token weights"},
-            {"key": "weight_precision", "type": "int", "default": 3, "help": "Weight formatting precision"},
-            {"key": "expand_k", "type": "int", "default": 12, "help": "Query expansion K"},
-            {"key": "min_abs_weight", "type": "float", "default": 0.0, "help": "Min abs weight"},
-            {"key": "focus_lines", "type": "int", "default": 0, "help": "Focus N lines (0=off)"},
-
-            {"key": "lowercase", "type": "bool", "default": True, "help": "Lowercase tokens"},
-            {"key": "drop_hexbytes", "type": "bool", "default": True, "help": "Drop hexbyte tokens"},
-            {"key": "drop_numbers", "type": "bool", "default": True, "help": "Drop numeric tokens"},
-            {"key": "drop_stopwords", "type": "bool", "default": True, "help": "Drop stopwords"},
-            {"key": "max_tokens_in", "type": "int", "default": 0, "help": "Max input tokens (0=off)"},
-
-            {"key": "match_k", "type": "int", "default": 24, "help": "Match K"},
-            {"key": "top_k", "type": "int", "default": 24, "help": "Top K features"},
-            {"key": "compute_cosine", "type": "bool", "default": False, "help": "Compute cosine similarity"},
-            {"key": "dim", "type": "int", "default": 384, "help": "Fallback dim if needed"},
-            {"key": "signed", "type": "bool", "default": True, "help": "Signed hashing fallback"},
-            {"key": "tf_log", "type": "bool", "default": True, "help": "TF-log weighting fallback"},
-            {"key": "normalize", "type": "bool", "default": True, "help": "Normalize fallback"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
-        # This mirrors the “big dict” idea you showed (trimmed to what this block can plausibly carry)
         return {
             "relay": "127.0.0.1:38888",
             "token": "",
             "api_prefix": "/v1",
+            "timeout_ms": 120_000,
 
+            # defaults when payload isn't dict
             "payload": "",
+            "seed": "",
+
+            # vector sources (optional)
+            "vector": None,                 # list[float] or None
+            "vector_b64f32": "",            # base64 string or ""
+            "require_vector": False,
+
+            # server-side keys
             "key": "",
             "lexicon_key": "",
             "context_key": "",
             "idf_key": "",
             "tokens_key": "",
 
+            # inline lexicon/context
             "lexicon": None,
             "context": None,
 
+            # generation
             "max_tokens": 256,
             "topk": 24,
-            "seed": "",
 
+            # optional enhancement knobs (pass-through)
             "query": "",
             "out": "append",
             "enhance": "both",
@@ -28100,51 +29315,154 @@ class BlockNetVectorTextBlock(BaseBlock):
             "expand_k": 12,
             "min_abs_weight": 0.0,
             "focus_lines": 0,
-
             "lowercase": True,
             "max_tokens_in": 0,
             "drop_hexbytes": True,
             "drop_numbers": True,
             "drop_stopwords": True,
-
             "match_k": 24,
             "top_k": 24,
             "compute_cosine": False,
-
             "dim": 384,
             "signed": True,
             "tf_log": True,
             "normalize": True,
+
+            # memory in
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_join": "\n\n",
+            "mem_in_max_chars": 0,
+
+            "mem_payload_keys": None,
+            "mem_payload_mode": "auto",
+            "mem_payload_join": "\n\n",
+
+            "mem_vector_keys": None,          # expects list[float] OR b64 string
+            "mem_vector_b64f32_keys": None,   # expects b64 string
+
+            "mem_lexicon_keys": None,
+            "mem_context_keys": None,
+
+            # memory out
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         relay = str(params.get("relay", "127.0.0.1:38888"))
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
+        timeout_ms = int(params.get("timeout_ms", 120_000) or 120_000)
 
-        if isinstance(payload, dict):
+        in_meta: Dict[str, Any] = {"input_kind": "vectortext", "coercions": []}
+
+        # ---------------- build body from payload ----------------
+        body: Dict[str, Any]
+
+        # vector-only payload
+        if isinstance(payload, (list, tuple)) and payload and all(isinstance(x, (int, float)) for x in payload):
+            prompt, prompt_meta = _bn_resolve_text_input("", params)
+            body = {"prompt": prompt, "vector": list(payload), "payload": str(params.get("payload", ""))}
+            in_meta["coercions"].append("payload:vector_list->body.vector")
+            in_meta["coercions"].extend(prompt_meta.get("coercions", []))
+            in_meta["mem_in_keys_used"] = prompt_meta.get("mem_in_keys_used", [])
+
+        elif isinstance(payload, dict):
             body = dict(payload)
-        else:
-            body = {
-                "prompt": "" if payload is None else str(payload),
-                "payload": str(params.get("payload", "")),
-            }
+            in_meta["coercions"].append("payload:dict->body")
 
-        # routing keys / stored components
+        else:
+            prompt, prompt_meta = _bn_resolve_text_input(payload, params)
+            body = {"prompt": prompt, "payload": str(params.get("payload", ""))}
+            in_meta["coercions"].extend(prompt_meta.get("coercions", []))
+            in_meta["mem_in_keys_used"] = prompt_meta.get("mem_in_keys_used", [])
+
+        # ---------------- fill payload from Memory if requested ----------------
+        if not body.get("payload") and params.get("mem_payload_keys") is not None:
+            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_payload_keys")))
+            mode = str(params.get("mem_payload_mode", "auto"))
+            joiner = str(params.get("mem_payload_join", "\n\n"))
+            combined, c = _bn_apply_mem_in_mode(body.get("payload", ""), mem_v, mode=mode, joiner=joiner)
+            body["payload"] = _bn_any_to_text(combined)
+            in_meta["coercions"].extend([f"payload_mem:{x}" for x in (c or [])])
+            in_meta["mem_payload_keys_used"] = used
+
+        # ---------------- server-side routing keys ----------------
         _put_many_if_missing(body, params, ("key", "lexicon_key", "context_key", "idf_key", "tokens_key"))
 
-        # inline lexicon/context
-        if "lexicon" in params and "lexicon" not in body:
+        # inline lexicon/context from params
+        if "lexicon" not in body and params.get("lexicon") is not None:
             body["lexicon"] = params.get("lexicon")
-        if "context" in params and "context" not in body:
+            in_meta["coercions"].append("params.lexicon->body.lexicon")
+        if "context" not in body and params.get("context") is not None:
             body["context"] = params.get("context")
+            in_meta["coercions"].append("params.context->body.context")
 
-        # generation controls
+        # inline lexicon/context from memory
+        if "lexicon" not in body and params.get("mem_lexicon_keys") is not None:
+            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_lexicon_keys")))
+            if mem_v is not None:
+                body["lexicon"] = mem_v
+                in_meta["coercions"].append("mem_lexicon_keys->body.lexicon")
+                in_meta["mem_lexicon_keys_used"] = used
+
+        if "context" not in body and params.get("mem_context_keys") is not None:
+            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_context_keys")))
+            if mem_v is not None:
+                body["context"] = mem_v
+                in_meta["coercions"].append("mem_context_keys->body.context")
+                in_meta["mem_context_keys_used"] = used
+
+        # ---------------- vector sources (params/memory) ----------------
+        if "vector" not in body and "vector_b64f32" not in body:
+            v = params.get("vector", None)
+            vb64 = str(params.get("vector_b64f32", "") or "").strip()
+            if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
+                body["vector"] = list(v)
+                in_meta["coercions"].append("params.vector->body.vector")
+            elif vb64:
+                body["vector_b64f32"] = vb64
+                in_meta["coercions"].append("params.vector_b64f32->body.vector_b64f32")
+
+        if "vector" not in body and "vector_b64f32" not in body and params.get("mem_vector_b64f32_keys") is not None:
+            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_b64f32_keys")))
+            if isinstance(mem_v, str) and mem_v.strip():
+                body["vector_b64f32"] = mem_v.strip()
+                in_meta["coercions"].append("mem_vector_b64f32_keys->body.vector_b64f32")
+                in_meta["mem_vector_b64f32_keys_used"] = used
+
+        if "vector" not in body and "vector_b64f32" not in body and params.get("mem_vector_keys") is not None:
+            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_keys")))
+            if isinstance(mem_v, (list, tuple)) and mem_v and all(isinstance(x, (int, float)) for x in mem_v):
+                body["vector"] = list(mem_v)
+                in_meta["coercions"].append("mem_vector_keys->body.vector")
+                in_meta["mem_vector_keys_used"] = used
+            elif isinstance(mem_v, str) and mem_v.strip():
+                body["vector_b64f32"] = mem_v.strip()
+                in_meta["coercions"].append("mem_vector_keys(str)->body.vector_b64f32")
+                in_meta["mem_vector_keys_used"] = used
+
+        if bool(params.get("require_vector", False)) and ("vector" not in body and "vector_b64f32" not in body):
+            return "", {"ok": False, "error": "missing vector/vector_b64f32 (require_vector=True)", **in_meta}
+
+        # ---------------- generation knobs ----------------
         _put_if_missing(body, params, "max_tokens", cast=int)
         _put_if_missing(body, params, "topk", cast=int)
-        _put_if_missing(body, params, "seed")
 
-        # optional enhancement knobs (server may ignore if not supported)
+        # seed: avoid sending "" (common server-side type error)
+        seed = params.get("seed", "")
+        if "seed" not in body and seed not in (None, ""):
+            try:
+                body["seed"] = int(seed)
+                in_meta["coercions"].append("params.seed(str)->int")
+            except Exception:
+                body["seed"] = seed
+
         passthru_keys = (
             "query", "out", "enhance", "lexicon_format",
             "include_weights", "weight_precision", "expand_k",
@@ -28157,11 +29475,20 @@ class BlockNetVectorTextBlock(BaseBlock):
         for k in passthru_keys:
             _put_if_missing(body, params, k)
 
+        # ---------------- call ----------------
         cli = BlockNetClient(relay=relay, token=token)
         j = cli.api_vectortext(body, prefix=pfx)
 
-        out = j.get("generated", j)
-        return out, {"ok": bool(j.get("ok", False)), "response": j}
+        ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+        out = (j.get("generated") if (ok and isinstance(j, dict)) else j)
+
+        exports = _bn_export_to_memory(out_value=out, response_json=j, ok=ok, params=params, links=None)
+
+        meta: Dict[str, Any] = {"ok": ok, "response": j}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return out, meta
 
 
 BLOCKS.register("blocknet_vectortext", BlockNetVectorTextBlock)
@@ -28170,23 +29497,20 @@ BLOCKS.register("blocknet_vectortext", BlockNetVectorTextBlock)
 @dataclass
 class BlockNetWebFetchBlock(BaseBlock):
     """
-    Payload:
-      - str: url
-      - dict: request body for /web/fetch
-    Params:
-      relay, token, api_prefix, mode, include_js, max_bytes, max_scripts
+    POST /web/fetch
+
+    NEW output controls:
+      - emit:
+          * "response" (default): return raw BlockNet JSON response(s)
+          * "links": return a flat list[str] of found links
+          * "links_per_item": return list[list[str]] (one list per fetched URL)
+      - links_mode:
+          * "page" (default): page/navigation links (avoids scripts/icons/ads)
+          * "all": aggressive URL mining
+
+      - same_host_only: if True, only keep links matching the fetched page host
+      - meta_include_response: if True, include full response in meta["response"] (can be huge)
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "mode", "type": "str", "default": "auto", "help": "Server fetch mode"},
-            {"key": "include_js", "type": "bool", "default": False, "help": "Include JS assets/scripts"},
-            {"key": "max_bytes", "type": "int", "default": 2_000_000, "help": "Max bytes to download"},
-            {"key": "max_scripts", "type": "int", "default": 64, "help": "Max scripts to include/analyze"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -28197,6 +29521,28 @@ class BlockNetWebFetchBlock(BaseBlock):
             "include_js": False,
             "max_bytes": 2_000_000,
             "max_scripts": 64,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_max_items": 16,
+            "extract_urls": True,
+
+            "batch": True,
+            "batch_max_items": 8,
+
+            # --- NEW ---
+            "emit": "response",              # "response" | "links" | "links_per_item"
+            "links_mode": "page",            # "page" | "all"
+            "same_host_only": True,
+            "meta_include_response": False,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -28204,22 +29550,136 @@ class BlockNetWebFetchBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
+        emit = str(params.get("emit", "response") or "response").strip().lower()
+        links_mode = str(params.get("links_mode", "page") or "page").strip().lower()
+        same_host_only = bool(params.get("same_host_only", True))
+        meta_include_response = bool(params.get("meta_include_response", False))
+
+        base_body: Dict[str, Any] = {}
+        coercions: List[str] = []
         if isinstance(payload, dict):
-            body = dict(payload)
+            base_body = dict(payload)
+            url_payload, c = _bn_body_take_url_payload(base_body)
+            coercions += (c or ["payload:dict->body"])
+            urls, in_meta = _bn_resolve_url_list(url_payload, params)
+            in_meta["input_kind"] = "web_fetch"
+            in_meta["coercions"] = coercions + list(in_meta.get("coercions", []))
         else:
-            body = {"url": str(payload or "")}
+            urls, in_meta = _bn_resolve_url_list(payload, params)
+            in_meta["input_kind"] = "web_fetch"
 
-        if not body.get("url"):
-            return "", {"ok": False, "error": "missing url"}
-
-        _put_if_missing(body, params, "mode")
-        _put_if_missing(body, params, "include_js", cast=bool)
-        _put_if_missing(body, params, "max_bytes", cast=int)
-        _put_if_missing(body, params, "max_scripts", cast=int)
+        if not urls:
+            return "", {"ok": False, "error": "missing url", **in_meta}
 
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_web_fetch(body, prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+        def _call_one(u: str) -> Any:
+            body = dict(base_body)
+            body["url"] = u
+            _put_if_missing(body, params, "mode")
+            _put_if_missing(body, params, "include_js", cast=bool)
+            _put_if_missing(body, params, "max_bytes", cast=int)
+            _put_if_missing(body, params, "max_scripts", cast=int)
+            return cli.api_web_fetch(body, prefix=pfx)
+
+        batch = bool(params.get("batch", True))
+        max_items = int(params.get("batch_max_items", 8))
+
+        # ---------------- single ----------------
+        if (len(urls) == 1) or (not batch):
+            used = [urls[0]]
+            j = _call_one(used[0])
+            ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+
+            found_links = _bn_found_links_from_response(
+                j,
+                base_url=used[0],
+                mode=links_mode,
+                same_host_only=same_host_only,
+            )
+
+            if emit == "links":
+                out_payload: Any = found_links
+            elif emit == "links_per_item":
+                out_payload = [found_links]
+            else:
+                out_payload = j
+
+            exports = _bn_export_to_memory(
+                out_value=out_payload,
+                response_json=j,
+                ok=ok,
+                params=params,
+                links=found_links,
+            )
+
+            meta: Dict[str, Any] = {
+                "ok": ok,
+                "resolved_urls": urls,
+                "used_urls": used,
+                "found_links": found_links,
+                "emit": emit,
+                "links_mode": links_mode,
+                "same_host_only": same_host_only,
+            }
+            if meta_include_response:
+                meta["response"] = j
+            meta.update(in_meta)
+            if exports:
+                meta["memory_exports"] = exports
+            return out_payload, meta
+
+        # ---------------- batch ----------------
+        used = urls[:max_items]
+        out_items: List[Any] = [_call_one(u) for u in used]
+        ok = all(bool(x.get("ok", False)) for x in out_items if isinstance(x, dict))
+
+        if emit == "links_per_item":
+            per_item: List[List[str]] = [
+                _bn_found_links_from_response(
+                    out_items[i],
+                    base_url=used[i],
+                    mode=links_mode,
+                    same_host_only=same_host_only,
+                )
+                for i in range(len(out_items))
+            ]
+            # flatten + dedupe for meta/mem-out-links
+            found_links = _bn_found_links_from_response(per_item, mode="all")
+            out_payload = per_item
+        else:
+            found_links = _bn_found_links_from_response(
+                out_items,
+                base_url=used[0] if used else "",
+                mode=links_mode,
+                same_host_only=same_host_only,
+            )
+            out_payload = found_links if emit == "links" else out_items
+
+        exports = _bn_export_to_memory(
+            out_value=out_payload,
+            response_json=out_items,
+            ok=ok,
+            params=params,
+            links=found_links,
+        )
+
+        meta = {
+            "ok": ok,
+            "batch_count": len(out_items),
+            "resolved_urls": urls,
+            "used_urls": used,
+            "found_links": found_links,
+            "emit": emit,
+            "links_mode": links_mode,
+            "same_host_only": same_host_only,
+        }
+        if meta_include_response:
+            meta["response"] = out_items
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return out_payload, meta
 
 
 BLOCKS.register("blocknet_web_fetch", BlockNetWebFetchBlock)
@@ -28228,21 +29688,16 @@ BLOCKS.register("blocknet_web_fetch", BlockNetWebFetchBlock)
 @dataclass
 class BlockNetWebJsBlock(BaseBlock):
     """
-    Payload:
-      - str: url
-      - dict: request body for /web/js
-    Params:
-      relay, token, api_prefix, fetch_bodies, max_scripts
+    POST /web/js
+
+    NEW output controls:
+      - emit:
+          * "response" (default): return raw BlockNet JSON response(s)
+          * "links": return a flat list[str] of found links (typically script URLs)
+          * "links_per_item": return list[list[str]] (one list per URL)
+      - links_mode: "page" (default) or "all"
+      - same_host_only / meta_include_response as in WebFetch
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "fetch_bodies", "type": "bool", "default": False, "help": "Fetch script bodies (if server supports)"},
-            {"key": "max_scripts", "type": "int", "default": 64, "help": "Max scripts"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -28251,6 +29706,28 @@ class BlockNetWebJsBlock(BaseBlock):
             "api_prefix": "/v1",
             "fetch_bodies": False,
             "max_scripts": 64,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_max_items": 16,
+            "extract_urls": True,
+
+            "batch": True,
+            "batch_max_items": 8,
+
+            # --- NEW ---
+            "emit": "response",              # "response" | "links" | "links_per_item"
+            "links_mode": "page",            # "page" | "all"
+            "same_host_only": True,
+            "meta_include_response": False,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -28258,20 +29735,133 @@ class BlockNetWebJsBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
+        emit = str(params.get("emit", "response") or "response").strip().lower()
+        links_mode = str(params.get("links_mode", "page") or "page").strip().lower()
+        same_host_only = bool(params.get("same_host_only", True))
+        meta_include_response = bool(params.get("meta_include_response", False))
+
+        base_body: Dict[str, Any] = {}
+        coercions: List[str] = []
         if isinstance(payload, dict):
-            body = dict(payload)
+            base_body = dict(payload)
+            url_payload, c = _bn_body_take_url_payload(base_body)
+            coercions += (c or ["payload:dict->body"])
+            urls, in_meta = _bn_resolve_url_list(url_payload, params)
+            in_meta["input_kind"] = "web_js"
+            in_meta["coercions"] = coercions + list(in_meta.get("coercions", []))
         else:
-            body = {"url": str(payload or "")}
+            urls, in_meta = _bn_resolve_url_list(payload, params)
+            in_meta["input_kind"] = "web_js"
 
-        if not body.get("url"):
-            return "", {"ok": False, "error": "missing url"}
-
-        _put_if_missing(body, params, "fetch_bodies", cast=bool)
-        _put_if_missing(body, params, "max_scripts", cast=int)
+        if not urls:
+            return "", {"ok": False, "error": "missing url", **in_meta}
 
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_web_js(body, prefix=pfx)
-        return j, {"ok": bool(j.get("ok", False)), "response": j}
+
+        def _call_one(u: str) -> Any:
+            body = dict(base_body)
+            body["url"] = u
+            _put_if_missing(body, params, "fetch_bodies", cast=bool)
+            _put_if_missing(body, params, "max_scripts", cast=int)
+            return cli.api_web_js(body, prefix=pfx)
+
+        batch = bool(params.get("batch", True))
+        max_items = int(params.get("batch_max_items", 8))
+
+        # ---------------- single ----------------
+        if (len(urls) == 1) or (not batch):
+            used = [urls[0]]
+            j = _call_one(used[0])
+            ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+
+            found_links = _bn_found_links_from_response(
+                j,
+                base_url=used[0],
+                mode=links_mode,
+                same_host_only=same_host_only,
+            )
+
+            if emit == "links":
+                out_payload: Any = found_links
+            elif emit == "links_per_item":
+                out_payload = [found_links]
+            else:
+                out_payload = j
+
+            exports = _bn_export_to_memory(
+                out_value=out_payload,
+                response_json=j,
+                ok=ok,
+                params=params,
+                links=found_links,
+            )
+
+            meta: Dict[str, Any] = {
+                "ok": ok,
+                "resolved_urls": urls,
+                "used_urls": used,
+                "found_links": found_links,
+                "emit": emit,
+                "links_mode": links_mode,
+                "same_host_only": same_host_only,
+            }
+            if meta_include_response:
+                meta["response"] = j
+            meta.update(in_meta)
+            if exports:
+                meta["memory_exports"] = exports
+            return out_payload, meta
+
+        # ---------------- batch ----------------
+        used = urls[:max_items]
+        out_items: List[Any] = [_call_one(u) for u in used]
+        ok = all(bool(x.get("ok", False)) for x in out_items if isinstance(x, dict))
+
+        if emit == "links_per_item":
+            per_item: List[List[str]] = [
+                _bn_found_links_from_response(
+                    out_items[i],
+                    base_url=used[i],
+                    mode=links_mode,
+                    same_host_only=same_host_only,
+                )
+                for i in range(len(out_items))
+            ]
+            found_links = _bn_found_links_from_response(per_item, mode="all")
+            out_payload = per_item
+        else:
+            found_links = _bn_found_links_from_response(
+                out_items,
+                base_url=used[0] if used else "",
+                mode=links_mode,
+                same_host_only=same_host_only,
+            )
+            out_payload = found_links if emit == "links" else out_items
+
+        exports = _bn_export_to_memory(
+            out_value=out_payload,
+            response_json=out_items,
+            ok=ok,
+            params=params,
+            links=found_links,
+        )
+
+        meta = {
+            "ok": ok,
+            "batch_count": len(out_items),
+            "resolved_urls": urls,
+            "used_urls": used,
+            "found_links": found_links,
+            "emit": emit,
+            "links_mode": links_mode,
+            "same_host_only": same_host_only,
+        }
+        if meta_include_response:
+            meta["response"] = out_items
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return out_payload, meta
 
 
 BLOCKS.register("blocknet_web_js", BlockNetWebJsBlock)
@@ -28282,22 +29872,11 @@ class BlockNetWebLinksBlock(BaseBlock):
     """
     POST /web/links
 
-    Payload:
-      - str: url
-      - dict: request body for /web/links
-    Params:
-      relay, token, api_prefix, same_origin, external_only, max_links
+    Output:
+      - Always returns list[str] of URLs (links).
+    Notes:
+      - If server returns {"list":[...]} we honor it.
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "same_origin", "type": "bool", "default": False, "help": "Only same-origin links"},
-            {"key": "external_only", "type": "bool", "default": False, "help": "Only external links"},
-            {"key": "max_links", "type": "int", "default": 256, "help": "Max links"},
-        ]
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -28307,6 +29886,22 @@ class BlockNetWebLinksBlock(BaseBlock):
             "same_origin": False,
             "external_only": False,
             "max_links": 256,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_max_items": 16,
+            "extract_urls": True,
+
+            "batch": True,
+            "batch_max_items": 8,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -28314,23 +29909,71 @@ class BlockNetWebLinksBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
+        base_body: Dict[str, Any] = {}
+        coercions: List[str] = []
         if isinstance(payload, dict):
-            body = dict(payload)
+            base_body = dict(payload)
+            url_payload, c = _bn_body_take_url_payload(base_body)
+            coercions += (c or ["payload:dict->body"])
+            urls, in_meta = _bn_resolve_url_list(url_payload, params)
+            in_meta["input_kind"] = "web_links"
+            in_meta["coercions"] = coercions + list(in_meta.get("coercions", []))
         else:
-            body = {"url": str(payload or "")}
+            urls, in_meta = _bn_resolve_url_list(payload, params)
+            in_meta["input_kind"] = "web_links"
 
-        if not body.get("url"):
-            return "", {"ok": False, "error": "missing url"}
-
-        _put_if_missing(body, params, "same_origin", cast=bool)
-        _put_if_missing(body, params, "external_only", cast=bool)
-        _put_if_missing(body, params, "max_links", cast=int)
+        if not urls:
+            return "", {"ok": False, "error": "missing url", **in_meta}
 
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_web_links(body, prefix=pfx)
 
-        out = j.get("links", j.get("urls", j))
-        return out, {"ok": bool(j.get("ok", False)), "response": j}
+        def _call_one(u: str) -> Tuple[Any, List[str], bool]:
+            body = dict(base_body)
+            body["url"] = u
+            _put_if_missing(body, params, "same_origin", cast=bool)
+            _put_if_missing(body, params, "external_only", cast=bool)
+            _put_if_missing(body, params, "max_links", cast=int)
+            j = cli.api_web_links(body, prefix=pfx)
+            ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+            links_list = _bn_response_take_list(j, keys=["links", "urls"])  # also honors "list"
+            return j, links_list, ok
+
+        batch = bool(params.get("batch", True))
+        max_items = int(params.get("batch_max_items", 8))
+
+        if (len(urls) == 1) or (not batch):
+            used = [urls[0]]
+            j, links_list, ok = _call_one(used[0])
+
+            exports = _bn_export_to_memory(out_value=links_list, response_json=j, ok=ok, params=params, links=links_list)
+
+            meta = {"ok": ok, "response": j, "resolved_urls": urls, "used_urls": used}
+            meta.update(in_meta)
+            if exports:
+                meta["memory_exports"] = exports
+            return links_list, meta
+
+        used = urls[:max_items]
+        responses: List[Any] = []
+        all_links: List[str] = []
+        oks: List[bool] = []
+
+        for u in used:
+            j, links_list, ok = _call_one(u)
+            responses.append(j)
+            all_links.extend(links_list)
+            oks.append(ok)
+
+        all_links = _bn_dedupe_strs(all_links)
+        ok = all(oks) if oks else False
+
+        exports = _bn_export_to_memory(out_value=all_links, response_json=responses, ok=ok, params=params, links=all_links)
+
+        meta = {"ok": ok, "response": responses, "batch_count": len(responses), "resolved_urls": urls, "used_urls": used}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return all_links, meta
 
 
 BLOCKS.register("blocknet_web_links", BlockNetWebLinksBlock)
@@ -28341,20 +29984,12 @@ class BlockNetWebRssFindBlock(BaseBlock):
     """
     POST /web/rss_find
 
-    Payload:
-      - str: url
-      - dict: request body for /web/rss_find
-    Params:
-      relay, token, api_prefix, max_feeds
+    Output:
+      - Always returns list[str] of feed URLs.
+    Notes:
+      - If server returns {"list":[...]} we honor it.
     """
-    @classmethod
-    def param_specs(cls):
-        return [
-            {"key": "relay", "type": "str", "default": "127.0.0.1:38888", "help": "Relay host:port"},
-            {"key": "token", "type": "str", "default": "", "help": "Bearer token"},
-            {"key": "api_prefix", "type": "str", "default": "/v1", "help": "API prefix"},
-            {"key": "max_feeds", "type": "int", "default": 32, "help": "Max feeds to return"},
-        ]
+
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -28362,6 +29997,22 @@ class BlockNetWebRssFindBlock(BaseBlock):
             "token": "",
             "api_prefix": "/v1",
             "max_feeds": 32,
+
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_max_items": 16,
+            "extract_urls": True,
+
+            "batch": True,
+            "batch_max_items": 8,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
         }
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
@@ -28369,21 +30020,195 @@ class BlockNetWebRssFindBlock(BaseBlock):
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
 
+        base_body: Dict[str, Any] = {}
+        coercions: List[str] = []
         if isinstance(payload, dict):
-            body = dict(payload)
+            base_body = dict(payload)
+            url_payload, c = _bn_body_take_url_payload(base_body)
+            coercions += (c or ["payload:dict->body"])
+            urls, in_meta = _bn_resolve_url_list(url_payload, params)
+            in_meta["input_kind"] = "web_rss_find"
+            in_meta["coercions"] = coercions + list(in_meta.get("coercions", []))
         else:
-            body = {"url": str(payload or "")}
+            urls, in_meta = _bn_resolve_url_list(payload, params)
+            in_meta["input_kind"] = "web_rss_find"
 
-        if not body.get("url"):
-            return "", {"ok": False, "error": "missing url"}
-
-        _put_if_missing(body, params, "max_feeds", cast=int)
+        if not urls:
+            return "", {"ok": False, "error": "missing url", **in_meta}
 
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_web_rss_find(body, prefix=pfx)
 
-        out = j.get("feeds", j.get("urls", j))
-        return out, {"ok": bool(j.get("ok", False)), "response": j}
+        def _call_one(u: str) -> Tuple[Any, List[str], bool]:
+            body = dict(base_body)
+            body["url"] = u
+            _put_if_missing(body, params, "max_feeds", cast=int)
+            j = cli.api_web_rss_find(body, prefix=pfx)
+            ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+            feeds_list = _bn_response_take_list(j, keys=["feeds", "urls"])  # also honors "list"
+            return j, feeds_list, ok
+
+        batch = bool(params.get("batch", True))
+        max_items = int(params.get("batch_max_items", 8))
+
+        if (len(urls) == 1) or (not batch):
+            used = [urls[0]]
+            j, feeds_list, ok = _call_one(used[0])
+
+            exports = _bn_export_to_memory(out_value=feeds_list, response_json=j, ok=ok, params=params, links=feeds_list)
+
+            meta = {"ok": ok, "response": j, "resolved_urls": urls, "used_urls": used}
+            meta.update(in_meta)
+            if exports:
+                meta["memory_exports"] = exports
+            return feeds_list, meta
+
+        used = urls[:max_items]
+        responses: List[Any] = []
+        all_feeds: List[str] = []
+        oks: List[bool] = []
+
+        for u in used:
+            j, feeds_list, ok = _call_one(u)
+            responses.append(j)
+            all_feeds.extend(feeds_list)
+            oks.append(ok)
+
+        all_feeds = _bn_dedupe_strs(all_feeds)
+        ok = all(oks) if oks else False
+
+        exports = _bn_export_to_memory(out_value=all_feeds, response_json=responses, ok=ok, params=params, links=all_feeds)
+
+        meta = {"ok": ok, "response": responses, "batch_count": len(responses), "resolved_urls": urls, "used_urls": used}
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return all_feeds, meta
 
 
 BLOCKS.register("blocknet_web_rss_find", BlockNetWebRssFindBlock)
+
+@dataclass
+class BlockNetWebRenderBlock(BaseBlock):
+    """
+    Companion: actually execute JS via Playwright and return rendered html/text/links.
+    Input: URL(s) (payload + Memory).
+    """
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_max_items": 4,
+            "extract_urls": True,
+
+            "headless": True,
+            "timeout_ms": 20_000,
+            "wait_until": "domcontentloaded",
+            "wait_after_ms": 500,
+            "user_agent": "",
+
+            "block_resources": True,
+            "blocked_resource_types": ["image", "font", "media"],
+
+            # --- NEW "smart hidden links" knobs ---
+            "include_frames": True,
+            "include_shadow_dom": True,  # (shadow traversal happens in the eval)
+            "include_perf_resources": True,
+            "include_attr_mining": True,
+            "include_inline_scripts": True,
+            "inline_script_max_chars": 200_000,
+
+            "capture_network": True,
+            "mine_response_bodies": True,
+            "max_mine_bytes": 250_000,
+            "mine_content_types": [
+                "text/html",
+                "application/json",
+                "text/plain",
+                "application/javascript",
+                "text/javascript",
+            ],
+
+            "wait_network_quiet": True,
+            "network_quiet_ms": 800,
+            "network_quiet_timeout_ms": 7_000,
+
+            "auto_scroll": True,
+            "scroll_steps": 6,
+            "scroll_wait_ms": 350,
+            "expand_details": True,
+
+            "emit": "links",  # "links" | "text" | "html" | "bundle" | "per_item"
+            "same_host_only": True,
+
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        emit = str(params.get("emit", "links") or "links").strip().lower()
+        same_host_only = bool(params.get("same_host_only", True))
+
+        urls, in_meta = _bn_resolve_url_list(payload, params)
+        in_meta["input_kind"] = "web_render"
+
+        if not urls:
+            return "", {"ok": False, "error": "missing url", **in_meta}
+
+        used = urls[: int(params.get("mem_in_max_items", 4) or 4)]
+        rendered = [_bn_playwright_render_one(u, params=params) for u in used]
+
+        # collect links + optionally same-host filter (relative to each page host)
+        all_links: List[str] = []
+        for r in rendered:
+            u0 = str(r.get("url") or "")
+            found = _bn_found_links_from_response(
+                r.get("links") or [],
+                base_url=u0,
+                mode="all",
+                same_host_only=same_host_only,
+            )
+            all_links.extend(found)
+
+        all_links = _bn_dedupe_strs(all_links)
+        ok = all(bool(r.get("ok")) for r in rendered) if rendered else False
+
+        if emit == "per_item":
+            out_payload: Any = rendered
+        elif emit == "text":
+            out_payload = "\n\n".join([str(r.get("text") or "").strip() for r in rendered if str(r.get("text") or "").strip()]).strip()
+        elif emit == "html":
+            out_payload = "\n\n".join([str(r.get("html") or "").strip() for r in rendered if str(r.get("html") or "").strip()]).strip()
+        elif emit == "bundle":
+            out_payload = {"items": rendered, "links": all_links}
+        else:
+            out_payload = all_links
+
+        exports = _bn_export_to_memory(
+            out_value=out_payload,
+            response_json=rendered,
+            ok=ok,
+            params=params,
+            links=all_links,
+        )
+
+        meta = {
+            "ok": ok,
+            "emit": emit,
+            "resolved_urls": urls,
+            "used_urls": used,
+            "found_links": all_links,
+            "batch_count": len(rendered),
+        }
+        meta.update(in_meta)
+        if exports:
+            meta["memory_exports"] = exports
+        return out_payload, meta
+
+
+BLOCKS.register("blocknet_web_render", BlockNetWebRenderBlock)

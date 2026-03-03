@@ -84,18 +84,14 @@ class BlockNetClient:
         return p
 
     def _request(
-        self,
-        method: str,
-        path: str,
-        body: bytes = b"",
-        headers: Optional[Dict[str, str]] = None,
-        *,
-        follow_redirects_for_get: bool = True,
+            self,
+            method: str,
+            path: str,
+            body: bytes = b"",
+            headers: Optional[Dict[str, str]] = None,
+            *,
+            follow_redirects_for_get: bool = True,
     ) -> Tuple[int, Dict[str, str], bytes]:
-        """
-        Returns: (status, headers, body_bytes)
-        Follows redirects for GET (useful for /v1/get?key=... which may redirect).
-        """
         conn, base_path = self._conn()
         full_path = self._normalize_path(base_path, path)
 
@@ -106,12 +102,11 @@ class BlockNetClient:
             status = int(res.status)
             hdrs = dict(res.getheaders())
 
-            # Redirect handling for GET only (safe default)
+            # Redirect handling for GET only
             if follow_redirects_for_get and method.upper() == "GET" and status in (301, 302, 303, 307, 308):
                 loc = res.getheader("Location") or ""
                 conn.close()
                 if loc:
-                    # Location may be absolute or relative
                     if loc.startswith("http://") or loc.startswith("https://"):
                         u = urlparse(loc)
                         new_scheme = u.scheme.lower() or "http"
@@ -134,32 +129,57 @@ class BlockNetClient:
                         finally:
                             c2.close()
                     else:
-                        # relative redirect stays on same relay/base_path
                         return self._request("GET", loc, b"", headers=headers, follow_redirects_for_get=True)
 
             conn.close()
             return status, hdrs, data
+
         except Exception as e:
             try:
                 conn.close()
             except Exception:
                 pass
-            msg = str(e).encode("utf-8", errors="replace")
-            return 0, {}, msg
+
+            # IMPORTANT: return JSON bytes so callers see the real error
+            err = {
+                "ok": False,
+                "error": f"request failed: {type(e).__name__}: {e}",
+                "status": 0,
+                "headers": {},
+                "method": method.upper(),
+                "path": full_path,
+            }
+            return 0, {}, json.dumps(err).encode("utf-8", errors="replace")
 
     @staticmethod
     def _as_json(status: int, data: bytes, hdrs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        txt = ""
         try:
-            j = json.loads(data.decode("utf-8", errors="replace") or "{}")
+            txt = data.decode("utf-8", errors="replace") if data else ""
         except Exception:
-            j = {"ok": False, "error": "non-json response"}
+            txt = ""
+
+        try:
+            j = json.loads(txt or "{}")
+        except Exception:
+            # keep a snippet so you can see HTML/tracebacks/etc
+            j = {
+                "ok": False,
+                "error": "non-json response",
+                "text_snippet": (txt[:1200] if txt else ""),
+            }
 
         if not isinstance(j, dict):
             j = {"ok": False, "error": "json was not an object", "data": j}
 
-        j.setdefault("status", status)
+        j.setdefault("status", int(status))
         if hdrs is not None:
             j.setdefault("headers", hdrs)
+
+        # infer ok if server didn't provide it
+        if "ok" not in j:
+            j["ok"] = (200 <= int(status) < 300)
+
         return j
 
     # ---------------- generic JSON helpers ----------------
@@ -175,21 +195,31 @@ class BlockNetClient:
         return self._request(method, path, body=body, headers=headers)
 
     def request_json(
-        self,
-        method: str,
-        path: str,
-        obj: Optional[Dict[str, Any]] = None,
+            self,
+            method: str,
+            path: str,
+            obj: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if obj is None:
             status, hdrs, data = self._request(method, path, body=b"", headers=None)
             return self._as_json(status, data, hdrs)
 
-        body = json.dumps(obj).encode("utf-8")
+        # safer JSON encoding (also avoids huge whitespace)
+        try:
+            body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"json encode failed: {type(e).__name__}: {e}",
+                "status": 0,
+                "headers": {},
+            }
+
         status, hdrs, data = self._request(
             method,
             path,
             body=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
         return self._as_json(status, data, hdrs)
 
