@@ -283,6 +283,7 @@ class BlockNetClient:
 
     def api_vectortext(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
+        print(body)
         return self.request_json("POST", f"{p}/vectortext", dict(body))
 
     # media

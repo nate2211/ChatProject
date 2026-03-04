@@ -29074,8 +29074,12 @@ class BlockNetTextToVecBlock(BaseBlock):
     """
     Payload: text (string-ish)
     Also supports reading input text from Memory via mem_in_keys.
-    """
 
+    New:
+      - emit:
+          * "response" (default): return full BlockNet JSON response
+          * "vector": return ONLY the vector field (e.g. "vector_b64f32")
+    """
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -29085,6 +29089,9 @@ class BlockNetTextToVecBlock(BaseBlock):
             "dim": 1024,
             "normalize": True,
             "output": "b64f32",
+
+            # NEW:
+            "emit": "response",  # "response" | "vector"
 
             "mem_in_keys": None,
             "mem_in_mode": "auto",
@@ -29102,6 +29109,39 @@ class BlockNetTextToVecBlock(BaseBlock):
             "mem_out_max_items": 0,
         }
 
+    @staticmethod
+    def _extract_vector(resp: Any, output: str) -> Any:
+        """
+        Best-effort extraction of the vector payload from a BlockNet response.
+
+        Typical response:
+          { "ok": true, "dim": 1024, "encoding": "f32-le-base64", "vector_b64f32": "..." }
+
+        If output == "b64f32", we prefer "vector_b64f32".
+        Otherwise we try common alternatives.
+        """
+        if not isinstance(resp, dict):
+            return None
+
+        # Prefer base64-f32 if present (common / default in your block)
+        if "vector_b64f32" in resp:
+            return resp.get("vector_b64f32")
+
+        # Other common shapes
+        if "vector" in resp:
+            return resp.get("vector")
+        if "embedding" in resp:
+            return resp.get("embedding")
+        if "embeddings" in resp:
+            return resp.get("embeddings")
+
+        # Last-resort: any key containing "vector"
+        for k, v in resp.items():
+            if isinstance(k, str) and "vector" in k.lower():
+                return v
+
+        return None
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         relay = str(params.get("relay", "127.0.0.1:38888"))
         token = str(params.get("token", ""))
@@ -29110,6 +29150,7 @@ class BlockNetTextToVecBlock(BaseBlock):
         dim = int(params.get("dim", 1024))
         normalize = bool(params.get("normalize", True))
         output = str(params.get("output", "b64f32"))
+        emit = str(params.get("emit", "response")).strip().lower()  # "response" | "vector"
 
         # Resolve input
         text_in, in_meta = _bn_resolve_text_input(payload, params)
@@ -29117,35 +29158,67 @@ class BlockNetTextToVecBlock(BaseBlock):
 
         # Batch mode: if memory produced a list and user asked to batch, embed each item
         if bool(params.get("batch", False)):
-            mem_v, _used = _bn_mem_get(_bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None)))
+            mem_v, _used = _bn_mem_get(
+                _bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None))
+            )
             if isinstance(mem_v, (list, tuple)) and len(mem_v) > 1:
-                out_items: List[Any] = []
                 max_items = int(params.get("batch_max_items", 16))
+
+                response_items: List[Any] = []
+                out_payload_items: List[Any] = []
+
                 for t in [str(x) for x in mem_v][:max_items]:
                     j = cli.api_texttovec(t, dim=dim, normalize=normalize, output=output, prefix=pfx)
-                    out_items.append(j)
-                ok = all(bool(x.get("ok", False)) for x in out_items if isinstance(x, dict))
-                exports = _bn_export_to_memory(out_value=out_items, response_json=out_items, ok=ok, params=params, links=None)
-                meta = {"ok": ok, "response": out_items, "batch_count": len(out_items)}
+                    response_items.append(j)
+                    if emit == "vector":
+                        out_payload_items.append(self._extract_vector(j, output))
+                    else:
+                        out_payload_items.append(j)
+
+                ok = all(bool(x.get("ok", False)) for x in response_items if isinstance(x, dict))
+
+                # Export what we actually returned as payload, but keep full response_json for traceability
+                exports = _bn_export_to_memory(
+                    out_value=out_payload_items,
+                    response_json=response_items,
+                    ok=ok,
+                    params=params,
+                    links=None,
+                )
+
+                meta = {
+                    "ok": ok,
+                    "emit": emit,
+                    "batch_count": len(out_payload_items),
+                    "response": response_items if emit != "response" else out_payload_items,
+                }
                 meta.update(in_meta)
                 if exports:
                     meta["memory_exports"] = exports
-                return out_items, meta
+                return out_payload_items, meta
 
         # Single
         j = cli.api_texttovec(text_in, dim=dim, normalize=normalize, output=output, prefix=pfx)
-        ok = bool(j.get("ok", False))
-        exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+        ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
 
-        meta = {"ok": ok, "response": j}
+        out_payload = self._extract_vector(j, output) if emit == "vector" else j
+
+        exports = _bn_export_to_memory(
+            out_value=out_payload,
+            response_json=j,
+            ok=ok,
+            params=params,
+            links=None,
+        )
+
+        meta = {"ok": ok, "emit": emit, "response": j}
         meta.update(in_meta)
         if exports:
             meta["memory_exports"] = exports
-        return j, meta
+        return out_payload, meta
 
 
 BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
-
 
 @dataclass
 class BlockNetImageToVecBlock(BaseBlock):
@@ -29266,12 +29339,17 @@ BLOCKS.register("blocknet_videotovec", BlockNetVideoToVecBlock)
 @dataclass
 class BlockNetVectorTextBlock(BaseBlock):
     """
-    POST /vectortext
+    POST /v1/vectortext
 
-    Payload accepted:
-      - dict: treated as full request body (prompt/payload/vector/etc)
-      - str: treated as prompt (payload can come from params/memory)
-      - list[float]/tuple[float]: treated as vector; prompt comes from mem_in/params
+    Designed to work with pipelines where the previous block may output vector_b64f32
+    as the *payload* (e.g. blocknet_texttovec.emit="vector").
+
+    This block:
+      - Detects if incoming payload looks like base64 float32 vector -> uses it as vector_b64f32
+      - Uses params.payload (e.g. blocknet_vectortext.payload={payload}) as the prompt/payload text
+      - Pulls lexicon/context from memory keys and normalizes them to server-friendly types
+      - Sends ONLY schema fields; avoids forwarding tons of extra defaults
+      - Uses dim only for validation by default (no server forward)
     """
 
     def get_params_info(self) -> Dict[str, Any]:
@@ -29281,16 +29359,16 @@ class BlockNetVectorTextBlock(BaseBlock):
             "api_prefix": "/v1",
             "timeout_ms": 120_000,
 
-            # defaults when payload isn't dict
-            "payload": "",
-            "seed": "",
+            # prompt/payload text
+            "prompt": "",      # optional explicit prompt override
+            "payload": "",     # you set this: blocknet_vectortext.payload={payload}
 
-            # vector sources (optional)
-            "vector": None,                 # list[float] or None
-            "vector_b64f32": "",            # base64 string or ""
+            # vector sources
+            "vector": None,
+            "vector_b64f32": "",
             "require_vector": False,
 
-            # server-side keys
+            # server-side keys (only sent if non-empty)
             "key": "",
             "lexicon_key": "",
             "context_key": "",
@@ -29301,34 +29379,16 @@ class BlockNetVectorTextBlock(BaseBlock):
             "lexicon": None,
             "context": None,
 
-            # generation
-            "max_tokens": 256,
-            "topk": 24,
+            # generation (schema)
+            "max_tokens": 160,
+            "topk": 16,
+            "seed": "",
 
-            # optional enhancement knobs (pass-through)
-            "query": "",
-            "out": "append",
-            "enhance": "both",
-            "lexicon_format": "inline",
-            "include_weights": False,
-            "weight_precision": 3,
-            "expand_k": 12,
-            "min_abs_weight": 0.0,
-            "focus_lines": 0,
-            "lowercase": True,
-            "max_tokens_in": 0,
-            "drop_hexbytes": True,
-            "drop_numbers": True,
-            "drop_stopwords": True,
-            "match_k": 24,
-            "top_k": 24,
-            "compute_cosine": False,
-            "dim": 384,
-            "signed": True,
-            "tf_log": True,
-            "normalize": True,
+            # dim handling (validation only by default)
+            "dim": 1024,
+            "forward_dim": False,   # set True ONLY if your server expects "dim"
 
-            # memory in
+            # memory inputs
             "mem_in_keys": None,
             "mem_in_mode": "auto",
             "mem_in_join": "\n\n",
@@ -29338,8 +29398,8 @@ class BlockNetVectorTextBlock(BaseBlock):
             "mem_payload_mode": "auto",
             "mem_payload_join": "\n\n",
 
-            "mem_vector_keys": None,          # expects list[float] OR b64 string
-            "mem_vector_b64f32_keys": None,   # expects b64 string
+            "mem_vector_keys": None,
+            "mem_vector_b64f32_keys": None,
 
             "mem_lexicon_keys": None,
             "mem_context_keys": None,
@@ -29353,142 +29413,317 @@ class BlockNetVectorTextBlock(BaseBlock):
             "mem_out_max_items": 0,
         }
 
+    # ---------------- helpers ----------------
+
+    @staticmethod
+    def _is_nonempty_str(x: Any) -> bool:
+        return isinstance(x, str) and bool(x.strip())
+
+    @staticmethod
+    def _looks_like_b64_f32_vector(s: str) -> bool:
+        # heuristic + validate
+        t = (s or "").strip()
+        if len(t) < 64:
+            return False
+        try:
+            raw = base64.b64decode(t, validate=True)
+        except Exception:
+            return False
+        if len(raw) < 4 * 16:
+            return False
+        return (len(raw) % 4) == 0
+
+    @staticmethod
+    def _coerce_vector(val: Any) -> Tuple[str, Any]:
+        # ("vector_b64f32", str) or ("vector", list[float]) or ("", None)
+        if isinstance(val, dict):
+            vb64 = val.get("vector_b64f32")
+            if isinstance(vb64, str) and vb64.strip():
+                return "vector_b64f32", vb64.strip()
+            v = val.get("vector")
+            if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
+                return "vector", list(v)
+        if isinstance(val, str) and val.strip():
+            return "vector_b64f32", val.strip()
+        if isinstance(val, (list, tuple)) and val and all(isinstance(x, (int, float)) for x in val):
+            return "vector", list(val)
+        return "", None
+
+    @staticmethod
+    def _infer_dim_from_vector(body: Dict[str, Any]) -> Optional[int]:
+        v = body.get("vector")
+        if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
+            return len(v)
+        vb64 = body.get("vector_b64f32")
+        if isinstance(vb64, str) and vb64.strip():
+            try:
+                raw = base64.b64decode(vb64.strip(), validate=True)
+                if len(raw) % 4 == 0:
+                    return len(raw) // 4
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _normalize_textish(x: Any, joiner: str = "\n") -> Any:
+        """
+        Make lexicon/context safe for server:
+          - list/tuple[str] -> joined string
+          - bytes -> decoded utf-8
+          - dict -> keep
+          - str -> keep
+          - other -> str(x)
+        """
+        if x is None:
+            return None
+        if isinstance(x, bytes):
+            try:
+                return x.decode("utf-8", errors="ignore")
+            except Exception:
+                return str(x)
+        if isinstance(x, str):
+            return x
+        if isinstance(x, dict):
+            return x
+        if isinstance(x, (list, tuple)):
+            # join items as lines
+            parts = []
+            for it in x:
+                if it is None:
+                    continue
+                if isinstance(it, bytes):
+                    try:
+                        it = it.decode("utf-8", errors="ignore")
+                    except Exception:
+                        it = str(it)
+                parts.append(str(it))
+            return joiner.join(parts)
+        return str(x)
+
+    @staticmethod
+    def _put_if_nonempty(body: Dict[str, Any], key: str, val: Any) -> None:
+        if val is None:
+            return
+        if isinstance(val, str):
+            if not val.strip():
+                return
+            body[key] = val.strip()
+            return
+        if isinstance(val, (list, tuple, dict)):
+            if not val:
+                return
+            body[key] = val
+            return
+        body[key] = val
+
+    # ---------------- main ----------------
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         relay = str(params.get("relay", "127.0.0.1:38888"))
         token = str(params.get("token", ""))
         pfx = _api_prefix(params)
         timeout_ms = int(params.get("timeout_ms", 120_000) or 120_000)
 
-        in_meta: Dict[str, Any] = {"input_kind": "vectortext", "coercions": []}
+        meta: Dict[str, Any] = {"input_kind": "vectortext", "coercions": []}
 
-        # ---------------- build body from payload ----------------
-        body: Dict[str, Any]
+        body: Dict[str, Any] = {}
 
-        # vector-only payload
-        if isinstance(payload, (list, tuple)) and payload and all(isinstance(x, (int, float)) for x in payload):
-            prompt, prompt_meta = _bn_resolve_text_input("", params)
-            body = {"prompt": prompt, "vector": list(payload), "payload": str(params.get("payload", ""))}
-            in_meta["coercions"].append("payload:vector_list->body.vector")
-            in_meta["coercions"].extend(prompt_meta.get("coercions", []))
-            in_meta["mem_in_keys_used"] = prompt_meta.get("mem_in_keys_used", [])
-
-        elif isinstance(payload, dict):
-            body = dict(payload)
-            in_meta["coercions"].append("payload:dict->body")
-
+        # ---- 1) If payload is dict, accept it (but we’ll sanitize & whitelist later) ----
+        if isinstance(payload, dict):
+            # start from payload dict, but don't trust it fully
+            payload_dict = dict(payload)
+            meta["coercions"].append("payload:dict->seed_body")
         else:
-            prompt, prompt_meta = _bn_resolve_text_input(payload, params)
-            body = {"prompt": prompt, "payload": str(params.get("payload", ""))}
-            in_meta["coercions"].extend(prompt_meta.get("coercions", []))
-            in_meta["mem_in_keys_used"] = prompt_meta.get("mem_in_keys_used", [])
+            payload_dict = {}
 
-        # ---------------- fill payload from Memory if requested ----------------
-        if not body.get("payload") and params.get("mem_payload_keys") is not None:
+        # ---- 2) Vector resolution (payload->params->memory) ----
+        # payload vector forms
+        if "vector_b64f32" in payload_dict or "vector" in payload_dict:
+            # we will keep these if non-empty after normalization
+            pass
+        elif isinstance(payload, (list, tuple)) and payload and all(isinstance(x, (int, float)) for x in payload):
+            payload_dict["vector"] = list(payload)
+            meta["coercions"].append("payload:vector_list->body.vector")
+        elif isinstance(payload, str) and self._looks_like_b64_f32_vector(payload):
+            payload_dict["vector_b64f32"] = payload.strip()
+            meta["coercions"].append("payload:str(b64)->body.vector_b64f32")
+
+        # params vector
+        if not payload_dict.get("vector") and not self._is_nonempty_str(payload_dict.get("vector_b64f32")):
+            v = params.get("vector")
+            vb64 = str(params.get("vector_b64f32", "") or "").strip()
+            if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
+                payload_dict["vector"] = list(v)
+                meta["coercions"].append("params.vector->body.vector")
+            elif vb64:
+                payload_dict["vector_b64f32"] = vb64
+                meta["coercions"].append("params.vector_b64f32->body.vector_b64f32")
+
+        # memory vector
+        if not payload_dict.get("vector") and not self._is_nonempty_str(payload_dict.get("vector_b64f32")):
+            if params.get("mem_vector_b64f32_keys") is not None:
+                mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_b64f32_keys")))
+                k, vv = self._coerce_vector(mem_v)
+                if vv is not None:
+                    payload_dict[k] = vv
+                    meta["coercions"].append(f"mem_vector_b64f32_keys->body.{k}")
+                    meta["mem_vector_b64f32_keys_used"] = used
+
+        if not payload_dict.get("vector") and not self._is_nonempty_str(payload_dict.get("vector_b64f32")):
+            if params.get("mem_vector_keys") is not None:
+                mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_keys")))
+                k, vv = self._coerce_vector(mem_v)
+                if vv is not None:
+                    payload_dict[k] = vv
+                    meta["coercions"].append(f"mem_vector_keys->body.{k}")
+                    meta["mem_vector_keys_used"] = used
+
+        # ---- 3) Prompt/payload text resolution ----
+        # prompt priority: params.prompt -> payload_dict.prompt -> params.payload -> mem_in_keys -> (payload if not b64)
+        prompt_text = ""
+        if self._is_nonempty_str(params.get("prompt", "")):
+            prompt_text = str(params.get("prompt", "")).strip()
+            meta["coercions"].append("params.prompt->prompt")
+        elif self._is_nonempty_str(payload_dict.get("prompt")) and not self._looks_like_b64_f32_vector(str(payload_dict["prompt"])):
+            prompt_text = str(payload_dict["prompt"]).strip()
+            meta["coercions"].append("payload.prompt->prompt")
+        elif self._is_nonempty_str(params.get("payload", "")) and not self._looks_like_b64_f32_vector(str(params.get("payload")).strip()):
+            # your config: blocknet_vectortext.payload={payload}
+            prompt_text = str(params.get("payload", "")).strip()
+            meta["coercions"].append("params.payload->prompt")
+        else:
+            # last: mem_in_keys
+            p, pm = _bn_resolve_text_input("", params)
+            if self._is_nonempty_str(p):
+                prompt_text = p
+                meta["coercions"].extend(pm.get("coercions", []))
+                meta["mem_in_keys_used"] = pm.get("mem_in_keys_used", [])
+
+        # request payload field: payload_dict.payload -> params.payload -> mem_payload_keys
+        req_payload_text = ""
+        if self._is_nonempty_str(payload_dict.get("payload")) and not self._looks_like_b64_f32_vector(str(payload_dict["payload"])):
+            req_payload_text = str(payload_dict["payload"]).strip()
+            meta["coercions"].append("payload.payload->body.payload")
+        elif self._is_nonempty_str(params.get("payload", "")) and not self._looks_like_b64_f32_vector(str(params.get("payload")).strip()):
+            req_payload_text = str(params.get("payload", "")).strip()
+            meta["coercions"].append("params.payload->body.payload")
+        elif params.get("mem_payload_keys") is not None:
             mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_payload_keys")))
             mode = str(params.get("mem_payload_mode", "auto"))
             joiner = str(params.get("mem_payload_join", "\n\n"))
-            combined, c = _bn_apply_mem_in_mode(body.get("payload", ""), mem_v, mode=mode, joiner=joiner)
-            body["payload"] = _bn_any_to_text(combined)
-            in_meta["coercions"].extend([f"payload_mem:{x}" for x in (c or [])])
-            in_meta["mem_payload_keys_used"] = used
+            combined, c = _bn_apply_mem_in_mode("", mem_v, mode=mode, joiner=joiner)
+            req_payload_text = _bn_any_to_text(combined)
+            meta["coercions"].extend([f"payload_mem:{x}" for x in (c or [])])
+            meta["mem_payload_keys_used"] = used
 
-        # ---------------- server-side routing keys ----------------
-        _put_many_if_missing(body, params, ("key", "lexicon_key", "context_key", "idf_key", "tokens_key"))
+        # ---- 4) Lexicon/context: memory first (your config uses mem_*) then params then payload_dict ----
+        lex = None
+        ctx = None
 
-        # inline lexicon/context from params
-        if "lexicon" not in body and params.get("lexicon") is not None:
-            body["lexicon"] = params.get("lexicon")
-            in_meta["coercions"].append("params.lexicon->body.lexicon")
-        if "context" not in body and params.get("context") is not None:
-            body["context"] = params.get("context")
-            in_meta["coercions"].append("params.context->body.context")
-
-        # inline lexicon/context from memory
-        if "lexicon" not in body and params.get("mem_lexicon_keys") is not None:
+        if params.get("mem_lexicon_keys") is not None:
             mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_lexicon_keys")))
             if mem_v is not None:
-                body["lexicon"] = mem_v
-                in_meta["coercions"].append("mem_lexicon_keys->body.lexicon")
-                in_meta["mem_lexicon_keys_used"] = used
+                lex = mem_v
+                meta["coercions"].append("mem_lexicon_keys->lexicon")
+                meta["mem_lexicon_keys_used"] = used
+        if lex is None and payload_dict.get("lexicon") is not None:
+            lex = payload_dict.get("lexicon")
+        if lex is None and params.get("lexicon") is not None:
+            lex = params.get("lexicon")
 
-        if "context" not in body and params.get("mem_context_keys") is not None:
+        if params.get("mem_context_keys") is not None:
             mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_context_keys")))
             if mem_v is not None:
-                body["context"] = mem_v
-                in_meta["coercions"].append("mem_context_keys->body.context")
-                in_meta["mem_context_keys_used"] = used
+                ctx = mem_v
+                meta["coercions"].append("mem_context_keys->context")
+                meta["mem_context_keys_used"] = used
+        if ctx is None and payload_dict.get("context") is not None:
+            ctx = payload_dict.get("context")
+        if ctx is None and params.get("context") is not None:
+            ctx = params.get("context")
 
-        # ---------------- vector sources (params/memory) ----------------
-        if "vector" not in body and "vector_b64f32" not in body:
-            v = params.get("vector", None)
-            vb64 = str(params.get("vector_b64f32", "") or "").strip()
-            if isinstance(v, (list, tuple)) and v and all(isinstance(x, (int, float)) for x in v):
-                body["vector"] = list(v)
-                in_meta["coercions"].append("params.vector->body.vector")
-            elif vb64:
-                body["vector_b64f32"] = vb64
-                in_meta["coercions"].append("params.vector_b64f32->body.vector_b64f32")
+        lex_norm = self._normalize_textish(lex, joiner="\n")
+        ctx_norm = self._normalize_textish(ctx, joiner="\n\n")
 
-        if "vector" not in body and "vector_b64f32" not in body and params.get("mem_vector_b64f32_keys") is not None:
-            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_b64f32_keys")))
-            if isinstance(mem_v, str) and mem_v.strip():
-                body["vector_b64f32"] = mem_v.strip()
-                in_meta["coercions"].append("mem_vector_b64f32_keys->body.vector_b64f32")
-                in_meta["mem_vector_b64f32_keys_used"] = used
+        # ---- 5) Build final body using ONLY /v1/vectortext schema fields ----
+        self._put_if_nonempty(body, "prompt", prompt_text)
+        self._put_if_nonempty(body, "payload", req_payload_text)
 
-        if "vector" not in body and "vector_b64f32" not in body and params.get("mem_vector_keys") is not None:
-            mem_v, used = _bn_mem_get(_bn_parse_keys(params.get("mem_vector_keys")))
-            if isinstance(mem_v, (list, tuple)) and mem_v and all(isinstance(x, (int, float)) for x in mem_v):
-                body["vector"] = list(mem_v)
-                in_meta["coercions"].append("mem_vector_keys->body.vector")
-                in_meta["mem_vector_keys_used"] = used
-            elif isinstance(mem_v, str) and mem_v.strip():
-                body["vector_b64f32"] = mem_v.strip()
-                in_meta["coercions"].append("mem_vector_keys(str)->body.vector_b64f32")
-                in_meta["mem_vector_keys_used"] = used
+        # vector
+        if isinstance(payload_dict.get("vector"), (list, tuple)) and payload_dict["vector"]:
+            body["vector"] = list(payload_dict["vector"])
+        vb64 = payload_dict.get("vector_b64f32")
+        if self._is_nonempty_str(vb64):
+            body["vector_b64f32"] = str(vb64).strip()
 
-        if bool(params.get("require_vector", False)) and ("vector" not in body and "vector_b64f32" not in body):
-            return "", {"ok": False, "error": "missing vector/vector_b64f32 (require_vector=True)", **in_meta}
+        # server-side keys only if non-empty
+        for k in ("key", "lexicon_key", "context_key", "idf_key", "tokens_key"):
+            v = params.get(k, "")
+            if self._is_nonempty_str(v):
+                body[k] = str(v).strip()
 
-        # ---------------- generation knobs ----------------
-        _put_if_missing(body, params, "max_tokens", cast=int)
-        _put_if_missing(body, params, "topk", cast=int)
+        # inline lexicon/context only if present and server-side keys not used
+        # (you set lexicon_key/context_key="", so inline will be used)
+        if "lexicon_key" not in body and lex_norm is not None and str(lex_norm).strip():
+            body["lexicon"] = lex_norm
+        if "context_key" not in body and ctx_norm is not None and str(ctx_norm).strip():
+            body["context"] = ctx_norm
 
-        # seed: avoid sending "" (common server-side type error)
+        # generation knobs
+        self._put_if_nonempty(body, "max_tokens", int(params.get("max_tokens", 160) or 160))
+        self._put_if_nonempty(body, "topk", int(params.get("topk", 16) or 16))
+
         seed = params.get("seed", "")
-        if "seed" not in body and seed not in (None, ""):
+        if seed not in (None, ""):
             try:
                 body["seed"] = int(seed)
-                in_meta["coercions"].append("params.seed(str)->int")
             except Exception:
                 body["seed"] = seed
 
-        passthru_keys = (
-            "query", "out", "enhance", "lexicon_format",
-            "include_weights", "weight_precision", "expand_k",
-            "min_abs_weight", "focus_lines",
-            "lowercase", "max_tokens_in",
-            "drop_hexbytes", "drop_numbers", "drop_stopwords",
-            "match_k", "top_k", "compute_cosine",
-            "dim", "signed", "tf_log", "normalize",
-        )
-        for k in passthru_keys:
-            _put_if_missing(body, params, k)
+        # dim: validate only (do not forward unless asked)
+        inferred = self._infer_dim_from_vector(body)
+        want_dim = int(params.get("dim", 0) or 0)
+        if inferred is not None and want_dim and inferred != want_dim:
+            # mismatch is a likely server-crash trigger in some backends
+            return "", {
+                "ok": False,
+                "error": f"vector dim mismatch: inferred={inferred} params.dim={want_dim}",
+                **meta,
+            }
+        if bool(params.get("forward_dim", False)) and want_dim:
+            body["dim"] = want_dim
 
-        # ---------------- call ----------------
+        if bool(params.get("require_vector", False)) and ("vector" not in body and "vector_b64f32" not in body):
+            return "", {"ok": False, "error": "missing vector/vector_b64f32 (require_vector=True)", **meta}
+
+        if not self._is_nonempty_str(body.get("prompt")):
+            return "", {"ok": False, "error": "missing prompt (set blocknet_vectortext.payload={payload} or params.prompt)", **meta}
+
+        # ---- 6) Call ----
         cli = BlockNetClient(relay=relay, token=token)
-        j = cli.api_vectortext(body, prefix=pfx)
+        try:
+            j = cli.api_vectortext(body, prefix=pfx)
+        except TypeError:
+            j = cli.api_vectortext(body, prefix=pfx)
 
         ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
         out = (j.get("generated") if (ok and isinstance(j, dict)) else j)
 
         exports = _bn_export_to_memory(out_value=out, response_json=j, ok=ok, params=params, links=None)
 
-        meta: Dict[str, Any] = {"ok": ok, "response": j}
-        meta.update(in_meta)
+        meta_out: Dict[str, Any] = {"ok": ok, "response": j, **meta}
+        meta_out["request_debug"] = {
+            "prompt_len": len(str(body.get("prompt", ""))),
+            "payload_len": len(str(body.get("payload", ""))),
+            "has_vector_b64": "vector_b64f32" in body,
+            "has_vector_list": "vector" in body,
+            "lexicon_type": type(body.get("lexicon")).__name__ if "lexicon" in body else None,
+            "context_len": len(str(body.get("context", ""))) if "context" in body else 0,
+            "forward_dim": bool(params.get("forward_dim", False)),
+        }
         if exports:
-            meta["memory_exports"] = exports
-        return out, meta
+            meta_out["memory_exports"] = exports
+        return out, meta_out
 
 
 BLOCKS.register("blocknet_vectortext", BlockNetVectorTextBlock)
