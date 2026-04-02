@@ -422,6 +422,19 @@ class NetworkSniffer:
         correlate_window_ms: int = 1500
         correlate_max_per_key: int = 8
 
+        # ---------------- Stronger candidate promotion ----------------
+        enable_candidate_promotion: bool = True
+        max_promoted_candidates: int = 120
+        min_candidate_score: float = 2.5
+        promote_probe_timeout_ms: int = 4500
+        promote_probe_concurrency: int = 6
+        promote_json_media_urls: bool = True
+        promote_json_structured_candidates: bool = True
+        promote_mse_candidates: bool = True
+        promote_param_correlation: bool = True
+        promote_bundle_scan_candidates: bool = True
+        require_probe_for_weak_candidates: bool = False
+
     # ---------------------------- init ---------------------------- #
     def __init__(self, config: Optional["NetworkSniffer.Config"] = None, logger=None, http=None):
         self.cfg = config or self.Config()
@@ -782,6 +795,9 @@ class NetworkSniffer:
             "kind": self._to_str(it.get("kind") or "unknown"),
             "content_type": self._to_str(it.get("content_type") or "?"),
             "size": self._to_str(it.get("size") or "?"),
+            "score": self._to_str(it.get("score") if it.get("score") is not None else ""),
+            "confidence": self._to_str(it.get("confidence") or ""),
+            "evidence": self._to_str(it.get("evidence") or ""),
         }
 
     # ============================== URL salvage (unchanged core) ============================== #
@@ -1991,6 +2007,461 @@ class NetworkSniffer:
         reports.sort(key=lambda r: int(r.get("reads", 0)), reverse=True)
         return reports[:200]
 
+
+    # ============================== Stronger promotion helpers ============================== #
+    _MEDIA_KEYWORDS = {
+        "video", "videos", "audio", "media", "stream", "streams", "src", "source", "sources",
+        "file", "files", "play", "playback", "playlist", "manifest", "download", "cdn",
+        "dash", "hls", "mp4", "webm", "m3u8", "mpd", "poster", "thumb", "thumbnail",
+    }
+
+    def _looks_like_media_key(self, key: Any) -> bool:
+        k = self._to_str(key).strip().lower()
+        if not k:
+            return False
+        return any(tok in k for tok in self._MEDIA_KEYWORDS)
+
+    def _kind_from_key_name(self, key: Any) -> "NetworkSniffer.Optional[str]":
+        k = self._to_str(key).strip().lower()
+        if not k:
+            return None
+        if any(x in k for x in ("audio", "sound", "track", "mp3", "aac", "opus", "ogg", "m4a", "wav")):
+            return "audio"
+        if any(x in k for x in ("poster", "thumb", "thumbnail", "preview_image", "previewimage", "cover")):
+            return "image"
+        if any(x in k for x in ("video", "stream", "manifest", "playlist", "dash", "hls", "mp4", "webm", "m3u8", "mpd", "playback")):
+            return "video"
+        return None
+
+    def _is_urlish_candidate(self, value: Any, *, parent_key: str = "") -> bool:
+        s = self._to_str(value).strip()
+        if not s:
+            return False
+        sl = s.lower()
+        if s.startswith(("http://", "https://", "ws://", "wss://", "//", "/")):
+            return True
+        if any(sl.endswith(ext) for ext in (
+            ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".ts", ".m4s", ".m3u8", ".mpd",
+            ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif",
+        )):
+            return True
+        if any(h in sl for h in (
+            "videoplayback", "manifest", "playlist", "chunklist", "master.m3u8", "index.m3u8", ".m3u8", ".mpd",
+            "/segment", "/seg/", "segment-", "chunk-", "bytestream", "init.mp4", "moov", "transcode", "cdn",
+        )):
+            return True
+        return self._looks_like_media_key(parent_key)
+
+    def _extract_candidate_urls_from_obj(
+        self,
+        obj: Any,
+        *,
+        base_url: str,
+        limit: int = 1200,
+    ) -> "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]":
+        out: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        stack: "NetworkSniffer.List[NetworkSniffer.Tuple[Any, str, int]]" = [(obj, "", 0)]
+        seen: "NetworkSniffer.Set[str]" = set()
+
+        while stack and len(out) < limit:
+            cur, parent_key, depth = stack.pop()
+            if depth > 10 or cur is None:
+                continue
+
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    stack.append((v, self._to_str(k), depth + 1))
+                continue
+
+            if isinstance(cur, (list, tuple)):
+                for v in cur:
+                    stack.append((v, parent_key, depth + 1))
+                continue
+
+            s = self._to_str(cur).strip()
+            if not s:
+                continue
+            if len(s) > 4096:
+                continue
+            if not self._is_urlish_candidate(s, parent_key=parent_key):
+                continue
+
+            full = s
+            if s.startswith("//"):
+                full = "https:" + s
+            elif not s.startswith(("http://", "https://", "ws://", "wss://")):
+                full = self._safe_urljoin(base_url, s)
+
+            cu = self._canonicalize_url(full)
+            if not cu or cu in seen:
+                continue
+            seen.add(cu)
+
+            out.append({
+                "url": cu,
+                "parent_key": parent_key,
+                "kind_hint": self._kind_from_key_name(parent_key),
+            })
+
+        return out
+
+    def _score_promoted_candidate(
+        self,
+        *,
+        url: str,
+        source: str,
+        parent_key: str = "",
+        kind_hint: "NetworkSniffer.Optional[str]" = None,
+        content_type: str = "",
+        count: int = 1,
+        event_name: str = "",
+    ) -> "NetworkSniffer.Tuple[float, NetworkSniffer.Optional[str], str]":
+        cu = self._canonicalize_url(url)
+        if not cu:
+            return 0.0, None, "empty"
+
+        p = self._safe_urlparse(cu)
+        path = self._to_str(p.path).lower()
+        netloc = self._to_str(p.netloc).lower()
+        ul = cu.lower()
+        if self._looks_like_ad(netloc, path):
+            return -100.0, None, "ad"
+        if not self._host_allowed(cu):
+            return -100.0, None, "host_blocked"
+
+        kind = (
+            kind_hint
+            or self._classify_by_extension(path)
+            or self._classify_by_content_type(content_type)
+            or self._classify_by_stream_hint(ul)
+        )
+
+        score = 0.0
+        reason_parts = [source]
+
+        if kind:
+            score += 2.0
+            reason_parts.append(f"kind:{kind}")
+        if self._is_manifest(cu, content_type):
+            score += 3.0
+            reason_parts.append("manifest")
+        if self._looks_like_segment(ul, content_type, None, {}):
+            score += 1.5
+            reason_parts.append("segment")
+        if self._looks_like_media_key(parent_key):
+            score += 1.5
+            reason_parts.append(f"key:{parent_key}")
+        if source == "mse":
+            score += 3.0
+        elif source == "param_corr":
+            score += 2.5
+        elif source == "bundle":
+            score += 1.75
+        elif source == "json":
+            score += 1.25
+        if event_name:
+            el = event_name.lower()
+            if any(x in el for x in ("append", "source", "xhr_resp", "fetch_resp", "media_src", "video")):
+                score += 1.25
+                reason_parts.append(f"event:{el[:24]}")
+        if count > 1:
+            score += min(3.0, (count - 1) * 0.5)
+            reason_parts.append(f"count:{count}")
+
+        if any(h in ul for h in ("master.m3u8", "chunklist.m3u8", "index.m3u8", "manifest", "playlist", "videoplayback")):
+            score += 1.5
+            reason_parts.append("url_hint")
+
+        return score, kind, "|".join(reason_parts)
+
+    def _score_existing_item(self, item: "NetworkSniffer.Dict[str, Any]") -> float:
+        tag = self._to_str(item.get("tag")).lower()
+        kind = self._to_str(item.get("kind")).lower()
+        ct = self._to_str(item.get("content_type")).lower()
+        score = 0.0
+        if tag == "binary_sig_sniff":
+            score += 9.0
+        elif tag == "network_sniff":
+            score += 7.0
+        elif "promoted" in tag:
+            try:
+                return float(item.get("score") or 0.0)
+            except Exception:
+                score += 4.0
+        if kind == "video":
+            score += 2.0
+        elif kind == "audio":
+            score += 1.5
+        elif kind == "image":
+            score += 0.5
+        if ct.startswith("video/") or ct in self.cfg.hls_types or ct in self.cfg.dash_types:
+            score += 2.0
+        elif ct.startswith("audio/"):
+            score += 1.0
+        return score
+
+    def _item_rank_tuple(self, item: "NetworkSniffer.Dict[str, Any]") -> "NetworkSniffer.Tuple[float, int, int, int]":
+        try:
+            score = float(item.get("score") if item.get("score") is not None else self._score_existing_item(item))
+        except Exception:
+            score = self._score_existing_item(item)
+        kind = self._to_str(item.get("kind")).lower()
+        tag = self._to_str(item.get("tag")).lower()
+        kind_rank = 3 if kind == "video" else 2 if kind == "audio" else 1 if kind == "image" else 0
+        tag_rank = 3 if tag == "binary_sig_sniff" else 2 if tag == "network_sniff" else 1 if "promoted" in tag else 0
+        ctype_rank = 1 if self._to_str(item.get("content_type")).lower().startswith(("video/", "audio/")) else 0
+        return (score, kind_rank, tag_rank, ctype_rank)
+
+    def _upsert_promoted_candidate(
+        self,
+        bucket: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]",
+        *,
+        url: str,
+        source: str,
+        parent_key: str = "",
+        kind_hint: "NetworkSniffer.Optional[str]" = None,
+        content_type: str = "",
+        count: int = 1,
+        event_name: str = "",
+        size: Any = "?",
+    ) -> None:
+        score, kind, reason = self._score_promoted_candidate(
+            url=url,
+            source=source,
+            parent_key=parent_key,
+            kind_hint=kind_hint,
+            content_type=content_type,
+            count=count,
+            event_name=event_name,
+        )
+        if score < float(self.cfg.min_candidate_score):
+            return
+        cu = self._canonicalize_url(url)
+        if not cu:
+            return
+        existing = bucket.get(cu)
+        confidence = "strong" if score >= 6.5 else "medium" if score >= 4.0 else "weak"
+        item = {
+            "url": cu,
+            "text": f"[Promoted {((kind or kind_hint or 'media').capitalize())}] {source}",
+            "tag": f"promoted_{source}",
+            "kind": kind or kind_hint or "unknown",
+            "content_type": content_type or "?",
+            "size": self._to_str(size or "?"),
+            "score": round(float(score), 3),
+            "confidence": confidence,
+            "evidence": reason,
+        }
+        if existing is None or self._item_rank_tuple(item) > self._item_rank_tuple(existing):
+            bucket[cu] = item
+
+    async def _verify_promoted_candidates(
+        self,
+        api_ctx,
+        promoted_by_url: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]",
+        request_evidence: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]",
+        *,
+        extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]",
+        log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]",
+    ) -> None:
+        if not promoted_by_url:
+            return
+        if api_ctx is None and self.http is None:
+            return
+
+        top = sorted(promoted_by_url.values(), key=self._item_rank_tuple, reverse=True)[: int(self.cfg.max_promoted_candidates)]
+        sem = self.asyncio.Semaphore(max(1, int(self.cfg.promote_probe_concurrency)))
+
+        async def one(item: "NetworkSniffer.Dict[str, Any]"):
+            async with sem:
+                u = self._to_str(item.get("url"))
+                ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
+                req_hdrs = ev.get("headers_subset") or {}
+                try:
+                    pr = await self._probe_url(api_ctx, u, req_hdrs, timeout_ms=int(self.cfg.promote_probe_timeout_ms))
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] promote probe failed for {u}: {e}", log)
+                    return
+
+                status = pr.get("status")
+                pct = self._to_str(pr.get("content_type") or item.get("content_type") or "")
+                if pct:
+                    item["content_type"] = pct
+                if pr.get("content_length"):
+                    item["size"] = self._to_str(pr.get("content_length"))
+
+                if status in (200, 206):
+                    item["score"] = round(float(item.get("score") or 0.0) + 2.5, 3)
+                    item["confidence"] = "medium" if item.get("confidence") == "weak" else item.get("confidence") or "medium"
+
+                kind2 = self._classify_by_content_type(pct)
+                if kind2:
+                    item["kind"] = kind2
+                    item["score"] = round(float(item.get("score") or 0.0) + 1.0, 3)
+
+                need_prefix = (item.get("kind") in (None, "", "unknown")) or (not kind2)
+                if need_prefix:
+                    prefix = await self._get_prefix_bytes(
+                        api_ctx,
+                        u,
+                        req_hdrs,
+                        timeout_ms=int(self.cfg.promote_probe_timeout_ms),
+                        prefix_bytes=int(self.cfg.binary_sniff_prefix_bytes),
+                    )
+                    kind_magic, ctype_magic, detail = self._guess_kind_from_magic(prefix)
+                    if kind_magic:
+                        item["kind"] = kind_magic
+                        item["content_type"] = ctype_magic or item.get("content_type") or "?"
+                        item["tag"] = "promoted_magic"
+                        item["evidence"] = self._to_str(item.get("evidence") or "") + f"|magic:{detail}"
+                        item["score"] = round(float(item.get("score") or 0.0) + 4.0, 3)
+                        item["confidence"] = "strong"
+
+                if not self._is_allowed_by_extensions(u, extensions, self._to_str(item.get("kind")) or None):
+                    item["drop_me"] = True
+                elif (item.get("kind") in (None, "", "unknown")) and bool(self.cfg.require_probe_for_weak_candidates):
+                    item["drop_me"] = True
+
+        await self.asyncio.gather(*[one(it) for it in top], return_exceptions=True)
+        for k in list(promoted_by_url.keys()):
+            if promoted_by_url[k].get("drop_me"):
+                promoted_by_url.pop(k, None)
+
+    async def _promote_secondary_candidates(
+        self,
+        api_ctx,
+        *,
+        canonical_page_url: str,
+        json_hits: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+        mse_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+        correlation_reports: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+        bundle_scan: "NetworkSniffer.Dict[str, Any]",
+        request_evidence: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]",
+        extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]",
+        log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]",
+    ) -> "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]":
+        promoted_by_url: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+
+        if self.cfg.promote_json_media_urls or self.cfg.promote_json_structured_candidates:
+            for hit in json_hits:
+                base_url = self._to_str(hit.get("url") or canonical_page_url)
+                data = hit.get("json")
+                if not data:
+                    continue
+                candidates = self._extract_candidate_urls_from_obj(data, base_url=base_url, limit=300)
+                for cand in candidates:
+                    self._upsert_promoted_candidate(
+                        promoted_by_url,
+                        url=cand.get("url") or "",
+                        source="json",
+                        parent_key=self._to_str(cand.get("parent_key") or ""),
+                        kind_hint=cand.get("kind_hint"),
+                    )
+
+        if self.cfg.promote_mse_candidates and mse_events:
+            url_counts: "NetworkSniffer.Dict[str, int]" = {}
+            meta: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+            for ev in mse_events:
+                if not isinstance(ev, dict):
+                    continue
+                u = self._to_str(ev.get("url") or ev.get("src") or ev.get("request_url") or ev.get("mediaUrl"))
+                if not u:
+                    continue
+                cu = self._canonicalize_url(u)
+                if not cu:
+                    continue
+                url_counts[cu] = url_counts.get(cu, 0) + 1
+                if cu not in meta:
+                    meta[cu] = {
+                        "event_name": self._to_str(ev.get("event") or ev.get("type") or "mse"),
+                        "content_type": self._to_str(ev.get("content_type") or ""),
+                    }
+            for cu, cnt in url_counts.items():
+                mm = meta.get(cu) or {}
+                self._upsert_promoted_candidate(
+                    promoted_by_url,
+                    url=cu,
+                    source="mse",
+                    parent_key="mse",
+                    kind_hint=None,
+                    content_type=self._to_str(mm.get("content_type") or ""),
+                    count=cnt,
+                    event_name=self._to_str(mm.get("event_name") or "mse"),
+                )
+
+        if self.cfg.promote_param_correlation and correlation_reports:
+            for rep in correlation_reports:
+                pkey = self._to_str(rep.get("param_key") or "")
+                reads = int(rep.get("reads") or 0)
+                for trg in (rep.get("likely_triggers") or []):
+                    if not isinstance(trg, dict):
+                        continue
+                    u = self._to_str(trg.get("url") or "")
+                    cnt = int(trg.get("count") or 1)
+                    self._upsert_promoted_candidate(
+                        promoted_by_url,
+                        url=u,
+                        source="param_corr",
+                        parent_key=pkey,
+                        kind_hint=self._kind_from_key_name(pkey),
+                        count=max(reads, cnt),
+                        event_name=self._to_str(trg.get("type") or "resp"),
+                    )
+
+        if self.cfg.promote_bundle_scan_candidates and bundle_scan:
+            for hit in (bundle_scan.get("hits") or []):
+                if not isinstance(hit, dict):
+                    continue
+                raw = self._to_str(hit.get("hit") or "")
+                if not raw:
+                    continue
+                pat = self._to_str(hit.get("pattern") or "bundle")
+                if raw.startswith("/"):
+                    raw = self._safe_urljoin(canonical_page_url, raw)
+                elif not raw.startswith(("http://", "https://", "ws://", "wss://")):
+                    continue
+                self._upsert_promoted_candidate(
+                    promoted_by_url,
+                    url=raw,
+                    source="bundle",
+                    parent_key=pat,
+                    kind_hint=self._kind_from_key_name(pat),
+                )
+
+        await self._verify_promoted_candidates(
+            api_ctx,
+            promoted_by_url,
+            request_evidence,
+            extensions=extensions,
+            log=log,
+        )
+
+        items = list(promoted_by_url.values())
+        items.sort(key=self._item_rank_tuple, reverse=True)
+        return items[: int(self.cfg.max_promoted_candidates)]
+
+    def _dedupe_and_rank_items(self, items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]") -> "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]":
+        best: "NetworkSniffer.Dict[str, NetworkSniffer.Dict[str, Any]]" = {}
+        ordered: "NetworkSniffer.List[str]" = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cu = self._canonicalize_url(item.get("url"))
+            if not cu:
+                continue
+            item = dict(item)
+            item["url"] = cu
+            if cu not in best:
+                best[cu] = item
+                ordered.append(cu)
+            else:
+                if self._item_rank_tuple(item) > self._item_rank_tuple(best[cu]):
+                    best[cu] = item
+        out = [best[u] for u in ordered]
+        out.sort(key=self._item_rank_tuple, reverse=True)
+        return out
+
     # ============================== sniff ============================== #
     async def sniff(
         self,
@@ -2062,6 +2533,9 @@ class NetworkSniffer:
         max_manifests = int(self.cfg.max_manifests_to_expand)
 
         manifests_to_expand: "NetworkSniffer.List[NetworkSniffer.Tuple[Any, str, str]]" = []
+        promoted_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        corr: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        bundle_scan: "NetworkSniffer.Dict[str, Any]" = {"enabled": False, "scripts_scanned": 0, "hits": []}
 
         self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
 
@@ -2871,6 +3345,23 @@ class NetworkSniffer:
                         "source_page": canonical_page_url,
                     })
 
+            if self.cfg.enable_candidate_promotion:
+                try:
+                    promoted_items = await self._promote_secondary_candidates(
+                        api_ctx,
+                        canonical_page_url=canonical_page_url,
+                        json_hits=json_hits,
+                        mse_events=mse_events,
+                        correlation_reports=corr,
+                        bundle_scan=bundle_scan,
+                        request_evidence=request_evidence,
+                        extensions=extensions,
+                        log=log,
+                    )
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] Candidate promotion failed: {e}", log)
+                    promoted_items = []
+
             if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
                 json_hits.append({
                     "url": canonical_page_url,
@@ -2911,12 +3402,13 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-        merged_items_any = found_items + derived_items + blob_placeholders
+        merged_items_any = found_items + derived_items + promoted_items + blob_placeholders
+        merged_items_any = self._dedupe_and_rank_items([it for it in merged_items_any if it.get("url")])
         merged_items = [self._normalize_item(it) for it in merged_items_any if it.get("url")]
 
         summary = (
             f"[NetworkSniffer] Finished sniff for {canonical_page_url}: "
-            f"media={len(found_items)} derived={len(derived_items)} "
+            f"media={len(found_items)} derived={len(derived_items)} promoted={len(promoted_items)} "
             f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
             f"forensics={len(forensics)} salvage={len(salvage_bundles)} mse={len(mse_events)} "
             f"param_events={len(param_events)} scripts={len(script_urls)} "
@@ -2926,7 +3418,6 @@ class NetworkSniffer:
         self._log(summary, log)
 
         return html, merged_items, json_hits
-
 
 # ======================================================================
 # JSSniffer

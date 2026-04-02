@@ -9759,6 +9759,7 @@ BLOCKS.register("youtube", YouTubeDataBlock)
 
 # ======================= VideoLinkTrackerBlock =============================
 
+
 @dataclass
 class VideoLinkTrackerBlock(BaseBlock):
     """
@@ -9843,6 +9844,24 @@ class VideoLinkTrackerBlock(BaseBlock):
         r"(xvideos\.com_[a-f0-9]{16,}\.(?:mp4|m4v|webm|3gp))",
         re.IGNORECASE,
     )
+
+    TRUSTED_TAG_TYPES = {
+        "video", "source",
+        "network_sniff", "runtime_sniff", "db_link",
+        "react_sniff", "database_sniff"
+    }
+
+    NEGATIVE_ASSET_HINTS = {
+        "trailer", "promo", "preview", "sample", "thumb", "thumbnail",
+        "sprite", "icon", "logo", "banner", "pixel", "ads", "advert",
+        "tracking", "placeholder", "captcha", "poster"
+    }
+
+    POSITIVE_ASSET_HINTS = {
+        "1080p", "720p", "2160p", "4k", "h264", "h265", "x264", "x265",
+        "webrip", "bluray", "hdrip", "manifest", "master", "playlist",
+        "chunklist", "episode", "full", "stream"
+    }
 
     def __post_init__(self):
         # DB plumbing
@@ -10145,51 +10164,251 @@ class VideoLinkTrackerBlock(BaseBlock):
     # [PATCH] Content Scoring Logic
     # ------------------------------------------------------------------ #
 
+    def _safe_int(self, value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _keyword_hit_count(self, haystack: str, keywords: List[str]) -> int:
+        if not haystack or not keywords:
+            return 0
+        h = haystack.lower()
+        hits = 0
+        seen = set()
+        for k in keywords:
+            kk = (k or "").strip().lower()
+            if not kk or kk in seen:
+                continue
+            seen.add(kk)
+            if kk in h:
+                hits += 1
+        return hits
+
+    def _is_mediaish_content_type(self, content_type: str) -> bool:
+        ct = (content_type or "").lower().split(";", 1)[0].strip()
+        if not ct:
+            return False
+        if ct.startswith("video/") or ct.startswith("audio/"):
+            return True
+        if ct in self.HLS_CONTENT_TYPES or ct in self.DASH_CONTENT_TYPES:
+            return True
+        return False
+
+    def _content_type_score(self, content_type: str) -> int:
+        ct = (content_type or "").lower().split(";", 1)[0].strip()
+        if not ct:
+            return 0
+        if ct.startswith("video/"):
+            return 35
+        if ct.startswith("audio/"):
+            return 12
+        if ct in self.HLS_CONTENT_TYPES or ct in self.DASH_CONTENT_TYPES:
+            return 30
+        if "octet-stream" in ct:
+            return 4
+        return 0
+
+    def _tag_score(self, tag: str) -> int:
+        t = (tag or "").lower().strip()
+        if t in {"video", "source"}:
+            return 28
+        if t in {"network_sniff", "runtime_sniff"}:
+            return 24
+        if t in {"db_link", "database_sniff", "react_sniff"}:
+            return 18
+        if t == "direct_asset":
+            return 16
+        if t == "a":
+            return 4
+        return 0
+
+    def _size_score(self, size_text: str) -> int:
+        b = self._parse_size_to_bytes(size_text or "")
+        if b >= 200 * 1024 * 1024:
+            return 18
+        if b >= 50 * 1024 * 1024:
+            return 12
+        if b >= 5 * 1024 * 1024:
+            return 7
+        if b >= 512 * 1024:
+            return 3
+        return 0
+
+    def _build_asset_evidence(
+        self,
+        *,
+        url: str,
+        text: str,
+        tag: str,
+        content_type: str,
+        status: str,
+        source_page: str,
+        keywords: List[str],
+        size: str = "",
+    ) -> Dict[str, Any]:
+        raw_url = str(url or "")
+        raw_text = str(text or "")
+        raw_page = str(source_page or "")
+        tag_l = str(tag or "").lower()
+        status_l = str(status or "").lower()
+        ctype_l = str(content_type or "").lower()
+
+        path_lower = self._clean_path(raw_url)
+        url_lower = raw_url.lower()
+
+        haystack = f"{raw_url} {raw_text} {raw_page}"
+        keyword_hits = self._keyword_hit_count(haystack, keywords)
+
+        is_probable_url = self._is_probable_video_url(raw_url, path_lower, url_lower)
+        is_media_ct = self._is_mediaish_content_type(ctype_l)
+        is_hls = raw_url.lower().endswith(".m3u8") or ctype_l in self.HLS_CONTENT_TYPES
+        is_dash = raw_url.lower().endswith(".mpd") or ctype_l in self.DASH_CONTENT_TYPES
+        is_search = self._is_search_url(raw_url)
+        looks_ad = self._looks_like_ad(self._clean_domain(raw_url), path_lower)
+
+        positive_hint_hits = sum(1 for h in self.POSITIVE_ASSET_HINTS if h in haystack.lower())
+        negative_hint_hits = sum(1 for h in self.NEGATIVE_ASSET_HINTS if h in haystack.lower())
+
+        verified_ok = "200 ok" in status_l or status_l == "unverified"
+        blocked_or_dead = any(x in status_l for x in ("dead", "timeout", "error", "403", "404", "401"))
+
+        score = 0
+        score += self._tag_score(tag_l)
+        score += self._content_type_score(ctype_l)
+        score += self._size_score(size)
+        score += keyword_hits * 12
+        score += positive_hint_hits * 4
+
+        if is_probable_url:
+            score += 18
+        if is_hls or is_dash:
+            score += 24
+        if verified_ok:
+            score += 18
+        if is_media_ct:
+            score += 16
+
+        if not raw_text.strip():
+            score -= 4
+        if is_search:
+            score -= 12
+        if looks_ad:
+            score -= 50
+        if negative_hint_hits:
+            score -= 10 * negative_hint_hits
+        if blocked_or_dead and not (is_hls or is_dash):
+            score -= 20
+
+        confidence_rank = 0
+        if score >= 85:
+            confidence_rank = 3
+        elif score >= 55:
+            confidence_rank = 2
+        elif score >= 28:
+            confidence_rank = 1
+
+        confidence = (
+            "strong" if confidence_rank == 3 else
+            "medium" if confidence_rank == 2 else
+            "weak" if confidence_rank == 1 else
+            "low"
+        )
+
+        return {
+            "keyword_hits": keyword_hits,
+            "is_probable_url": is_probable_url,
+            "is_media_content_type": is_media_ct,
+            "is_hls_manifest": is_hls,
+            "is_dash_manifest": is_dash,
+            "looks_like_search": is_search,
+            "looks_like_ad": looks_ad,
+            "verified_ok": verified_ok,
+            "blocked_or_dead": blocked_or_dead,
+            "positive_hint_hits": positive_hint_hits,
+            "negative_hint_hits": negative_hint_hits,
+            "score": score,
+            "confidence_rank": confidence_rank,
+            "confidence": confidence,
+        }
+
+    def _normalize_asset_record(self, asset: Dict[str, Any], keywords: List[str]) -> Dict[str, Any]:
+        out = dict(asset or {})
+        evidence = self._build_asset_evidence(
+            url=str(out.get("url") or ""),
+            text=str(out.get("text") or ""),
+            tag=str(out.get("tag") or ""),
+            content_type=str(out.get("content_type") or ""),
+            status=str(out.get("status") or ""),
+            source_page=str(out.get("source_page") or out.get("source") or ""),
+            keywords=keywords,
+            size=str(out.get("size") or ""),
+        )
+        out.update(evidence)
+        return out
+
+    def _asset_rank_tuple(self, asset: Dict[str, Any]) -> Tuple[int, int, int, int, int, int]:
+        return (
+            self._safe_int(asset.get("confidence_rank"), 0),
+            self._safe_int(asset.get("score"), 0),
+            self._safe_int(asset.get("keyword_hits"), 0),
+            1 if asset.get("is_media_content_type") else 0,
+            1 if asset.get("verified_ok") else 0,
+            self._parse_size_to_bytes(str(asset.get("size") or "0")),
+        )
+
+    def _pick_preferred_asset(self, old: Optional[Dict[str, Any]], new: Dict[str, Any]) -> Dict[str, Any]:
+        if not old:
+            return new
+        return new if self._asset_rank_tuple(new) > self._asset_rank_tuple(old) else old
+
+    def _should_keep_candidate(
+        self,
+        asset: Dict[str, Any],
+        *,
+        page_has_keywords: bool,
+        min_term_overlap: int,
+    ) -> bool:
+        if asset.get("looks_like_ad"):
+            return False
+
+        tag = str(asset.get("tag") or "").lower()
+        if tag in self.TRUSTED_TAG_TYPES and self._safe_int(asset.get("confidence_rank"), 0) >= 1:
+            return True
+
+        if asset.get("is_hls_manifest") or asset.get("is_dash_manifest"):
+            return True
+
+        if self._safe_int(asset.get("confidence_rank"), 0) >= 2:
+            return True
+
+        if page_has_keywords and self._safe_int(asset.get("keyword_hits"), 0) >= max(1, min_term_overlap):
+            return True
+
+        return False
+
     def _score_video_asset(self, url: str, text: str, keywords: List[str]) -> int:
         """
-        Scoring heuristics:
-        + Positive for keyword matches in URL/Text
-        + Positive for high-quality container types (.mkv, .m3u8)
-        - Heavy penalty for ad-like filenames (trailer, promo, preview)
-        - Penalty for missing link text
+        Better internal asset score:
+          - rewards trusted media signals
+          - rewards keyword overlap
+          - penalizes search/ad/junk patterns
+          - still cheap enough to use everywhere
         """
-        score = 0
-        u_lower = url.lower()
-        t_lower = (text or "").lower()
+        asset = self._normalize_asset_record(
+            {
+                "url": str(url or ""),
+                "text": str(text or ""),
+                "tag": "a",
+                "status": "candidate",
+                "content_type": "",
+                "source_page": "",
+                "size": "?",
+            },
+            keywords,
+        )
+        return self._safe_int(asset.get("score"), 0)
 
-        # 1. Critical Filters (Immediate penalties)
-        negative_hints = {
-         "ad_", "advert", "pixel", "tracker", "overlay"
-        }
-        if any(h in u_lower for h in negative_hints):
-            score -= 50
-        if any(h in t_lower for h in negative_hints):
-            score -= 50
-
-        # 2. Keyword Relevance
-        for k in keywords:
-            k = k.lower()
-            if k in u_lower:
-                score += 20
-            if k in t_lower:
-                score += 10
-
-        # 3. Format preferences
-        # .m3u8 often implies a full stream; .mkv implies high quality rip
-        if ".m3u8" in u_lower or ".mpd" in u_lower:
-            score += 15
-        elif ".mkv" in u_lower:
-            score += 10
-        elif ".mp4" in u_lower:
-            score += 5  # Generic, could be ad or content
-
-        # 4. Context heuristics
-        if "1080p" in u_lower or "720p" in u_lower:
-            score += 5
-        if not t_lower:
-            score -= 5  # Blind links are riskier
-
-        return score
     # ------------------------------------------------------------------ #
     # Reverse Image/Video Lookup Helpers
     # ------------------------------------------------------------------ #
@@ -12573,23 +12792,29 @@ class VideoLinkTrackerBlock(BaseBlock):
                         except Exception:
                             status = "Timeout/Error"
 
-                    if not verify_links or "OK" in status:
+                    is_hls_manifest = canon.lower().endswith(".m3u8") or (content_type in self.HLS_CONTENT_TYPES)
+                    is_dash_manifest = canon.lower().endswith(".mpd") or (content_type in self.DASH_CONTENT_TYPES)
+                    strong_candidate = (
+                        is_hls_manifest
+                        or is_dash_manifest
+                        or self._is_probable_video_url(canon, self._clean_path(canon), canon.lower())
+                        or self._is_mediaish_content_type(content_type)
+                    )
+
+                    if (not verify_links) or ("OK" in status) or strong_candidate:
                         filename = self._clean_path(canon).rsplit("/", 1)[-1] or "[asset]"
                         asset = {
                             "text": filename[:100],
                             "url": canon,
                             "source_page": "<urls>",
                             "size": size,
-                            "status": status,
+                            "status": status if ("OK" in status or not strong_candidate) else "candidate",
                             "tag": "direct_asset",
+                            "content_type": content_type,
+                            "content_id": cid,
                         }
 
-                        is_hls_manifest = canon.lower().endswith(".m3u8") or (
-                                content_type in self.HLS_CONTENT_TYPES
-                        )
-
-                        # HLS capture (you already had this)
-                        if is_hls_manifest and self.hls_manager:
+                        if (is_hls_manifest or is_dash_manifest) and self.hls_manager:
                             try:
                                 hls_res = await self.hls_manager.capture_hls_stream(
                                     http, canon, timeout=timeout, log=log
@@ -12601,20 +12826,15 @@ class VideoLinkTrackerBlock(BaseBlock):
                                         asset["hls_variant_manifest_path"] = hls_res.variant_manifest_path
                                     if hls_res.segment_paths:
                                         asset["hls_segment_paths"] = hls_res.segment_paths[:10]
-
-                                        # OPTIONAL: local root dir for all segments
                                         try:
                                             import os as _os
-                                            asset["local_hls_root"] = _os.path.dirname(
-                                                hls_res.segment_paths[0]
-                                            )
+                                            asset["local_hls_root"] = _os.path.dirname(hls_res.segment_paths[0])
                                         except Exception:
                                             pass
                             except Exception as e:
                                 log.append(f"[VideoLinkTracker][HLS] Error capturing direct asset {canon}: {e}")
 
-                        # NEW: download non-HLS direct files
-                        if download_assets and not is_hls_manifest:
+                        if download_assets and not (is_hls_manifest or is_dash_manifest):
                             local_path = await self._download_asset_to_cache(
                                 http,
                                 canon,
@@ -12627,25 +12847,25 @@ class VideoLinkTrackerBlock(BaseBlock):
                             if local_path:
                                 asset["local_path"] = local_path
 
-                        new_b = self._parse_size_to_bytes(size)
-                        old = final_found_assets_by_content_id.get(cid)
-                        if not old or new_b > self._parse_size_to_bytes(old.get("size", "")):
-                            asset["content_id"] = cid
-                            final_found_assets_by_content_id[cid] = asset
+                        asset = self._normalize_asset_record(asset, keywords)
 
-                        if use_database and self.store:
-                            self.store.upsert_asset(
-                                asset,
-                                canonical_url=canon,
-                                content_id=cid,
-                                synthetic_tags={
-                                    "direct_asset",
-                                    "db_seed",
-                                    "db_expand",
-                                    "db_manifest",
-                                    "synthetic",
-                                },
-                            )
+                        if asset.get("confidence_rank", 0) >= 2 or is_hls_manifest or is_dash_manifest:
+                            old = final_found_assets_by_content_id.get(cid)
+                            final_found_assets_by_content_id[cid] = self._pick_preferred_asset(old, asset)
+
+                            if use_database and self.store:
+                                self.store.upsert_asset(
+                                    asset,
+                                    canonical_url=canon,
+                                    content_id=cid,
+                                    synthetic_tags={
+                                        "direct_asset",
+                                        "db_seed",
+                                        "db_expand",
+                                        "db_manifest",
+                                        "synthetic",
+                                    },
+                                )
 
             pw_p = pw_browser = pw_context = None
             try:
@@ -13095,6 +13315,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 "status": status,
                                 "tag": link["tag"],
                                 "content_id": cid,
+                                "content_type": content_type,
                             }
                             asset["score"] = int(asset_score)
                             DEBUG_LOGGER.log_message(
@@ -13141,7 +13362,17 @@ class VideoLinkTrackerBlock(BaseBlock):
                                 if local_path:
                                     asset["local_path"] = local_path
 
+                            asset = self._normalize_asset_record(asset, keywords)
+                            if not self._should_keep_candidate(
+                                asset,
+                                page_has_keywords=page_has_keywords,
+                                min_term_overlap=min_term_overlap,
+                            ):
+                                continue
+
                             local_assets.append(asset)
+                            old = final_found_assets_by_content_id.get(cid)
+                            final_found_assets_by_content_id[cid] = self._pick_preferred_asset(old, asset)
 
                             if use_database and self.store:
                                 self.store.upsert_asset(
@@ -13317,10 +13548,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                     all_interaction_hits.extend(res.get("interaction_hits", []))
                     for asset in res["assets"]:
                         cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
-                        new_b = self._parse_size_to_bytes(asset.get("size", ""))
                         old = final_found_assets_by_content_id.get(cid)
-                        if not old or new_b > self._parse_size_to_bytes(old.get("size", "")):
-                            final_found_assets_by_content_id[cid] = asset
+                        final_found_assets_by_content_id[cid] = self._pick_preferred_asset(old, asset)
 
                     # Only collect next pages if we haven't hit max depth
                     if current_depth < max_depth:
@@ -13357,13 +13586,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         )
 
         found_assets = list(final_found_assets_by_content_id.values())
-        found_assets.sort(
-            key=lambda a: (
-                a.get("score", 0),
-                self._parse_size_to_bytes(a.get("size", "0"))
-            ),
-            reverse=True
-        )
+        found_assets.sort(key=self._asset_rank_tuple, reverse=True)
 
         # cooldown on output, then mark returned
         if source == "database" and output_cooldown_hours > 0 and use_database and self.store:
@@ -13662,6 +13885,8 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "--disable-features=UseDnsHttpsSvcb"
             ],
         }
+
+
 
 
 BLOCKS.register("videotracker", VideoLinkTrackerBlock)
@@ -29084,7 +29309,245 @@ def _validate_vector_b64f32(vb64: str) -> Tuple[bool, str, int]:
         return False, f"vector_b64f32 bytes not multiple of 4 (len={len(raw)})", 0
     return True, "", len(raw) // 4
 
+def _bn_playwright_render_one(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sync helper for BlockNetWebRenderBlock.
+    Returns:
+      {
+        "url": ...,
+        "ok": bool,
+        "status": int | None,
+        "html": str,
+        "text": str,
+        "links": List[Dict[str, str]],
+        "error": str,
+      }
+    """
+    import asyncio
+    import re
+    from urllib.parse import urljoin
 
+    def _extract_links_basic(html: str, base_url: str) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        seen = set()
+
+        # href/src scan
+        for m in re.finditer(r'''(?i)\b(?:href|src)\s*=\s*["']([^"'#]+)["']''', html or ""):
+            raw = (m.group(1) or "").strip()
+            if not raw:
+                continue
+            full = urljoin(base_url, raw)
+            if full in seen:
+                continue
+            seen.add(full)
+            out.append({"url": full, "text": "", "tag": "html_attr"})
+
+        return out
+
+    async def _run() -> Dict[str, Any]:
+        try:
+            from playwright.async_api import async_playwright
+        except Exception as e:
+            return {
+                "url": url,
+                "ok": False,
+                "status": None,
+                "html": "",
+                "text": "",
+                "links": [],
+                "error": f"Playwright import failed: {e}",
+            }
+
+        headless = bool(params.get("headless", True))
+        timeout_ms = int(params.get("timeout_ms", 20000) or 20000)
+        wait_until = str(params.get("wait_until", "domcontentloaded") or "domcontentloaded")
+        wait_after_ms = int(params.get("wait_after_ms", 500) or 0)
+        user_agent = str(params.get("user_agent", "") or "").strip() or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0 Safari/537.36"
+        )
+
+        block_resources = bool(params.get("block_resources", True))
+        blocked_resource_types = {
+            str(x).strip().lower()
+            for x in (params.get("blocked_resource_types", ["image", "font", "media"]) or [])
+            if str(x).strip()
+        }
+
+        auto_scroll = bool(params.get("auto_scroll", True))
+        scroll_steps = int(params.get("scroll_steps", 6) or 6)
+        scroll_wait_ms = int(params.get("scroll_wait_ms", 350) or 350)
+
+        html = ""
+        text = ""
+        links: List[Dict[str, str]] = []
+        status_code = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=headless,
+                    args=["--disable-blink-features=AutomationControlled"],
+                )
+                context = await browser.new_context(user_agent=user_agent)
+                page = await context.new_page()
+                page.set_default_timeout(timeout_ms)
+                page.set_default_navigation_timeout(timeout_ms)
+
+                if block_resources and blocked_resource_types:
+                    async def _route(route):
+                        try:
+                            req = route.request
+                            if (req.resource_type or "").lower() in blocked_resource_types:
+                                await route.abort()
+                                return
+                        except Exception:
+                            pass
+                        await route.continue_()
+
+                    await page.route("**/*", _route)
+
+                resp = None
+                try:
+                    resp = await page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+                    if resp is not None:
+                        try:
+                            status_code = resp.status
+                        except Exception:
+                            status_code = None
+                except Exception:
+                    # still try to read whatever rendered
+                    pass
+
+                if wait_after_ms > 0:
+                    await page.wait_for_timeout(wait_after_ms)
+
+                if auto_scroll:
+                    for _ in range(max(0, scroll_steps)):
+                        try:
+                            await page.evaluate("window.scrollBy(0, Math.max(600, window.innerHeight));")
+                        except Exception:
+                            break
+                        if scroll_wait_ms > 0:
+                            await page.wait_for_timeout(scroll_wait_ms)
+
+                try:
+                    html = await page.content()
+                except Exception:
+                    html = ""
+
+                try:
+                    text = await page.evaluate(
+                        """() => (document.body && document.body.innerText) ? document.body.innerText : """""
+                    )
+                except Exception:
+                    text = ""
+
+                try:
+                    js_links = await page.evaluate(
+                        """
+                        () => {
+                          const out = [];
+                          const seen = new Set();
+
+                          const push = (u, txt, tag) => {
+                            try {
+                              if (!u) return;
+                              const full = new URL(u, document.baseURI).href;
+                              if (seen.has(full)) return;
+                              seen.add(full);
+                              out.push({ url: full, text: txt || "", tag: tag || "dom" });
+                            } catch {}
+                          };
+
+                          document.querySelectorAll("a[href], area[href]").forEach(el => {
+                            push(el.getAttribute("href"), (el.innerText || el.textContent || "").trim(), "a");
+                          });
+
+                          document.querySelectorAll("video[src], source[src], audio[src]").forEach(el => {
+                            push(el.getAttribute("src"), "", el.tagName.toLowerCase());
+                          });
+
+                          document.querySelectorAll("[src]").forEach(el => {
+                            const tag = (el.tagName || "").toLowerCase();
+                            const src = el.getAttribute("src");
+                            if (src) push(src, "", tag);
+                          });
+
+                          return out;
+                        }
+                        """
+                    )
+                    if isinstance(js_links, list):
+                        links.extend([
+                            {
+                                "url": str(x.get("url") or ""),
+                                "text": str(x.get("text") or ""),
+                                "tag": str(x.get("tag") or "dom"),
+                            }
+                            for x in js_links
+                            if str(x.get("url") or "").strip()
+                        ])
+                except Exception:
+                    pass
+
+                if html:
+                    seen = {str(x.get("url") or "") for x in links}
+                    for item in _extract_links_basic(html, url):
+                        u = item["url"]
+                        if u not in seen:
+                            links.append(item)
+                            seen.add(u)
+
+                await context.close()
+                await browser.close()
+
+                return {
+                    "url": url,
+                    "ok": True,
+                    "status": status_code,
+                    "html": html,
+                    "text": text,
+                    "links": links,
+                    "error": "",
+                }
+
+        except Exception as e:
+            return {
+                "url": url,
+                "ok": False,
+                "status": status_code,
+                "html": html,
+                "text": text,
+                "links": links,
+                "error": str(e),
+            }
+
+    try:
+        return asyncio.run(_run())
+    except RuntimeError:
+        # fallback for environments already running an event loop
+        import threading
+
+        result: Dict[str, Any] = {
+            "url": url,
+            "ok": False,
+            "status": None,
+            "html": "",
+            "text": "",
+            "links": [],
+            "error": "failed to start event loop",
+        }
+
+        def _worker():
+            nonlocal result
+            result = asyncio.run(_run())
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join()
+        return result
 
 @dataclass
 class BlockNetPingBlock(BaseBlock):
