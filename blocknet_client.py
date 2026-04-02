@@ -84,14 +84,18 @@ class BlockNetClient:
         return p
 
     def _request(
-            self,
-            method: str,
-            path: str,
-            body: bytes = b"",
-            headers: Optional[Dict[str, str]] = None,
-            *,
-            follow_redirects_for_get: bool = True,
+        self,
+        method: str,
+        path: str,
+        body: bytes = b"",
+        headers: Optional[Dict[str, str]] = None,
+        *,
+        follow_redirects_for_get: bool = True,
     ) -> Tuple[int, Dict[str, str], bytes]:
+        """
+        Returns: (status, headers, body_bytes)
+        Follows redirects for GET (useful for /v1/get?key=... which may redirect).
+        """
         conn, base_path = self._conn()
         full_path = self._normalize_path(base_path, path)
 
@@ -102,11 +106,12 @@ class BlockNetClient:
             status = int(res.status)
             hdrs = dict(res.getheaders())
 
-            # Redirect handling for GET only
+            # Redirect handling for GET only (safe default)
             if follow_redirects_for_get and method.upper() == "GET" and status in (301, 302, 303, 307, 308):
                 loc = res.getheader("Location") or ""
                 conn.close()
                 if loc:
+                    # Location may be absolute or relative
                     if loc.startswith("http://") or loc.startswith("https://"):
                         u = urlparse(loc)
                         new_scheme = u.scheme.lower() or "http"
@@ -129,57 +134,32 @@ class BlockNetClient:
                         finally:
                             c2.close()
                     else:
+                        # relative redirect stays on same relay/base_path
                         return self._request("GET", loc, b"", headers=headers, follow_redirects_for_get=True)
 
             conn.close()
             return status, hdrs, data
-
         except Exception as e:
             try:
                 conn.close()
             except Exception:
                 pass
-
-            # IMPORTANT: return JSON bytes so callers see the real error
-            err = {
-                "ok": False,
-                "error": f"request failed: {type(e).__name__}: {e}",
-                "status": 0,
-                "headers": {},
-                "method": method.upper(),
-                "path": full_path,
-            }
-            return 0, {}, json.dumps(err).encode("utf-8", errors="replace")
+            msg = str(e).encode("utf-8", errors="replace")
+            return 0, {}, msg
 
     @staticmethod
     def _as_json(status: int, data: bytes, hdrs: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        txt = ""
         try:
-            txt = data.decode("utf-8", errors="replace") if data else ""
+            j = json.loads(data.decode("utf-8", errors="replace") or "{}")
         except Exception:
-            txt = ""
-
-        try:
-            j = json.loads(txt or "{}")
-        except Exception:
-            # keep a snippet so you can see HTML/tracebacks/etc
-            j = {
-                "ok": False,
-                "error": "non-json response",
-                "text_snippet": (txt[:1200] if txt else ""),
-            }
+            j = {"ok": False, "error": "non-json response"}
 
         if not isinstance(j, dict):
             j = {"ok": False, "error": "json was not an object", "data": j}
 
-        j.setdefault("status", int(status))
+        j.setdefault("status", status)
         if hdrs is not None:
             j.setdefault("headers", hdrs)
-
-        # infer ok if server didn't provide it
-        if "ok" not in j:
-            j["ok"] = (200 <= int(status) < 300)
-
         return j
 
     # ---------------- generic JSON helpers ----------------
@@ -195,31 +175,21 @@ class BlockNetClient:
         return self._request(method, path, body=body, headers=headers)
 
     def request_json(
-            self,
-            method: str,
-            path: str,
-            obj: Optional[Dict[str, Any]] = None,
+        self,
+        method: str,
+        path: str,
+        obj: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if obj is None:
             status, hdrs, data = self._request(method, path, body=b"", headers=None)
             return self._as_json(status, data, hdrs)
 
-        # safer JSON encoding (also avoids huge whitespace)
-        try:
-            body = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-        except Exception as e:
-            return {
-                "ok": False,
-                "error": f"json encode failed: {type(e).__name__}: {e}",
-                "status": 0,
-                "headers": {},
-            }
-
+        body = json.dumps(obj).encode("utf-8")
         status, hdrs, data = self._request(
             method,
             path,
             body=body,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers={"Content-Type": "application/json"},
         )
         return self._as_json(status, data, hdrs)
 
@@ -259,6 +229,13 @@ class BlockNetClient:
             p = "/" + p
         return p.rstrip("/")
 
+    @staticmethod
+    def _join_prefix(pfx: str, subpath: str) -> str:
+        sp = (subpath or "").strip()
+        if not sp.startswith("/"):
+            sp = "/" + sp
+        return pfx + sp
+
     # core
     def api_ping(self, *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
@@ -283,7 +260,6 @@ class BlockNetClient:
 
     def api_vectortext(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
-        print(body)
         return self.request_json("POST", f"{p}/vectortext", dict(body))
 
     # media
@@ -312,6 +288,7 @@ class BlockNetClient:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/randomx/scan", dict(body))
 
+    # web
     def api_web_fetch(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/web/fetch", dict(body))
@@ -328,6 +305,70 @@ class BlockNetClient:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/web/rss_find", dict(body))
 
+    # webworker (serve scripts + config)
+    def api_webworker_config(self, *, prefix: str = "/v1") -> Dict[str, Any]:
+        """
+        GET /webworker/config
+        Returns URLs + default tuning for the browser worker scripts.
+        """
+        p = self._pfx(prefix)
+        return self.request_json("GET", f"{p}/webworker/config", None)
+
+    def api_webworker_miner_js(
+        self,
+        *,
+        prefix: str = "/v1",
+        miner_js_path: str = "/webworker/miner.js",
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        """
+        GET <prefix><miner_js_path>
+        Default: /v1/webworker/miner.js
+        Returns raw JS bytes (status, headers, body).
+        """
+        p = self._pfx(prefix)
+        return self.request_raw("GET", self._join_prefix(p, miner_js_path))
+
+    def api_webworker_miner_js_text(
+        self,
+        *,
+        prefix: str = "/v1",
+        miner_js_path: str = "/webworker/miner.js",
+        encoding: str = "utf-8",
+    ) -> Tuple[int, Dict[str, str], str]:
+        """
+        Convenience wrapper that decodes miner.js to text.
+        """
+        status, hdrs, data = self.api_webworker_miner_js(prefix=prefix, miner_js_path=miner_js_path)
+        return status, hdrs, (data or b"").decode(encoding, errors="replace")
+
+    def api_webworker_client_js(
+        self,
+        *,
+        prefix: str = "/v1",
+        client_js_path: str = "/webworker/client.js",
+    ) -> Tuple[int, Dict[str, str], bytes]:
+        """
+        GET <prefix><client_js_path>
+        Default: /v1/webworker/client.js
+        Returns raw JS bytes (status, headers, body).
+        """
+        p = self._pfx(prefix)
+        return self.request_raw("GET", self._join_prefix(p, client_js_path))
+
+    def api_webworker_client_js_text(
+        self,
+        *,
+        prefix: str = "/v1",
+        client_js_path: str = "/webworker/client.js",
+        encoding: str = "utf-8",
+    ) -> Tuple[int, Dict[str, str], str]:
+        """
+        Convenience wrapper that decodes client.js to text.
+        """
+        status, hdrs, data = self.api_webworker_client_js(prefix=prefix, client_js_path=client_js_path)
+        return status, hdrs, (data or b"").decode(encoding, errors="replace")
+
+    # p2pool
     def api_p2pool_open(self, *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/p2pool/open", {})
@@ -347,6 +388,7 @@ class BlockNetClient:
     def api_p2pool_close(self, session: str, *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/p2pool/close", {"session": session})
+
     def api_p2pool_scan(self, body: Dict[str, Any], *, prefix: str = "/v1") -> Dict[str, Any]:
         p = self._pfx(prefix)
         return self.request_json("POST", f"{p}/p2pool/scan", dict(body))

@@ -28676,7 +28676,7 @@ def _bn_found_links_from_response(
     return _dedupe_keep_order(cleaned)
 
 
-def x_bn_playwright_render_one(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
+def _bn_playwright_render_one(url: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Smarter renderer:
       - extracts links from DOM (incl shadow roots) + frames
@@ -30322,3 +30322,1337 @@ class BlockNetWebRenderBlock(BaseBlock):
 
 
 BLOCKS.register("blocknet_web_render", BlockNetWebRenderBlock)
+
+# --- helper: resolve JSON-ish cfg from payload + Memory --------------------
+
+def _bn_any_to_json_obj(v: Any) -> Dict[str, Any]:
+    if v is None:
+        return {}
+    if isinstance(v, dict):
+        return dict(v)
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            v = bytes(v).decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return {}
+        try:
+            j = json.loads(s)
+            return dict(j) if isinstance(j, dict) else {}
+        except Exception:
+            return {}
+    # last resort: try JSON stringify then parse
+    try:
+        s = json.dumps(v, ensure_ascii=False)
+        j = json.loads(s)
+        return dict(j) if isinstance(j, dict) else {}
+    except Exception:
+        return {}
+
+def _bn_b64url_json(obj: Dict[str, Any]) -> str:
+    raw = json.dumps(obj or {}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+def _bn_resolve_injected_cfg(payload: Any, params: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Resolve an injected cfg dict from:
+      1) params.inject_cfg (dict or JSON string) if provided
+      2) payload (dict or JSON string)
+      3) mem_in_keys (dict or JSON string)
+    Combine with mem_in_mode via _bn_apply_mem_in_mode (merge supported).
+    """
+    meta: Dict[str, Any] = {"input_kind": "inject_cfg", "coercions": []}
+
+    # params override first
+    inject_cfg_param = params.get("inject_cfg", None)
+    if inject_cfg_param is not None and inject_cfg_param != "":
+        meta["coercions"].append("params.inject_cfg->cfg")
+        cfg0 = _bn_any_to_json_obj(inject_cfg_param)
+    else:
+        cfg0 = _bn_any_to_json_obj(payload)
+        if isinstance(payload, dict):
+            meta["coercions"].append("payload:dict->cfg")
+        elif payload is not None and payload != "":
+            meta["coercions"].append(f"payload:{type(payload).__name__}->cfg")
+
+    mem_keys = _bn_parse_keys(_bn_param(params, "mem_in_keys", "memory_sources", default=None))
+    mem_v, used = _bn_mem_get(mem_keys)
+    meta["mem_in_keys_used"] = used
+    cfgm = _bn_any_to_json_obj(mem_v)
+
+    mode = str(params.get("mem_in_mode", "auto") or "auto")
+    joiner = str(params.get("mem_in_join", "\n\n") or "\n\n")
+
+    combined, mem_coercions = _bn_apply_mem_in_mode(cfg0, cfgm, mode=mode, joiner=joiner)
+    meta["coercions"].extend(mem_coercions)
+
+    out = combined if isinstance(combined, dict) else _bn_any_to_json_obj(combined)
+    if combined is not None and not isinstance(combined, dict):
+        meta["coercions"].append(f"combined:{type(combined).__name__}->dict")
+
+    return out, meta
+
+
+def _bn_worker_inject_snippet(inject_url_abs: str) -> str:
+    """
+    Consent-based snippet for pages you control.
+    Creates window.BlockNetMiner with start()/stop()/status().
+    Uses Blob Worker to avoid same-origin Worker restrictions.
+    """
+    # NOTE: keep it as a single string (Playwright add_init_script likes this).
+    return f"""
+(() => {{
+  const INJECT_URL = {json.dumps(inject_url_abs)};
+
+  async function _createWorkerFromUrl(url) {{
+    const resp = await fetch(url, {{ mode: "cors", credentials: "omit", cache: "no-store" }});
+    if (!resp.ok) throw new Error("worker fetch failed: " + resp.status + " " + resp.statusText);
+    const js = await resp.text();
+    const blob = new Blob([js], {{ type: "application/javascript" }});
+    const blobUrl = URL.createObjectURL(blob);
+    const w = new Worker(blobUrl);
+    return {{ worker: w, blobUrl }};
+  }}
+
+  const api = {{
+    workers: [],
+    events: [],
+    async start(autostart=false) {{
+      if (!autostart) {{
+        const ok = window.confirm("Start the BlockNet WebWorker on this page?");
+        if (!ok) return {{ ok: false, cancelled: true }};
+      }}
+
+      const {{ worker, blobUrl }} = await _createWorkerFromUrl(INJECT_URL);
+
+      const id = api.workers.length;
+      api.workers.push({{ id, worker, blobUrl, started_at: Date.now() }});
+
+      worker.onmessage = (ev) => {{
+        api.events.push({{ t: Date.now(), id, type: "message", data: ev.data }});
+      }};
+      worker.onerror = (ev) => {{
+        api.events.push({{ t: Date.now(), id, type: "error", message: String(ev && ev.message || ev) }});
+      }};
+
+      return {{ ok: true, id }};
+    }},
+    stop(id=null) {{
+      if (id === null) {{
+        for (const it of api.workers) {{
+          try {{ it.worker.terminate(); }} catch (e) {{}}
+          try {{ URL.revokeObjectURL(it.blobUrl); }} catch (e) {{}}
+        }}
+        api.workers = [];
+        return {{ ok: true, stopped: "all" }};
+      }}
+      const it = api.workers.find(x => x.id === id);
+      if (!it) return {{ ok: false, error: "unknown id" }};
+      try {{ it.worker.terminate(); }} catch (e) {{}}
+      try {{ URL.revokeObjectURL(it.blobUrl); }} catch (e) {{}}
+      api.workers = api.workers.filter(x => x.id !== id);
+      return {{ ok: true, stopped: id }};
+    }},
+    status() {{
+      return {{
+        ok: true,
+        inject_url: INJECT_URL,
+        workers: api.workers.map(w => ({{ id: w.id, started_at: w.started_at }})),
+        events: api.events.slice(-50),
+      }};
+    }}
+  }};
+
+  window.BlockNetMiner = api;
+}})();
+""".strip()
+
+@dataclass
+class BlockNetMinerBlock(BaseBlock):
+    """
+    WebWorker script/control block.
+
+    op:
+      - "config"
+      - "miner_js"
+      - "client_js"
+      - "inject_miner_js"
+      - "inject_url"
+      - "harness"
+
+    SAFE additions (for pages you control):
+      - "inject_snippet"     : returns consent-based JS snippet that starts the worker
+      - "playwright_harness" : opens /webworker/harness and autostarts via Playwright
+    """
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "relay": "127.0.0.1:38888",
+            "token": "",
+            "api_prefix": "/v1",
+
+            "op": "config",
+
+            "decode": True,
+            "encoding": "utf-8",
+
+            "inject_cfg": None,
+            "mem_in_keys": None,
+            "mem_in_mode": "auto",
+            "mem_in_join": "\n\n",
+
+            "inject_start": None,
+            "inject_use_b64": True,
+
+            "miner_js_path": "/webworker/miner.js",
+            "client_js_path": "/webworker/client.js",
+            "inject_miner_js_path": "/webworker/inject/miner.js",
+
+            # NEW: playwright harness options
+            "pw_headless": True,
+            "pw_timeout_ms": 30_000,
+            "pw_wait_until": "domcontentloaded",  # load|domcontentloaded|networkidle
+            "pw_wait_after_ms": 500,              # small settle delay
+            "pw_keep_open_ms": 0,                 # set >0 if you want to observe manually
+
+            # memory out
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_links_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
+        }
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        relay = str(params.get("relay", "127.0.0.1:38888") or "127.0.0.1:38888")
+        token = str(params.get("token", "") or "")
+        pfx = _api_prefix(params)
+
+        op = str(params.get("op", "config") or "config").strip().lower()
+        decode = bool(params.get("decode", True))
+        encoding = str(params.get("encoding", "utf-8") or "utf-8")
+
+        cli = BlockNetClient(relay=relay, token=token)
+        meta: Dict[str, Any] = {"ok": False, "op": op, "api_prefix": pfx, "coercions": []}
+
+        # helper for raw GETs
+        def _get_raw(path: str):
+            return cli.request_raw("GET", path)
+
+        def _as_text(b: bytes) -> str:
+            return (b or b"").decode(encoding, errors="replace")
+
+        # ---------- config ----------
+        if op == "config":
+            j = cli.api_webworker_config(prefix=pfx)
+            ok = bool(j.get("ok", False)) if isinstance(j, dict) else False
+            exports = _bn_export_to_memory(out_value=j, response_json=j, ok=ok, params=params, links=None)
+            meta.update({"ok": ok, "response": j})
+            if exports:
+                meta["memory_exports"] = exports
+            return j, meta
+
+        # ---------- miner_js ----------
+        if op == "miner_js":
+            path = f"{pfx}{str(params.get('miner_js_path', '/webworker/miner.js') or '/webworker/miner.js')}"
+            st, hdrs, data = _get_raw(path)
+            ok = (st == 200 and data is not None and len(data) > 0)
+
+            out = _as_text(data) if decode else data
+            resp = {"status": st, "headers": hdrs, "bytes": len(data or b"")}
+            exports = _bn_export_to_memory(out_value=out, response_json=resp, ok=ok, params=params, links=None)
+
+            meta.update({"ok": ok, "response": resp, "content_type": hdrs.get("Content-Type", "")})
+            if exports:
+                meta["memory_exports"] = exports
+            return out, meta
+
+        # ---------- client_js ----------
+        if op == "client_js":
+            path = f"{pfx}{str(params.get('client_js_path', '/webworker/client.js') or '/webworker/client.js')}"
+            st, hdrs, data = _get_raw(path)
+            ok = (st == 200 and data is not None and len(data) > 0)
+
+            out = _as_text(data) if decode else data
+            resp = {"status": st, "headers": hdrs, "bytes": len(data or b"")}
+            exports = _bn_export_to_memory(out_value=out, response_json=resp, ok=ok, params=params, links=None)
+
+            meta.update({"ok": ok, "response": resp, "content_type": hdrs.get("Content-Type", "")})
+            if exports:
+                meta["memory_exports"] = exports
+            return out, meta
+
+        # ---------- harness ----------
+        if op == "harness":
+            path = f"{pfx}/webworker/harness"
+            st, hdrs, data = _get_raw(path)
+            ok = (st == 200 and data is not None and len(data) > 0)
+
+            out = _as_text(data) if decode else data
+            resp = {"status": st, "headers": hdrs, "bytes": len(data or b"")}
+            exports = _bn_export_to_memory(out_value=out, response_json=resp, ok=ok, params=params, links=None)
+
+            meta.update({"ok": ok, "response": resp, "content_type": hdrs.get("Content-Type", "")})
+            if exports:
+                meta["memory_exports"] = exports
+            return out, meta
+
+        # ---------- inject_url / inject_miner_js / inject_snippet / playwright_harness ----------
+        if op in ("inject_url", "inject_miner_js", "inject_snippet", "playwright_harness"):
+            cfg_obj, cmeta = _bn_resolve_injected_cfg(payload, params)
+            meta["coercions"].extend(cmeta.get("coercions", []))
+            meta["mem_in_keys_used"] = cmeta.get("mem_in_keys_used", [])
+
+            inject_path = str(params.get("inject_miner_js_path", "/webworker/inject/miner.js") or "/webworker/inject/miner.js")
+            inject_start = params.get("inject_start", None)
+            inject_use_b64 = bool(params.get("inject_use_b64", True))
+
+            qs: Dict[str, str] = {}
+            if inject_use_b64:
+                qs["cfg_b64"] = _bn_b64url_json(cfg_obj)
+            else:
+                qs["cfg"] = json.dumps(cfg_obj or {}, ensure_ascii=False, separators=(",", ":"))
+            if inject_start is not None:
+                qs["start"] = "1" if bool(inject_start) else "0"
+
+            rel_url = f"{pfx}{inject_path}"
+            if qs:
+                rel_url += "?" + urlencode(qs)
+
+            # absolute URL base
+            try:
+                scheme, host, port, base_path = cli._parse()
+                default_port = (443 if scheme == "https" else 80)
+                hostport = f"{host}:{port}" if int(port) != default_port else host
+                abs_base = f"{scheme}://{hostport}{base_path}".rstrip("/")
+                abs_url = abs_base + rel_url
+                harness_url = abs_base + f"{pfx}/webworker/harness"
+            except Exception:
+                abs_url = rel_url
+                harness_url = f"{pfx}/webworker/harness"
+
+            meta["inject_cfg"] = cfg_obj
+            meta["inject_url"] = rel_url
+            meta["inject_url_abs"] = abs_url
+
+            if op == "inject_url":
+                out = {"url": rel_url, "url_abs": abs_url, "cfg": cfg_obj}
+                exports = _bn_export_to_memory(out_value=out, response_json=out, ok=True, params=params, links=None)
+                meta["ok"] = True
+                if exports:
+                    meta["memory_exports"] = exports
+                return out, meta
+
+            if op == "inject_snippet":
+                snippet = _bn_worker_inject_snippet(abs_url)
+                out = snippet
+                resp = {"inject_url_abs": abs_url, "bytes": len(snippet.encode("utf-8"))}
+                exports = _bn_export_to_memory(out_value=out, response_json=resp, ok=True, params=params, links=None)
+                meta.update({"ok": True, "response": resp, "harness_url": harness_url})
+                if exports:
+                    meta["memory_exports"] = exports
+                return out, meta
+
+            if op == "playwright_harness":
+                # This only automates YOUR OWN harness page.
+                from playwright.sync_api import sync_playwright
+
+                headless = bool(params.get("pw_headless", True))
+                timeout_ms = int(params.get("pw_timeout_ms", 30_000))
+                wait_until = str(params.get("pw_wait_until", "domcontentloaded") or "domcontentloaded")
+                wait_after_ms = int(params.get("pw_wait_after_ms", 500))
+                keep_open_ms = int(params.get("pw_keep_open_ms", 0))
+
+                snippet = _bn_worker_inject_snippet(abs_url)
+
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(headless=headless)
+                    context = browser.new_context()
+                    # install snippet early
+                    context.add_init_script(snippet)
+
+                    page = context.new_page()
+                    page.goto(harness_url, wait_until=wait_until, timeout=timeout_ms)
+
+                    # autostart inside harness (no confirm dialog)
+                    started = page.evaluate("() => window.BlockNetMiner && window.BlockNetMiner.start(true)")
+                    if wait_after_ms > 0:
+                        time.sleep(wait_after_ms / 1000.0)
+                    status = page.evaluate("() => window.BlockNetMiner && window.BlockNetMiner.status()")
+
+                    if keep_open_ms > 0:
+                        time.sleep(keep_open_ms / 1000.0)
+
+                    browser.close()
+
+                out = {"harness_url": harness_url, "started": started, "status": status, "inject_url_abs": abs_url}
+                exports = _bn_export_to_memory(out_value=out, response_json=out, ok=True, params=params, links=None)
+                meta.update({"ok": True, "response": out})
+                if exports:
+                    meta["memory_exports"] = exports
+                return out, meta
+
+            # inject_miner_js = fetch the injected JS
+            st, hdrs, data = _get_raw(rel_url)
+            ok = (st == 200 and data is not None and len(data) > 0)
+            out = _as_text(data) if decode else data
+            resp = {"status": st, "headers": hdrs, "bytes": len(data or b""), "inject_url": rel_url}
+            exports = _bn_export_to_memory(out_value=out, response_json=resp, ok=ok, params=params, links=None)
+
+            meta.update({"ok": ok, "response": resp, "content_type": hdrs.get("Content-Type", "")})
+            if exports:
+                meta["memory_exports"] = exports
+            return out, meta
+
+        return "", {"ok": False, "error": f"unknown op: {op}", **meta}
+
+
+BLOCKS.register("blocknet_miner", BlockNetMinerBlock)
+
+
+
+# ================ OpenCLLoader (SELF-CONTAINED, INLINE KERNEL) ================
+@dataclass
+class OpenCLLoaderBlock(BaseBlock):
+    """
+    Self-contained OpenCL text/code ranking block.
+
+    What it does:
+      - embeds the OpenCL kernel inline (no external .cl file needed)
+      - loads OpenCL + builds the kernel once and caches runtime
+      - reads payload + inline [context]/[lexicon]
+      - reads Memory context/lexicon keys
+      - GPU-ranks candidate text/code units
+      - exports refined context / lexicon / native draft into Memory
+      - mirrors keys so your existing blocks can use them immediately
+
+    This is NOT a full transformer/LLM kernel.
+    It is the GPU-native retrieval/ranking/drafting stage that works with:
+      prompt / chat / tensor / code / tokenizer / idf / idfrefine
+    """
+
+    # ---------- inline OpenCL kernel ----------
+    KERNEL_SOURCE = r"""
+    __kernel void score_units_kernel(
+        __global const uint* unit_tokens,
+        __global const ushort* unit_sizes,
+        __global const float* unit_bias,
+        const uint unit_stride,
+        __global const uint* query_tokens,
+        __global const float* query_weights,
+        const ushort query_size,
+        __global float* out_scores,
+        __global float* out_weighted_overlap,
+        __global float* out_density,
+        __global uint* out_ordered_hits,
+        const uint n_units
+    ) {
+        const uint gid = get_global_id(0);
+        if (gid >= n_units) {
+            return;
+        }
+
+        const __global uint* u = unit_tokens + (gid * unit_stride);
+        const ushort usz = unit_sizes[gid];
+
+        float weighted_overlap = 0.0f;
+        uint ordered_hits = 0u;
+        int last_pos = -1;
+        uint raw_hits = 0u;
+
+        for (ushort qi = 0; qi < query_size; ++qi) {
+            const uint q = query_tokens[qi];
+            if (q == 0u) {
+                continue;
+            }
+
+            int first_pos = -1;
+            for (ushort ui = 0; ui < usz; ++ui) {
+                if (u[ui] == q) {
+                    first_pos = (int)ui;
+                    break;
+                }
+            }
+
+            if (first_pos >= 0) {
+                const float qw = query_weights[qi] > 0.0f ? query_weights[qi] : 1.0f;
+                weighted_overlap += qw;
+                raw_hits += 1u;
+
+                if (last_pos < first_pos) {
+                    ordered_hits += 1u;
+                }
+                last_pos = first_pos;
+            }
+        }
+
+        const float density = (usz > 0) ? ((float)raw_hits / (float)usz) : 0.0f;
+
+        const float score =
+            (weighted_overlap * 3.5f) +
+            ((float)ordered_hits * 0.65f) +
+            (density * 2.0f) +
+            unit_bias[gid];
+
+        out_scores[gid] = score;
+        out_weighted_overlap[gid] = weighted_overlap;
+        out_density[gid] = density;
+        out_ordered_hits[gid] = ordered_hits;
+    }
+    """
+
+    # ---------- simple class cache ----------
+    _RUNTIME_CACHE = {}
+    _SECTION_RE = re.compile(r"\n\[[A-Za-z0-9_\-]+\]\n")
+    _FENCE_RE = re.compile(r"```[ \t]*([A-Za-z0-9_\-\+\.]*)[ \t]*\n(.*?)\n```", re.DOTALL | re.MULTILINE)
+    _TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_\.:\-/]{1,}")
+    _WORD_RE = re.compile(r"[A-Za-z0-9_]{2,}")
+    _STOP_LOCAL = {
+        "true", "false", "none", "null", "http", "https", "www", "com", "net", "org",
+        "return", "returns", "value", "values", "param", "params", "parameter", "parameters",
+        "class", "function", "method", "block", "using", "import", "from",
+    }
+
+    # ---------- helpers ----------
+    def _log(self, msg: str) -> None:
+        print(msg)
+
+    def _normalize_key_list(self, v: Any) -> List[str]:
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple)):
+            return [str(x).strip() for x in v if str(x).strip()]
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return []
+
+    def _dedupe_preserve_order(self, seq: List[str]) -> List[str]:
+        seen = set()
+        out = []
+        for s in seq:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def _merge_bounded_local(self, existing: List[str], incoming: List[str], *, max_total: int) -> List[str]:
+        out = list(existing or [])
+        seen = set(existing or [])
+        for t in incoming or []:
+            tt = (t or "").strip()
+            if not tt:
+                continue
+            if tt in seen:
+                continue
+            seen.add(tt)
+            out.append(tt)
+        if max_total > 0 and len(out) > max_total:
+            out = out[-max_total:]
+        return out
+
+    def _parse_all_sections(self, text: str, tag: str) -> List[str]:
+        if not text:
+            return []
+        needle = f"[{tag}]\n"
+        if needle not in text:
+            return []
+        parts = text.split(needle)
+        out = []
+        for seg in parts[1:]:
+            m = self._SECTION_RE.search(seg)
+            body = seg[:m.start()] if m else seg
+            body = body.strip()
+            if body:
+                out.append(body)
+        return out
+
+    def _parse_inline_lexicon(self, text: str) -> List[str]:
+        chunks = self._parse_all_sections(text, "lexicon")
+        terms = []
+        for c in chunks:
+            c = c.replace("\n", ",")
+            for t in c.split(","):
+                tt = (t or "").strip()
+                if tt:
+                    terms.append(tt)
+        return self._dedupe_preserve_order(terms)
+
+    def _strip_known_sections(self, text: str) -> str:
+        if not text:
+            return ""
+        out = str(text)
+        for tag in ("context", "lexicon", "opencl_draft", "opencl_context", "opencl_lexicon", "opencl_json"):
+            needle = f"\n[{tag}]\n"
+            if needle in out:
+                out = out.split(needle, 1)[0]
+            elif out.startswith(f"[{tag}]\n"):
+                out = ""
+        return out.strip()
+
+    def _looks_code_like(self, text: str) -> bool:
+        if not text:
+            return False
+        lower = text.lower()
+        score = 0
+        signals = (
+            "def ", "class ", "import ", "from ", "return ", "async ", "await ",
+            "function ", "const ", "let ", "var ", "#include", "std::",
+            "using ", "namespace ", "fn ", "impl ", "package ", "func ",
+        )
+        for s in signals:
+            if s in lower:
+                score += 2
+        punct = sum(ch in "{}[]();:=<>+-/*#._" for ch in text)
+        newlines = text.count("\n")
+        if punct >= 12:
+            score += 2
+        if newlines >= 4:
+            score += 1
+        return score >= 3
+
+    def _hash_token(self, token: str) -> int:
+        import zlib
+        return int(zlib.crc32(token.encode("utf-8")) & 0xFFFFFFFF)
+
+    def _clean_token(self, tok: str) -> Optional[str]:
+        tt = (tok or "").strip().lower().strip("._:-/")
+        if not tt:
+            return None
+        if tt in _STOPWORDS or tt in self._STOP_LOCAL:
+            return None
+        if len(tt) < 3:
+            return None
+        if tt.isdigit():
+            return None
+        return tt
+
+    def _extract_terms(self, text: str, *, mode: str, top_k: int = 64) -> List[str]:
+        """
+        Fully self-contained extractor.
+        Works for text + code.
+        """
+        counts: Dict[str, float] = {}
+        s = text or ""
+
+        # generic tokens
+        for m in self._TOKEN_RE.finditer(s):
+            tok = self._clean_token(m.group(0))
+            if not tok:
+                continue
+            counts[tok] = counts.get(tok, 0.0) + 1.0
+            if "." in tok:
+                for part in tok.split("."):
+                    p = self._clean_token(part)
+                    if p:
+                        counts[p] = counts.get(p, 0.0) + 0.65
+
+        # code-ish keywords / identifiers
+        if mode == "code":
+            code_patterns = [
+                r"\bdef\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bclass\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\bstruct\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\benum\s+([A-Za-z_][A-Za-z0-9_]*)",
+                r"\busing\s+([A-Za-z_][A-Za-z0-9_\.]*)",
+                r"\bimport\s+([A-Za-z_][A-Za-z0-9_\.]*)",
+                r"\bfrom\s+([A-Za-z_][A-Za-z0-9_\.]*)\s+import\b",
+            ]
+            for pat in code_patterns:
+                for m in re.finditer(pat, s):
+                    tok = self._clean_token(m.group(1))
+                    if tok:
+                        counts[tok] = counts.get(tok, 0.0) + 4.0
+
+        # prose-ish word freq
+        else:
+            for w in self._WORD_RE.findall(s.lower()):
+                tok = self._clean_token(w)
+                if tok:
+                    counts[tok] = counts.get(tok, 0.0) + 1.0
+
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [t for t, _ in ranked[:top_k]]
+
+    def _split_units(self, source_name: str, text: str, *, default_mode: str, max_units: int) -> List[Dict[str, Any]]:
+        units: List[Dict[str, Any]] = []
+        if not text:
+            return units
+
+        working = str(text)
+
+        # fenced code first
+        for m in self._FENCE_RE.finditer(working):
+            lang = (m.group(1) or "").strip()
+            body = (m.group(2) or "").strip()
+            if not body:
+                continue
+            units.append({
+                "source": source_name,
+                "kind": "code",
+                "lang": lang,
+                "text": body,
+            })
+            if len(units) >= max_units:
+                return units[:max_units]
+
+        working = self._FENCE_RE.sub("\n", working)
+
+        # paragraphs / lines
+        paras = [p.strip() for p in re.split(r"\n{2,}", working) if p.strip()]
+        for para in paras:
+            if len(para) < 24:
+                continue
+
+            if len(para) > 420:
+                chunks = [x.strip() for x in re.split(r"(?<=[.!?])\s+|\n+", para) if x.strip()]
+            else:
+                chunks = [para]
+
+            for chunk in chunks:
+                if len(chunk) < 24:
+                    continue
+                kind = "code" if self._looks_code_like(chunk) else default_mode
+                units.append({
+                    "source": source_name,
+                    "kind": kind if kind in ("text", "code") else "text",
+                    "lang": "",
+                    "text": chunk,
+                })
+                if len(units) >= max_units:
+                    return units[:max_units]
+
+        return units[:max_units]
+
+    def _preload_opencl_dll(self, opencl_dll: Optional[str]) -> None:
+        import os
+        import ctypes
+
+        if not opencl_dll:
+            return
+
+        dll_path = os.path.abspath(str(opencl_dll))
+        if not os.path.exists(dll_path):
+            raise FileNotFoundError(f"OpenCL DLL not found: {dll_path}")
+
+        if os.name == "nt":
+            dll_dir = os.path.dirname(dll_path)
+            if dll_dir and hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(dll_dir)
+                except Exception:
+                    pass
+            ctypes.WinDLL(dll_path)
+        else:
+            ctypes.CDLL(dll_path)
+
+        self._log(f"[openclloader] preloaded OpenCL runtime: {dll_path}")
+
+    def _list_devices(self, opencl_dll: Optional[str] = None) -> List[Dict[str, Any]]:
+        self._preload_opencl_dll(opencl_dll)
+        import pyopencl as cl
+
+        out = []
+        for pi, p in enumerate(cl.get_platforms()):
+            for di, d in enumerate(p.get_devices()):
+                out.append({
+                    "platform_index": pi,
+                    "device_index": di,
+                    "platform_name": p.name.strip(),
+                    "device_name": d.name.strip(),
+                    "global_mem_bytes": int(getattr(d, "global_mem_size", 0) or 0),
+                    "max_compute_units": int(getattr(d, "max_compute_units", 0) or 0),
+                    "max_work_group_size": int(getattr(d, "max_work_group_size", 0) or 0),
+                })
+        return out
+
+    def _get_runtime(
+        self,
+        *,
+        platform_index: int,
+        device_index: int,
+        build_options: str = "",
+        opencl_dll: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        import pyopencl as cl
+        import numpy as np
+
+        self._preload_opencl_dll(opencl_dll)
+
+        key = "||".join([
+            str(platform_index),
+            str(device_index),
+            str(build_options or ""),
+            str(opencl_dll or ""),
+        ])
+
+        rt = self._RUNTIME_CACHE.get(key)
+        if rt is not None:
+            return rt
+
+        platforms = cl.get_platforms()
+        if not platforms:
+            raise RuntimeError("No OpenCL platforms found.")
+
+        if platform_index < 0 or platform_index >= len(platforms):
+            raise IndexError(f"platform_index out of range: {platform_index}")
+
+        platform = platforms[platform_index]
+        devices = platform.get_devices()
+        if not devices:
+            raise RuntimeError(f"No devices found on platform {platform_index}")
+
+        if device_index < 0 or device_index >= len(devices):
+            raise IndexError(f"device_index out of range: {device_index}")
+
+        device = devices[device_index]
+        ctx = cl.Context([device])
+        queue = cl.CommandQueue(ctx, device)
+        program = cl.Program(ctx, self.KERNEL_SOURCE).build(options=build_options or None)
+
+        rt = {
+            "cl": cl,
+            "np": np,
+            "ctx": ctx,
+            "queue": queue,
+            "program": program,
+            "platform": platform,
+            "device": device,
+        }
+        self._RUNTIME_CACHE[key] = rt
+
+        self._log(
+            f"[openclloader] using platform={platform.name.strip()} "
+            f"device={device.name.strip()}"
+        )
+        return rt
+
+    def _gpu_score_units(
+        self,
+        runtime: Dict[str, Any],
+        *,
+        unit_term_lists: List[List[str]],
+        unit_bias_list: List[float],
+        query_terms: List[str],
+        query_weights: List[float],
+        kernel_name: str,
+        local_size: int,
+        max_unit_tokens: int,
+        max_query_tokens: int,
+    ) -> Dict[str, Any]:
+        cl = runtime["cl"]
+        np = runtime["np"]
+        ctx = runtime["ctx"]
+        queue = runtime["queue"]
+        program = runtime["program"]
+        mf = cl.mem_flags
+
+        n_units = len(unit_term_lists)
+        if n_units <= 0:
+            return {
+                "scores": [],
+                "weighted_overlap": [],
+                "density": [],
+                "ordered_hits": [],
+            }
+
+        unit_tokens = np.zeros((n_units, max_unit_tokens), dtype=np.uint32)
+        unit_sizes = np.zeros((n_units,), dtype=np.uint16)
+        unit_bias = np.zeros((n_units,), dtype=np.float32)
+
+        for i, toks in enumerate(unit_term_lists):
+            toks = toks[:max_unit_tokens]
+            unit_sizes[i] = np.uint16(len(toks))
+            unit_bias[i] = np.float32(unit_bias_list[i] if i < len(unit_bias_list) else 0.0)
+            for j, tok in enumerate(toks):
+                unit_tokens[i, j] = np.uint32(self._hash_token(tok))
+
+        q_terms = query_terms[:max_query_tokens]
+        q_weights = query_weights[:max_query_tokens]
+
+        query_tokens = np.zeros((max_query_tokens,), dtype=np.uint32)
+        query_weight_arr = np.zeros((max_query_tokens,), dtype=np.float32)
+
+        for i, tok in enumerate(q_terms):
+            query_tokens[i] = np.uint32(self._hash_token(tok))
+            query_weight_arr[i] = np.float32(q_weights[i] if i < len(q_weights) else 1.0)
+
+        out_scores = np.zeros((n_units,), dtype=np.float32)
+        out_overlap = np.zeros((n_units,), dtype=np.float32)
+        out_density = np.zeros((n_units,), dtype=np.float32)
+        out_ordered = np.zeros((n_units,), dtype=np.uint32)
+
+        unit_tokens_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=unit_tokens)
+        unit_sizes_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=unit_sizes)
+        unit_bias_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=unit_bias)
+        query_tokens_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=query_tokens)
+        query_weights_buf = cl.Buffer(ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=query_weight_arr)
+
+        out_scores_buf = cl.Buffer(ctx, mf.WRITE_ONLY, out_scores.nbytes)
+        out_overlap_buf = cl.Buffer(ctx, mf.WRITE_ONLY, out_overlap.nbytes)
+        out_density_buf = cl.Buffer(ctx, mf.WRITE_ONLY, out_density.nbytes)
+        out_ordered_buf = cl.Buffer(ctx, mf.WRITE_ONLY, out_ordered.nbytes)
+
+        kernel = getattr(program, kernel_name)
+
+        if local_size > 0:
+            padded = ((n_units + local_size - 1) // local_size) * local_size
+            gws = (int(padded),)
+            lws = (int(local_size),)
+        else:
+            gws = (int(n_units),)
+            lws = None
+
+        kernel(
+            queue,
+            gws,
+            lws,
+            unit_tokens_buf,
+            unit_sizes_buf,
+            unit_bias_buf,
+            np.uint32(max_unit_tokens),
+            query_tokens_buf,
+            query_weights_buf,
+            np.uint16(len(q_terms)),
+            out_scores_buf,
+            out_overlap_buf,
+            out_density_buf,
+            out_ordered_buf,
+            np.uint32(n_units),
+        )
+
+        cl.enqueue_copy(queue, out_scores, out_scores_buf)
+        cl.enqueue_copy(queue, out_overlap, out_overlap_buf)
+        cl.enqueue_copy(queue, out_density, out_density_buf)
+        cl.enqueue_copy(queue, out_ordered, out_ordered_buf)
+        queue.finish()
+
+        return {
+            "scores": [float(x) for x in out_scores.tolist()],
+            "weighted_overlap": [float(x) for x in out_overlap.tolist()],
+            "density": [float(x) for x in out_density.tolist()],
+            "ordered_hits": [int(x) for x in out_ordered.tolist()],
+        }
+
+    def _build_text_draft(self, top_units: List[Dict[str, Any]], lexicon: List[str]) -> str:
+        lines = []
+        if lexicon:
+            lines.append("Focus: " + ", ".join(lexicon[:8]) + ".")
+        for u in top_units[:4]:
+            txt = re.sub(r"\s+", " ", (u.get("text") or "").strip())
+            if txt:
+                lines.append(txt[:320])
+        return "\n".join(lines).strip()
+
+    def _build_code_draft(self, top_units: List[Dict[str, Any]], lexicon: List[str]) -> str:
+        code_units = [u for u in top_units if u.get("kind") == "code"]
+        if code_units:
+            return (code_units[0].get("text") or "").strip()
+
+        apis = ", ".join(lexicon[:10]) if lexicon else "core logic"
+        return (
+            "# GPU-ranked code draft\n"
+            f"# Focus APIs / symbols: {apis}\n\n"
+            "def main():\n"
+            "    raise NotImplementedError('Fill from downstream CodeBlock or TensorBlock')\n\n"
+            "if __name__ == '__main__':\n"
+            "    main()\n"
+        )
+
+    # ---------- main execute ----------
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        import json
+
+        text = "" if payload is None else str(payload)
+        op = str(params.get("op", "analyze")).lower().strip()
+
+        platform_index = int(params.get("platform_index", 0))
+        device_index = int(params.get("device_index", 0))
+        local_size = int(params.get("local_size", 64))
+        build_options = str(params.get("build_options", ""))
+        opencl_dll = params.get("opencl_dll")
+        kernel_name = str(params.get("kernel_name", "score_units_kernel"))
+
+        if op == "list_devices":
+            devices = self._list_devices(opencl_dll=opencl_dll)
+            return json.dumps(devices, indent=2), {"op": "list_devices", "count": len(devices)}
+
+        mode = str(params.get("mode", "auto")).lower().strip()
+        if mode not in ("auto", "text", "code"):
+            mode = "auto"
+
+        # Inputs from memory
+        context_in_keys = self._normalize_key_list(
+            params.get("context_in_keys", "web_context,code_context,code_search_context,topic_context,idfrefine_context")
+        )
+        lexicon_in_keys = self._normalize_key_list(
+            params.get("lexicon_in_keys", "web_lexicon,code_lexicon,code_search_lexicon,corpus_lexicon,idfrefine_lexicon")
+        )
+
+        # Exports
+        export_context_key = str(params.get("export_context_key", "opencl_context")).strip() or "opencl_context"
+        export_lexicon_key = str(params.get("export_lexicon_key", "opencl_lexicon")).strip() or "opencl_lexicon"
+        export_draft_key = str(params.get("export_draft_key", "opencl_draft")).strip() or "opencl_draft"
+
+        # Mirror keys for your existing blocks
+        mirror_context_keys = self._normalize_key_list(
+            params.get("mirror_context_keys", "topic_context,web_context,code_context,code_search_context")
+        )
+        mirror_lexicon_keys = self._normalize_key_list(
+            params.get("mirror_lexicon_keys", "corpus_lexicon,web_lexicon,code_lexicon,code_search_lexicon")
+        )
+
+        include_payload_units = bool(params.get("include_payload_units", True))
+        include_inline_context = bool(params.get("include_inline_context", True))
+        include_memory_context = bool(params.get("include_memory_context", True))
+        include_inline_lexicon = bool(params.get("include_inline_lexicon", True))
+        include_memory_lexicon = bool(params.get("include_memory_lexicon", True))
+
+        merge_existing = bool(params.get("merge_existing", True))
+        inject_context = bool(params.get("inject_context", True))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_draft = bool(params.get("inject_draft", True))
+        emit_debug_json = bool(params.get("emit_debug_json", False))
+
+        top_units = int(params.get("top_units", 8))
+        top_terms = int(params.get("top_terms", 48))
+        max_units = int(params.get("max_units", 256))
+        max_unit_tokens = int(params.get("max_unit_tokens", 64))
+        max_query_tokens = int(params.get("max_query_tokens", 64))
+        max_context_chars = int(params.get("max_context_chars", 5000))
+        lexicon_max_total = int(params.get("lexicon_max_total", 256))
+
+        core = self._strip_known_sections(text)
+        inline_context_blocks = self._parse_all_sections(text, "context") if include_inline_context else []
+        inline_lexicon = self._parse_inline_lexicon(text) if include_inline_lexicon else []
+
+        store = Memory.load()
+
+        memory_context_parts: List[str] = []
+        if include_memory_context:
+            for k in context_in_keys:
+                v = store.get(k)
+                if isinstance(v, str) and v.strip():
+                    memory_context_parts.append(v.strip())
+
+        memory_lexicon: List[str] = []
+        if include_memory_lexicon:
+            for k in lexicon_in_keys:
+                v = store.get(k)
+                if isinstance(v, list):
+                    memory_lexicon.extend([str(x).strip() for x in v if str(x).strip()])
+                elif isinstance(v, str) and v.strip():
+                    vv = v.replace("\n", ",")
+                    memory_lexicon.extend([x.strip() for x in vv.split(",") if x.strip()])
+
+        resolved_mode = mode
+        if resolved_mode == "auto":
+            resolved_mode = "code" if self._looks_code_like(core) else "text"
+
+        # ---------- build weighted query terms ----------
+        seed_weights: Dict[str, float] = {}
+
+        def add_seed_terms(items: List[str], weight: float) -> None:
+            for t in items:
+                tt = self._clean_token(str(t))
+                if not tt:
+                    continue
+                current = seed_weights.get(tt, 0.0)
+                if weight > current:
+                    seed_weights[tt] = float(weight)
+
+        add_seed_terms(self._extract_terms(core, mode=resolved_mode, top_k=max_query_tokens * 2), 2.50)
+        add_seed_terms(inline_lexicon, 1.50)
+        add_seed_terms(memory_lexicon, 1.25)
+
+        query_terms = self._dedupe_preserve_order(list(seed_weights.keys()))[:max_query_tokens]
+        query_weights = [float(seed_weights.get(t, 1.0)) for t in query_terms]
+
+        if not query_terms and core.strip():
+            query_terms = self._extract_terms(core, mode=resolved_mode, top_k=max_query_tokens)
+            query_weights = [1.0 for _ in query_terms]
+
+        # ---------- candidate units ----------
+        units: List[Dict[str, Any]] = []
+
+        if include_payload_units and core.strip():
+            units.extend(self._split_units("payload", core, default_mode=resolved_mode, max_units=max_units))
+
+        for i, block in enumerate(inline_context_blocks):
+            if len(units) >= max_units:
+                break
+            units.extend(
+                self._split_units(
+                    f"inline_context:{i}",
+                    block,
+                    default_mode=resolved_mode,
+                    max_units=max_units - len(units),
+                )
+            )
+
+        if include_memory_context:
+            for i, (k, block) in enumerate(zip(context_in_keys, memory_context_parts)):
+                if len(units) >= max_units:
+                    break
+                units.extend(
+                    self._split_units(
+                        f"mem:{k}:{i}",
+                        block,
+                        default_mode=resolved_mode,
+                        max_units=max_units - len(units),
+                    )
+                )
+
+        if not units:
+            return text, {
+                "ok": False,
+                "error": "No candidate units found for GPU scoring.",
+                "mode": resolved_mode,
+            }
+
+        units = units[:max_units]
+
+        # ---------- per-unit tokenization + bias ----------
+        unit_term_lists: List[List[str]] = []
+        unit_bias_list: List[float] = []
+
+        for u in units:
+            unit_mode = "code" if u.get("kind") == "code" else resolved_mode
+            toks = self._extract_terms(u.get("text", ""), mode=unit_mode, top_k=max_unit_tokens)
+            unit_term_lists.append(toks)
+
+            bias = 0.0
+            if u.get("kind") == "code":
+                bias += 1.10 if resolved_mode == "code" else 0.20
+            else:
+                bias += 0.85 if resolved_mode == "text" else 0.10
+
+            src = str(u.get("source", ""))
+            if "code_context" in src or "code_search_context" in src:
+                bias += 0.35
+            if "web_context" in src or "topic_context" in src:
+                bias += 0.15
+
+            unit_bias_list.append(float(bias))
+
+        # ---------- run OpenCL ----------
+        runtime = self._get_runtime(
+            platform_index=platform_index,
+            device_index=device_index,
+            build_options=build_options,
+            opencl_dll=opencl_dll,
+        )
+
+        gpu = self._gpu_score_units(
+            runtime,
+            unit_term_lists=unit_term_lists,
+            unit_bias_list=unit_bias_list,
+            query_terms=query_terms,
+            query_weights=query_weights,
+            kernel_name=kernel_name,
+            local_size=local_size,
+            max_unit_tokens=max_unit_tokens,
+            max_query_tokens=max_query_tokens,
+        )
+
+        ranked: List[Tuple[float, int]] = []
+        for i, sc in enumerate(gpu["scores"]):
+            ranked.append((float(sc), i))
+        ranked.sort(reverse=True, key=lambda x: x[0])
+
+        selected_idx: List[int] = []
+        for score, idx in ranked:
+            if len(selected_idx) >= top_units:
+                break
+            if score <= 0 and selected_idx:
+                continue
+            selected_idx.append(idx)
+
+        if not selected_idx and ranked:
+            selected_idx = [ranked[0][1]]
+
+        selected_units: List[Dict[str, Any]] = []
+        for idx in selected_idx:
+            u = dict(units[idx])
+            u["gpu_score"] = float(gpu["scores"][idx])
+            u["gpu_overlap"] = float(gpu["weighted_overlap"][idx])
+            u["gpu_density"] = float(gpu["density"][idx])
+            u["gpu_ordered_hits"] = int(gpu["ordered_hits"][idx])
+            selected_units.append(u)
+
+        # ---------- refined context ----------
+        ctx_parts: List[str] = []
+        total_ctx = 0
+        for u in selected_units:
+            header = (
+                f"# source={u.get('source','')} kind={u.get('kind','')} "
+                f"score={u.get('gpu_score', 0.0):.3f}"
+            )
+            body = (u.get("text") or "").strip()
+            if not body:
+                continue
+            chunk = f"{header}\n{body}".strip()
+            if max_context_chars > 0 and total_ctx + len(chunk) > max_context_chars:
+                break
+            ctx_parts.append(chunk)
+            total_ctx += len(chunk) + 2
+
+        refined_context = "\n\n".join(ctx_parts).strip()
+
+        # ---------- refined lexicon ----------
+        term_scores: Dict[str, float] = {}
+
+        for t in query_terms:
+            term_scores[t] = term_scores.get(t, 0.0) + 2.50
+
+        for pos, idx in enumerate(selected_idx):
+            base_score = max(0.25, float(gpu["scores"][idx]))
+            rank_bonus = max(0.10, float(top_units - pos) / max(1.0, float(top_units)))
+            for tok in unit_term_lists[idx]:
+                tt = self._clean_token(tok)
+                if not tt:
+                    continue
+                term_scores[tt] = term_scores.get(tt, 0.0) + base_score + rank_bonus
+
+        refined_lexicon = [
+            t for t, _ in sorted(term_scores.items(), key=lambda kv: (-kv[1], kv[0]))
+        ][:top_terms]
+
+        # ---------- native draft ----------
+        if resolved_mode == "code":
+            native_draft = self._build_code_draft(selected_units, refined_lexicon)
+        else:
+            native_draft = self._build_text_draft(selected_units, refined_lexicon)
+
+        # ---------- save to Memory ----------
+        mem = Memory.load()
+
+        def save_context_key(key: str, value: str) -> None:
+            if not key or not value:
+                return
+            if merge_existing and isinstance(mem.get(key), str) and mem.get(key).strip():
+                existing = mem.get(key).strip()
+                if value[:120] not in existing:
+                    mem[key] = existing.rstrip() + "\n\n" + value
+            else:
+                mem[key] = value
+
+        def save_lexicon_key(key: str, value: List[str]) -> None:
+            if not key or not value:
+                return
+            existing = mem.get(key, [])
+            if merge_existing and isinstance(existing, list):
+                mem[key] = self._merge_bounded_local(existing, value, max_total=lexicon_max_total)
+            else:
+                mem[key] = list(value[:lexicon_max_total])
+
+        save_context_key(export_context_key, refined_context)
+        save_lexicon_key(export_lexicon_key, refined_lexicon)
+        if export_draft_key:
+            mem[export_draft_key] = native_draft
+
+        for k in mirror_context_keys:
+            save_context_key(k, refined_context)
+        for k in mirror_lexicon_keys:
+            save_lexicon_key(k, refined_lexicon)
+
+        Memory.save(mem)
+
+        # ---------- output ----------
+        parts: List[str] = [text] if text else []
+
+        if inject_lexicon and refined_lexicon:
+            parts.append("[lexicon]\n" + ", ".join(refined_lexicon))
+
+        if inject_context and refined_context:
+            parts.append("[context]\n" + refined_context)
+
+        if inject_draft and native_draft:
+            parts.append("[opencl_draft]\n" + native_draft)
+
+        if emit_debug_json:
+            debug_obj = {
+                "mode": resolved_mode,
+                "query_terms": query_terms,
+                "selected_units": selected_units,
+                "gpu": gpu,
+            }
+            parts.append("[opencl_json]\n" + json.dumps(debug_obj, indent=2, ensure_ascii=False))
+
+        out = "\n\n".join([p for p in parts if p]).strip()
+
+        meta = {
+            "ok": True,
+            "op": "analyze",
+            "mode": resolved_mode,
+            "platform_index": platform_index,
+            "device_index": device_index,
+            "kernel_name": kernel_name,
+            "units_total": len(units),
+            "units_selected": len(selected_units),
+            "query_terms": len(query_terms),
+            "lexicon_size": len(refined_lexicon),
+            "context_chars": len(refined_context),
+            "export_context_key": export_context_key,
+            "export_lexicon_key": export_lexicon_key,
+            "export_draft_key": export_draft_key,
+            "mirror_context_keys": mirror_context_keys,
+            "mirror_lexicon_keys": mirror_lexicon_keys,
+        }
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "op": "analyze",  # analyze | list_devices
+
+            "platform_index": 0,
+            "device_index": 0,
+            "local_size": 64,
+            "build_options": "",
+            "opencl_dll": None,
+            "kernel_name": "score_units_kernel",
+
+            "mode": "auto",  # auto | text | code
+
+            "context_in_keys": "web_context,code_context,code_search_context,topic_context,idfrefine_context",
+            "lexicon_in_keys": "web_lexicon,code_lexicon,code_search_lexicon,corpus_lexicon,idfrefine_lexicon",
+
+            "export_context_key": "opencl_context",
+            "export_lexicon_key": "opencl_lexicon",
+            "export_draft_key": "opencl_draft",
+
+            "mirror_context_keys": "topic_context,web_context,code_context,code_search_context",
+            "mirror_lexicon_keys": "corpus_lexicon,web_lexicon,code_lexicon,code_search_lexicon",
+
+            "include_payload_units": True,
+            "include_inline_context": True,
+            "include_memory_context": True,
+            "include_inline_lexicon": True,
+            "include_memory_lexicon": True,
+
+            "merge_existing": True,
+            "inject_context": True,
+            "inject_lexicon": True,
+            "inject_draft": True,
+            "emit_debug_json": False,
+
+            "top_units": 8,
+            "top_terms": 48,
+            "max_units": 256,
+            "max_unit_tokens": 64,
+            "max_query_tokens": 64,
+            "max_context_chars": 5000,
+            "lexicon_max_total": 256,
+        }
+
+
+BLOCKS.register("openclloader", OpenCLLoaderBlock)
