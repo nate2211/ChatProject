@@ -3435,6 +3435,8 @@ class JSSniffer:
       - All timeouts enforced via asyncio.wait_for wrappers
       - Multi-pass, budgeted scanning to avoid reverse-image / heavy pages wedging you
       - Watchdog hard-cap for the entire sniff run (returns partials)
+      - Uses staged "cheap -> medium -> heavy" passes and skips expensive passes if time is low
+      - Can return partial HTML/links if later passes hang or the page is too heavy
     """
 
     # ------------------------------------------------------------------ #
@@ -3461,6 +3463,18 @@ class JSSniffer:
         content_timeout_s: float = 2.0           # page.content() budget
         close_timeout_s: float = 1.2             # page.close budget
         watchdog_multiplier: float = 1.25        # whole sniff hard-cap multiplier
+
+        # newly emphasized anti-stall controls
+        max_nav_timeout_s: float = 10.0
+        preflight_timeout_s: float = 1.25
+        pass_guard_s: float = 2.2
+        min_seconds_reserved_for_close: float = 0.60
+        min_seconds_reserved_for_content: float = 0.75
+        skip_heavy_if_remaining_below_s: float = 2.0
+        skip_clicks_if_remaining_below_s: float = 2.8
+        degrade_on_large_dom: bool = True
+        large_dom_threshold: int = 3500
+        max_pending_requests_hint: int = 24
 
         max_items_soft_limit: int = 1800         # browser-side cap before returning to Python
 
@@ -3497,15 +3511,14 @@ class JSSniffer:
         enable_perf_entries: bool = True
         max_perf_entries: int = 500
 
-        enable_meta_scan: bool = True  # meta content, canonical, og:, twitter:
-        enable_link_rel_scan: bool = True  # preload/prefetch/modulepreload/alternate
-
+        enable_meta_scan: bool = True
+        enable_link_rel_scan: bool = True
         enable_srcset_scan: bool = True
 
         # NOTE: computedStyle can be EXPENSIVE on huge pages.
-        enable_css_url_scan: bool = True   # style tags + inline style url(...)
-        enable_computed_style_bg_scan: bool = False  # OFF by default for anti-stuck
-        computed_style_bg_budget: int = 350          # max elements to computed-style scan
+        enable_css_url_scan: bool = True
+        enable_computed_style_bg_scan: bool = False
+        computed_style_bg_budget: int = 350
         max_style_chars: int = 80_000
 
         enable_storage_scan: bool = True
@@ -3520,7 +3533,16 @@ class JSSniffer:
             "REDUX_STATE", "INITIAL_REDUX_STATE",
         ])
 
-        # selectors for direct URL-bearing elements
+        # Optional runtime collectors mentioned elsewhere in your codebase
+        enable_runtime_url_ring: bool = True
+        runtime_ring_soft_limit: int = 300
+        enable_mutation_url_ring: bool = True
+        mutation_ring_soft_limit: int = 250
+        enable_hydration_scan: bool = True
+        enable_worker_scan: bool = True
+        enable_sw_scan: bool = True
+        enable_webrtc_scan: bool = True
+
         selectors: List[str] = field(default_factory=lambda: [
             "a[href]",
             "video[src]", "video source[src]", "source[src]",
@@ -3537,7 +3559,7 @@ class JSSniffer:
 
         video_extensions: Set[str] = field(default_factory=lambda: {
             ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv",
-            ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv"
+            ".m3u8", ".mpd", ".ts", ".3gp", ".m4v", ".f4v", ".ogv", ".m4s"
         })
         audio_extensions: Set[str] = field(default_factory=lambda: {
             ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav",
@@ -3556,12 +3578,12 @@ class JSSniffer:
         })
 
         onclick_url_regexes: List[str] = field(default_factory=lambda: [
-            r"""['"]((?:https?:)?//[^'"]+)['"]""",
-            r"""location\.href\s*=\s*['"]([^'"]+)['"]""",
-            r"""window\.open\(\s*['"]([^'"]+)['"]""",
-            r"""window\.location\.assign\(\s*['"]([^'"]+)['"]\)""",
-            r"""window\.location\.replace\(\s*['"]([^'"]+)['"]\)""",
-            r"""decodeURIComponent\s*\(\s*['"]([^'"]+)['"]\)""",
+            r"""['\"]((?:https?:)?//[^'\"]+)['\"]""",
+            r"""location\.href\s*=\s*['\"]([^'\"]+)['\"]""",
+            r"""window\.open\(\s*['\"]([^'\"]+)['\"]""",
+            r"""window\.location\.assign\(\s*['\"]([^'\"]+)['\"]\)""",
+            r"""window\.location\.replace\(\s*['\"]([^'\"]+)['\"]\)""",
+            r"""decodeURIComponent\s*\(\s*['\"]([^'\"]+)['\"]\)""",
         ])
 
         redirect_hints: Set[str] = field(default_factory=lambda: {
@@ -3577,7 +3599,6 @@ class JSSniffer:
         # Optional: speed up pages by blocking heavy resources (OFF by default)
         block_resource_types: bool = False
         blocked_types: Set[str] = field(default_factory=lambda: {"image", "media", "font"})
-
 
     def __init__(self, config: Optional["JSSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
@@ -3618,7 +3639,6 @@ class JSSniffer:
         try:
             await asyncio.wait_for(page.close(), timeout=self.cfg.close_timeout_s)
         except Exception:
-            # if it's wedged, don't propagate—sniffer must return
             return None
 
     # ------------------------- URL helpers ------------------------- #
@@ -3669,6 +3689,116 @@ class JSSniffer:
             pass
         return url
 
+    def _canonicalize_local(self, url: str) -> str:
+        try:
+            return _canonicalize_url(self._fix_common_escapes(url))
+        except Exception:
+            try:
+                return self._fix_common_escapes(url)
+            except Exception:
+                return url
+
+    def _dedupe_links(self, items: List[Dict[str, str]], *, limit: Optional[int] = None) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        max_n = int(limit or self.cfg.max_links)
+        for item in items:
+            try:
+                raw_url = str((item or {}).get("url") or "").strip()
+            except Exception:
+                raw_url = ""
+            if not raw_url:
+                continue
+            u = self._canonicalize_local(raw_url)
+            if not u or self._is_junk_url(u) or u in seen:
+                continue
+            kind = self._classify_kind(u)
+            if not self._is_allowed_by_extensions(u, None, kind):
+                continue
+            seen.add(u)
+            out.append({
+                "url": u,
+                "text": str((item or {}).get("text") or "")[:400],
+                "tag": str((item or {}).get("tag") or "a")[:80],
+            })
+            if len(out) >= max_n:
+                break
+        return out
+
+    def _deadline(self, started: float, hard_cap: float) -> float:
+        return started + hard_cap
+
+    def _remaining(self, started: float, hard_cap: float) -> float:
+        return self._deadline(started, hard_cap) - time.monotonic()
+
+    def _budget_low_for_heavy(self, started: float, hard_cap: float) -> bool:
+        return self._remaining(started, hard_cap) < float(self.cfg.skip_heavy_if_remaining_below_s)
+
+    def _budget_low_for_clicks(self, started: float, hard_cap: float) -> bool:
+        return self._remaining(started, hard_cap) < float(self.cfg.skip_clicks_if_remaining_below_s)
+
+    async def _safe_wait(self, coro, *, timeout_s: float, label: str, log: Optional[List[str]], default=None):
+        try:
+            return await asyncio.wait_for(coro, timeout=max(0.05, timeout_s))
+        except asyncio.TimeoutError:
+            self._log(f"{label} timed out after {timeout_s:.2f}s", log)
+            return default
+        except Exception as e:
+            self._log(f"{label} failed: {e}", log)
+            return default
+
+    async def _get_dom_metrics(self, page, log: Optional[List[str]]) -> Dict[str, Any]:
+        script = r"""
+        () => {
+          try {
+            const all = document.querySelectorAll('*');
+            const scripts = document.scripts ? document.scripts.length : 0;
+            const links = document.links ? document.links.length : 0;
+            return {
+              nodeCount: all ? all.length : 0,
+              scriptCount: scripts,
+              linkCount: links,
+              readyState: document.readyState || '',
+              title: document.title || '',
+            };
+          } catch (e) {
+            return { nodeCount: 0, scriptCount: 0, linkCount: 0, error: String(e || '') };
+          }
+        }
+        """
+        try:
+            return await asyncio.wait_for(page.evaluate(script), timeout=min(self.cfg.preflight_timeout_s, self.cfg.evaluate_timeout_s))
+        except Exception as e:
+            self._log(f"DOM metrics probe failed: {e}", log)
+            return {"nodeCount": 0, "scriptCount": 0, "linkCount": 0}
+
+    async def _maybe_block_resources(self, page, log: Optional[List[str]]) -> None:
+        if not self.cfg.block_resource_types:
+            return
+        blocked = {str(x).strip().lower() for x in (self.cfg.blocked_types or set()) if str(x).strip()}
+        if not blocked:
+            return
+
+        async def _route(route):
+            try:
+                req = route.request
+                rt = str(getattr(req, "resource_type", "") or "").lower()
+                if rt in blocked:
+                    await route.abort()
+                    return
+            except Exception:
+                pass
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+        try:
+            await page.route("**/*", _route)
+            self._log(f"Resource blocking enabled for types={sorted(blocked)}", log)
+        except Exception as e:
+            self._log(f"Failed to enable route blocking: {e}", log)
+
     # ------------------------- auto-scroll ------------------------- #
 
     async def _auto_scroll(self, page, tmo: float, log: Optional[List[str]]) -> None:
@@ -3698,7 +3828,6 @@ class JSSniffer:
                     self._log("Auto-scroll: reached time budget; stopping.", log)
                     break
 
-                # no timeout kwarg; use asyncio.wait_for around evaluate
                 try:
                     await asyncio.wait_for(
                         page.evaluate("() => window.scrollBy(0, window.innerHeight);"),
@@ -3739,21 +3868,15 @@ class JSSniffer:
         except Exception as e:
             self._log(f"Auto-scroll error: {e}", log)
 
-    # ------------------------- JS passes ------------------------- #
+    # ------------------------- staged JS passes ------------------------- #
 
-    _JS_COMMON = r"""
+    _JS_PASS_CHEAP = r'''
     (args) => {
       const {
-        selectors, includeShadow, dataKeys,
-        onclickRegexes, redirectHints, scriptJsonHints,
-        baseUrl, maxItems, maxDomNodes, shadowHostLimit,
-        enableMeta, enableRelLinks, enablePerf, maxPerf,
-        enableCssUrls, enableComputedBg, computedBgBudget, maxStyleChars,
-        enableSrcset,
-        enableScriptScan, scriptLimit, maxScriptChars, enableJsonParse, maxJsonParseChars,
-        enableStorage, maxStorageKeys, maxStorageChars,
-        enableSpa, maxSpaChars, spaKeys,
-        enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints
+        baseUrl, selectors, dataKeys, onclickRegexes, maxItems,
+        maxDomNodes, includeShadow, shadowHostLimit,
+        enableMeta, enableRelLinks, enableSrcset,
+        enablePerf, maxPerf
       } = args;
 
       const out = [];
@@ -3775,326 +3898,59 @@ class JSSniffer:
         catch { return String(u).trim(); }
       }
 
-      function push(el, url, tag, reason=null) {
+      function labelOf(el) {
+        try {
+          const txt = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim();
+          return txt.slice(0, 240);
+        } catch { return ''; }
+      }
+
+      function push(el, url, tag) {
         if (out.length >= maxItems) return false;
         url = absUrl(url);
-        if (!url ||
-            url.startsWith("blob:") ||
-            url.startsWith("javascript:") ||
-            url.startsWith("data:") ||
-            seen.has(url)) {
-          return true;
-        }
+        if (!url || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('data:') || seen.has(url)) return true;
         seen.add(url);
-
-        let text = "";
-        try { text = (el && (el.innerText || el.textContent || el.title) || "").trim(); } catch {}
-        const item = { url, text, tag };
-        if (reason) item.reason = reason;
-        out.push(item);
-        return true;
+        out.push({ url, text: labelOf(el), tag: tag || (el && el.tagName ? String(el.tagName).toLowerCase() : 'dom') });
+        return out.length < maxItems;
       }
 
-      function pushAny(el, s, tag, reason) {
-        if (!s) return true;
-        const txt = normalizeUrlRaw(s);
-        if (!txt) return true;
-
-        const rx = /((https?:)?\/\/[^\s'"`<>]{6,}|\/[^\s'"`<>]{6,})/ig;
-        let m;
-        rx.lastIndex = 0;
-        while ((m = rx.exec(txt)) !== null) {
-          const cand = m[1];
-          if (!cand) continue;
-          if (!push(el, cand, tag, reason)) return false;
-          if (out.length >= maxItems) return false;
-        }
-        return true;
-      }
-
-      function parseSrcsetValue(v) {
-        const parts = String(v || "").split(",");
-        const urls = [];
-        for (const p of parts) {
-          const u = (p || "").trim().split(/\s+/)[0];
-          if (u) urls.push(u);
-        }
-        return urls;
-      }
-
-      function sniffDataAttrs(el) {
-        for (const k of dataKeys) {
-          const v = el.getAttribute?.(k);
-          if (v) { if (!push(el, v, (el.tagName||"").toLowerCase(), "data-attr")) return false; }
-        }
-        for (const attr of (el.attributes || [])) {
-          const n = (attr.name || "").toLowerCase();
-          const v = attr.value;
-          if (n.startsWith("data-") && v && (v.includes("http") || v.includes("://") || v.startsWith("/"))) {
-            if (!pushAny(el, v, (el.tagName||"").toLowerCase(), "data-generic")) return false;
-          }
-        }
-        return true;
-      }
-
-      function sniffOnclick(el) {
-        const oc = el.getAttribute?.("onclick") || "";
-        if (!oc) return true;
-
-        for (const rx of onclickRegexes) {
-          try {
-            const r = new RegExp(rx, "ig");
-            let m;
-            while ((m = r.exec(oc)) !== null) {
-              if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), "onclick")) return false; }
-            }
-          } catch {}
-        }
-
-        const ocl = oc.toLowerCase();
-        for (const h of redirectHints) {
-          if (ocl.includes(h)) {
-            const urlMatch = ocl.match(/(https?:)?\/\/[^\s'"]+/);
-            if (urlMatch) {
-              if (!push(el, urlMatch[0], (el.tagName||"").toLowerCase(), "redirect-hint-url")) return false;
-            } else {
-              if (!pushAny(el, oc, (el.tagName||"").toLowerCase(), "redirect-hint")) return false;
-            }
-            break;
-          }
-        }
-        return true;
-      }
-
-      function sniffInlineListeners(el) {
-        const inlineEvents = ["onclick","onmousedown","onmouseup","ontouchstart","ontouchend","onplay","oncanplay"];
-        for (const k of inlineEvents) {
-          const v = el.getAttribute?.(k);
-          if (!v) continue;
-          for (const rx of onclickRegexes) {
-            try {
-              const r = new RegExp(rx, "ig");
-              let m;
-              while ((m = r.exec(v)) !== null) {
-                if (m[1]) { if (!push(el, m[1], (el.tagName||"").toLowerCase(), `inline-${k}`)) return false; }
-              }
-            } catch {}
-          }
-          if (!pushAny(el, v, (el.tagName||"").toLowerCase(), `inline-text-${k}`)) return false;
-        }
-        return true;
-      }
-
-      function sniffStyleUrls(el) {
-        if (!enableCssUrls) return true;
-
-        // inline style attribute is cheap
+      function scanNode(root) {
+        let nodes = [];
         try {
-          const st = el.getAttribute?.("style") || "";
-          if (st) { if (!pushAny(el, st, (el.tagName||"").toLowerCase(), "style-attr")) return false; }
+          nodes = root.querySelectorAll(selectors.join(','));
         } catch {}
-
-        // computed background-image can be expensive; do it only if enabled and budgeted
-        if (!enableComputedBg) return true;
-        return true;
-      }
-
-      function scanRoot(root) {
-        let scanned = 0;
-        try {
-          const els = root.querySelectorAll?.(selectors) || [];
-          for (const el of els) {
-            scanned++;
-            if (scanned > maxDomNodes) break;
-
-            const tag = (el.tagName || "a").toLowerCase();
-
-            const url = el.href || el.currentSrc || el.src ||
-                        el.getAttribute?.("href") || el.getAttribute?.("src") || "";
-            if (!push(el, url, tag, "dom")) return;
-
-            if (enableSrcset) {
-              try {
-                const ss = el.getAttribute?.("srcset") || "";
-                if (ss) {
-                  for (const u of parseSrcsetValue(ss)) {
-                    if (!push(el, u, tag, "srcset")) return;
-                  }
+        const lim = Math.min(nodes.length || 0, maxDomNodes);
+        for (let i = 0; i < lim; i++) {
+          const el = nodes[i];
+          try {
+            const tag = (el.tagName || '').toLowerCase();
+            const href = el.getAttribute && (el.getAttribute('href') || el.getAttribute('src') || el.getAttribute('content'));
+            if (href && !push(el, href, tag)) return;
+            if (enableSrcset && el.getAttribute) {
+              const srcset = el.getAttribute('srcset') || '';
+              if (srcset) {
+                for (const part of String(srcset).split(',')) {
+                  const url = String(part || '').trim().split(/\s+/)[0];
+                  if (url && !push(el, url, tag + ':srcset')) return;
                 }
-              } catch {}
-            }
-
-            try {
-              const poster = el.getAttribute?.("poster") || "";
-              if (poster) { if (!push(el, poster, tag, "poster")) return; }
-            } catch {}
-
-            if (!sniffDataAttrs(el)) return;
-            if (!sniffOnclick(el)) return;
-            if (!sniffInlineListeners(el)) return;
-
-            if (!sniffStyleUrls(el)) return;
-
-            if (out.length >= maxItems) return;
-          }
-        } catch {}
-      }
-
-      function scanComputedBgBudgeted() {
-        if (!enableCssUrls || !enableComputedBg) return;
-        let cnt = 0;
-        let els = [];
-        try { els = Array.from(document.querySelectorAll("*")).slice(0, Math.max(1, computedBgBudget)); } catch {}
-        for (const el of els) {
-          if (out.length >= maxItems) return;
-          cnt++;
-          try {
-            const cs = window.getComputedStyle?.(el);
-            const bg = cs && cs.getPropertyValue && cs.getPropertyValue("background-image");
-            if (bg && bg.includes("url(")) {
-              if (!pushAny(el, bg, (el.tagName||"").toLowerCase(), "style-bg")) return;
-            }
-          } catch {}
-        }
-      }
-
-      function scanShadowRootsBounded() {
-        if (!includeShadow) return;
-        let hosts = [];
-        try {
-          hosts = Array.from(document.querySelectorAll("[id],[class],*")).slice(0, shadowHostLimit);
-        } catch {
-          try { hosts = Array.from(document.querySelectorAll("*")).slice(0, shadowHostLimit); } catch {}
-        }
-        for (const el of hosts) {
-          try {
-            if (el && el.shadowRoot) {
-              scanRoot(el.shadowRoot);
-              if (out.length >= maxItems) return;
-            }
-          } catch {}
-        }
-      }
-
-      function scanMetaAndRelLinks() {
-        if (!enableMeta && !enableRelLinks) return;
-
-        if (enableRelLinks) {
-          try {
-            const rels = new Set(["preload","prefetch","modulepreload","dns-prefetch","preconnect","alternate","canonical"]);
-            const links = Array.from(document.querySelectorAll("link[href]")).slice(0, 500);
-            for (const l of links) {
-              if (out.length >= maxItems) return;
-              const rel = String(l.getAttribute("rel") || "").toLowerCase().trim();
-              if (!rel) continue;
-              const relParts = rel.split(/\s+/);
-              if (!relParts.some(r => rels.has(r))) continue;
-              const href = l.getAttribute("href") || "";
-              if (!push(l, href, "link", `link-rel-${rel}`)) return;
-            }
-          } catch {}
-        }
-
-        if (enableMeta) {
-          try {
-            const metas = Array.from(document.querySelectorAll("meta[content]")).slice(0, 600);
-            for (const m of metas) {
-              if (out.length >= maxItems) return;
-              const content = m.getAttribute("content") || "";
-              const name = (m.getAttribute("name") || m.getAttribute("property") || "").toLowerCase();
-              if (name.includes("url") || name.startsWith("og:") || name.startsWith("twitter:") || name.includes("image")) {
-                if (!pushAny(m, content, "meta", `meta-${name || "content"}`)) return;
-              } else if (content.includes("http") || content.includes("://") || content.startsWith("/")) {
-                if (!pushAny(m, content, "meta", "meta-content")) return;
               }
             }
-          } catch {}
-        }
-      }
-
-      function scanPerfEntries() {
-        if (!enablePerf) return;
-        try {
-          const entries = performance.getEntriesByType?.("resource") || [];
-          const sliced = entries.slice(0, Math.max(1, maxPerf));
-          for (const e of sliced) {
-            if (out.length >= maxItems) return;
-            const n = e && e.name;
-            if (!n) continue;
-            if (!push(document, n, "perf", "performance-resource")) return;
-          }
-        } catch {}
-      }
-
-      function scanCssTextBounded() {
-        if (!enableCssUrls) return;
-        let styleText = "";
-        try {
-          const styles = Array.from(document.querySelectorAll("style")).slice(0, 40);
-          for (const s of styles) {
-            if (out.length >= maxItems) return;
-            let t = "";
-            try { t = (s.textContent || "").trim(); } catch {}
-            if (!t) continue;
-            styleText += "\n" + t;
-            if (styleText.length >= maxStyleChars) break;
-          }
-        } catch {}
-        if (!styleText) return;
-        if (styleText.length > maxStyleChars) styleText = styleText.slice(0, maxStyleChars);
-        pushAny(document, styleText, "style", "style-tag");
-      }
-
-      function scanScriptsBounded() {
-        if (!enableScriptScan) return;
-        let scripts = [];
-        try { scripts = Array.from(document.querySelectorAll("script")).slice(0, scriptLimit); } catch {}
-        for (const s of scripts) {
-          if (out.length >= maxItems) return;
-
-          const type = String(s.getAttribute("type") || "").toLowerCase();
-          const isJsonType = type.includes("json") || type.includes("ld+json");
-
-          let txt = "";
-          try { txt = (s.textContent || "").trim(); } catch {}
-          if (!txt) continue;
-          if (txt.length > maxScriptChars) txt = txt.slice(0, maxScriptChars);
-
-          pushAny(s, txt, "script", "script-text");
-
-          if (!enableJsonParse) continue;
-
-          // only attempt JSON parse when it looks like JSON and is within size cap
-          if (!(isJsonType || txt.startsWith("{") || txt.startsWith("["))) continue;
-          if (txt.length > maxJsonParseChars) continue;
-
-          try {
-            const data = JSON.parse(txt);
-            const stack = [data];
-            const visited = new WeakSet();
-            while (stack.length) {
-              if (out.length >= maxItems) return;
-              const cur = stack.pop();
-              if (!cur || typeof cur !== "object" || visited.has(cur)) continue;
-              visited.add(cur);
-
-              if (Array.isArray(cur)) {
-                for (let i = cur.length - 1; i >= 0; i--) stack.push(cur[i]);
-                continue;
+            if (el.getAttribute) {
+              for (const k of dataKeys) {
+                const v = el.getAttribute(k);
+                if (v && !push(el, v, tag + ':' + k)) return;
               }
-
-              for (const [k, v] of Object.entries(cur)) {
-                const kl = String(k || "").toLowerCase();
-                if (typeof v === "string") {
-                  const low = v.toLowerCase();
-                  if (low.includes("http") || low.includes("m3u8") || low.includes("mpd") || low.startsWith("/")) {
-                    if (!push(s, v, "script", "script-json-string")) return;
+              const onclick = el.getAttribute('onclick') || '';
+              if (onclick) {
+                for (const rxSrc of onclickRegexes) {
+                  let rx = null;
+                  try { rx = new RegExp(rxSrc, 'ig'); } catch {}
+                  if (!rx) continue;
+                  let m;
+                  while ((m = rx.exec(onclick)) !== null) {
+                    const u = m && m[1] ? m[1] : (m && m[0] ? m[0] : '');
+                    if (u && !push(el, u, tag + ':onclick')) return;
                   }
-                  if (scriptJsonHints.some(h => kl.includes(h))) {
-                    if (!push(s, v, "script", "script-json-key")) return;
-                  }
-                } else {
-                  stack.push(v);
                 }
               }
             }
@@ -4102,137 +3958,615 @@ class JSSniffer:
         }
       }
 
-      function scanStorage() {
-        if (!enableStorage) return;
+      scanNode(document);
 
-        function dumpStorage(st, tag) {
-          try {
-            if (!st) return true;
-            const n = Math.min(st.length || 0, Math.max(1, maxStorageKeys));
-            let acc = "";
-            for (let i = 0; i < n; i++) {
-              if (out.length >= maxItems) return false;
-              const k = st.key(i);
-              if (!k) continue;
-              const v = st.getItem(k) || "";
-              acc += "\n" + k + "\n" + v;
-              if (acc.length >= maxStorageChars) break;
-            }
-            if (acc) {
-              if (acc.length > maxStorageChars) acc = acc.slice(0, maxStorageChars);
-              return pushAny(document, acc, tag, `${tag}-dump`);
-            }
-          } catch {}
-          return true;
-        }
-
-        if (!dumpStorage(window.localStorage, "localStorage")) return;
-        if (!dumpStorage(window.sessionStorage, "sessionStorage")) return;
+      if (includeShadow) {
+        try {
+          const all = Array.from(document.querySelectorAll('*')).slice(0, shadowHostLimit);
+          for (const host of all) {
+            if (out.length >= maxItems) break;
+            try {
+              if (host && host.shadowRoot) scanNode(host.shadowRoot);
+            } catch {}
+          }
+        } catch {}
       }
 
-      function scanSpaState() {
-        if (!enableSpa) return;
-
-        for (const k of spaKeys || []) {
-          if (out.length >= maxItems) return;
-          try {
-            const v = window[k];
+      if (enableMeta) {
+        try {
+          const metas = Array.from(document.querySelectorAll('meta[content]')).slice(0, 200);
+          for (const el of metas) {
+            if (out.length >= maxItems) break;
+            const v = el.getAttribute('content');
             if (!v) continue;
-            let s = "";
-            try { s = JSON.stringify(v); } catch { s = String(v); }
+            if (/https?:\/\//i.test(v) || /^\//.test(v)) {
+              if (!push(el, v, 'meta')) break;
+            }
+          }
+        } catch {}
+      }
+
+      if (enableRelLinks) {
+        try {
+          const rels = Array.from(document.querySelectorAll('link[href]')).slice(0, 200);
+          for (const el of rels) {
+            if (out.length >= maxItems) break;
+            const v = el.getAttribute('href');
+            if (v && !push(el, v, 'link')) break;
+          }
+        } catch {}
+      }
+
+      if (enablePerf && typeof performance !== 'undefined' && performance.getEntries) {
+        try {
+          const perf = performance.getEntries().slice(0, maxPerf);
+          for (const e of perf) {
+            if (out.length >= maxItems) break;
+            try {
+              if (e && e.name && (String(e.name).startsWith('http://') || String(e.name).startsWith('https://') || String(e.name).startsWith('/'))) {
+                if (!push(document.documentElement || document.body || document, e.name, 'perf')) break;
+              }
+            } catch {}
+          }
+        } catch {}
+      }
+
+      return { items: out, capped: out.length >= maxItems, stage: 'cheap' };
+    }
+    '''
+
+    _JS_PASS_MEDIUM = r'''
+    (args) => {
+      const {
+        baseUrl, maxItems, maxStyleChars,
+        enableCssUrls, enableStorage, maxStorageKeys, maxStorageChars,
+        enableSpa, maxSpaChars, spaKeys,
+        enableScriptScan, scriptLimit, maxScriptChars,
+        enableJsonParse, maxJsonParseChars, scriptJsonHints
+      } = args;
+
+      const out = [];
+      const seen = new Set();
+
+      function normalizeUrlRaw(u) {
+        if (!u) return "";
+        try { u = String(u); } catch { return ""; }
+        try { u = u.replace(/\\u0026/gi, "&"); } catch {}
+        try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
+        try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
+        try { u = u.replace(/\\\//g, "/"); } catch {}
+        return u;
+      }
+
+      function absUrl(u) {
+        if (!u) return "";
+        try { u = normalizeUrlRaw(String(u).trim()); return new URL(u, baseUrl).href; }
+        catch { return String(u).trim(); }
+      }
+
+      function push(url, text, tag) {
+        if (out.length >= maxItems) return false;
+        url = absUrl(url);
+        if (!url || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('data:') || seen.has(url)) return true;
+        seen.add(url);
+        out.push({ url, text: String(text || '').slice(0, 240), tag: tag || 'js' });
+        return out.length < maxItems;
+      }
+
+      function extractUrlsFromText(s, tag) {
+        try {
+          s = String(s || '');
+          if (!s) return;
+          const rx = /(https?:\/\/[^\s'"`<>]+|\/[A-Za-z0-9_\-\.\/\?\=&%#]{3,})/ig;
+          let m;
+          while ((m = rx.exec(s)) !== null) {
+            const u = m && m[1] ? m[1] : (m && m[0] ? m[0] : '');
+            if (!u) continue;
+            if (!push(u, '', tag)) return;
+          }
+        } catch {}
+      }
+
+      if (enableCssUrls) {
+        try {
+          const styles = Array.from(document.querySelectorAll('style,[style]')).slice(0, 180);
+          for (const el of styles) {
+            if (out.length >= maxItems) break;
+            let txt = '';
+            try { txt = el.tagName && el.tagName.toLowerCase() === 'style' ? (el.textContent || '') : (el.getAttribute('style') || ''); } catch {}
+            if (!txt) continue;
+            if (txt.length > maxStyleChars) txt = txt.slice(0, maxStyleChars);
+            extractUrlsFromText(txt, 'css');
+          }
+        } catch {}
+      }
+
+      if (enableStorage) {
+        try {
+          let seenKeys = 0;
+          const buckets = [window.localStorage, window.sessionStorage];
+          for (const store of buckets) {
+            if (!store) continue;
+            const lim = Math.min(store.length || 0, maxStorageKeys);
+            for (let i = 0; i < lim; i++) {
+              if (out.length >= maxItems) break;
+              let k = '', v = '';
+              try { k = String(store.key(i) || ''); } catch {}
+              try { v = String(store.getItem(k) || ''); } catch {}
+              if (!k && !v) continue;
+              if (v.length > maxStorageChars) v = v.slice(0, maxStorageChars);
+              extractUrlsFromText(v, 'storage');
+              seenKeys += 1;
+            }
+          }
+        } catch {}
+      }
+
+      if (enableSpa) {
+        try {
+          for (const k of spaKeys) {
+            if (out.length >= maxItems) break;
+            let val = null;
+            try { val = window[k]; } catch {}
+            if (val == null) continue;
+            let s = '';
+            try { s = JSON.stringify(val); } catch { try { s = String(val); } catch {} }
             if (!s) continue;
             if (s.length > maxSpaChars) s = s.slice(0, maxSpaChars);
-            if (!pushAny(document, s, "spa", `spa-${k}`)) return;
-          } catch {}
-        }
+            extractUrlsFromText(s, 'spa-state');
+          }
+        } catch {}
+      }
 
+      if (enableScriptScan) {
         try {
-          const nodes = [];
-          const n1 = document.querySelector("script#__NEXT_DATA__");
-          if (n1) nodes.push(n1);
-          const n2 = document.querySelector("script[type='application/ld+json']");
-          if (n2) nodes.push(n2);
-
-          for (const n of nodes.slice(0, 6)) {
-            if (out.length >= maxItems) return;
-            let txt = "";
-            try { txt = (n.textContent || "").trim(); } catch {}
+          const scripts = Array.from(document.scripts || []).slice(0, scriptLimit);
+          for (const el of scripts) {
+            if (out.length >= maxItems) break;
+            try {
+              const src = el.getAttribute && el.getAttribute('src');
+              if (src && !push(src, '', 'script:src')) break;
+            } catch {}
+            let txt = '';
+            try { txt = String(el.textContent || ''); } catch {}
             if (!txt) continue;
-            if (txt.length > maxSpaChars) txt = txt.slice(0, maxSpaChars);
-            if (!pushAny(n, txt, "spa", "spa-embedded-script")) return;
+            if (txt.length > maxScriptChars) txt = txt.slice(0, maxScriptChars);
+            extractUrlsFromText(txt, 'script');
+
+            if (enableJsonParse) {
+              try {
+                const low = txt.toLowerCase();
+                let hinted = false;
+                for (const hint of scriptJsonHints) {
+                  if (low.includes(String(hint).toLowerCase())) { hinted = true; break; }
+                }
+                if (!hinted) continue;
+                const m = txt.match(/\{[\s\S]{20,}\}|\[[\s\S]{20,}\]/);
+                if (!m) continue;
+                let chunk = String(m[0] || '');
+                if (chunk.length > maxJsonParseChars) chunk = chunk.slice(0, maxJsonParseChars);
+                extractUrlsFromText(chunk, 'script-json');
+              } catch {}
+            }
           }
         } catch {}
       }
 
-      function scanWebpackModulesBounded() {
-        if (!enableWebpack) return;
-        let req = null;
+      return { items: out, capped: out.length >= maxItems, stage: 'medium' };
+    }
+    '''
+
+    _JS_PASS_HEAVY = r'''
+    (args) => {
+      const {
+        baseUrl, maxItems,
+        enableComputedBg, computedBgBudget,
+        enableWebpack, webpackLimit, maxWebpackFnChars, webpackUrlRegex, webpackApiHints,
+        maxDomNodes
+      } = args;
+
+      const out = [];
+      const seen = new Set();
+
+      function normalizeUrlRaw(u) {
+        if (!u) return "";
+        try { u = String(u); } catch { return ""; }
+        try { u = u.replace(/\\u0026/gi, "&"); } catch {}
+        try { u = u.replace(/%5Cu0026/gi, "%26"); } catch {}
+        try { u = u.replace(/\\u003a/gi, ":").replace(/\\u002f/gi, "/"); } catch {}
+        try { u = u.replace(/\\\//g, "/"); } catch {}
+        return u;
+      }
+
+      function absUrl(u) {
+        if (!u) return "";
+        try { u = normalizeUrlRaw(String(u).trim()); return new URL(u, baseUrl).href; }
+        catch { return String(u).trim(); }
+      }
+
+      function push(url, text, tag) {
+        if (out.length >= maxItems) return false;
+        url = absUrl(url);
+        if (!url || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('data:') || seen.has(url)) return true;
+        seen.add(url);
+        out.push({ url, text: String(text || '').slice(0, 240), tag: tag || 'js-heavy' });
+        return out.length < maxItems;
+      }
+
+      function extractUrlsFromText(s, tag) {
         try {
-          if (window.__webpack_require__ && window.__webpack_require__.c) req = window.__webpack_require__;
-        } catch {}
-        if (!req || !req.c) return;
-
-        let modules = [];
-        try { modules = Object.values(req.c || {}); } catch {}
-        if (!modules.length) return;
-
-        const limit = Math.max(1, webpackLimit);
-        if (modules.length > limit) modules = modules.slice(0, limit);
-
-        let rx;
-        try { rx = new RegExp(webpackUrlRegex, "ig"); } catch { return; }
-
-        const host = document.documentElement || document.body || document;
-
-        for (const mod of modules) {
-          if (out.length >= maxItems) return;
-          let src = "";
-          try {
-            let fn = null;
-            if (mod && typeof mod.toString === "function") fn = mod;
-            else if (mod && mod.exports && typeof mod.exports.toString === "function") fn = mod.exports;
-            if (!fn) continue;
-            src = String(fn.toString());
-          } catch { continue; }
-
-          if (!src) continue;
-          if (src.length > maxWebpackFnChars) src = src.slice(0, maxWebpackFnChars);
-
-          rx.lastIndex = 0;
+          s = String(s || '');
+          if (!s) return;
+          const rx = /(https?:\/\/[^\s'"`<>]+|\/[A-Za-z0-9_\-\.\/\?\=&%#]{3,})/ig;
           let m;
-          while ((m = rx.exec(src)) !== null) {
-            if (out.length >= maxItems) return;
-            const candidate = m[0];
-            if (!candidate) continue;
-            const low = candidate.toLowerCase();
-            let ok = false;
-            for (const hint of webpackApiHints) {
-              if (low.includes(String(hint).toLowerCase())) { ok = true; break; }
+          while ((m = rx.exec(s)) !== null) {
+            const u = m && m[1] ? m[1] : (m && m[0] ? m[0] : '');
+            if (!u) continue;
+            if (!push(u, '', tag)) return;
+          }
+        } catch {}
+      }
+
+      if (enableComputedBg && typeof getComputedStyle === 'function') {
+        try {
+          const els = Array.from(document.querySelectorAll('*')).slice(0, Math.min(maxDomNodes, computedBgBudget));
+          for (const el of els) {
+            if (out.length >= maxItems) break;
+            let bg = '';
+            try { bg = String(getComputedStyle(el).backgroundImage || ''); } catch {}
+            if (!bg || bg === 'none') continue;
+            extractUrlsFromText(bg, 'computed-style');
+          }
+        } catch {}
+      }
+
+      if (enableWebpack) {
+        try {
+          let req = null;
+          try {
+            req = (window.__webpack_require__ || null);
+          } catch {}
+          if (req && req.c) {
+            let modules = [];
+            try { modules = Object.values(req.c || {}); } catch {}
+            if (modules.length > webpackLimit) modules = modules.slice(0, webpackLimit);
+
+            let rx = null;
+            try { rx = new RegExp(webpackUrlRegex, 'ig'); } catch {}
+            if (rx) {
+              for (const mod of modules) {
+                if (out.length >= maxItems) break;
+                let src = '';
+                try {
+                  let fn = null;
+                  if (mod && typeof mod.toString === 'function') fn = mod;
+                  else if (mod && mod.exports && typeof mod.exports.toString === 'function') fn = mod.exports;
+                  if (!fn) continue;
+                  src = String(fn.toString() || '');
+                } catch { continue; }
+
+                if (!src) continue;
+                if (src.length > maxWebpackFnChars) src = src.slice(0, maxWebpackFnChars);
+                rx.lastIndex = 0;
+                let m;
+                while ((m = rx.exec(src)) !== null) {
+                  const candidate = m && m[0] ? m[0] : '';
+                  if (!candidate) continue;
+                  const low = candidate.toLowerCase();
+                  let ok = false;
+                  for (const hint of webpackApiHints) {
+                    if (low.includes(String(hint).toLowerCase())) { ok = true; break; }
+                  }
+                  if (!ok) continue;
+                  if (!push(candidate, '', 'webpack')) break;
+                }
+              }
             }
-            if (!ok) continue;
-            if (!push(host, candidate, "webpack", "webpack-module")) return;
+          }
+        } catch {}
+      }
+
+      return { items: out, capped: out.length >= maxItems, stage: 'heavy' };
+    }
+    '''
+
+    async def _collect_runtime_url_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_runtime_url_ring:
+            return
+        script = r'''
+        () => {
+          try {
+            const buf = Array.isArray(window.__jsSnifferRuntimeUrls) ? window.__jsSnifferRuntimeUrls : [];
+            return buf.slice(0, 500);
+          } catch (e) {
+            return [];
           }
         }
-      }
+        '''
+        result = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.0), label="runtime-url-ring", log=log, default=[])
+        if not isinstance(result, list):
+            return
+        for u in result[: self.cfg.runtime_ring_soft_limit]:
+            try:
+                su = self._canonicalize_local(str(u or "").strip())
+                if su and not self._is_junk_url(su):
+                    runtime_hits.append({"url": su, "text": "", "tag": "runtime-url"})
+            except Exception:
+                pass
 
-      // Execute in cheap→heavier order
-      scanRoot(document);
-      scanShadowRootsBounded();
-      scanMetaAndRelLinks();
-      scanPerfEntries();
-      scanCssTextBounded();
+    async def _collect_mutation_url_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_mutation_url_ring:
+            return
+        script = r'''
+        () => {
+          try {
+            const buf = Array.isArray(window.__jsSnifferMutationUrls) ? window.__jsSnifferMutationUrls : [];
+            return buf.slice(0, 500);
+          } catch (e) {
+            return [];
+          }
+        }
+        '''
+        result = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.0), label="mutation-url-ring", log=log, default=[])
+        if not isinstance(result, list):
+            return
+        for u in result[: self.cfg.mutation_ring_soft_limit]:
+            try:
+                su = self._canonicalize_local(str(u or "").strip())
+                if su and not self._is_junk_url(su):
+                    runtime_hits.append({"url": su, "text": "", "tag": "mutation-url"})
+            except Exception:
+                pass
 
-      // computedStyle scan last (and optional)
-      scanComputedBgBudgeted();
+    async def _collect_hydration_state(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_hydration_scan:
+            return
+        script = r'''
+        () => {
+          const keys = ['__NEXT_DATA__','__NUXT__','__NUXT_DATA__','__APOLLO_STATE__','__INITIAL_STATE__','__PRELOADED_STATE__','__SSR_STATE__','REDUX_STATE','INITIAL_REDUX_STATE'];
+          const out = [];
+          function walk(v, depth) {
+            if (depth > 3 || out.length > 200) return;
+            if (v == null) return;
+            if (typeof v === 'string') {
+              out.push(v);
+              return;
+            }
+            if (Array.isArray(v)) {
+              for (const x of v.slice(0, 40)) walk(x, depth + 1);
+              return;
+            }
+            if (typeof v === 'object') {
+              for (const k of Object.keys(v).slice(0, 60)) {
+                try { walk(v[k], depth + 1); } catch {}
+              }
+            }
+          }
+          try {
+            for (const k of keys) {
+              try { if (window[k] != null) walk(window[k], 0); } catch {}
+            }
+          } catch {}
+          return out;
+        }
+        '''
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.25), label="hydration-state", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        rx = re.compile(r"(https?:\/\/[^\s'\"`<>]+|\/[A-Za-z0-9_\-\.\/\?\=&%#]{3,})", re.I)
+        for s in vals[:200]:
+            try:
+                text = str(s or "")
+            except Exception:
+                continue
+            for m in rx.findall(text):
+                try:
+                    u = self._canonicalize_local(m)
+                    if u and not self._is_junk_url(u):
+                        runtime_hits.append({"url": u, "text": "", "tag": "hydration"})
+                except Exception:
+                    pass
 
-      scanStorage();
-      scanSpaState();
-      scanScriptsBounded();
-      scanWebpackModulesBounded();
+    async def _collect_worker_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_worker_scan:
+            return
+        script = r"""
+        () => {
+          try {
+            const out = [];
+            const ss = Array.from(document.querySelectorAll('script[src], link[rel="modulepreload"][href]')).slice(0, 120);
+            for (const el of ss) {
+              const v = el.getAttribute('src') || el.getAttribute('href') || '';
+              if (v) out.push(v);
+            }
+            return out;
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.0), label="worker-scan", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        for s in vals[:100]:
+            try:
+                u = self._canonicalize_local(str(s or "").strip())
+                if u and not self._is_junk_url(u):
+                    runtime_hits.append({"url": u, "text": "", "tag": "worker-related"})
+            except Exception:
+                pass
 
-      return { items: out, capped: out.length >= maxItems };
-    }
-    """
+    async def _collect_sw_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_sw_scan:
+            return
+        script = r"""
+        async () => {
+          try {
+            if (!('serviceWorker' in navigator)) return [];
+            const regs = await navigator.serviceWorker.getRegistrations();
+            const out = [];
+            for (const reg of regs || []) {
+              try { if (reg.scope) out.push(reg.scope); } catch {}
+              try { if (reg.active && reg.active.scriptURL) out.push(reg.active.scriptURL); } catch {}
+              try { if (reg.waiting && reg.waiting.scriptURL) out.push(reg.waiting.scriptURL); } catch {}
+              try { if (reg.installing && reg.installing.scriptURL) out.push(reg.installing.scriptURL); } catch {}
+            }
+            return out;
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.6), label="service-worker-scan", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        for s in vals[:60]:
+            try:
+                u = self._canonicalize_local(str(s or "").strip())
+                if u and not self._is_junk_url(u):
+                    runtime_hits.append({"url": u, "text": "", "tag": "service-worker"})
+            except Exception:
+                pass
+
+    async def _collect_css_url_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_css_url_scan:
+            return
+        script = r"""
+        () => {
+          try {
+            const out = [];
+            const rx = /url\((['"]?)(.*?)\1\)/ig;
+            const nodes = Array.from(document.querySelectorAll('style,[style]')).slice(0, 150);
+            for (const el of nodes) {
+              let txt = '';
+              try { txt = el.tagName && el.tagName.toLowerCase() === 'style' ? (el.textContent || '') : (el.getAttribute('style') || ''); } catch {}
+              if (!txt) continue;
+              let m;
+              while ((m = rx.exec(txt)) !== null) {
+                const u = m && m[2] ? m[2] : '';
+                if (u) out.push(u);
+              }
+            }
+            return out;
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.1), label="css-url-events", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        for s in vals[:120]:
+            try:
+                u = self._canonicalize_local(str(s or "").strip())
+                if u and not self._is_junk_url(u):
+                    runtime_hits.append({"url": u, "text": "", "tag": "css-runtime"})
+            except Exception:
+                pass
+
+    async def _collect_webrtc_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_webrtc_scan:
+            return
+        # intentionally light: detect config/ICE URL hints, not active peer intervention
+        script = r"""
+        () => {
+          try {
+            const out = [];
+            const keys = ['__rtcConfig', '__webrtcConfig', '__iceServers'];
+            for (const k of keys) {
+              try {
+                const v = window[k];
+                if (!v) continue;
+                out.push(JSON.stringify(v));
+              } catch {}
+            }
+            return out;
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 1.0), label="webrtc-events", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        rx = re.compile(r"((?:stun|turn|turns):[^\s'\"`<>]+|https?:\/\/[^\s'\"`<>]+)", re.I)
+        for s in vals[:60]:
+            try:
+                text = str(s or "")
+            except Exception:
+                continue
+            for m in rx.findall(text):
+                runtime_hits.append({"url": str(m), "text": "", "tag": "webrtc"})
+
+    async def _collect_json_parse_events(self, page, canonical_page_url: str, runtime_hits: List[Dict[str, str]], log: Optional[List[str]]) -> None:
+        # lightweight placeholder that reads optional hook buffers if page instrumentation created them elsewhere
+        script = r"""
+        () => {
+          try {
+            const buf = Array.isArray(window.__jsonParseUrlHits) ? window.__jsonParseUrlHits : [];
+            return buf.slice(0, 250);
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        vals = await self._safe_wait(page.evaluate(script), timeout_s=min(self.cfg.evaluate_timeout_s, 0.9), label="json-parse-events", log=log, default=[])
+        if not isinstance(vals, list):
+            return
+        for s in vals[:120]:
+            try:
+                u = self._canonicalize_local(str(s or "").strip())
+                if u and not self._is_junk_url(u):
+                    runtime_hits.append({"url": u, "text": "", "tag": "json-parse"})
+            except Exception:
+                pass
+
+    async def _maybe_simulate_clicks(self, page, started: float, hard_cap: float, log: Optional[List[str]]) -> None:
+        if not self.cfg.enable_click_simulation:
+            return
+        if self._budget_low_for_clicks(started, hard_cap):
+            self._log("Skipping click simulation due to low remaining budget.", log)
+            return
+
+        selector = ", ".join(self.cfg.click_target_selectors or [])
+        script = r"""
+        (sel) => {
+          try {
+            const els = Array.from(document.querySelectorAll(sel)).slice(0, 30);
+            return els.map((el, idx) => ({
+              idx,
+              selector: sel,
+              text: String((el.innerText || el.textContent || el.getAttribute('aria-label') || '').trim()).slice(0, 140),
+              visible: !!(el.offsetWidth || el.offsetHeight || (el.getClientRects && el.getClientRects().length)),
+            }));
+          } catch (e) {
+            return [];
+          }
+        }
+        """
+        candidates = await self._safe_wait(page.evaluate(script, selector), timeout_s=min(self.cfg.evaluate_timeout_s, 1.0), label="click-candidate-scan", log=log, default=[])
+        if not isinstance(candidates, list) or not candidates:
+            return
+
+        clicked = 0
+        for idx, _entry in enumerate(candidates):
+            if clicked >= int(self.cfg.max_click_targets):
+                break
+            if self._budget_low_for_clicks(started, hard_cap):
+                break
+            try:
+                loc = page.locator(selector).nth(idx)
+                await self._safe_wait(loc.click(timeout=int(self.cfg.click_timeout_ms)), timeout_s=max(0.5, self.cfg.click_timeout_ms / 1000.0 + 0.6), label=f"click[{idx}]", log=log, default=None)
+                try:
+                    await page.wait_for_timeout(int(self.cfg.click_timeout_ms // 3 or 250))
+                except Exception:
+                    pass
+                clicked += 1
+            except Exception as e:
+                self._log(f"Click simulation failed for candidate {idx}: {e}", log)
+
+        if clicked:
+            self._log(f"Click simulation completed for {clicked} target(s).", log)
 
     # ------------------------- main sniff ------------------------- #
 
@@ -4251,216 +4585,186 @@ class JSSniffer:
             return "", []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
-        canonical_page_url = _canonicalize_url(page_url)
+        canonical_page_url = self._canonicalize_local(page_url)
 
         html: str = ""
         links: List[Dict[str, str]] = []
         seen_urls_in_js: Set[str] = set()
-
+        runtime_hits: List[Dict[str, str]] = []
         page = await context.new_page()
 
-        # Whole-run watchdog hard cap
         hard_cap = max(3.0, tmo * float(self.cfg.watchdog_multiplier))
+        started = time.monotonic()
 
         async def _run() -> Tuple[str, List[Dict[str, str]]]:
-            nonlocal html, links, seen_urls_in_js
+            nonlocal html, links, seen_urls_in_js, runtime_hits
 
             try:
-                # these are safe in older PW
                 try:
-                    page.set_default_timeout(int(max(1.0, tmo) * 1000))
-                    page.set_default_navigation_timeout(int(max(5.0, tmo) * 1000))
+                    page.set_default_timeout(int(max(1.0, min(tmo, self.cfg.max_nav_timeout_s)) * 1000))
+                    page.set_default_navigation_timeout(int(max(2.0, min(max(tmo, 5.0), self.cfg.max_nav_timeout_s)) * 1000))
                 except Exception:
                     pass
 
-                # optional resource blocking
-                if self.cfg.block_resource_types:
+                await self._maybe_block_resources(page, log)
+
+                nav_wait = max(1.0, min(tmo + 1.0, self.cfg.max_nav_timeout_s))
+                goto_result = await self._safe_wait(
+                    page.goto(canonical_page_url, wait_until=self.cfg.goto_wait_until),
+                    timeout_s=nav_wait,
+                    label="page.goto",
+                    log=log,
+                    default=None,
+                )
+                if goto_result is None:
+                    self._log("Navigation returned no response/partial state; continuing with partial page state.", log)
+
+                if self.cfg.wait_after_goto_ms > 0:
                     try:
-                        async def _route_handler(route):
-                            try:
-                                req = route.request
-                                if req.resource_type in self.cfg.blocked_types:
-                                    return await route.abort()
-                            except Exception:
-                                pass
-                            return await route.continue_()
-                        await page.route("**/*", _route_handler)
+                        await page.wait_for_timeout(int(self.cfg.wait_after_goto_ms))
+                    except Exception:
+                        pass
+
+                dom_metrics = await self._get_dom_metrics(page, log)
+                node_count = int((dom_metrics or {}).get("nodeCount") or 0)
+                script_count = int((dom_metrics or {}).get("scriptCount") or 0)
+                self._log(f"DOM preflight: nodes={node_count}, scripts={script_count}, ready={dom_metrics.get('readyState','')}", log)
+
+                local_cfg = dict(
+                    baseUrl=canonical_page_url,
+                    selectors=list(self.cfg.selectors),
+                    includeShadow=bool(self.cfg.include_shadow_dom),
+                    dataKeys=list(self.cfg.data_url_keys),
+                    onclickRegexes=list(self.cfg.onclick_url_regexes),
+                    redirectHints=list(self.cfg.redirect_hints),
+                    scriptJsonHints=list(self.cfg.script_json_hints),
+                    maxItems=int(self.cfg.max_items_soft_limit),
+                    maxDomNodes=int(self.cfg.max_dom_nodes_scanned),
+                    shadowHostLimit=int(self.cfg.shadow_host_soft_limit),
+                    enableMeta=bool(self.cfg.enable_meta_scan),
+                    enableRelLinks=bool(self.cfg.enable_link_rel_scan),
+                    enablePerf=bool(self.cfg.enable_perf_entries),
+                    maxPerf=int(self.cfg.max_perf_entries),
+                    enableCssUrls=bool(self.cfg.enable_css_url_scan),
+                    enableComputedBg=bool(self.cfg.enable_computed_style_bg_scan),
+                    computedBgBudget=int(self.cfg.computed_style_bg_budget),
+                    maxStyleChars=int(self.cfg.max_style_chars),
+                    enableSrcset=bool(self.cfg.enable_srcset_scan),
+                    enableScriptScan=bool(self.cfg.enable_script_scan),
+                    scriptLimit=int(self.cfg.script_soft_limit),
+                    maxScriptChars=int(self.cfg.max_script_chars),
+                    enableJsonParse=bool(self.cfg.enable_json_parse_in_scripts),
+                    maxJsonParseChars=int(self.cfg.max_json_parse_chars),
+                    enableStorage=bool(self.cfg.enable_storage_scan),
+                    maxStorageKeys=int(self.cfg.max_storage_keys),
+                    maxStorageChars=int(self.cfg.max_storage_chars),
+                    enableSpa=bool(self.cfg.enable_spa_state_scan),
+                    maxSpaChars=int(self.cfg.max_spa_json_chars),
+                    spaKeys=list(self.cfg.spa_state_keys),
+                    enableWebpack=bool(self.cfg.enable_webpack_scan),
+                    webpackLimit=int(self.cfg.webpack_module_soft_limit),
+                    maxWebpackFnChars=int(self.cfg.max_webpack_fn_chars),
+                    webpackUrlRegex=str(self.cfg.webpack_url_regex),
+                    webpackApiHints=list(self.cfg.webpack_api_hints),
+                )
+
+                # fast pass always
+                cheap = await self._safe_wait(
+                    self._pw_eval(page, self._JS_PASS_CHEAP, local_cfg, log),
+                    timeout_s=min(self.cfg.pass_guard_s, max(0.8, self._remaining(started, hard_cap) - self.cfg.min_seconds_reserved_for_close)),
+                    label="cheap-js-pass",
+                    log=log,
+                    default={"items": [], "capped": False, "stage": "cheap"},
+                )
+                if isinstance(cheap, dict):
+                    links.extend(list(cheap.get("items") or []))
+                    self._log(f"Cheap pass returned {len(cheap.get('items') or [])} items.", log)
+
+                # auto-scroll only if page is not already huge and time is available
+                if self.cfg.enable_auto_scroll and not self._budget_low_for_heavy(started, hard_cap):
+                    if (not self.cfg.degrade_on_large_dom) or node_count < self.cfg.large_dom_threshold:
+                        await self._auto_scroll(page, min(1.8, max(0.75, self._remaining(started, hard_cap) * 0.35)), log)
+
+                # medium pass unless page/budget suggests we should degrade
+                degrade = bool(self.cfg.degrade_on_large_dom and node_count >= self.cfg.large_dom_threshold)
+                if degrade:
+                    self._log(f"Large DOM detected ({node_count}); downgrading heavy scans.", log)
+                if not degrade and not self._budget_low_for_heavy(started, hard_cap):
+                    medium = await self._safe_wait(
+                        self._pw_eval(page, self._JS_PASS_MEDIUM, local_cfg, log),
+                        timeout_s=min(self.cfg.pass_guard_s, max(0.9, self._remaining(started, hard_cap) - self.cfg.min_seconds_reserved_for_close)),
+                        label="medium-js-pass",
+                        log=log,
+                        default={"items": [], "capped": False, "stage": "medium"},
+                    )
+                    if isinstance(medium, dict):
+                        links.extend(list(medium.get("items") or []))
+                        self._log(f"Medium pass returned {len(medium.get('items') or [])} items.", log)
+                else:
+                    self._log("Skipping medium/heavier JS pass due to low budget or degraded mode.", log)
+
+                # optional click simulation before runtime collectors
+                await self._maybe_simulate_clicks(page, started, hard_cap, log)
+
+                # runtime collectors are cheapish and often useful
+                await self._collect_json_parse_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_hydration_state(page, canonical_page_url, runtime_hits, log)
+                await self._collect_runtime_url_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_mutation_url_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_worker_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_sw_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_css_url_events(page, canonical_page_url, runtime_hits, log)
+                await self._collect_webrtc_events(page, canonical_page_url, runtime_hits, log)
+
+                # heavy pass is last and only if time remains
+                if (not degrade) and (not self._budget_low_for_heavy(started, hard_cap)):
+                    heavy = await self._safe_wait(
+                        self._pw_eval(page, self._JS_PASS_HEAVY, local_cfg, log),
+                        timeout_s=min(self.cfg.pass_guard_s, max(0.8, self._remaining(started, hard_cap) - self.cfg.min_seconds_reserved_for_close)),
+                        label="heavy-js-pass",
+                        log=log,
+                        default={"items": [], "capped": False, "stage": "heavy"},
+                    )
+                    if isinstance(heavy, dict):
+                        links.extend(list(heavy.get("items") or []))
+                        self._log(f"Heavy pass returned {len(heavy.get('items') or [])} items.", log)
+                else:
+                    self._log("Skipping heavy JS pass due to low remaining budget or degraded mode.", log)
+
+                # html fetch near the end but reserve time for it
+                if self._remaining(started, hard_cap) > self.cfg.min_seconds_reserved_for_content:
+                    try:
+                        html = await self._pw_content(page, log)
                     except Exception as e:
-                        self._log(f"Resource blocking setup failed: {e}", log)
-
-                js_timeout_ms = int(max(tmo, 6.0) * 1000)
-                wait_after_ms = int(self.cfg.wait_after_goto_ms)
-                wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
-
-                selector_js = ", ".join(self.cfg.selectors)
-
-                self._log(f"Start: {canonical_page_url} timeout={tmo}s", log)
-
-                # navigation
-                try:
-                    await page.goto(canonical_page_url, wait_until=wait_mode, timeout=js_timeout_ms)
-                except Exception as e:
-                    self._log(f"goto timeout/fail on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
-
-                if wait_after_ms > 0:
-                    await page.wait_for_timeout(wait_after_ms)
-
-                # auto-scroll (budgeted)
-                await self._auto_scroll(page, tmo, log)
-
-                # extra settle
-                await page.wait_for_timeout(max(200, int(tmo * 1000 * 0.08)))
-
-                # html snapshot (never uses timeout kwarg)
-                try:
-                    html = await self._pw_content(page, log)
-                except Exception as e:
-                    self._log(f"page.content() skipped/timeout: {e}", log)
+                        self._log(f"Failed to get page content: {e}", log)
+                        html = ""
+                else:
+                    self._log("Skipping page.content due to low remaining budget.", log)
                     html = ""
 
-                # evaluate once with all passes (single evaluate is safer than many)
-                eval_args = {
-                    "selectors": selector_js,
-                    "includeShadow": bool(self.cfg.include_shadow_dom),
-                    "dataKeys": list(self.cfg.data_url_keys),
-                    "onclickRegexes": [r.replace("\\", "\\\\") for r in self.cfg.onclick_url_regexes],
-                    "redirectHints": list(self.cfg.redirect_hints),
-                    "scriptJsonHints": list(self.cfg.script_json_hints),
-                    "baseUrl": canonical_page_url,
-
-                    "maxItems": int(self.cfg.max_items_soft_limit),
-                    "maxDomNodes": int(self.cfg.max_dom_nodes_scanned),
-                    "shadowHostLimit": int(self.cfg.shadow_host_soft_limit),
-
-                    "enableMeta": bool(self.cfg.enable_meta_scan),
-                    "enableRelLinks": bool(self.cfg.enable_link_rel_scan),
-
-                    "enablePerf": bool(self.cfg.enable_perf_entries),
-                    "maxPerf": int(self.cfg.max_perf_entries),
-
-                    "enableCssUrls": bool(self.cfg.enable_css_url_scan),
-                    "enableComputedBg": bool(self.cfg.enable_computed_style_bg_scan),
-                    "computedBgBudget": int(self.cfg.computed_style_bg_budget),
-                    "maxStyleChars": int(self.cfg.max_style_chars),
-
-                    "enableSrcset": bool(self.cfg.enable_srcset_scan),
-
-                    "enableScriptScan": bool(self.cfg.enable_script_scan),
-                    "scriptLimit": int(self.cfg.script_soft_limit),
-                    "maxScriptChars": int(self.cfg.max_script_chars),
-                    "enableJsonParse": bool(self.cfg.enable_json_parse_in_scripts),
-                    "maxJsonParseChars": int(self.cfg.max_json_parse_chars),
-
-                    "enableStorage": bool(self.cfg.enable_storage_scan),
-                    "maxStorageKeys": int(self.cfg.max_storage_keys),
-                    "maxStorageChars": int(self.cfg.max_storage_chars),
-
-                    "enableSpa": bool(self.cfg.enable_spa_state_scan),
-                    "maxSpaChars": int(self.cfg.max_spa_json_chars),
-                    "spaKeys": list(self.cfg.spa_state_keys),
-
-                    "enableWebpack": bool(self.cfg.enable_webpack_scan),
-                    "webpackLimit": int(self.cfg.webpack_module_soft_limit),
-                    "maxWebpackFnChars": int(self.cfg.max_webpack_fn_chars),
-                    "webpackUrlRegex": self.cfg.webpack_url_regex,
-                    "webpackApiHints": list(self.cfg.webpack_api_hints),
-                }
-
-                raw_payload = {}
-                try:
-                    raw_payload = await self._pw_eval(page, self._JS_COMMON, eval_args, log) or {}
-                except Exception as e:
-                    self._log(f"DOM/Meta/Perf/Style/Script/Storage/SPA pass failed/timeout: {e}", log)
-                    raw_payload = {}
-
-                raw_links = raw_payload.get("items") or []
-                self._log(f"Raw items total (single-pass): {len(raw_links)}", log)
-
-                # optional click simulation (bounded) — uses action timeouts, no kwarg timeouts
-                if self.cfg.enable_click_simulation:
-                    self._log("Starting click simulation…", log)
-                    try:
-                        click_sel = ", ".join(self.cfg.click_target_selectors)
-                        handles = await page.query_selector_all(click_sel)
-                        handles = handles[: int(self.cfg.max_click_targets)]
-                        self._log(f"Found {len(handles)} click targets.", log)
-
-                        for h_idx, h in enumerate(handles):
-                            try:
-                                el_info = await h.evaluate("""el => ({
-                                    tagName: (el.tagName || "").toLowerCase(),
-                                    hasHref: !!el.href,
-                                    innerText: el.innerText,
-                                    isVisible: el.offsetParent !== null
-                                })""")
-
-                                if not el_info.get("isVisible"):
-                                    continue
-
-                                await h.scroll_into_view_if_needed(timeout=1000)
-                                await h.click(timeout=int(self.cfg.click_timeout_ms))
-                                await page.wait_for_timeout(250)
-
-                                # after click, re-run the single evaluate quickly
-                                try:
-                                    click_payload = await self._pw_eval(page, self._JS_COMMON, eval_args, log) or {}
-                                    raw_links.extend(click_payload.get("items") or [])
-                                except Exception as e:
-                                    self._log(f"Click re-scan failed: {e}", log)
-
-                            except Exception as click_e:
-                                self._log(f"Error during click sim for target {h_idx + 1}: {click_e}", log)
-                                continue
-                    except Exception as e:
-                        self._log(f"Overall click-sim error: {e}", log)
-
-                # Filter + normalize (Python-side)
-                max_links = int(self.cfg.max_links)
-                for item in raw_links:
-                    if len(links) >= max_links:
-                        break
-
-                    url = (item.get("url") or "").strip()
-                    if not url:
-                        continue
-
-                    url = self._fix_common_escapes(url)
-
-                    canonical_url_py = _canonicalize_url(url)
-                    if canonical_url_py in seen_urls_in_js:
-                        continue
-                    seen_urls_in_js.add(canonical_url_py)
-
-                    if self._is_junk_url(url):
-                        continue
-
-                    kind = self._classify_kind(url)
-                    if not self._is_allowed_by_extensions(url, extensions, kind):
-                        continue
-
-                    links.append(self._normalize_link(
-                        url=canonical_url_py,
-                        text=(item.get("text") or "").strip(),
-                        tag=(item.get("tag") or "a"),
-                    ))
-
-                self._log(f"Done: {len(links)} links for {canonical_page_url}", log)
-
             except Exception as e:
-                self._log(f"Overall error on {canonical_page_url}: {e}", log)
+                self._log(f"Unexpected error during JS sniff: {e}", log)
+            finally:
+                try:
+                    await self._pw_close(page, log)
+                except Exception as e:
+                    self._log(f"Failed to close page: {e}", log)
 
-            return html, links
+            merged = self._dedupe_links(links + runtime_hits, limit=self.cfg.max_links)
+            self._log(f"Finished JS sniff for {canonical_page_url}: links={len(merged)}, elapsed={time.monotonic() - started:.2f}s", log)
+            return html, merged
 
         try:
             return await asyncio.wait_for(_run(), timeout=hard_cap)
         except asyncio.TimeoutError:
-            self._log(f"Watchdog: sniff exceeded hard cap {hard_cap:.2f}s; returning partials.", log)
-            return html, links
-        finally:
+            self._log(f"Whole-run watchdog fired at {hard_cap:.2f}s; returning partial results.", log)
+            merged = self._dedupe_links(links + runtime_hits, limit=self.cfg.max_links)
             try:
                 await self._pw_close(page, log)
             except Exception:
                 pass
+            return html, merged
+
 
 
 # ======================================================================
@@ -8331,15 +8635,15 @@ class DatabaseSniffer:
             return []
 
 # ======================================================================
-# InteractionSniffer (CDP-based Event & Overlay Analysis)
+# InteractionSniffer (bounded / fail-fast rewrite)
 # ======================================================================
 
 class InteractionSniffer:
     """
-    Playwright + CDP sniffer for "Invisible" interactivity & UI barriers.
+    Bounded Playwright + CDP sniffer for interactivity, overlays, barriers, forms,
+    and accessible controls.
 
     Contract:
-
         html, hits = await sniff(
             context,
             page_url,
@@ -8348,8 +8652,7 @@ class InteractionSniffer:
             extensions=None,
         )
 
-    hits schema (consistent with your suite):
-
+    hits schema:
         {
             "page": <page_url>,
             "url": <page_url or derived>,
@@ -8357,83 +8660,59 @@ class InteractionSniffer:
             "kind": "...",
             "meta": {...}
         }
-
-    Advanced features added:
-      - UI barrier scan (captcha / paywall / cookie / adblock / cloudflare hints)
-      - Overlay detection (z-index + pointer-events + transparent blockers + scroll-lock)
-      - Hit-test blocker grid (elementFromPoint) to catch invisible panes
-      - CDP event listener extraction (Chromium only) + element confidence scoring
-      - Optional AX tree scan (Chromium CDP if available, else Playwright accessibility snapshot)
-      - Dynamic simulation loop:
-          * short scroll(s)
-          * click 1–2 likely CTAs
-          * re-run overlay + hit-test + barrier scans after each action
-      - Hard budgets: never bricks your pipeline; always returns partial data
     """
 
-    # ------------------------------------------------------------------ #
-    # Config
-    # ------------------------------------------------------------------ #
     @dataclass
     class Config:
-        # generic controls
-        timeout: float = 8.0
-        max_hits: int = 300
-        wait_after_load_ms: int = 900
+        timeout: float = 6.0
+        max_hits: int = 180
+        wait_after_load_ms: int = 400
 
-        # global hard budgets
-        hard_total_budget_s: float = 12.0         # total sniff budget (guardrail)
-        per_eval_timeout_s: float = 3.5           # JS evaluate timeout
-        per_cdp_timeout_s: float = 2.5            # CDP send timeout
-        per_action_settle_ms: int = 450
+        # hard budgets
+        hard_total_budget_s: float = 6.5
+        goto_timeout_ms: int = 3500
+        per_eval_timeout_s: float = 1.6
+        per_cdp_timeout_s: float = 1.5
+        per_action_settle_ms: int = 250
 
-        # ---------------- Dynamic simulation ----------------
+        # adaptive gates
+        min_budget_for_cdp_s: float = 1.8
+        min_budget_for_ax_s: float = 1.2
+        min_budget_for_dynamic_s: float = 1.6
+        min_budget_for_post_phase_s: float = 0.8
+
+        # dynamic simulation
         enable_dynamic_simulation: bool = True
-        sim_scroll_steps: int = 3
-        sim_scroll_delay_ms: int = 350
-        sim_click_targets: int = 2
-        sim_click_timeout_ms: int = 2200
-
-        # click target text cues (lowercased contains)
+        sim_scroll_steps: int = 1
+        sim_scroll_delay_ms: int = 180
+        sim_click_targets: int = 1
+        sim_click_timeout_ms: int = 1200
         cta_text_hints: List[str] = field(default_factory=lambda: [
             "accept", "agree", "continue", "close", "ok", "okay", "got it",
             "play", "watch", "enter", "allow", "next", "submit",
             "sign in", "log in", "login", "sign up", "register",
+            "open", "view", "show",
         ])
 
-        # ---------------- CDP: Event Listener Extraction ----------------
+        # CDP listeners
         enable_cdp_listeners: bool = True
         listener_types: Set[str] = field(default_factory=lambda: {
-            "click", "mousedown", "mouseup",
-            "submit",
-            "keydown", "keyup",
-            "touchstart", "touchend",
+            "click", "mousedown", "mouseup", "submit",
+            "keydown", "keyup", "touchstart", "touchend",
             "pointerdown", "pointerup",
         })
-        max_listener_hits: int = 140
-        max_candidate_nodes: int = 520
-
+        max_listener_hits: int = 64
+        max_candidate_nodes: int = 160
         candidate_selector: str = (
             "button, a, input, select, textarea, summary, details, label, "
-            "[role='button'], [role='link'], [tabindex], [contenteditable='true'], "
-            "div, span, li, svg"
+            "[role='button'], [role='link'], [tabindex], [contenteditable='true']"
         )
 
-        include_listener_flags: bool = True
-        include_outer_html_snippet: bool = True
-        outer_html_max_chars: int = 320
-
-        # Listener scoring
-        enable_listener_scoring: bool = True
-        max_scoring_nodes: int = 120  # score only first N listener-passing nodes
-
-        # ---------------- Overlays / Modals (JS) ----------------
+        # overlays / blockers / barriers
         enable_overlay_detection: bool = True
         min_z_index: int = 900
-        coverage_threshold_percent: float = 50.0
-        max_overlay_hits: int = 60
-
-        # overlay extras
+        coverage_threshold_percent: float = 45.0
+        max_overlay_hits: int = 20
         detect_scroll_lock: bool = True
         overlay_keywords: List[str] = field(default_factory=lambda: [
             "cookie", "consent", "subscribe", "sign in", "log in",
@@ -8441,148 +8720,92 @@ class InteractionSniffer:
             "verify you are human", "captcha", "hcaptcha", "recaptcha",
         ])
 
-        # ---------------- Hit-test blocker grid (JS) ----------------
         enable_hit_test_blockers: bool = True
-        hit_test_grid: int = 3            # 3 => 3x3 + center (effectively 9 points)
-        max_hit_test_hits: int = 30
+        hit_test_grid: int = 2
+        max_hit_test_hits: int = 12
 
-        # ---------------- UI barrier scan (JS) ----------------
         enable_ui_barrier_scan: bool = True
-        max_barrier_hits: int = 40
+        max_barrier_hits: int = 16
 
-        # ---------------- Forms (JS) ----------------
+        # forms
         enable_form_extraction: bool = True
-        max_form_hits: int = 90
-        max_inputs_per_form: int = 90
-
+        max_form_hits: int = 24
+        max_inputs_per_form: int = 32
         redact_input_types: Set[str] = field(default_factory=lambda: {"password"})
         redact_name_regex: str = r"(csrf|token|auth|bearer|secret|key|session|jwt)"
         emit_summary_hit: bool = True
 
-        # form classification
-        enable_form_classification: bool = True
-
-        # honeypot detection
-        enable_honeypot_detection: bool = True
-
-        # ---------------- AX / Accessibility ----------------
+        # AX / accessibility
         enable_ax_tree_scan: bool = True
-        # roles to keep
         ax_roles: Set[str] = field(default_factory=lambda: {
             "button", "link", "checkbox", "textbox", "combobox", "menuitem"
         })
-        max_ax_hits: int = 120
+        max_ax_hits: int = 40
 
-        # if using CDP AX tree, we try mapping backendDOMNodeId -> nodeId (best-effort)
-        try_map_ax_to_dom: bool = True
+        # page gating
+        skip_asset_paths: bool = True
+        skip_challenge_pages: bool = True
+        asset_exts: Set[str] = field(default_factory=lambda: {
+            ".js", ".css", ".map", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+            ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".webp", ".avif"
+        })
+        asset_path_hints: Set[str] = field(default_factory=lambda: {
+            "/assets/", "/thumbnails/", "/logos/", "/favicons/", "/fonts/",
+            "/css/", "/js/", "/libraries/", "/cms-uploads/", "/translations/"
+        })
+        challenge_hints: Set[str] = field(default_factory=lambda: {
+            "/cdn-cgi/", "captcha", "recaptcha", "hcaptcha", "turnstile",
+            "cloudflare", "challenge-platform", "verify you are human",
+        })
 
-    # ------------------------------------------------------------------ #
-    # Internal memory dataclasses
-    # ------------------------------------------------------------------ #
-    @dataclass
-    class ListenerMem:
-        node_id: int
-        node_name: str
-        types: List[str]
-        attributes: Dict[str, str]
-        flags: Dict[str, Any] = field(default_factory=dict)
-        outer_html: Optional[str] = None
-        confidence: Optional[float] = None
-        reasons: List[str] = field(default_factory=list)
-
-    @dataclass
-    class OverlayMem:
-        tag_name: str
-        id: str
-        class_name: str
-        z_index: int
-        coverage: str
-        text_preview: str
-        meta: Dict[str, Any] = field(default_factory=dict)
-
-    @dataclass
-    class BarrierMem:
-        barrier_type: str
-        evidence: str
-        selector_hint: str = ""
-        meta: Dict[str, Any] = field(default_factory=dict)
-
-    @dataclass
-    class HitTestMem:
-        point: Tuple[int, int]
-        tag_name: str
-        id: str
-        class_name: str
-        pointer_events: str
-        opacity: float
-        z_index: str
-        position: str
-        rect: Dict[str, Any]
-        text_preview: str
-        outer_html: str
-
-    @dataclass
-    class FormMem:
-        action: str
-        method: str
-        id: str
-        class_name: str
-        input_count: int
-        inputs: List[Dict[str, Any]]
-        form_kind: str = "unknown"
-        honeypot_suspected: bool = False
-        honeypot_reasons: List[str] = field(default_factory=list)
-
-    @dataclass
-    class AXMem:
-        role: str
-        name: str
-        value: str
-        disabled: bool
-        focused: bool
-        backend_dom_node_id: Optional[int] = None
-        node_id: Optional[int] = None
-        selector_hint: str = ""
-        meta: Dict[str, Any] = field(default_factory=dict)
-
-    # ------------------------------------------------------------------ #
-    # Lifecycle
-    # ------------------------------------------------------------------ #
     def __init__(self, config: Optional["InteractionSniffer.Config"] = None, logger=None):
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
         self._reset_memory()
         self._log("InteractionSniffer Initialized", None)
 
+    # ------------------------------------------------------------------ #
+    # memory / logging
+    # ------------------------------------------------------------------ #
+
     def _reset_memory(self) -> None:
-        self._listeners: List[InteractionSniffer.ListenerMem] = []
-        self._overlays: List[InteractionSniffer.OverlayMem] = []
-        self._barriers: List[InteractionSniffer.BarrierMem] = []
-        self._hit_tests: List[InteractionSniffer.HitTestMem] = []
-        self._forms: List[InteractionSniffer.FormMem] = []
-        self._ax: List[InteractionSniffer.AXMem] = []
-        self._seen_fingerprints: Set[Tuple[Any, ...]] = set()
+        self._hits: List[Dict[str, Any]] = []
+        self._seen: Set[Tuple[Any, ...]] = set()
 
-        # used during dynamic passes
-        self._phase_tags: List[str] = []  # e.g. ["pre", "post1", "post2"]
-
-    # ------------------------------------------------------------------ #
-    # Logging helper
-    # ------------------------------------------------------------------ #
     def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
         full = f"[InteractionSniffer] {msg}"
         try:
             if log_list is not None:
                 log_list.append(full)
             if self.logger is not None:
-                # your logger likely has log_message()
                 self.logger.log_message(full)  # type: ignore[attr-defined]
         except Exception:
             pass
 
+    def _emit_hit(self, page_url: str, kind: str, meta: Dict[str, Any], *, url: Optional[str] = None) -> None:
+        u = url or page_url
+        fp = (
+            kind,
+            str(u),
+            str(meta.get("selector_hint") or ""),
+            str(meta.get("phase") or ""),
+            str(meta.get("evidence") or meta.get("text_preview") or meta.get("role") or ""),
+        )
+        if fp in self._seen:
+            return
+        self._seen.add(fp)
+        self._hits.append({
+            "page": page_url,
+            "url": u,
+            "tag": "interaction",
+            "kind": kind,
+            "meta": meta,
+        })
+
     # ------------------------------------------------------------------ #
-    # Helpers: timeouts
+    # helpers
     # ------------------------------------------------------------------ #
+
     async def _safe_eval(self, page, script: str, arg: Any, log: Optional[List[str]]) -> Any:
         try:
             return await asyncio.wait_for(page.evaluate(script, arg), timeout=self.cfg.per_eval_timeout_s)
@@ -8595,627 +8818,579 @@ class InteractionSniffer:
             return await asyncio.wait_for(cdp.send(method, params or {}), timeout=self.cfg.per_cdp_timeout_s)
         except Exception as e:
             msg = str(e)
-
-            # known benign CDP condition: DOM doc not ready for backend->frontend mapping
             if method == "DOM.pushNodesByBackendIdsToFrontend" and "Document needs to be requested first" in msg:
                 return None
-
             self._log(f"CDP send {method} failed/timeout: {e}", log)
             return None
 
     def _canon_url(self, u: str) -> str:
-        # Keep conservative; your suite likely has a canonicalizer already.
         return (u or "").strip()
 
+    def _remaining_budget(self, deadline: float) -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    def _url_profile(self, page_url: str) -> Dict[str, Any]:
+        low = (page_url or "").strip().lower()
+
+        is_valid = low.startswith("http://") or low.startswith("https://")
+
+        parsed = urlparse(low) if is_valid else None
+        path = parsed.path or "" if parsed else ""
+        host = parsed.netloc or "" if parsed else ""
+
+        asset_ext = any(path.endswith(ext) for ext in self.cfg.asset_exts)
+        asset_hint = any(h in path for h in self.cfg.asset_path_hints)
+        challenge = any(h in low for h in self.cfg.challenge_hints)
+
+        return {
+            "is_valid": is_valid,
+            "host": host,
+            "path": path,
+            "is_asset_like": bool(asset_ext or asset_hint),
+            "is_challenge_like": bool(challenge),
+        }
+
+    def _should_skip_dynamic(self, profile: Dict[str, Any]) -> bool:
+        return bool(profile.get("is_asset_like") or profile.get("is_challenge_like"))
+
+    def _is_html_response(self, response) -> bool:
+        try:
+            ctype = (response.headers.get("content-type") or "").lower()
+        except Exception:
+            ctype = ""
+        if not ctype:
+            return True
+        return ("text/html" in ctype) or ("application/xhtml" in ctype)
+
+    async def _cheap_dom_probe(self, page, log: Optional[List[str]]) -> Dict[str, Any]:
+        probe = await self._safe_eval(
+            page,
+            """
+            () => {
+                try {
+                    const nodes = document.querySelectorAll("*").length;
+                    const scripts = document.scripts ? document.scripts.length : 0;
+                    const title = (document.title || "").trim().slice(0, 120);
+                    const bodyText = ((document.body && document.body.innerText) || "").trim();
+                    const textLen = bodyText.length;
+                    const buttons = document.querySelectorAll("button, [role='button'], a[role='button']").length;
+                    const forms = document.querySelectorAll("form").length;
+                    const links = document.links ? document.links.length : 0;
+                    return {
+                        ok: true,
+                        ready: document.readyState || "",
+                        nodes,
+                        scripts,
+                        title,
+                        textLen,
+                        buttons,
+                        forms,
+                        links,
+                        bodySample: bodyText.slice(0, 220),
+                    };
+                } catch (e) {
+                    return { ok: false, error: String(e || "") };
+                }
+            }
+            """,
+            None,
+            log,
+        )
+        return probe if isinstance(probe, dict) else {"ok": False}
+
     # ------------------------------------------------------------------ #
-    # Public API (matches other sniffers)
+    # public API
     # ------------------------------------------------------------------ #
+
     async def sniff(
         self,
-        context,              # Playwright BrowserContext
+        context,
         page_url: str,
         timeout: float,
         log: List[str],
-        extensions=None,      # unused; kept for signature compatibility
+        extensions=None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
-        """
-        Main entrypoint.
-
-        Returns:
-            (html, hits)
-        """
         from playwright.async_api import TimeoutError as PWTimeoutError
 
         self._reset_memory()
+        html = ""
 
         if not context:
             self._log("No BrowserContext supplied; skipping.", log)
             return "", []
 
-        tmo = float(timeout or self.cfg.timeout)
-        total_budget = max(tmo, self.cfg.hard_total_budget_s)
-        html: str = ""
-        hits: List[Dict[str, Any]] = []
+        profile = self._url_profile(page_url)
+        if not profile["is_valid"]:
+            self._log(f"Skipping invalid URL: {page_url}", log)
+            return "", []
+
+        deadline = time.monotonic() + min(
+            float(self.cfg.hard_total_budget_s),
+            max(1.0, float(timeout or self.cfg.timeout))
+        )
+
+        self._log(
+            f"Start interaction sniff: {page_url} timeout={float(timeout or self.cfg.timeout):.1f}s "
+            f"budget={self._remaining_budget(deadline):.1f}s",
+            log,
+        )
+
+        # Early skip for obvious low-value asset-like targets
+        if self.cfg.skip_asset_paths and profile["is_asset_like"]:
+            self._emit_hit(
+                page_url,
+                "skip_asset_page",
+                {
+                    "reason": "asset_like_path",
+                    "path": profile["path"],
+                    "host": profile["host"],
+                },
+            )
+            self._log(f"Fast-skip asset-like page: {page_url}", log)
+            return "", self._hits[: self.cfg.max_hits]
+
         page = None
-
-        self._log(f"Start interaction sniff: {page_url} timeout={tmo}s budget={total_budget}s", log)
-
-        async def _run() -> Tuple[str, List[Dict[str, Any]]]:
-            nonlocal html, hits, page
-            page = await context.new_page()
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
-            await page.wait_for_timeout(int(self.cfg.wait_after_load_ms))
-
-            # ---------------- PRE SCAN ----------------
-            self._phase_tags.append("pre")
-            await self._collect_phase(page, page_url, log, phase="pre", context=context)
-
-            # CDP listeners early (helps pick click targets)
-            if self.cfg.enable_cdp_listeners:
-                await self._collect_cdp_listeners(context, page, page_url, log)
-
-            # AX scan (optional; helps pick click targets too)
-            if self.cfg.enable_ax_tree_scan:
-                await self._collect_ax_tree(context, page, page_url, log)
-
-            # Listener scoring (optional)
-            if self.cfg.enable_listener_scoring and self._listeners:
-                await self._score_listeners(page, log)
-
-            # ---------------- DYNAMIC SIMULATION ----------------
-            if self.cfg.enable_dynamic_simulation:
-                await self._simulate_and_rescan(context, page, page_url, log)
-
-            # HTML snapshot
-            try:
-                html = await page.content()
-            except Exception as e:
-                self._log(f"Error getting HTML for {page_url}: {e}", log)
-                html = ""
-
-            hits = self._materialize_hits(page_url)
-
-            # global cap
-            if len(hits) > self.cfg.max_hits:
-                hits = hits[: self.cfg.max_hits]
-            return html or "", hits
-
         try:
-            # hard guardrail: never hang indefinitely
-            html, hits = await asyncio.wait_for(_run(), timeout=total_budget)
-        except asyncio.TimeoutError:
-            self._log(f"Global sniff budget exceeded for {page_url}; returning partial hits.", log)
-            hits = self._materialize_hits(page_url)
-            if len(hits) > self.cfg.max_hits:
-                hits = hits[: self.cfg.max_hits]
+            page = await context.new_page()
+            goto_timeout_ms = min(
+                int(self.cfg.goto_timeout_ms),
+                max(900, int(self._remaining_budget(deadline) * 1000) - 200),
+            )
+
+            response = await page.goto(
+                page_url,
+                wait_until="domcontentloaded",
+                timeout=goto_timeout_ms,
+            )
+
+            if response is not None and not self._is_html_response(response):
+                try:
+                    ctype = (response.headers.get("content-type") or "")
+                except Exception:
+                    ctype = ""
+                self._emit_hit(
+                    page_url,
+                    "non_html_response",
+                    {"content_type": ctype, "status": getattr(response, "status", None)},
+                )
+                self._log(f"Skipping non-HTML response for {page_url}: {ctype}", log)
+                return "", self._hits[: self.cfg.max_hits]
+
+            if self._remaining_budget(deadline) <= 0.15:
+                return "", self._hits[: self.cfg.max_hits]
+
+            await page.wait_for_timeout(min(int(self.cfg.wait_after_load_ms), max(50, int(self._remaining_budget(deadline) * 250))))
+
+            probe = await self._cheap_dom_probe(page, log)
+            if probe.get("ok"):
+                self._emit_hit(page_url, "dom_probe", probe)
+                self._log(
+                    f"DOM probe: nodes={probe.get('nodes')} scripts={probe.get('scripts')} "
+                    f"buttons={probe.get('buttons')} forms={probe.get('forms')} textLen={probe.get('textLen')}",
+                    log,
+                )
+
+            if not probe.get("ok", False):
+                self._log("DOM probe failed; returning partial hits.", log)
+                return "", self._hits[: self.cfg.max_hits]
+
+            # Low-value tiny pages or challenge pages: only cheap scans
+            degraded = bool(
+                profile["is_challenge_like"] or
+                int(probe.get("nodes") or 0) <= 6 or
+                int(probe.get("textLen") or 0) <= 40
+            )
+
+            # PRE phase
+            await self._collect_phase(page, page_url, log, phase="pre", deadline=deadline)
+
+            # CDP listeners
+            if (
+                self.cfg.enable_cdp_listeners
+                and not degraded
+                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_cdp_s
+            ):
+                await self._collect_cdp_listeners(context, page, page_url, log, deadline=deadline)
+
+            # AX
+            if (
+                self.cfg.enable_ax_tree_scan
+                and not degraded
+                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_ax_s
+            ):
+                await self._collect_ax_tree(context, page, page_url, log, deadline=deadline)
+
+            # Dynamic simulation
+            if (
+                self.cfg.enable_dynamic_simulation
+                and not degraded
+                and not self._should_skip_dynamic(profile)
+                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_dynamic_s
+            ):
+                await self._simulate_and_rescan(context, page, page_url, log, deadline=deadline)
+
+            if self._remaining_budget(deadline) > 0.20:
+                try:
+                    html = await asyncio.wait_for(page.content(), timeout=min(1.0, self._remaining_budget(deadline)))
+                except Exception as e:
+                    self._log(f"Error getting HTML for {page_url}: {e}", log)
+                    html = ""
+
         except PWTimeoutError:
             self._log(f"Timeout while loading {page_url}", log)
-            hits = self._materialize_hits(page_url)
         except Exception as e:
-            self._log(f"Fatal error on {page_url}: {e}", log)
-            hits = self._materialize_hits(page_url)
+            msg = str(e)
+            # Fail fast on obviously unrecoverable navigation errors
+            if (
+                "ERR_NAME_NOT_RESOLVED" in msg
+                or "Cannot navigate to invalid URL" in msg
+                or "ERR_INVALID_URL" in msg
+            ):
+                self._emit_hit(page_url, "navigation_error", {"error": msg[:240], "fatal": True})
+                self._log(f"Fatal navigation failure on {page_url}: {e}", log)
+            else:
+                self._emit_hit(page_url, "sniff_error", {"error": msg[:240]})
+                self._log(f"Fatal error on {page_url}: {e}", log)
         finally:
             if page is not None:
                 try:
-                    await asyncio.wait_for(page.close(), timeout=3.0)
+                    await asyncio.wait_for(page.close(), timeout=2.0)
                 except Exception as e:
                     self._log(f"Error closing page for {page_url}: {e}", log)
 
+        hits = self._hits[: self.cfg.max_hits]
         self._log(f"Finished interaction sniff for {page_url}: hits={len(hits)}", log)
         return html or "", hits
 
     # ------------------------------------------------------------------ #
-    # Phase collector (overlays/forms/barriers/hit-test) used pre/post
+    # collectors
     # ------------------------------------------------------------------ #
-    async def _collect_phase(self, page, page_url: str, log: Optional[List[str]], phase: str, context=None) -> None:
-        # 1) Forms
-        if self.cfg.enable_form_extraction:
+
+    async def _collect_phase(self, page, page_url: str, log: Optional[List[str]], *, phase: str, deadline: float) -> None:
+        if self._remaining_budget(deadline) <= 0.15:
+            return
+
+        if self.cfg.enable_form_extraction and self._remaining_budget(deadline) > 0.25:
             await self._collect_forms(page, page_url, log, phase=phase)
 
-        # 2) Overlays (now includes pointer-events + transparent blockers + scroll-lock)
-        if self.cfg.enable_overlay_detection:
+        if self.cfg.enable_overlay_detection and self._remaining_budget(deadline) > 0.25:
             await self._collect_overlays(page, page_url, log, phase=phase)
 
-        # 3) UI barrier scan
-        if self.cfg.enable_ui_barrier_scan:
+        if self.cfg.enable_ui_barrier_scan and self._remaining_budget(deadline) > 0.20:
             await self._collect_ui_barriers(page, page_url, log, phase=phase)
 
-        # 4) Hit-test blockers grid
-        if self.cfg.enable_hit_test_blockers:
+        if self.cfg.enable_hit_test_blockers and self._remaining_budget(deadline) > 0.20:
             await self._collect_hit_test_blockers(page, page_url, log, phase=phase)
 
-    # ------------------------------------------------------------------ #
-    # JS: Forms (now includes classification + honeypot detection)
-    # ------------------------------------------------------------------ #
-    def _should_redact_field(self, name: str, input_type: str) -> bool:
-        try:
-            t = (input_type or "").lower().strip()
-            if t in self.cfg.redact_input_types:
-                return True
-            n = (name or "").lower()
-            if n and re.search(self.cfg.redact_name_regex, n, re.IGNORECASE):
-                return True
-        except Exception:
-            pass
-        return False
+    async def _collect_forms(self, page, page_url: str, log: Optional[List[str]], *, phase: str) -> None:
+        payload = await self._safe_eval(
+            page,
+            """
+            (cfg) => {
+                const out = [];
+                const forms = Array.from(document.querySelectorAll("form")).slice(0, cfg.maxForms);
 
-    def _classify_form_kind(self, form_action: str, inputs: List[Dict[str, Any]]) -> str:
-        if not self.cfg.enable_form_classification:
-            return "unknown"
-        a = (form_action or "").lower()
-        if any(x in a for x in ("/login", "/signin", "/sign-in", "/session", "/auth")):
-            return "login"
-        if any(x in a for x in ("/signup", "/sign-up", "/register")):
-            return "signup"
-        # input-based heuristics
-        types = {str(i.get("type") or "").lower() for i in inputs}
-        names = " ".join([str(i.get("name") or "").lower() for i in inputs])
-        if "password" in types:
-            return "login"
-        if any(k in names for k in ("search", "q", "query")):
-            return "search"
-        if any(k in names for k in ("card", "cc", "checkout", "shipping", "billing")):
-            return "checkout"
-        return "unknown"
+                for (const f of forms) {
+                    const inputs = [];
+                    const els = Array.from(f.querySelectorAll("input, textarea, select, button")).slice(0, cfg.maxInputs);
+                    for (const i of els) {
+                        inputs.push({
+                            name: i.name || i.id || "",
+                            type: (i.type || i.tagName || "").toLowerCase(),
+                            required: !!i.required,
+                            disabled: !!i.disabled,
+                            placeholder: i.placeholder || "",
+                            autocomplete: i.autocomplete || "",
+                        });
+                    }
+                    out.push({
+                        action: f.action || "",
+                        method: (f.method || "get").toLowerCase(),
+                        id: f.id || "",
+                        className: (typeof f.className === "string" ? f.className : ""),
+                        input_count: inputs.length,
+                        inputs
+                    });
+                }
+                return out;
+            }
+            """,
+            {"maxForms": int(self.cfg.max_form_hits), "maxInputs": int(self.cfg.max_inputs_per_form)},
+            log,
+        )
 
-    def _detect_honeypot(self, raw_inputs: List[Dict[str, Any]]) -> Tuple[bool, List[str]]:
-        if not self.cfg.enable_honeypot_detection:
-            return False, []
-        reasons: List[str] = []
-        for i in raw_inputs:
-            try:
-                name = (i.get("name") or "").lower()
-                itype = (i.get("type") or "").lower()
-                style = (i.get("style") or "").lower()
-                aria_hidden = bool(i.get("ariaHidden", False))
-                rect = i.get("rect") or {}
-                w = float(rect.get("w") or 0)
-                h = float(rect.get("h") or 0)
+        if not isinstance(payload, list):
+            return
 
-                # classic token hidden fields are not honeypots; they're normal
-                if itype == "hidden" and re.search(self.cfg.redact_name_regex, name, re.IGNORECASE):
-                    continue
-
-                # suspicious: offscreen or zero-size but still present
-                if "left:-9999" in style or "top:-9999" in style or "opacity:0" in style:
-                    reasons.append(f"offscreen/hidden-style field: {name or itype}")
-                if aria_hidden and itype not in ("hidden",):
-                    reasons.append(f"aria-hidden input: {name or itype}")
-                if (w <= 1 or h <= 1) and itype not in ("hidden",):
-                    reasons.append(f"tiny/0-size input: {name or itype}")
-            except Exception:
+        for form in payload[: self.cfg.max_form_hits]:
+            if not isinstance(form, dict):
                 continue
-        return (len(reasons) > 0), reasons[:6]
 
-    async def _collect_forms(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
-        try:
-            payload = await self._safe_eval(
-                page,
-                """
-                (cfg) => {
-                    const maxForms = cfg.maxForms;
-                    const maxInputs = cfg.maxInputs;
-                    const out = [];
-                    const forms = Array.from(document.querySelectorAll('form')).slice(0, maxForms);
-
-                    function rectOf(el){
-                        try {
-                            const r = el.getBoundingClientRect();
-                            return {x:r.x,y:r.y,w:r.width,h:r.height};
-                        } catch { return {x:0,y:0,w:0,h:0}; }
-                    }
-
-                    for (const f of forms) {
-                        const inputs = [];
-                        const els = Array.from(f.querySelectorAll('input, textarea, select, button'))
-                                         .slice(0, maxInputs);
-
-                        for (const i of els) {
-                            const st = (i.getAttribute("style") || "");
-                            inputs.push({
-                                name: i.name || i.id || "",
-                                type: (i.type || i.tagName || "").toLowerCase(),
-                                value: (typeof i.value === "string" ? i.value : ""),
-                                required: !!i.required,
-                                disabled: !!i.disabled,
-                                autocomplete: (i.autocomplete || ""),
-                                placeholder: (i.placeholder || ""),
-                                label: (() => {
-                                    try {
-                                      const id = i.id;
-                                      if (id) {
-                                        const l = document.querySelector(`label[for="${CSS.escape(id)}"]`);
-                                        if (l) return (l.innerText || "").trim().slice(0,80);
-                                      }
-                                    } catch {}
-                                    return "";
-                                })(),
-                                style: st,
-                                ariaHidden: (i.getAttribute("aria-hidden") === "true"),
-                                rect: rectOf(i)
-                            });
-                        }
-
-                        out.push({
-                            action: f.action || "",
-                            method: (f.method || "get").toLowerCase(),
-                            id: f.id || "",
-                            className: (typeof f.className === "string" ? f.className : ""),
-                            input_count: inputs.length,
-                            inputs: inputs
-                        });
-                    }
-                    return out;
-                }
-                """,
-                {"maxForms": int(self.cfg.max_form_hits), "maxInputs": int(self.cfg.max_inputs_per_form)},
-                log,
-            )
-
-            forms = payload if isinstance(payload, list) else []
-            for f in forms[: self.cfg.max_form_hits]:
-                if not isinstance(f, dict):
+            inputs = []
+            for inp in (form.get("inputs") or [])[: self.cfg.max_inputs_per_form]:
+                if not isinstance(inp, dict):
                     continue
-                raw_inputs = f.get("inputs") or []
-                if not isinstance(raw_inputs, list):
-                    raw_inputs = []
+                name = str(inp.get("name") or "")
+                typ = str(inp.get("type") or "")
+                if typ in self.cfg.redact_input_types or re.search(self.cfg.redact_name_regex, name, re.I):
+                    value = "[REDACTED]"
+                else:
+                    value = ""
+                inputs.append({
+                    "name": name,
+                    "type": typ,
+                    "value": value,
+                    "required": bool(inp.get("required", False)),
+                    "disabled": bool(inp.get("disabled", False)),
+                    "placeholder": str(inp.get("placeholder") or ""),
+                    "autocomplete": str(inp.get("autocomplete") or ""),
+                })
 
-                # redact + bound value
-                redacted_inputs: List[Dict[str, Any]] = []
-                for inp in raw_inputs[: self.cfg.max_inputs_per_form]:
-                    if not isinstance(inp, dict):
-                        continue
-                    name = str(inp.get("name") or "")
-                    itype = str(inp.get("type") or "")
-                    val = str(inp.get("value") or "")
-                    if self._should_redact_field(name, itype):
-                        val = "[REDACTED]"
-                    else:
-                        if len(val) > 200:
-                            val = val[:200] + "…"
-                    redacted_inputs.append({
-                        "name": name,
-                        "type": itype,
-                        "value": val,
-                        "required": bool(inp.get("required", False)),
-                        "disabled": bool(inp.get("disabled", False)),
-                        "autocomplete": str(inp.get("autocomplete") or ""),
-                        "placeholder": str(inp.get("placeholder") or ""),
-                        "label": str(inp.get("label") or ""),
-                    })
-
-                # classify + honeypot
-                form_kind = self._classify_form_kind(str(f.get("action") or ""), redacted_inputs)
-                honeypot, reasons = self._detect_honeypot(raw_inputs)
-
-                self._forms.append(
-                    InteractionSniffer.FormMem(
-                        action=str(f.get("action") or ""),
-                        method=str(f.get("method") or "get"),
-                        id=str(f.get("id") or ""),
-                        class_name=str(f.get("className") or ""),
-                        input_count=int(f.get("input_count") or len(redacted_inputs)),
-                        inputs=redacted_inputs,
-                        form_kind=form_kind,
-                        honeypot_suspected=honeypot,
-                        honeypot_reasons=reasons,
-                    )
-                )
-
-            if self._forms:
-                self._log(f"[{phase}] Extracted {len(self._forms)} form definitions (cum)", log)
-        except Exception as e:
-            self._log(f"Form extraction error: {e}", log)
-
-    # ------------------------------------------------------------------ #
-    # JS: Overlays / Modals (enhanced)
-    # ------------------------------------------------------------------ #
-    async def _collect_overlays(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
-        try:
-            payload = await self._safe_eval(
-                page,
-                """
-                (config) => {
-                    const { minZ, minCoverage, maxHits, detectScrollLock, keywords } = config;
-                    const results = [];
-
-                    const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
-                    const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
-                    const viewportArea = Math.max(1, vw * vh);
-
-                    const bodyOv = (() => {
-                      try { return (getComputedStyle(document.body).overflow || ""); } catch { return ""; }
-                    })();
-                    const htmlOv = (() => {
-                      try { return (getComputedStyle(document.documentElement).overflow || ""); } catch { return ""; }
-                    })();
-
-                    const all = Array.from(document.querySelectorAll('div, section, aside, iframe, dialog, [role="dialog"], [aria-modal="true"]'));
-
-                    function hasKeyword(txt){
-                      const t = String(txt||"").toLowerCase();
-                      for (const k of (keywords||[])) {
-                        if (k && t.includes(String(k).toLowerCase())) return true;
-                      }
-                      return false;
-                    }
-
-                    for (const el of all) {
-                        if (results.length >= maxHits) break;
-
-                        const style = window.getComputedStyle(el);
-                        const zRaw = style.zIndex;
-                        const z = parseInt(zRaw, 10);
-                        const pos = style.position;
-                        const vis = style.visibility;
-                        const disp = style.display;
-                        const opac = parseFloat(style.opacity || "1");
-                        const pe = style.pointerEvents || "";
-                        const bg = style.backgroundColor || "";
-                        const inset = style.inset || "";
-                        const ta = style.touchAction || "";
-                        const bf = style.backdropFilter || style.webkitBackdropFilter || "";
-
-                        // allow "auto" z-index but still detect full-screen blockers later via hit-test
-                        if (Number.isNaN(z)) continue;
-
-                        const rect = el.getBoundingClientRect();
-                        const area = Math.max(0, rect.width) * Math.max(0, rect.height);
-                        if (area <= 0) continue;
-
-                        const coveragePct = (area / viewportArea) * 100;
-
-                        const txt = (el.innerText || "").trim();
-                        const txtPrev = txt.slice(0, 120);
-
-                        const isOverlayLike =
-                            (z >= minZ) &&
-                            vis !== 'hidden' && disp !== 'none' &&
-                            (pos === 'fixed' || pos === 'absolute') &&
-                            coveragePct >= minCoverage;
-
-                        if (!isOverlayLike) continue;
-
-                        // extra blockers: transparent but click-blocking
-                        const transparentBlocker =
-                            (pe !== 'none') &&
-                            ((opac === 0) || bg === 'rgba(0, 0, 0, 0)' || bg === 'transparent');
-
-                        const fullScreenLike =
-                            (String(inset).includes("0")) &&
-                            (rect.width >= vw * 0.9) && (rect.height >= vh * 0.9);
-
-                        const keywordHit = hasKeyword(txtPrev);
-
-                        results.push({
-                            tagName: el.tagName.toLowerCase(),
-                            id: el.id || "",
-                            className: (typeof el.className === "string" ? el.className : ""),
-                            zIndex: z,
-                            zIndexRaw: zRaw,
-                            coverage: coveragePct.toFixed(1) + '%',
-                            textPreview: txtPrev.slice(0, 80),
-                            pointerEvents: pe,
-                            opacity: opac,
-                            background: bg,
-                            inset: inset,
-                            touchAction: ta,
-                            backdropFilter: bf,
-                            fullScreenLike: !!fullScreenLike,
-                            transparentBlocker: !!transparentBlocker,
-                            keywordHit: !!keywordHit,
-                            rect: {x: rect.x, y: rect.y, w: rect.width, h: rect.height},
-                            scrollLock: detectScrollLock ? ((bodyOv === "hidden") || (htmlOv === "hidden")) : false,
-                            bodyOverflow: bodyOv,
-                            htmlOverflow: htmlOv
-                        });
-                    }
-
-                    return { overlays: results, bodyOverflow: bodyOv, htmlOverflow: htmlOv };
-                }
-                """,
+            self._emit_hit(
+                page_url,
+                "form",
                 {
-                    "minZ": int(self.cfg.min_z_index),
-                    "minCoverage": float(self.cfg.coverage_threshold_percent),
-                    "maxHits": int(self.cfg.max_overlay_hits),
-                    "detectScrollLock": bool(self.cfg.detect_scroll_lock),
-                    "keywords": list(self.cfg.overlay_keywords),
+                    "phase": phase,
+                    "action": str(form.get("action") or ""),
+                    "method": str(form.get("method") or "get"),
+                    "id": str(form.get("id") or ""),
+                    "class_name": str(form.get("className") or ""),
+                    "input_count": int(form.get("input_count") or len(inputs)),
+                    "inputs": inputs,
                 },
-                log,
             )
 
-            overlays = []
-            body_ov = ""
-            html_ov = ""
-            if isinstance(payload, dict):
-                overlays = payload.get("overlays") or []
-                body_ov = str(payload.get("bodyOverflow") or "")
-                html_ov = str(payload.get("htmlOverflow") or "")
+        if payload:
+            self._log(f"[{phase}] Extracted {len(payload)} form definitions", log)
 
-                # emit scroll_lock hit if relevant and overlay exists
-                if self.cfg.detect_scroll_lock and overlays:
-                    if body_ov == "hidden" or html_ov == "hidden":
-                        self._barriers.append(
-                            InteractionSniffer.BarrierMem(
-                                barrier_type="scroll_lock",
-                                evidence=f"bodyOverflow={body_ov} htmlOverflow={html_ov}",
-                                selector_hint="document.body/documentElement",
-                                meta={"phase": phase},
-                            )
-                        )
+    async def _collect_overlays(self, page, page_url: str, log: Optional[List[str]], *, phase: str) -> None:
+        payload = await self._safe_eval(
+            page,
+            """
+            (config) => {
+                const { minZ, minCoverage, maxHits, detectScrollLock, keywords } = config;
+                const results = [];
 
-            if not isinstance(overlays, list):
-                overlays = []
+                const vw = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0);
+                const vh = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0);
+                const viewportArea = Math.max(1, vw * vh);
 
-            for ov in overlays[: self.cfg.max_overlay_hits]:
-                if not isinstance(ov, dict):
-                    continue
-                self._overlays.append(
-                    InteractionSniffer.OverlayMem(
-                        tag_name=str(ov.get("tagName") or ""),
-                        id=str(ov.get("id") or ""),
-                        class_name=str(ov.get("className") or ""),
-                        z_index=int(ov.get("zIndex") or 0),
-                        coverage=str(ov.get("coverage") or ""),
-                        text_preview=str(ov.get("textPreview") or ""),
-                        meta={
-                            "phase": phase,
-                            "pointerEvents": ov.get("pointerEvents"),
-                            "opacity": ov.get("opacity"),
-                            "background": ov.get("background"),
-                            "inset": ov.get("inset"),
-                            "touchAction": ov.get("touchAction"),
-                            "backdropFilter": ov.get("backdropFilter"),
-                            "fullScreenLike": bool(ov.get("fullScreenLike", False)),
-                            "transparentBlocker": bool(ov.get("transparentBlocker", False)),
-                            "keywordHit": bool(ov.get("keywordHit", False)),
-                            "rect": ov.get("rect") or {},
-                            "zIndexRaw": ov.get("zIndexRaw"),
-                            "scrollLock": bool(ov.get("scrollLock", False)),
-                        },
-                    )
-                )
+                const bodyOv = (() => { try { return getComputedStyle(document.body).overflow || ""; } catch { return ""; } })();
+                const htmlOv = (() => { try { return getComputedStyle(document.documentElement).overflow || ""; } catch { return ""; } })();
 
-            if overlays:
-                self._log(f"[{phase}] Overlay detection: +{len(overlays)} hits (cum={len(self._overlays)})", log)
-
-        except Exception as e:
-            self._log(f"Overlay detection error: {e}", log)
-
-    # ------------------------------------------------------------------ #
-    # JS: UI barrier scan (captcha/paywall/adblock/cloudflare/etc)
-    # ------------------------------------------------------------------ #
-    async def _collect_ui_barriers(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
-        try:
-            payload = await self._safe_eval(
-                page,
-                """
-                (cfg) => {
-                    const maxHits = cfg.maxHits;
-                    const out = [];
-
-                    function push(type, evidence, selector){
-                      if (out.length >= maxHits) return;
-                      out.push({type, evidence, selector: selector || ""});
-                    }
-
-                    // 1) Captcha iframes / scripts
-                    const ifr = Array.from(document.querySelectorAll('iframe[src], script[src]')).slice(0, 250);
-                    for (const el of ifr) {
-                      if (out.length >= maxHits) break;
-                      const src = String(el.getAttribute("src") || "");
-                      const low = src.toLowerCase();
-                      if (!src) continue;
-                      if (low.includes("recaptcha") || low.includes("hcaptcha") || low.includes("captcha") || low.includes("turnstile")) {
-                        push("captcha", src, el.tagName.toLowerCase());
-                      }
-                      if (low.includes("/cdn-cgi/") || low.includes("cloudflare") || low.includes("cf-")) {
-                        push("cloudflare_challenge", src, el.tagName.toLowerCase());
-                      }
-                    }
-
-                    // 2) Keyword walls in visible text (bounded)
-                    const bodyText = (() => {
-                      try { return (document.body && (document.body.innerText || "")) || ""; }
-                      catch { return ""; }
-                    })().toLowerCase();
-
-                    const keywords = [
-                      ["paywall", ["subscribe", "subscription", "continue reading", "to continue reading"]],
-                      ["cookie_consent", ["cookie", "consent", "privacy choices", "gdpr"]],
-                      ["adblock", ["disable adblock", "ad blocker", "turn off adblock"]],
-                      ["bot_check", ["verify you are human", "unusual traffic", "bot detection"]],
-                    ];
-
-                    for (const [typ, ks] of keywords) {
-                      for (const k of ks) {
-                        if (bodyText.includes(k)) {
-                          push(String(typ), `keyword:${k}`, "bodyText");
-                          break;
-                        }
-                      }
-                    }
-
-                    // 3) Known challenge containers (selectors)
-                    const selPairs = [
-                      ["captcha", "[data-sitekey], .h-captcha, .g-recaptcha, iframe[title*='captcha' i]"],
-                      ["cloudflare_challenge", "#challenge-form, .cf-challenge, iframe[src*='cdn-cgi' i]"],
-                      ["consent", "[id*='consent' i], [class*='consent' i], [id*='cookie' i], [class*='cookie' i]"],
-                    ];
-                    for (const [typ, sel] of selPairs) {
-                      if (out.length >= maxHits) break;
-                      let hit = null;
-                      try { hit = document.querySelector(sel); } catch {}
-                      if (hit) push(String(typ), `selector:${sel}`, sel);
-                    }
-
-                    return out;
+                function hasKeyword(txt){
+                  const t = String(txt || "").toLowerCase();
+                  for (const k of (keywords || [])) {
+                    if (k && t.includes(String(k).toLowerCase())) return true;
+                  }
+                  return false;
                 }
-                """,
-                {"maxHits": int(self.cfg.max_barrier_hits)},
-                log,
+
+                const nodes = Array.from(document.querySelectorAll("div, section, aside, iframe, dialog, [role='dialog'], [aria-modal='true']")).slice(0, 250);
+
+                for (const el of nodes) {
+                    if (results.length >= maxHits) break;
+                    const style = getComputedStyle(el);
+                    const zRaw = style.zIndex;
+                    const z = parseInt(zRaw, 10);
+                    if (Number.isNaN(z)) continue;
+
+                    const rect = el.getBoundingClientRect();
+                    const area = Math.max(0, rect.width) * Math.max(0, rect.height);
+                    if (area <= 0) continue;
+                    const coveragePct = (area / viewportArea) * 100;
+
+                    const isOverlayLike =
+                        (z >= minZ) &&
+                        style.visibility !== "hidden" &&
+                        style.display !== "none" &&
+                        (style.position === "fixed" || style.position === "absolute") &&
+                        coveragePct >= minCoverage;
+
+                    if (!isOverlayLike) continue;
+
+                    const txt = (el.innerText || "").trim();
+                    results.push({
+                        tagName: el.tagName.toLowerCase(),
+                        id: el.id || "",
+                        className: (typeof el.className === "string" ? el.className : ""),
+                        zIndex: z,
+                        coverage: coveragePct.toFixed(1) + "%",
+                        textPreview: txt.slice(0, 80),
+                        pointerEvents: style.pointerEvents || "",
+                        opacity: parseFloat(style.opacity || "1"),
+                        position: style.position || "",
+                        scrollLock: detectScrollLock ? ((bodyOv === "hidden") || (htmlOv === "hidden")) : false,
+                        keywordHit: hasKeyword(txt),
+                    });
+                }
+
+                return { overlays: results, bodyOverflow: bodyOv, htmlOverflow: htmlOv };
+            }
+            """,
+            {
+                "minZ": int(self.cfg.min_z_index),
+                "minCoverage": float(self.cfg.coverage_threshold_percent),
+                "maxHits": int(self.cfg.max_overlay_hits),
+                "detectScrollLock": bool(self.cfg.detect_scroll_lock),
+                "keywords": list(self.cfg.overlay_keywords),
+            },
+            log,
+        )
+
+        if not isinstance(payload, dict):
+            return
+
+        overlays = payload.get("overlays") or []
+        if not isinstance(overlays, list):
+            return
+
+        for ov in overlays[: self.cfg.max_overlay_hits]:
+            if not isinstance(ov, dict):
+                continue
+            self._emit_hit(
+                page_url,
+                "overlay",
+                {
+                    "phase": phase,
+                    "tag_name": str(ov.get("tagName") or ""),
+                    "id": str(ov.get("id") or ""),
+                    "class_name": str(ov.get("className") or ""),
+                    "z_index": int(ov.get("zIndex") or 0),
+                    "coverage": str(ov.get("coverage") or ""),
+                    "text_preview": str(ov.get("textPreview") or ""),
+                    "pointer_events": str(ov.get("pointerEvents") or ""),
+                    "opacity": float(ov.get("opacity") or 1.0),
+                    "position": str(ov.get("position") or ""),
+                    "keyword_hit": bool(ov.get("keywordHit", False)),
+                    "scroll_lock": bool(ov.get("scrollLock", False)),
+                },
             )
 
-            barriers = payload if isinstance(payload, list) else []
-            for b in barriers[: self.cfg.max_barrier_hits]:
-                if not isinstance(b, dict):
-                    continue
-                self._barriers.append(
-                    InteractionSniffer.BarrierMem(
-                        barrier_type=str(b.get("type") or "unknown"),
-                        evidence=str(b.get("evidence") or ""),
-                        selector_hint=str(b.get("selector") or ""),
-                        meta={"phase": phase},
-                    )
-                )
+        if overlays:
+            self._log(f"[{phase}] Overlay detection: +{len(overlays)}", log)
 
-            if barriers:
-                self._log(f"[{phase}] UI barriers: +{len(barriers)} (cum={len(self._barriers)})", log)
+    async def _collect_ui_barriers(self, page, page_url: str, log: Optional[List[str]], *, phase: str) -> None:
+        payload = await self._safe_eval(
+            page,
+            """
+            (cfg) => {
+                const out = [];
+                const maxHits = cfg.maxHits;
 
-        except Exception as e:
-            self._log(f"UI barrier scan error: {e}", log)
+                function push(type, evidence, selector){
+                    if (out.length >= maxHits) return;
+                    out.push({type, evidence, selector: selector || ""});
+                }
 
-    # ------------------------------------------------------------------ #
-    # JS: Hit-test blocker grid (elementFromPoint)
-    # ------------------------------------------------------------------ #
-    async def _collect_hit_test_blockers(self, page, page_url: str, log: Optional[List[str]], phase: str) -> None:
-        try:
-            payload = await self._safe_eval(
-                page,
-                """
-                (cfg) => {
-                    const grid = Math.max(2, cfg.grid|0);
-                    const maxHits = cfg.maxHits|0;
+                const bodyText = (() => {
+                    try { return ((document.body && document.body.innerText) || "").toLowerCase(); }
+                    catch { return ""; }
+                })();
 
-                    const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
-                    const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
+                const ifr = Array.from(document.querySelectorAll("iframe[src], script[src]")).slice(0, 200);
+                for (const el of ifr) {
+                    if (out.length >= maxHits) break;
+                    const src = String(el.getAttribute("src") || "").toLowerCase();
+                    if (!src) continue;
+                    if (src.includes("recaptcha") || src.includes("hcaptcha") || src.includes("captcha") || src.includes("turnstile")) {
+                        push("captcha", src, el.tagName.toLowerCase());
+                    }
+                    if (src.includes("/cdn-cgi/") || src.includes("cloudflare")) {
+                        push("cloudflare_challenge", src, el.tagName.toLowerCase());
+                    }
+                }
 
-                    const pts = [];
-                    // grid points inside viewport (avoid edges)
-                    for (let gy=0; gy<grid; gy++){
-                      for (let gx=0; gx<grid; gx++){
+                const keywords = [
+                    ["paywall", ["subscribe", "subscription", "continue reading"]],
+                    ["cookie_consent", ["cookie", "consent", "privacy choices"]],
+                    ["adblock", ["disable adblock", "ad blocker", "turn off adblock"]],
+                    ["bot_check", ["verify you are human", "unusual traffic", "bot detection"]],
+                ];
+
+                for (const [typ, ks] of keywords) {
+                    for (const k of ks) {
+                        if (bodyText.includes(k)) {
+                            push(String(typ), `keyword:${k}`, "bodyText");
+                            break;
+                        }
+                    }
+                }
+
+                const selPairs = [
+                    ["captcha", "[data-sitekey], .h-captcha, .g-recaptcha, iframe[title*='captcha' i]"],
+                    ["cloudflare_challenge", "#challenge-form, .cf-challenge, iframe[src*='cdn-cgi' i]"],
+                    ["consent", "[id*='consent' i], [class*='consent' i], [id*='cookie' i], [class*='cookie' i]"],
+                ];
+
+                for (const [typ, sel] of selPairs) {
+                    if (out.length >= maxHits) break;
+                    let hit = null;
+                    try { hit = document.querySelector(sel); } catch {}
+                    if (hit) push(String(typ), `selector:${sel}`, sel);
+                }
+
+                return out;
+            }
+            """,
+            {"maxHits": int(self.cfg.max_barrier_hits)},
+            log,
+        )
+
+        if not isinstance(payload, list):
+            return
+
+        for item in payload[: self.cfg.max_barrier_hits]:
+            if not isinstance(item, dict):
+                continue
+            self._emit_hit(
+                page_url,
+                "barrier",
+                {
+                    "phase": phase,
+                    "barrier_type": str(item.get("type") or "unknown"),
+                    "evidence": str(item.get("evidence") or ""),
+                    "selector_hint": str(item.get("selector") or ""),
+                },
+            )
+
+        if payload:
+            self._log(f"[{phase}] UI barriers: +{len(payload)}", log)
+
+    async def _collect_hit_test_blockers(self, page, page_url: str, log: Optional[List[str]], *, phase: str) -> None:
+        payload = await self._safe_eval(
+            page,
+            """
+            (cfg) => {
+                const grid = Math.max(2, cfg.grid|0);
+                const maxHits = cfg.maxHits|0;
+                const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
+                const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
+
+                const pts = [];
+                for (let gy=0; gy<grid; gy++){
+                    for (let gx=0; gx<grid; gx++){
                         const x = Math.floor((gx+1) * vw / (grid+1));
                         const y = Math.floor((gy+1) * vh / (grid+1));
                         pts.push([x,y]);
-                      }
                     }
-                    // ensure center
-                    pts.push([Math.floor(vw/2), Math.floor(vh/2)]);
+                }
+                pts.push([Math.floor(vw/2), Math.floor(vh/2)]);
 
-                    function safeOuter(el){
-                      try { return (el && el.outerHTML ? String(el.outerHTML).slice(0, 420) : ""); } catch { return ""; }
-                    }
+                function safeOuter(el){
+                    try { return (el && el.outerHTML ? String(el.outerHTML).slice(0, 220) : ""); } catch { return ""; }
+                }
 
-                    function infoAt(x,y){
-                      let el = null;
-                      try { el = document.elementFromPoint(x,y); } catch { el = null; }
-                      if (!el) return null;
-                      let st = null;
-                      try { st = window.getComputedStyle(el); } catch { st = null; }
-                      let rect = {x:0,y:0,w:0,h:0};
-                      try { const r = el.getBoundingClientRect(); rect = {x:r.x,y:r.y,w:r.width,h:r.height}; } catch {}
-                      const txt = (() => { try { return (el.innerText||"").trim().slice(0,80); } catch { return ""; } })();
-                      return {
+                function infoAt(x,y){
+                    let el = null;
+                    try { el = document.elementFromPoint(x,y); } catch { el = null; }
+                    if (!el) return null;
+                    let st = null;
+                    try { st = getComputedStyle(el); } catch { st = null; }
+                    let rect = {x:0,y:0,w:0,h:0};
+                    try { const r = el.getBoundingClientRect(); rect = {x:r.x,y:r.y,w:r.width,h:r.height}; } catch {}
+                    const txt = (() => { try { return (el.innerText||"").trim().slice(0,80); } catch { return ""; } })();
+                    return {
                         point: [x,y],
                         tagName: (el.tagName||"").toLowerCase(),
                         id: el.id||"",
@@ -9227,68 +9402,69 @@ class InteractionSniffer:
                         rect,
                         textPreview: txt,
                         outerHTML: safeOuter(el),
-                      };
-                    }
-
-                    const out = [];
-                    const seen = new Set();
-                    for (const [x,y] of pts){
-                      if (out.length >= maxHits) break;
-                      const it = infoAt(x,y);
-                      if (!it) continue;
-                      const fp = `${it.tagName}#${it.id}.${it.className}|${it.pointerEvents}|${it.opacity}|${it.position}|${it.zIndex}`;
-                      if (seen.has(fp)) continue;
-                      seen.add(fp);
-
-                      // blocker-ish heuristic: pointer-events active AND element covers large area OR is fixed
-                      const area = Math.max(0, it.rect.w) * Math.max(0, it.rect.h);
-                      const viewportArea = Math.max(1, vw*vh);
-                      const coverPct = (area / viewportArea) * 100;
-
-                      const isBlocker = (it.pointerEvents !== "none") && (
-                        (it.position === "fixed") || (coverPct >= 20) || (it.tagName === "dialog")
-                      );
-
-                      if (isBlocker) out.push({...it, coveragePct: coverPct.toFixed(1)});
-                    }
-
-                    return out;
+                    };
                 }
-                """,
-                {"grid": int(self.cfg.hit_test_grid), "maxHits": int(self.cfg.max_hit_test_hits)},
-                log,
+
+                const out = [];
+                const seen = new Set();
+
+                for (const [x,y] of pts){
+                    if (out.length >= maxHits) break;
+                    const it = infoAt(x,y);
+                    if (!it) continue;
+
+                    const fp = `${it.tagName}#${it.id}.${it.className}|${it.pointerEvents}|${it.position}|${it.zIndex}`;
+                    if (seen.has(fp)) continue;
+                    seen.add(fp);
+
+                    const area = Math.max(0, it.rect.w) * Math.max(0, it.rect.h);
+                    const viewportArea = Math.max(1, vw*vh);
+                    const coverPct = (area / viewportArea) * 100;
+
+                    const isBlocker = (it.pointerEvents !== "none") && (
+                        (it.position === "fixed") || (coverPct >= 20) || (it.tagName === "dialog")
+                    );
+
+                    if (isBlocker) out.push({...it, coveragePct: coverPct.toFixed(1)});
+                }
+
+                return out;
+            }
+            """,
+            {"grid": int(self.cfg.hit_test_grid), "maxHits": int(self.cfg.max_hit_test_hits)},
+            log,
+        )
+
+        if not isinstance(payload, list):
+            return
+
+        for item in payload[: self.cfg.max_hit_test_hits]:
+            if not isinstance(item, dict):
+                continue
+            self._emit_hit(
+                page_url,
+                "hit_test_blocker",
+                {
+                    "phase": phase,
+                    "point": item.get("point") or [0, 0],
+                    "tag_name": str(item.get("tagName") or ""),
+                    "id": str(item.get("id") or ""),
+                    "class_name": str(item.get("className") or ""),
+                    "pointer_events": str(item.get("pointerEvents") or ""),
+                    "opacity": float(item.get("opacity") or 1.0),
+                    "z_index": str(item.get("zIndex") or ""),
+                    "position": str(item.get("position") or ""),
+                    "rect": dict(item.get("rect") or {}),
+                    "text_preview": str(item.get("textPreview") or ""),
+                    "outer_html": str(item.get("outerHTML") or ""),
+                    "coverage_pct": str(item.get("coveragePct") or ""),
+                },
             )
 
-            items = payload if isinstance(payload, list) else []
-            for it in items[: self.cfg.max_hit_test_hits]:
-                if not isinstance(it, dict):
-                    continue
-                self._hit_tests.append(
-                    InteractionSniffer.HitTestMem(
-                        point=tuple(it.get("point") or (0, 0)),
-                        tag_name=str(it.get("tagName") or ""),
-                        id=str(it.get("id") or ""),
-                        class_name=str(it.get("className") or ""),
-                        pointer_events=str(it.get("pointerEvents") or ""),
-                        opacity=float(it.get("opacity") or 1.0),
-                        z_index=str(it.get("zIndex") or ""),
-                        position=str(it.get("position") or ""),
-                        rect=dict(it.get("rect") or {}),
-                        text_preview=str(it.get("textPreview") or ""),
-                        outer_html=str(it.get("outerHTML") or ""),
-                    )
-                )
+        if payload:
+            self._log(f"[{phase}] Hit-test blockers: +{len(payload)}", log)
 
-            if items:
-                self._log(f"[{phase}] Hit-test blockers: +{len(items)} (cum={len(self._hit_tests)})", log)
-
-        except Exception as e:
-            self._log(f"Hit-test scan error: {e}", log)
-
-    # ------------------------------------------------------------------ #
-    # CDP: Event listeners (Chromium only) + confidence scoring hooks
-    # ------------------------------------------------------------------ #
-    async def _collect_cdp_listeners(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
+    async def _collect_cdp_listeners(self, context, page, page_url: str, log: Optional[List[str]], *, deadline: float) -> None:
         browser_name = "unknown"
         try:
             if getattr(context, "browser", None) and context.browser:
@@ -9298,6 +9474,9 @@ class InteractionSniffer:
 
         if browser_name != "chromium":
             self._log(f"Skipping CDP scan (browser is {browser_name}, need chromium)", log)
+            return
+
+        if self._remaining_budget(deadline) < self.cfg.min_budget_for_cdp_s:
             return
 
         try:
@@ -9313,210 +9492,89 @@ class InteractionSniffer:
             doc = await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
             root_node_id = (doc or {}).get("root", {}).get("nodeId")
             if not root_node_id:
-                self._log("CDP: no DOM root nodeId", log)
                 return
 
-            sel = str(self.cfg.candidate_selector or "div,span,button,a,input")
-            qs = await self._cdp_send(cdp, "DOM.querySelectorAll", {"nodeId": root_node_id, "selector": sel}, log)
+            qs = await self._cdp_send(cdp, "DOM.querySelectorAll", {
+                "nodeId": root_node_id,
+                "selector": str(self.cfg.candidate_selector),
+            }, log)
             node_ids = (qs or {}).get("nodeIds", []) or []
-            if not node_ids:
-                self._log("CDP: no candidates matched selector", log)
-                return
-
             node_ids = node_ids[: int(self.cfg.max_candidate_nodes)]
 
-            def _attr_list_to_dict(attr_list: List[str]) -> Dict[str, str]:
+            def attrs_to_dict(attr_list: List[str]) -> Dict[str, str]:
                 try:
                     return dict(zip(attr_list[0::2], attr_list[1::2]))
                 except Exception:
                     return {}
 
             for nid in node_ids:
+                if self._remaining_budget(deadline) < 0.35:
+                    break
                 if found >= int(self.cfg.max_listener_hits):
                     break
 
                 inspected += 1
-                try:
-                    remote_obj = await self._cdp_send(cdp, "DOM.resolveNode", {"nodeId": nid}, log)
-                    object_id = (remote_obj or {}).get("object", {}).get("objectId")
-                    if not object_id:
+
+                remote_obj = await self._cdp_send(cdp, "DOM.resolveNode", {"nodeId": nid}, log)
+                object_id = (remote_obj or {}).get("object", {}).get("objectId")
+                if not object_id:
+                    continue
+
+                listeners_resp = await self._cdp_send(
+                    cdp,
+                    "DOMDebugger.getEventListeners",
+                    {"objectId": object_id, "depth": 1},
+                    log,
+                )
+                listeners = (listeners_resp or {}).get("listeners", []) or []
+                if not listeners:
+                    continue
+
+                relevant = []
+                for l in listeners:
+                    if not isinstance(l, dict):
                         continue
+                    lt = str(l.get("type") or "")
+                    if lt in self.cfg.listener_types:
+                        relevant.append(l)
+                if not relevant:
+                    continue
 
-                    listeners_resp = await self._cdp_send(
-                        cdp,
-                        "DOMDebugger.getEventListeners",
-                        {"objectId": object_id, "depth": 1},
-                        log,
-                    )
-                    listeners = (listeners_resp or {}).get("listeners", []) or []
-                    if not listeners:
-                        continue
+                attrs_resp = await self._cdp_send(cdp, "DOM.getAttributes", {"nodeId": nid}, log)
+                attr_dict = attrs_to_dict((attrs_resp or {}).get("attributes", []) or [])
 
-                    relevant = []
-                    for l in listeners:
-                        if not isinstance(l, dict):
-                            continue
-                        lt = str(l.get("type") or "")
-                        if lt in self.cfg.listener_types:
-                            relevant.append(l)
-                    if not relevant:
-                        continue
+                desc = await self._cdp_send(cdp, "DOM.describeNode", {"nodeId": nid}, log)
+                node_name = str((desc or {}).get("node", {}).get("nodeName") or "").lower()
 
-                    attrs_resp = await self._cdp_send(cdp, "DOM.getAttributes", {"nodeId": nid}, log)
-                    attr_list = (attrs_resp or {}).get("attributes", []) or []
-                    attr_dict = _attr_list_to_dict(attr_list)
-
-                    desc = await self._cdp_send(cdp, "DOM.describeNode", {"nodeId": nid}, log)
-                    node_name = str((desc or {}).get("node", {}).get("nodeName") or "")
-
-                    flags: Dict[str, Any] = {}
-                    if self.cfg.include_listener_flags:
-                        flags = {
+                self._emit_hit(
+                    page_url,
+                    "listener",
+                    {
+                        "node_id": int(nid),
+                        "node_name": node_name,
+                        "listener_types": sorted({str(r.get("type") or "") for r in relevant}),
+                        "attributes": attr_dict,
+                        "flags": {
                             "count": len(relevant),
                             "capture": any(bool(r.get("useCapture")) for r in relevant),
                             "passive": any(bool(r.get("passive")) for r in relevant),
                             "once": any(bool(r.get("once")) for r in relevant),
-                        }
-
-                    outer_html = None
-                    if self.cfg.include_outer_html_snippet:
-                        oh = await self._cdp_send(cdp, "DOM.getOuterHTML", {"nodeId": nid}, log)
-                        outer_html = str((oh or {}).get("outerHTML") or "")
-                        if outer_html and len(outer_html) > int(self.cfg.outer_html_max_chars):
-                            outer_html = outer_html[: int(self.cfg.outer_html_max_chars)] + "…"
-
-                    fp = (
-                        int(nid),
-                        node_name,
-                        tuple(sorted({str(r.get("type") or "") for r in relevant})),
-                        attr_dict.get("id", ""),
-                        attr_dict.get("class", ""),
-                    )
-                    if fp in self._seen_fingerprints:
-                        continue
-                    self._seen_fingerprints.add(fp)
-
-                    self._listeners.append(
-                        InteractionSniffer.ListenerMem(
-                            node_id=int(nid),
-                            node_name=node_name,
-                            types=sorted({str(r.get("type") or "") for r in relevant}),
-                            attributes=attr_dict,
-                            flags=flags,
-                            outer_html=outer_html,
-                        )
-                    )
-                    found += 1
-                except Exception:
-                    continue
+                        },
+                    },
+                )
+                found += 1
 
             self._log(f"CDP listener scan: inspected={inspected} found={found}", log)
-        except Exception as e:
-            self._log(f"CDP listener scan failed: {e}", log)
         finally:
             try:
                 await cdp.detach()
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ #
-    # Listener scoring (computed style / rect / visibility / cues)
-    # ------------------------------------------------------------------ #
-    async def _score_listeners(self, page, log: Optional[List[str]]) -> None:
-        try:
-            # score only first N to keep it bounded
-            todo = self._listeners[: int(self.cfg.max_scoring_nodes)]
-            if not todo:
-                return
+    async def _collect_ax_tree(self, context, page, page_url: str, log: Optional[List[str]], *, deadline: float) -> None:
+        if self._remaining_budget(deadline) < self.cfg.min_budget_for_ax_s:
+            return
 
-            node_ids = [int(x.node_id) for x in todo]
-            payload = await self._safe_eval(
-                page,
-                """
-                (nodeIds) => {
-                  // Given CDP nodeIds, we cannot directly access nodes by nodeId in JS.
-                  // So we approximate: return a list of "best effort" candidates by querying for common id/class.
-                  // We'll do scoring by fingerprints from attributes we already have in Python later.
-                  return { ok: true };
-                }
-                """,
-                node_ids,
-                log,
-            )
-
-            # We can't map CDP nodeId -> DOM element in pure page.evaluate without CDP.
-            # Instead: do a scoring heuristic purely from attributes + outerHTML when available.
-            for l in todo:
-                conf, reasons = self._score_from_attrs(l.attributes, l.outer_html or "", l.node_name, l.types)
-                l.confidence = conf
-                l.reasons = reasons
-
-            self._log(f"Listener scoring: scored={len(todo)} (attr/outerHTML heuristic)", log)
-        except Exception as e:
-            self._log(f"Listener scoring error: {e}", log)
-
-    def _score_from_attrs(self, attrs: Dict[str, str], outer_html: str, node_name: str, types: List[str]) -> Tuple[float, List[str]]:
-        reasons: List[str] = []
-        score = 0.0
-
-        nn = (node_name or "").lower()
-        if nn in ("button", "a", "input", "select", "textarea", "label"):
-            score += 0.35
-            reasons.append(f"native:{nn}")
-
-        role = (attrs.get("role") or "").lower()
-        if role in ("button", "link", "menuitem"):
-            score += 0.25
-            reasons.append(f"role:{role}")
-
-        tabindex = attrs.get("tabindex")
-        if tabindex is not None:
-            score += 0.10
-            reasons.append("tabindex")
-
-        if "contenteditable" in (attrs.get("contenteditable") or "").lower():
-            score += 0.08
-            reasons.append("contenteditable")
-
-        # aria signals
-        for k in ("aria-label", "aria-controls", "aria-expanded"):
-            if attrs.get(k):
-                score += 0.08
-                reasons.append(k)
-
-        # dataset tracking signals
-        for k in list(attrs.keys()):
-            lk = k.lower()
-            if lk.startswith("data-") and any(x in lk for x in ("testid", "action", "track", "analytics")):
-                score += 0.07
-                reasons.append(f"data:{lk}")
-                break
-
-        # class hints
-        cls = (attrs.get("class") or "").lower()
-        if any(s in cls for s in ("btn", "button", "cta", "primary", "submit")):
-            score += 0.10
-            reasons.append("class-hint")
-
-        # outerHTML hints
-        oh = (outer_html or "").lower()
-        if any(s in oh for s in ("onclick", "data-action", "aria-label", "role=\"button\"")):
-            score += 0.07
-            reasons.append("outerHTML-hint")
-
-        # types
-        if "click" in types:
-            score += 0.05
-            reasons.append("has-click")
-
-        score = max(0.0, min(1.0, score))
-        return score, reasons[:8]
-
-    # ------------------------------------------------------------------ #
-    # AX / Accessibility scan (CDP first, fallback to Playwright snapshot)
-    # ------------------------------------------------------------------ #
-    async def _collect_ax_tree(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
-        # Try CDP AX tree on Chromium; fallback to page.accessibility.snapshot
         browser_name = "unknown"
         try:
             if getattr(context, "browser", None) and context.browser:
@@ -9531,511 +9589,218 @@ class InteractionSniffer:
                     await self._cdp_send(cdp, "Accessibility.enable", {}, log)
                     ax = await self._cdp_send(cdp, "Accessibility.getFullAXTree", {}, log)
                     nodes = (ax or {}).get("nodes", []) or []
-                    if not nodes:
-                        return
-
-                    # helper: pull properties
-                    def _prop(node: Dict[str, Any], key: str) -> str:
-                        try:
-                            v = node.get(key)
-                            if isinstance(v, dict) and "value" in v:
-                                return str(v.get("value") or "")
-                            return str(v or "")
-                        except Exception:
-                            return ""
-
                     kept = 0
+
+                    def prop(node: Dict[str, Any], key: str) -> str:
+                        v = node.get(key)
+                        if isinstance(v, dict) and "value" in v:
+                            return str(v.get("value") or "")
+                        return str(v or "")
+
                     for n in nodes:
+                        if self._remaining_budget(deadline) < 0.25:
+                            break
                         if kept >= int(self.cfg.max_ax_hits):
                             break
                         if not isinstance(n, dict):
                             continue
 
-                        role = _prop(n, "role").lower()
+                        role = prop(n, "role").lower()
                         if role and role not in self.cfg.ax_roles:
                             continue
 
-                        name = _prop(n, "name")
-                        value = _prop(n, "value")
-                        disabled = False
-                        focused = False
-                        try:
-                            props = n.get("properties") or []
-                            for p in props:
-                                pn = str(p.get("name") or "")
-                                pv = p.get("value") or {}
-                                if pn == "disabled":
-                                    disabled = bool(pv.get("value", False))
-                                if pn == "focused":
-                                    focused = bool(pv.get("value", False))
-                        except Exception:
-                            pass
-
-                        backend_id = None
-                        try:
-                            backend_id = int(n.get("backendDOMNodeId")) if n.get("backendDOMNodeId") else None
-                        except Exception:
-                            backend_id = None
-
-                        self._ax.append(
-                            InteractionSniffer.AXMem(
-                                role=role or "unknown",
-                                name=str(name or ""),
-                                value=str(value or ""),
-                                disabled=bool(disabled),
-                                focused=bool(focused),
-                                backend_dom_node_id=backend_id,
-                                selector_hint="ax_tree",
-                                meta={"source": "cdp", "page": page_url},
-                            )
+                        self._emit_hit(
+                            page_url,
+                            "ax_node",
+                            {
+                                "role": role or "unknown",
+                                "name": prop(n, "name"),
+                                "value": prop(n, "value"),
+                                "selector_hint": "ax_tree",
+                                "source": "cdp",
+                            },
                         )
                         kept += 1
 
-                    # Best-effort: map backendDOMNodeId -> nodeId (optional)
-                    if self.cfg.try_map_ax_to_dom and self._ax:
-                        # IMPORTANT: DOM.pushNodesByBackendIdsToFrontend requires DOM.getDocument first (per session)
-                        _ = await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
-                        await self._map_ax_backend_to_dom_nodeid(cdp, log)
-
-                    self._log(f"AX tree (CDP): kept={len(self._ax)}", log)
+                    self._log(f"AX tree (CDP): kept={kept}", log)
+                    return
                 finally:
                     try:
                         await cdp.detach()
                     except Exception:
                         pass
-                return
             except Exception as e:
-                self._log(f"AX tree via CDP failed; will fallback: {e}", log)
+                self._log(f"AX tree via CDP failed; fallback: {e}", log)
 
-        # Fallback: Playwright snapshot
         try:
-            snap = await asyncio.wait_for(page.accessibility.snapshot(), timeout=self.cfg.per_eval_timeout_s)
-            # snapshot is a tree; we BFS it and keep nodes with roles
-            kept = 0
+            snap = await asyncio.wait_for(page.accessibility.snapshot(), timeout=min(self.cfg.per_eval_timeout_s, self._remaining_budget(deadline)))
             q = [snap] if isinstance(snap, dict) else []
-            while q and kept < int(self.cfg.max_ax_hits):
+            kept = 0
+            while q and kept < int(self.cfg.max_ax_hits) and self._remaining_budget(deadline) > 0.2:
                 cur = q.pop(0)
                 if not isinstance(cur, dict):
                     continue
                 role = str(cur.get("role") or "").lower()
-                name = str(cur.get("name") or "")
-                value = str(cur.get("value") or "")
-                disabled = bool(cur.get("disabled", False))
-                focused = bool(cur.get("focused", False))
-
                 if role in self.cfg.ax_roles:
-                    self._ax.append(
-                        InteractionSniffer.AXMem(
-                            role=role,
-                            name=name,
-                            value=value,
-                            disabled=disabled,
-                            focused=focused,
-                            selector_hint="ax_snapshot",
-                            meta={"source": "playwright", "page": page_url},
-                        )
+                    self._emit_hit(
+                        page_url,
+                        "ax_node",
+                        {
+                            "role": role,
+                            "name": str(cur.get("name") or ""),
+                            "value": str(cur.get("value") or ""),
+                            "disabled": bool(cur.get("disabled", False)),
+                            "focused": bool(cur.get("focused", False)),
+                            "selector_hint": "ax_snapshot",
+                            "source": "playwright",
+                        },
                     )
                     kept += 1
 
-                ch = cur.get("children") or []
-                if isinstance(ch, list):
-                    q.extend(ch)
+                children = cur.get("children") or []
+                if isinstance(children, list):
+                    q.extend(children)
 
-            if self._ax:
-                self._log(f"AX snapshot (Playwright): kept={len(self._ax)}", log)
+            if kept:
+                self._log(f"AX snapshot (Playwright): kept={kept}", log)
         except Exception as e:
             self._log(f"AX snapshot failed: {e}", log)
 
-    async def _map_ax_backend_to_dom_nodeid(self, cdp, log: Optional[List[str]]) -> None:
-        backend_ids = [int(a.backend_dom_node_id) for a in self._ax
-                       if a.backend_dom_node_id and a.node_id is None]
-        backend_ids = backend_ids[:200]
-        if not backend_ids:
-            return
-
-        # DOM document must be requested first (per CDP session)
-        await self._cdp_send(cdp, "DOM.getDocument", {"depth": 1, "pierce": True}, log)
-
-        resp = await self._cdp_send(
-            cdp,
-            "DOM.pushNodesByBackendIdsToFrontend",
-            {"backendNodeIds": backend_ids},
-            log,
-        )
-
-        # If protocol rejected, silently bail (best-effort mapping only)
-        node_ids = (resp or {}).get("nodeIds") or []
-        if not isinstance(node_ids, list) or len(node_ids) != len(backend_ids):
-            return
-
-        # assign back in-order
-        idx = 0
-        for a in self._ax:
-            if a.backend_dom_node_id and a.node_id is None:
-                a.node_id = int(node_ids[idx]) if node_ids[idx] else None
-                idx += 1
-
-    # ------------------------------------------------------------------ #
-    # Dynamic simulation: scroll + click likely CTAs + rescan per step
-    # ------------------------------------------------------------------ #
-    async def _simulate_and_rescan(self, context, page, page_url: str, log: Optional[List[str]]) -> None:
-        try:
-            # 1) short scroll(s)
-            for i in range(max(0, int(self.cfg.sim_scroll_steps))):
-                try:
-                    await page.evaluate("() => window.scrollBy(0, Math.max(200, window.innerHeight * 0.7));")
-                    await page.wait_for_timeout(int(self.cfg.sim_scroll_delay_ms))
-                except Exception:
-                    break
-
-            # collect post-scroll phase (no click yet)
-            self._phase_tags.append("post_scroll")
-            await self._collect_phase(page, page_url, log, phase="post_scroll", context=context)
-
-            # 2) choose click targets
-            targets = await self._pick_click_targets(page, log)
-            if not targets:
-                self._log("Dynamic sim: no click targets selected.", log)
-                return
-
-            clicks_done = 0
-            for t in targets[: int(self.cfg.sim_click_targets)]:
-                if clicks_done >= int(self.cfg.sim_click_targets):
-                    break
-                try:
-                    # click via selector
-                    sel = t.get("selector") or ""
-                    if not sel:
-                        continue
-
-                    # ensure visible
-                    try:
-                        h = await page.query_selector(sel)
-                        if not h:
-                            continue
-                        await h.scroll_into_view_if_needed(timeout=1200)
-                        await h.click(timeout=int(self.cfg.sim_click_timeout_ms))
-                    except Exception:
-                        # fallback: click by JS
-                        try:
-                            await page.evaluate(
-                                """
-                                (sel) => {
-                                  const el = document.querySelector(sel);
-                                  if (el) el.click();
-                                }
-                                """,
-                                sel,
-                            )
-                        except Exception:
-                            continue
-
-                    clicks_done += 1
-                    await page.wait_for_timeout(int(self.cfg.per_action_settle_ms))
-
-                    phase = f"post_click_{clicks_done}"
-                    self._phase_tags.append(phase)
-                    await self._collect_phase(page, page_url, log, phase=phase, context=context)
-
-                except Exception:
-                    continue
-
-            self._log(f"Dynamic sim: scroll_steps={self.cfg.sim_scroll_steps} clicks={clicks_done}", log)
-        except Exception as e:
-            self._log(f"Dynamic simulation error: {e}", log)
-
     async def _pick_click_targets(self, page, log: Optional[List[str]]) -> List[Dict[str, Any]]:
-        """
-        Choose likely CTAs:
-          - visible buttons / role=button / a[role=button] with text hints
-          - if we have listener hits with good confidence, prefer those by looking for IDs/classes in outerHTML
-        Returns a list of {selector, text, reason}
-        """
-        # Primary: DOM-based selection (works everywhere)
-        try:
-            payload = await self._safe_eval(
-                page,
-                """
-                (cfg) => {
-                  const hints = (cfg.hints || []).map(s => String(s||"").toLowerCase());
-                  const max = cfg.max|0;
+        payload = await self._safe_eval(
+            page,
+            """
+            (cfg) => {
+                const hints = (cfg.hints || []).map(s => String(s||"").toLowerCase());
+                const max = cfg.max|0;
 
-                  function isVisible(el){
+                function isVisible(el){
                     try {
-                      const st = getComputedStyle(el);
-                      if (st.display === "none" || st.visibility === "hidden" || parseFloat(st.opacity||"1") <= 0) return false;
-                      const r = el.getBoundingClientRect();
-                      if (r.width <= 2 || r.height <= 2) return false;
-                      if (r.bottom < 0 || r.right < 0) return false;
-                      const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
-                      const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
-                      if (r.top > vh || r.left > vw) return false;
-                      return true;
+                        const st = getComputedStyle(el);
+                        if (st.display === "none" || st.visibility === "hidden" || parseFloat(st.opacity||"1") <= 0) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width <= 2 || r.height <= 2) return false;
+                        const vw = Math.max(document.documentElement.clientWidth||0, window.innerWidth||0);
+                        const vh = Math.max(document.documentElement.clientHeight||0, window.innerHeight||0);
+                        if (r.bottom < 0 || r.right < 0) return false;
+                        if (r.top > vh || r.left > vw) return false;
+                        return true;
                     } catch { return false; }
-                  }
+                }
 
-                  function textOf(el){
+                function textOf(el){
+                    try { return (el.innerText || el.textContent || el.value || "").trim().slice(0, 90); }
+                    catch { return ""; }
+                }
+
+                function selectorOf(el){
                     try {
-                      const t = (el.innerText || el.textContent || el.value || "").trim();
-                      return t.slice(0, 90);
+                        if (el.id) return `#${CSS.escape(el.id)}`;
+                        const cls = (typeof el.className === "string" ? el.className : "");
+                        const c1 = cls.split(/\\s+/).filter(Boolean)[0];
+                        if (c1) return `${el.tagName.toLowerCase()}.${CSS.escape(c1)}`;
+                        return el.tagName.toLowerCase();
                     } catch { return ""; }
-                  }
+                }
 
-                  function makeSelector(el){
-                    // best-effort stable selector
-                    try {
-                      if (el.id) return `#${CSS.escape(el.id)}`;
-                      const cls = (typeof el.className === "string" ? el.className : "");
-                      const c1 = cls.split(/\\s+/).filter(Boolean)[0];
-                      if (c1) return `${el.tagName.toLowerCase()}.${CSS.escape(c1)}`;
-                      const tn = el.tagName.toLowerCase();
-                      if (tn === "button") return "button";
-                      if (tn === "a") return "a";
-                      return tn;
-                    } catch {
-                      return el.tagName ? el.tagName.toLowerCase() : "";
-                    }
-                  }
+                const sel = "button, [role='button'], a[role='button'], input[type='button'], input[type='submit'], [onclick]";
+                const cands = Array.from(document.querySelectorAll(sel)).slice(0, 100);
 
-                  const candSel = "button, [role='button'], a[role='button'], input[type='button'], input[type='submit'], [onclick]";
-                  const cands = Array.from(document.querySelectorAll(candSel)).slice(0, 260);
-
-                  const scored = [];
-                  for (const el of cands){
+                const out = [];
+                for (const el of cands){
                     if (!isVisible(el)) continue;
                     const t = textOf(el);
                     const tl = t.toLowerCase();
                     let score = 0;
-                    let why = [];
-                    if (t) { score += 0.2; }
+                    let reason = [];
+                    if (t) score += 0.2;
                     for (const h of hints){
-                      if (h && tl.includes(h)) { score += 1.0; why.push(`text:${h}`); break; }
+                        if (h && tl.includes(h)) {
+                            score += 1.0;
+                            reason.push(`text:${h}`);
+                            break;
+                        }
                     }
-                    const st = getComputedStyle(el);
-                    if ((st.cursor||"") === "pointer") { score += 0.15; why.push("cursor:pointer"); }
-                    if (el.tagName.toLowerCase() === "button") { score += 0.2; why.push("button"); }
-                    if (el.getAttribute("aria-label")) { score += 0.15; why.push("aria-label"); }
-
-                    const sel = makeSelector(el);
-                    if (!sel) continue;
-                    scored.push({selector: sel, text: t, score, reason: why.join(",")});
-                  }
-
-                  scored.sort((a,b) => (b.score - a.score));
-                  return scored.slice(0, max);
+                    if (el.tagName.toLowerCase() === "button") {
+                        score += 0.2;
+                        reason.push("button");
+                    }
+                    if (el.getAttribute("aria-label")) {
+                        score += 0.1;
+                        reason.push("aria-label");
+                    }
+                    const selector = selectorOf(el);
+                    if (!selector) continue;
+                    out.push({selector, text: t, score, reason: reason.join(",")});
                 }
-                """,
-                {"hints": self.cfg.cta_text_hints, "max": 6},
-                log,
-            )
-            out = payload if isinstance(payload, list) else []
-        except Exception:
-            out = []
 
-        # Secondary: blend in listener-confidence elements (if we can make stable selectors)
-        # We only have id/class and outerHTML; so we can promote those by preferring #id and .class selectors.
-        promoted: List[Dict[str, Any]] = []
-        for l in self._listeners:
-            conf = float(l.confidence or 0.0)
-            if conf < 0.45:
-                continue
-            attrs = l.attributes or {}
-            if attrs.get("id"):
-                promoted.append({"selector": f"#{attrs['id']}", "text": "", "score": 0.9 + conf * 0.1, "reason": "listener:id"})
-            else:
-                cls = (attrs.get("class") or "").split()
-                if cls:
-                    promoted.append({"selector": f".{cls[0]}", "text": "", "score": 0.75 + conf * 0.1, "reason": "listener:class"})
-
-        # combine, dedupe selectors
-        combined = []
-        seen = set()
-        for it in (out or []) + promoted:
-            try:
-                sel = str(it.get("selector") or "")
-                if not sel or sel in seen:
-                    continue
-                seen.add(sel)
-                combined.append({"selector": sel, "text": it.get("text", ""), "reason": it.get("reason", "")})
-            except Exception:
-                continue
-
-        return combined[: max(1, int(self.cfg.sim_click_targets) * 3)]
-
-    # ------------------------------------------------------------------ #
-    # Materialize final hits
-    # ------------------------------------------------------------------ #
-    def _materialize_hits(self, page_url: str) -> List[Dict[str, Any]]:
-        hits: List[Dict[str, Any]] = []
-
-        # 1) Event listener hits (now includes confidence/reasons)
-        for l in self._listeners:
-            meta = {
-                "nodeId": l.node_id,
-                "nodeName": l.node_name,
-                "types": list(l.types),
-                "attributes": dict(l.attributes or {}),
-                "flags": dict(l.flags or {}),
-                "is_pure_js": True,
+                out.sort((a,b) => b.score - a.score);
+                return out.slice(0, max);
             }
-            if l.outer_html:
-                meta["outerHTML"] = l.outer_html
-            if l.confidence is not None:
-                meta["confidence"] = float(l.confidence)
-            if l.reasons:
-                meta["reasons"] = list(l.reasons)
+            """,
+            {"hints": self.cfg.cta_text_hints, "max": 4},
+            log,
+        )
+        return payload if isinstance(payload, list) else []
 
-            hits.append({"page": page_url, "url": page_url, "tag": "interaction", "kind": "event_listener", "meta": meta})
+    async def _simulate_and_rescan(self, context, page, page_url: str, log: Optional[List[str]], *, deadline: float) -> None:
+        if self._remaining_budget(deadline) < self.cfg.min_budget_for_dynamic_s:
+            return
 
-        # 2) Overlays
-        for ov in self._overlays:
-            hits.append({
-                "page": page_url,
-                "url": page_url,
-                "tag": "interaction",
-                "kind": "overlay_detected",
-                "meta": {
-                    "tagName": ov.tag_name,
-                    "id": ov.id,
-                    "className": ov.class_name,
-                    "zIndex": ov.z_index,
-                    "coverage": ov.coverage,
-                    "textPreview": ov.text_preview,
-                    **(ov.meta or {}),
-                },
-            })
+        # One short scroll only
+        try:
+            await page.evaluate("() => window.scrollBy(0, Math.max(160, window.innerHeight * 0.6));")
+            await page.wait_for_timeout(int(self.cfg.sim_scroll_delay_ms))
+        except Exception:
+            pass
 
-        # 3) UI barriers (captcha/paywall/consent/adblock/scroll_lock/etc)
-        for b in self._barriers:
-            hits.append({
-                "page": page_url,
-                "url": page_url,
-                "tag": "interaction",
-                "kind": "ui_barrier",
-                "meta": {
-                    "barrier_type": b.barrier_type,
-                    "evidence": b.evidence,
-                    "selector_hint": b.selector_hint,
-                    **(b.meta or {}),
-                },
-            })
+        if self._remaining_budget(deadline) >= self.cfg.min_budget_for_post_phase_s:
+            await self._collect_phase(page, page_url, log, phase="post_scroll", deadline=deadline)
 
-        # 4) Hit-test blockers
-        for ht in self._hit_tests:
-            hits.append({
-                "page": page_url,
-                "url": page_url,
-                "tag": "interaction",
-                "kind": "hit_test_blocker",
-                "meta": {
-                    "point": list(ht.point),
-                    "tagName": ht.tag_name,
-                    "id": ht.id,
-                    "className": ht.class_name,
-                    "pointerEvents": ht.pointer_events,
-                    "opacity": ht.opacity,
-                    "zIndex": ht.z_index,
-                    "position": ht.position,
-                    "rect": ht.rect,
-                    "textPreview": ht.text_preview,
-                    "outerHTML": ht.outer_html,
-                },
-            })
+        if self._remaining_budget(deadline) < 0.9:
+            self._log("Dynamic sim: not enough budget left for click phase.", log)
+            return
 
-        # 5) Forms (now includes kind + honeypot)
-        for f in self._forms:
-            hits.append({
-                "page": page_url,
-                "url": (f.action or page_url),
-                "tag": "interaction",
-                "kind": "form_definition",
-                "meta": {
-                    "action": f.action,
-                    "method": f.method,
-                    "id": f.id,
-                    "class": f.class_name,
-                    "input_count": f.input_count,
-                    "inputs": f.inputs,
-                    "form_kind": f.form_kind,
-                    "honeypot_suspected": bool(f.honeypot_suspected),
-                    "honeypot_reasons": list(f.honeypot_reasons or []),
-                },
-            })
+        targets = await self._pick_click_targets(page, log)
+        if not targets:
+            self._log("Dynamic sim: no click targets selected.", log)
+            return
 
-        # 6) AX nodes
-        for a in self._ax:
-            hits.append({
-                "page": page_url,
-                "url": page_url,
-                "tag": "interaction",
-                "kind": "ax_node",
-                "meta": {
-                    "role": a.role,
-                    "name": a.name,
-                    "value": a.value,
-                    "disabled": bool(a.disabled),
-                    "focused": bool(a.focused),
-                    "backendDOMNodeId": a.backend_dom_node_id,
-                    "nodeId": a.node_id,
-                    "selector_hint": a.selector_hint,
-                    **(a.meta or {}),
-                },
-            })
+        clicks_done = 0
+        for t in targets[: int(self.cfg.sim_click_targets)]:
+            if self._remaining_budget(deadline) < 0.8:
+                break
 
-        # 7) Summary
-        if self.cfg.emit_summary_hit:
-            s = self._build_summary_hit(page_url)
-            if s is not None:
-                hits.append(s)
+            selector = str(t.get("selector") or "")
+            if not selector:
+                continue
 
-        return hits
-
-    def _build_summary_hit(self, page_url: str) -> Optional[Dict[str, Any]]:
-        if not self._listeners and not self._overlays and not self._forms and not self._barriers and not self._hit_tests and not self._ax:
-            return None
-
-        # listener type counts
-        top_listener_types: Dict[str, int] = {}
-        for l in self._listeners:
-            for t in l.types:
-                top_listener_types[t] = top_listener_types.get(t, 0) + 1
-        top_types = sorted(top_listener_types.items(), key=lambda kv: kv[1], reverse=True)[:10]
-
-        # overlay severity
-        max_coverage = None
-        max_z = None
-        for ov in self._overlays:
             try:
-                cov = float(str(ov.coverage).replace("%", ""))
-                max_coverage = cov if max_coverage is None else max(max_coverage, cov)
+                handle = await page.query_selector(selector)
+                if not handle:
+                    continue
+                await handle.scroll_into_view_if_needed(timeout=700)
+                await handle.click(timeout=int(self.cfg.sim_click_timeout_ms))
+                clicks_done += 1
+                self._emit_hit(
+                    page_url,
+                    "interaction_action",
+                    {
+                        "phase": f"post_click_{clicks_done}",
+                        "action": "click",
+                        "selector_hint": selector,
+                        "reason": str(t.get("reason") or ""),
+                        "text_preview": str(t.get("text") or ""),
+                    },
+                )
+                await page.wait_for_timeout(int(self.cfg.per_action_settle_ms))
+
+                if self._remaining_budget(deadline) >= self.cfg.min_budget_for_post_phase_s:
+                    await self._collect_phase(page, page_url, log, phase=f"post_click_{clicks_done}", deadline=deadline)
             except Exception:
-                pass
-            try:
-                max_z = ov.z_index if max_z is None else max(max_z, ov.z_index)
-            except Exception:
-                pass
+                continue
 
-        # barrier histogram
-        barrier_counts: Dict[str, int] = {}
-        for b in self._barriers:
-            barrier_counts[b.barrier_type] = barrier_counts.get(b.barrier_type, 0) + 1
-        top_barriers = sorted(barrier_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
-
-        meta: Dict[str, Any] = {
-            "listener_count": len(self._listeners),
-            "overlay_count": len(self._overlays),
-            "form_count": len(self._forms),
-            "barrier_count": len(self._barriers),
-            "hit_test_blocker_count": len(self._hit_tests),
-            "ax_node_count": len(self._ax),
-            "top_listener_types": top_types,
-            "top_barriers": top_barriers,
-            "max_overlay_coverage_percent": max_coverage,
-            "max_overlay_z_index": max_z,
-            "phases_seen": list(dict.fromkeys(self._phase_tags)),
-        }
-
-        return {"page": page_url, "url": page_url, "tag": "interaction", "kind": "summary", "meta": meta}
+        self._log(f"Dynamic sim: scroll_steps={self.cfg.sim_scroll_steps} clicks={clicks_done}", log)
 
 # ======================================================================
 # Database

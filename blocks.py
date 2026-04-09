@@ -18,7 +18,9 @@ import math
 import operator
 import os
 import re
+import socket
 import sqlite3
+import struct
 import sys
 import threading
 import urllib
@@ -28,7 +30,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 import random
-from typing import Any, Dict, Tuple, List, Optional, Set
+from typing import Any, Dict, Tuple, List, Optional, Set, Iterable, Counter
 import json as _json
 import os as _os
 import time
@@ -43,6 +45,8 @@ from bs4 import BeautifulSoup
 from camoufox import AsyncCamoufox
 from playwright.async_api import async_playwright, Page, Response
 from playwright.sync_api import BrowserContext
+
+from libpcap_backend import LibpcapCtypesBackend
 from registry import BLOCKS
 from models import get_chat_model  # <-- models now live separately
 import xml.etree.ElementTree as ET
@@ -6744,6 +6748,8 @@ class LinkTrackerBlock(BaseBlock):
       • All sqlite access goes through DatabaseSubmanager + LinkTrackerStore.
       • No direct sqlite3 usage in this block.
       • Schema + queries are store-owned.
+      • media mode no longer accidentally blocks audio/media requests before sniffers see them.
+      • DB content-link reinjection is filtered in media mode so mp3/wav hunts stay focused.
     """
 
     JUNK_FILENAME_KEYWORDS = {
@@ -6755,21 +6761,31 @@ class LinkTrackerBlock(BaseBlock):
         ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
     }
 
-    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+    _URL_RE = re.compile(r'https?://[^\s\"\'<>\\)]+', re.IGNORECASE)
 
     MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
     MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
-    MEGA_QUERY_MARKERS = ("mega.nz",)  # fallback
-
+    MEGA_QUERY_MARKERS = ("mega.nz",)
 
     def __post_init__(self):
-        # Store/submanager are initialized per-run when use_database=True
         self.db: Optional[submanagers.DatabaseSubmanager] = None
         self.store: Optional[LinkTrackerStore] = None
-        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
-        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
-        self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
 
+        self.js_sniffer = submanagers.JSSniffer(
+            submanagers.JSSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+        self.network_sniffer = submanagers.NetworkSniffer(
+            submanagers.NetworkSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+        self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
         self.react_sniffer = submanagers.ReactSniffer(
             submanagers.ReactSniffer.Config(
                 hook_history_api=True,
@@ -6779,19 +6795,20 @@ class LinkTrackerBlock(BaseBlock):
         )
         self.database_sniffer = submanagers.DatabaseSniffer(
             submanagers.DatabaseSniffer.Config(
-                enable_indexeddb_dump=True,  # Get Metadata
-                enable_backend_fingerprint=True,  # Get Tech Stack
-                enable_html_link_scan=True,  # Scan HTML for raw links
-                enable_backend_link_scan=True  # Scan JS Globals for links
+                enable_indexeddb_dump=True,
+                enable_backend_fingerprint=True,
+                enable_html_link_scan=True,
+                enable_backend_link_scan=True,
             )
         )
         self.interaction_sniffer = submanagers.InteractionSniffer(
             submanagers.InteractionSniffer.Config(
                 enable_cdp_listeners=True,
                 enable_overlay_detection=True,
-                enable_form_extraction=True
+                enable_form_extraction=True,
             )
         )
+
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -6827,6 +6844,7 @@ class LinkTrackerBlock(BaseBlock):
                 if frag.startswith("f!") or frag.startswith("!") or "file/" in frag or "folder/" in frag:
                     return True
                 return True
+
             if "mega.nz/#" in full_low or "mega.co.nz/#" in full_low:
                 return True
 
@@ -6835,38 +6853,24 @@ class LinkTrackerBlock(BaseBlock):
             return False
 
     # ------------------------------------------------------------------ #
-    # Search engines (unchanged)
+    # Search engines
     # ------------------------------------------------------------------ #
-
     async def _search_searxng(
-            self,
-            q: str,
-            max_results: int,
-            timeout: float,
-            base_url: Optional[str] = None,
-            page_limit: int = 1,
+        self,
+        q: str,
+        max_results: int,
+        timeout: float,
+        base_url: Optional[str] = None,
+        page_limit: int = 1,
     ) -> List[str]:
-        """
-        Query a SearXNG instance and return a list of result URLs.
+        import os
+        import json
 
-        - Uses ?format=json
-        - Respects max_results and page_limit
-        - base_url can be passed via params['searxng_url'] or SEARXNG_URL env var.
-        """
-        import os, json
-
-        # Where is SearXNG?
-        base_url = (
-                base_url
-                or os.environ.get("SEARXNG_URL")
-                or "http://127.0.0.1:8080"
-        ).rstrip("/")
-
+        base_url = (base_url or os.environ.get("SEARXNG_URL") or "http://127.0.0.1:8080").rstrip("/")
         search_url = base_url + "/search"
 
         max_results = max(1, min(int(max_results), 256))
         page_limit = max(1, min(int(page_limit), 5))
-
         out: List[str] = []
         did_dump_debug = False
 
@@ -6876,35 +6880,17 @@ class LinkTrackerBlock(BaseBlock):
                     if len(out) >= max_results:
                         break
 
-                    # SearXNG pagination: 'pageno' is 1-based
-                    params = {
-                        "q": q,
-                        "format": "json",
-                        "pageno": str(page_idx + 1),
-                    }
-
+                    params = {"q": q, "format": "json", "pageno": str(page_idx + 1)}
                     text = ""
-                    status = None
 
                     try:
                         async with session.get(
-                                search_url,
-                                params=params,
-                                timeout=aiohttp.ClientTimeout(total=timeout),
+                            search_url,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            status = resp.status
                             text = await resp.text()
-
-                            # Classic misconfig case: JSON disabled -> 403 HTML
-                            if status == 403:
-                                if not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(
-                                        f"[LinkTracker][SearXNG][debug] HTTP 403 "
-                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
-                                    )
-                                    did_dump_debug = True
-                                break
+                            status = resp.status
 
                             if status != 200:
                                 if not did_dump_debug:
@@ -6916,21 +6902,9 @@ class LinkTrackerBlock(BaseBlock):
                                     did_dump_debug = True
                                 break
 
-                            try:
-                                data = json.loads(text)
-                            except json.JSONDecodeError as e:
-                                print(f"[LinkTracker][SearXNG] JSON decode error: {e}")
-                                if not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(
-                                        f"[LinkTracker][SearXNG][debug] Bad JSON preview: {preview}"
-                                    )
-                                    did_dump_debug = True
-                                break
-
+                            data = json.loads(text)
                             results = data.get("results") or []
                             if not results:
-                                # No more pages.
                                 break
 
                             for item in results:
@@ -6939,21 +6913,17 @@ class LinkTrackerBlock(BaseBlock):
                                     out.append(u)
                                     if len(out) >= max_results:
                                         break
-
                     except aiohttp.ClientError as e:
                         print(f"[LinkTracker][SearXNG] AIOHTTP error: {e}")
-                        if not did_dump_debug and text:
-                            preview = text[:1500].replace("\n", " ")
-                            print(
-                                f"[LinkTracker][SearXNG][debug] ClientError body preview: {preview}"
-                            )
-                            did_dump_debug = True
                         break
-
+                    except json.JSONDecodeError as e:
+                        print(f"[LinkTracker][SearXNG] JSON decode error: {e}")
+                        break
         except Exception as e:
             print(f"[LinkTracker][SearXNG] General error: {e}")
 
         return out[:max_results]
+
     async def _search_duckduckgo(
         self,
         q: str,
@@ -6967,7 +6937,6 @@ class LinkTrackerBlock(BaseBlock):
 
         pages: List[str] = []
         seen_urls: set[str] = set()
-        did_dump_debug = False
 
         real_ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -7000,51 +6969,28 @@ class LinkTrackerBlock(BaseBlock):
                         break
 
                     if page_idx > 0:
-                        st = random.uniform(2.0, 5.0)
-                        print(f"[LinkTracker] Sleeping {st:.2f}s between search pages...")
-                        await asyncio.sleep(st)
+                        await asyncio.sleep(random.uniform(2.0, 5.0))
 
                     offset = page_idx * 30
-                    text = ""
-                    status = None
-                    final_url = base_url
+                    data = {"q": q, "s": str(offset), "dc": str(offset)}
 
                     try:
-                        data = {'q': q, 's': str(offset), 'dc': str(offset)}
                         async with session.post(
                             base_url,
                             data=data,
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            status = resp.status
-                            final_url = str(resp.url)
-
-                            if status == 403:
+                            if resp.status == 403:
                                 print(f"[LinkTracker] 403 Forbidden on page {page_idx}.")
-                                if not pages and not did_dump_debug:
-                                    text = await resp.text()
-                                    preview = text[:2000].replace("\n", " ")
-                                    print(f"[LinkTracker][DDG][debug] 403 body preview: {preview}")
-                                    did_dump_debug = True
-                                return pages
-
+                                break
                             resp.raise_for_status()
                             text = await resp.text()
-
                     except Exception as e:
                         print(f"[LinkTracker] DuckDuckGo request failed (page {page_idx}): {e}")
-                        if not pages and text and not did_dump_debug:
-                            preview = text[:2000].replace("\n", " ")
-                            print(f"[LinkTracker][DDG][debug] Failed page HTML preview: {preview}")
-                            did_dump_debug = True
                         break
 
                     if "Unfortunately, bots use DuckDuckGo too." in text:
                         print("[LinkTracker] Bot detected by DDG.")
-                        if not pages and not did_dump_debug:
-                            preview = text[:2000].replace("\n", " ")
-                            print(f"[LinkTracker][DDG][debug] Bot wall preview: {preview}")
-                            did_dump_debug = True
                         break
 
                     soup = BeautifulSoup(text, "html.parser")
@@ -7067,17 +7013,8 @@ class LinkTrackerBlock(BaseBlock):
                             pages.append(href)
                             found_new = True
 
-                    if not found_new and not pages and not did_dump_debug:
-                        preview = text[:2000].replace("\n", " ")
-                        print(
-                            f"[LinkTracker][DDG][debug] No results on page {page_idx} for query={q!r} "
-                            f"(status={status}, url={final_url}). HTML preview: {preview}"
-                        )
-                        did_dump_debug = True
-
                     if not found_new:
                         break
-
         except Exception as e:
             print(f"[LinkTracker] DDG outer error: {e}")
 
@@ -7090,7 +7027,8 @@ class LinkTrackerBlock(BaseBlock):
         timeout: float,
         page_limit: int = 1,
     ) -> List[str]:
-        import os, json
+        import os
+        import json
 
         cx = os.environ.get("GOOGLE_CSE_ID")
         key = os.environ.get("GOOGLE_API_KEY")
@@ -7104,7 +7042,6 @@ class LinkTrackerBlock(BaseBlock):
         pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
 
         out: List[str] = []
-        did_dump_debug = False
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -7115,9 +7052,6 @@ class LinkTrackerBlock(BaseBlock):
                     start = 1 + page_idx * per_page
                     if start > 100:
                         break
-
-                    text = ""
-                    status = None
 
                     try:
                         async with session.get(
@@ -7131,56 +7065,17 @@ class LinkTrackerBlock(BaseBlock):
                             },
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            status = resp.status
                             text = await resp.text()
-
-                            if status != 200:
-                                if not out and not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(
-                                        f"[LinkTracker][GoogleCSE][debug] HTTP {status} "
-                                        f"query={q!r} start={start}. Body preview: {preview}"
-                                    )
-                                    did_dump_debug = True
-                                break
-
-                            try:
-                                data = json.loads(text)
-                            except json.JSONDecodeError as e:
-                                print(f"[LinkTracker][GoogleCSE] JSON decode error: {e}")
-                                if not out and not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(f"[LinkTracker][GoogleCSE][debug] Bad JSON preview: {preview}")
-                                    did_dump_debug = True
-                                break
-
-                            err_obj = data.get("error")
-                            if err_obj:
-                                msg = err_obj.get("message") or "Unknown CSE error"
-                                reason = ""
-                                errors = err_obj.get("errors") or []
-                                if errors and isinstance(errors, list):
-                                    reason = errors[0].get("reason") or ""
+                            if resp.status != 200:
                                 print(
-                                    f"[LinkTracker][GoogleCSE] API error for query={q!r}, "
-                                    f"start={start}: {msg} ({reason})"
+                                    f"[LinkTracker][GoogleCSE][debug] HTTP {resp.status} "
+                                    f"query={q!r} start={start}."
                                 )
-                                if not out and not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(f"[LinkTracker][GoogleCSE][debug] Error JSON preview: {preview}")
-                                    did_dump_debug = True
                                 break
 
+                            data = json.loads(text)
                             items = data.get("items") or []
                             if not items:
-                                print(
-                                    f"[LinkTracker][GoogleCSE] No items for query={q!r}, "
-                                    f"start={start}. Stopping pagination."
-                                )
-                                if not out and not did_dump_debug:
-                                    preview = text[:1500].replace("\n", " ")
-                                    print(f"[LinkTracker][GoogleCSE][debug] Empty items JSON preview: {preview}")
-                                    did_dump_debug = True
                                 break
 
                             for item in items:
@@ -7189,15 +7084,9 @@ class LinkTrackerBlock(BaseBlock):
                                     out.append(u)
                                     if len(out) >= max_total:
                                         break
-
-                    except aiohttp.ClientError as e:
-                        print(f"[LinkTracker][GoogleCSE] AIOHTTP error: {e}")
-                        if not out and text and not did_dump_debug:
-                            preview = text[:1500].replace("\n", " ")
-                            print(f"[LinkTracker][GoogleCSE][debug] ClientError body preview: {preview}")
-                            did_dump_debug = True
+                    except Exception as e:
+                        print(f"[LinkTracker][GoogleCSE] Error: {e}")
                         break
-
         except Exception as e:
             print(f"[LinkTracker][GoogleCSE] General error: {e}")
 
@@ -7235,8 +7124,8 @@ class LinkTrackerBlock(BaseBlock):
         if root.tag.startswith("{"):
             ns = root.tag.split("}", 1)[0] + "}"
 
-        sitemap_urls = []
-        page_urls = []
+        sitemap_urls: list[str] = []
+        page_urls: list[str] = []
 
         if root.tag.endswith("sitemapindex"):
             for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
@@ -7286,7 +7175,6 @@ class LinkTrackerBlock(BaseBlock):
 
         low = u.lower().replace("%20", " ")
         score += sum(2 for k in keywords if k and k in low)
-
         return score
 
     def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
@@ -7299,9 +7187,7 @@ class LinkTrackerBlock(BaseBlock):
 
     def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
         out = []
-        containers = soup.select(
-            "article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]"
-        )
+        containers = soup.select("article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]")
         for a in containers:
             href = a.get("href")
             if not href:
@@ -7359,36 +7245,24 @@ class LinkTrackerBlock(BaseBlock):
         return collected[:per_site_cap]
 
     # ------------------------------------------------------------------ #
-    # Playwright shared context manager (unchanged)
+    # Playwright shared context manager
     # ------------------------------------------------------------------ #
     async def _open_playwright_context(
-            self,
-            ua: str,
-            block_resources: bool,
-            blocked_resource_types: set[str],
-            block_domains: bool,
-            blocked_domains: set[str],
-            log: List[str],
-            *,
-            use_camoufox: bool = False,
-            camoufox_options: Optional[Dict[str, Any]] = None,
-
-            # NEW:
-            pw_launch_args: Optional[List[str]] = None,
-            pw_headless: bool = True,
-            pw_channel: Optional[str] = None,
-            pw_proxy: Optional[Dict[str, Any]] = None,
+        self,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: set[str],
+        block_domains: bool,
+        blocked_domains: set[str],
+        log: List[str],
+        *,
+        use_camoufox: bool = False,
+        camoufox_options: Optional[Dict[str, Any]] = None,
+        pw_launch_args: Optional[List[str]] = None,
+        pw_headless: bool = True,
+        pw_channel: Optional[str] = None,
+        pw_proxy: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Open a shared Playwright/Camoufox browser context.
-
-        Returns (p_handle, browser, context) where:
-          - For plain Playwright:
-              p_handle = async_playwright() instance
-          - For Camoufox:
-              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
-        """
-        # ---- small helper for blocked domains ----
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
             for bd in blocked_domains:
@@ -7399,13 +7273,11 @@ class LinkTrackerBlock(BaseBlock):
                     return True
             return False
 
-        # ---- Camoufox path ----
         if use_camoufox:
             if AsyncCamoufox is None:
                 log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
             else:
                 try:
-                    # Default Camoufox launch opts; you can tweak these
                     options = {
                         "headless": True,
                         "block_images": block_resources,
@@ -7416,12 +7288,10 @@ class LinkTrackerBlock(BaseBlock):
                     if camoufox_options:
                         options.update(camoufox_options)
 
-                    # Async context manager: we keep the CM instance as p_handle
                     cf_cm = AsyncCamoufox(**options)
-                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
+                    browser = await cf_cm.__aenter__()
                     context = await browser.new_context(user_agent=ua)
 
-                    # Route blocking is exactly like Playwright Firefox
                     if block_resources or block_domains:
                         async def route_blocker(route, request):
                             rtype = (request.resource_type or "").lower()
@@ -7444,11 +7314,9 @@ class LinkTrackerBlock(BaseBlock):
 
                     log.append("[PlaywrightCtx] Camoufox context ready.")
                     return cf_cm, browser, context
-
                 except Exception as e:
                     log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
 
-        # ---- Standard Playwright (Chromium) path ----
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -7472,7 +7340,7 @@ class LinkTrackerBlock(BaseBlock):
             "--disable-renderer-backgrounding",
             "--metrics-recording-only",
             "--mute-audio",
-            "--js-flags=--max_old_space_size=512"
+            "--js-flags=--max_old_space_size=2048",
         ]
 
         def _merge_args(*arg_lists: list[str]) -> list[str]:
@@ -7484,33 +7352,7 @@ class LinkTrackerBlock(BaseBlock):
                         seen.add(a)
                         out.append(a)
             return out
-        DEFAULT_CHROMIUM_ARGS = [
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-default-apps",
-            "--disable-component-update",
-            "--disable-sync",
-            "--disable-notifications",
-            "--disable-popup-blocking",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--metrics-recording-only",
-            "--mute-audio",
-            "--js-flags=--max_old_space_size=512"
-        ]
 
-        def _merge_args(*arg_lists: list[str]) -> list[str]:
-            seen = set()
-            out: list[str] = []
-            for lst in arg_lists:
-                for a in lst:
-                    if a and a not in seen:
-                        seen.add(a)
-                        out.append(a)
-            return out
         launch_opts = {
             "headless": pw_headless,
             "args": _merge_args(DEFAULT_CHROMIUM_ARGS, list(pw_launch_args or [])),
@@ -7547,7 +7389,6 @@ class LinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
-        # Close page context
         try:
             if context:
                 close_ctx = getattr(context, "close", None)
@@ -7559,7 +7400,6 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
-        # Close browser
         try:
             if browser:
                 close_browser = getattr(browser, "close", None)
@@ -7571,1770 +7411,106 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
-        # Close handle:
-        #   - Playwright: p.stop()
-        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
                 stop = getattr(p, "stop", None)
-
-                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
-
                 else:
-                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
-
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
+
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
-        return await asyncio.wait_for(self.network_sniffer.sniff(
-            context, page_url,
+        return await asyncio.wait_for(
+            self.network_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+                extensions=extensions,
+            ),
             timeout=timeout,
-            log=log,
-            extensions=extensions,
-        ),timeout=25)
+        )
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
-        return await asyncio.wait_for(self.js_sniffer.sniff(
-            context,
-            page_url,
+        return await asyncio.wait_for(
+            self.js_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+                extensions=extensions,
+            ),
             timeout=timeout,
-            log=log,
-            extensions=extensions,
-        ),timeout=25)
+        )
+
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(self.runtime_sniffer.sniff(
-            context,
-            page_url,
+        return await asyncio.wait_for(
+            self.runtime_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
             timeout=timeout,
-            log=log,
-        ),timeout=25)
+        )
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(self.react_sniffer.sniff(
-            context,
-            page_url,
+        return await asyncio.wait_for(
+            self.react_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
             timeout=timeout,
-            log=log,
-        ),timeout=25)
+        )
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(self.database_sniffer.sniff(
-            context,
-            page_url,
+        return await asyncio.wait_for(
+            self.database_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
             timeout=timeout,
-            log=log,
-        ),timeout=25)
+        )
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(self.interaction_sniffer.sniff(
-            context,
-            page_url,
+        return await asyncio.wait_for(
+            self.interaction_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
             timeout=timeout,
-            log=log
-        ),timeout=25)
-    # ------------------------------------------------------------------ #
-    # Main execution (Async)
-    # ------------------------------------------------------------------ #
-    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        # --------- Natural ChatBlock-style parsing of context / lexicon ---------
-        text = str(payload or "")
-
-        inline_ctx: str = ""
-        inline_lex: List[str] = []
-
-        # Last [context] block
-        try:
-            inline_ctx = text.rsplit("[context]\n", 1)[1]
-        except Exception:
-            inline_ctx = ""
-
-        # Last [lexicon] block (up to the next [tag)
-        try:
-            lex_part = text.rsplit("[lexicon]\n", 1)[1]
-            lex_part = lex_part.split("\n[", 1)[0]
-            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
-        except Exception:
-            inline_lex = []
-
-        # Core text = everything before the blocks
-        core = text
-        if inline_ctx:
-            core = core.rsplit("[context]\n", 1)[0]
-        if inline_lex:
-            core = core.rsplit("[lexicon]\n", 1)[0]
-        core = core.strip()
-
-        query_raw = str(params.get("query", "") or str(payload or "")).strip()
-        subpipeline = params.get("subpipeline", None)
-
-        # --------- Extract URL seeds from context + lexicon (if present) ---------
-        context_urls: List[str] = []
-        if inline_ctx:
-            ctx_slice = inline_ctx[:20000]   # sanity cap
-            for m in self._URL_RE.finditer(ctx_slice):
-                context_urls.append(m.group(0))
-
-        lexicon_url_seeds: List[str] = []
-        non_url_lex_terms: List[str] = []
-        for term in inline_lex:
-            t = term.strip()
-            if not t:
-                continue
-            # If it looks like a URL, treat it as URL seed; otherwise as a keyword term
-            if self._URL_RE.match(t):
-                lexicon_url_seeds.append(t)
-            else:
-                non_url_lex_terms.append(t)
-
-        use_camoufox = bool(params.get("use_camoufox", False))
-        camoufox_options = params.get("camoufox_options") or {}
-        if not isinstance(camoufox_options, dict):
-            camoufox_options = {}
-        camoufox_options.update({"i_know_what_im_doing": True})
-        # ------------------- DB setup ------------------- #
-        use_database = bool(params.get("use_database", False))
-        db_path = params.get("db_path", "link_corpus.db")
-        if use_database:
-            self._initialize_database(db_path, logger=getattr(self, "logger", None))
-
-        store = self.store  # local alias (may be None)
-
-        # ----------------- Subpipeline ------------------ #
-        pipeline_result: Any = query_raw
-        pipeline_queries: List[str] = []
-        pipeline_urls: List[str] = []
-
-        if subpipeline:
-            subpipe_out: Any = self.run_sub_pipeline(
-                initial_value=query_raw,
-                pipeline_param_name="subpipeline",
-                parent_params=params,
-                collect=True,
-            )
-
-            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
-                pipeline_result = subpipe_out.get("final")
-                pipeline_queries = list(subpipe_out.get("queries") or [])
-                pipeline_urls = list(subpipe_out.get("urls") or [])
-            else:
-                pipeline_result = subpipe_out
-        # Naturally merge URL seeds from [context] and [lexicon] into pipeline URLs
-        extra_seed_urls: List[str] = []
-        if context_urls:
-            extra_seed_urls.extend(context_urls)
-        if lexicon_url_seeds:
-            extra_seed_urls.extend(lexicon_url_seeds)
-
-        if extra_seed_urls:
-            if not pipeline_urls:
-                pipeline_urls = []
-            pipeline_urls.extend(extra_seed_urls)
-
-        # =========================================================================
-        # <--- NEW: Memory Sources Ingestion (SocketPipe Bridge)
-        # =========================================================================
-        memory_sources_raw = str(params.get("memory_sources", "")).strip()
-
-        if memory_sources_raw:
-            try:
-                mem_data = Memory.load()
-                # Split "socketpipe_links, socketpipe_domains" into keys
-                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
-
-                for key in keys_to_read:
-                    data = mem_data.get(key)
-                    if not data:
-                        continue
-
-                    # Handle lists (standard SocketPipe output) or single items
-                    items = data if isinstance(data, list) else [data]
-
-                    for item in items:
-                        candidate = None
-
-                        # 1. Extract string from Dict or raw String
-                        if isinstance(item, dict):
-                            # Try standard SocketPipe keys
-                            candidate = item.get("url") or item.get("domain") or item.get("text")
-                        elif isinstance(item, (str, int, float)):
-                            candidate = str(item)
-
-                        if not candidate:
-                            continue
-
-                        cand_str = str(candidate).strip()
-                        if not cand_str:
-                            continue
-
-                        # 2. CLASSIFY: URL vs Keyword
-
-                        # A) It's definitely a URL (http/https)
-                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
-                            pipeline_urls.append(cand_str)
-
-                        # B) It looks like a domain (has dot, no spaces) -> Treat as Seed URL
-                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
-                            # Prepend protocol to make it actionable
-                            pipeline_urls.append(f"https://{cand_str}")
-
-                        # C) It's just text -> Treat as Lexicon Keyword
-                        else:
-                            # Adds to list used for relevancy scoring
-                            non_url_lex_terms.append(cand_str)
-
-            except Exception as e:
-                # Log but don't crash
-                msg = f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}"
-                print(msg)
-        # ------------------- Config --------------------- #
-        mode = str(params.get("mode", "docs")).lower()
-        scan_limit = int(params.get("scan_limit", 5))
-        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
-
-        timeout = float(params.get("timeout", 5.0))
-        verify_links = bool(params.get("verify", True))
-        engine = str(params.get("engine", "duckduckgo")).lower()
-
-        use_body = bool(params.get("use_body", False))
-        use_js = bool(params.get("use_js", False))
-        return_all_js_links = bool(params.get("return_all_js_links", False))
-        max_links_per_page = int(params.get("max_links_per_page", 500))
-        search_results_cap = int(params.get("search_results_cap", 256))
-
-        search_page_limit = int(params.get("search_page_limit", 1))
-        search_per_page = int(params.get("search_per_page", 50))
-
-        use_network_sniff = bool(params.get("use_network_sniff", False))
-        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
-
-        # NEW: runtime sniffer toggles
-        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
-        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
-        use_react_sniff = bool(params.get("use_react_sniff", False))
-        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
-
-        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
-        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
-
-        use_database_sniff = bool(params.get("use_database_sniff", False))
-        return_database_sniff_hits = bool(
-            params.get("return_database_sniff_hits", False)
         )
 
-        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
-        min_term_overlap = max(1, min_term_overlap_raw)
-
-        custom_ext = str(params.get("extensions", "")).split(",")
-        keywords_in_url = str(params.get("url_keywords", "")).split(",")
-        site_require_raw = str(params.get("site_require", "")).split(",")
-        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
-        max_depth = max(0, int(params.get("max_depth", 0)))
-
-        # HTTP/TLS config for HTTPSSubmanager
-        http_retries = int(params.get("http_retries", 2))
-        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
-        http_verify_tls = bool(params.get("http_verify_tls", True))
-        http_ca_bundle = params.get("http_ca_bundle", None)
-
-        db_allow_rescan = bool(params.get("db_allow_rescan", False))
-
-        # PW blocking params
-        block_resources = bool(params.get("block_resources", False))
-        blocked_resource_types = {
-            t.strip().lower()
-            for t in str(params.get("blocked_resource_types", "")).split(",")
-            if t.strip()
-        } or {"image", "stylesheet", "font"}
-
-        block_domains = bool(params.get("block_domains", True))
-        user_blocked_domains = {
-            d.strip().lower()
-            for d in str(params.get("blocked_domains", "")).split(",")
-            if d.strip()
-        }
-
-        default_blocked_domains = {
-            "google-analytics.com", "googletagmanager.com", "doubleclick.net",
-            "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
-            "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
-            "cloudflareinsights.com", "stats.g.doubleclick.net",
-            "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
-        }
-
-        blocked_domains: set[str] = set()
-        if block_domains:
-            blocked_domains = default_blocked_domains.union(user_blocked_domains)
-
-        pw_launch_args = params.get("pw_launch_args") or []
-        if isinstance(pw_launch_args, str):
-            # allow comma-separated string
-            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
-        if not isinstance(pw_launch_args, list):
-            pw_launch_args = []
-
-        pw_headless = bool(params.get("pw_headless", True))
-        pw_channel = params.get("pw_channel", None)  # e.g. "chrome"
-        pw_proxy = params.get("pw_proxy", None)  # e.g. {"server":"http://127.0.0.1:8080"}
-
-        # ------------------- Targets -------------------- #
-        targets: set[str] = set()
-        if mode == "media":
-            targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
-        elif mode == "pictures":
-            targets.update([
-                ".jpg", ".jpeg", ".png", ".gif", ".webp",
-                ".bmp", ".tiff", ".tif",
-                ".heic", ".heif",
-                ".avif", ".svg"
-            ])
-        elif mode == "docs":
-            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
-        elif mode == "archives":
-            targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
-
-        for e in custom_ext:
-            e = e.strip()
-            if not e:
-                continue
-            if not e.startswith("."):
-                e = "." + e
-            targets.add(e.lower())
-
-        if not targets:
-            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
-
-        # ------------------- Keywords ------------------- #
-        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
-        strict_keywords = bool(params.get("strict_keywords", False))
-
-        if query_raw:
-            if strict_keywords:
-                whole = query_raw.lower().strip()
-                if whole and whole not in keywords:
-                    keywords.append(whole)
-            else:
-                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
-                    if qt not in keywords:
-                        keywords.append(qt)
-        # Add non-URL lexicon terms as natural keyword seasoning
-        for term in non_url_lex_terms:
-            lt = term.lower()
-            if lt and lt not in keywords:
-                keywords.append(lt)
-        # -------------------- Helpers ------------------- #
-        def _clean_domain(u: str) -> str:
-            try:
-                return urlparse(u).netloc.lower().split(":")[0]
-            except Exception:
-                return ""
-
-        def _allowed_by_required_sites(u: str) -> bool:
-            if not required_sites:
-                return True
-            d = _clean_domain(u)
-            return any(req in d for req in required_sites)
-
-        def _term_overlap_ok(haystack: str) -> bool:
-            if not keywords:
-                return True
-            h = haystack.lower()
-            hits = 0
-            for k in keywords:
-                if k and k in h:
-                    hits += 1
-                    if hits >= min_term_overlap:
-                        return True
-            return False
-
-        def _clean_path(u: str) -> str:
-            try:
-                return urlparse(u).path.lower()
-            except Exception:
-                return ""
-
-        def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
-            sq = q.strip()
-            site_clauses = []
-            for raw in required_sites or []:
-                s = (raw or "").strip().lower()
-                if not s:
-                    continue
-                if "://" in s:
-                    s = s.split("://", 1)[1]
-                s = s.split("/", 1)[0].lstrip(".")
-                if s:
-                    site_clauses.append(f"site:{s}")
-
-            if site_clauses:
-                sites_expr = " OR ".join(site_clauses)
-                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
-
-            q_lower = sq.lower()
-            if mode == "media":
-                if not any(x in q_lower for x in ["mp3", "flac", "m4a", "ogg"]):
-                    sq = f"{sq} (mp3 OR flac OR m4a OR ogg)".strip()
-            elif mode == "docs":
-                if "filetype:pdf" not in q_lower:
-                    sq = f"{sq} filetype:pdf".strip()
-            return sq
-
-        def _is_search_url(u: str) -> bool:
-            try:
-                pu = urlparse(u)
-                path = (pu.path or "").lower()
-                q = (pu.query or "").lower()
-                if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
-                    return True
-                if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
-                    return True
-                return False
-            except Exception:
-                return False
-
-        def _dedupe(seq: List[str]) -> List[str]:
-            seen = set()
-            out = []
-            for s in seq:
-                if s not in seen:
-                    seen.add(s)
-                    out.append(s)
-            return out
-
-        # -------------------- Triage -------------------- #
-        candidate_pages: List[str] = []
-        direct_asset_urls: List[str] = []
-        queries_to_run: List[str] = []
-        skip_search_engine = False
-
-        if pipeline_urls:
-            skip_search_engine = False
-            unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
-
-            for u in unique_urls:
-                if not _allowed_by_required_sites(u):
-                    continue
-                path = _clean_path(u)
-
-                if self._is_mega_link(u):
-                    direct_asset_urls.append(u)
-                    continue
-
-                if any(path.endswith(ext) for ext in targets):
-                    if _term_overlap_ok(u):
-                        direct_asset_urls.append(u)
-                    continue
-
-                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                    continue
-
-                candidate_pages.append(u)
-
-            candidate_pages = candidate_pages[:max_pages_total]
-
-        if (not skip_search_engine) and pipeline_queries:
-            for qv in pipeline_queries:
-                qv_s = str(qv).strip()
-                if qv_s:
-                    queries_to_run.append(qv_s)
-
-        if not pipeline_urls and not pipeline_queries:
-            if isinstance(pipeline_result, list) and pipeline_result:
-                for qv in pipeline_result:
-                    qv_s = str(qv).strip()
-                    if qv_s:
-                        queries_to_run.append(qv_s)
-            else:
-                base_q: Optional[str] = None
-                if isinstance(pipeline_result, str) and pipeline_result.strip():
-                    base_q = pipeline_result.strip()
-                elif query_raw:
-                    base_q = query_raw
-                if base_q:
-                    queries_to_run.append(base_q)
-
-        if not queries_to_run and query_raw and not skip_search_engine:
-            queries_to_run = [query_raw]
-
-        queries_to_run = _dedupe(queries_to_run)
-        query = queries_to_run[0] if queries_to_run else query_raw
-
-        # ---------------- Search discovery --------------- #
-        explicit_site_seeds: set[str] = set()
-        synthetic_search_seeds: set[str] = set()
-
-        if not skip_search_engine and queries_to_run:
-            ua_search = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-            seen_search_urls: set[str] = set()
-
-            # -------- Engine: database (Store-backed) -------- #
-            if engine == "database":
-                if not use_database or not store:
-                    print("[LinkTracker][db] engine=database requires use_database=True.")
-                else:
-                    print("[LinkTracker] Running Advanced Database Intelligence...")
-
-                    db_seed_limit = int(params.get("db_seed_limit", 250))
-                    db_seed_max_age_days = params.get("db_seed_max_age_days", None)
-
-                    db_assets = store.fetch_db_seed_assets(
-                            query=query,                        # <-- your chosen query string
-                            limit=db_seed_limit * 2,
-                            extra_keywords=None,                # or keywords if you want, but query is primary
-                            required_sites=required_sites,
-                            max_age_days=db_seed_max_age_days,
-                            min_term_overlap=min_term_overlap,  # reuse your block param
-                        )
-
-                    proven_urls = [row["url"] for row in db_assets if row.get("url")]
-                    predicted_urls = self._predict_next_in_sequence(proven_urls)
-                    if predicted_urls:
-                        filtered_predicted: list[str] = []
-                        for pu in predicted_urls:
-                            ppath = _clean_path(pu)
-
-                            # allow MEGA always
-                            if self._is_mega_link(pu):
-                                filtered_predicted.append(pu)
-                                continue
-
-                            # hard-block known junk
-                            if any(ppath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                                continue
-
-                            # only keep if it matches your target extensions
-                            if any(ppath.endswith(ext) for ext in targets):
-                                filtered_predicted.append(pu)
-
-                        if filtered_predicted:
-                            print(f"[db] Generated {len(filtered_predicted)} predictive sequence URLs (filtered).")
-                            direct_asset_urls.extend(filtered_predicted)
-
-                    proven_hubs = store.fetch_proven_hubs(required_sites, min_hits=1)
-                    if proven_hubs:
-                        print(f"[db] identified {len(proven_hubs)} high-yield hubs for re-crawling.")
-                        candidate_pages.extend(proven_hubs)
-
-                    cand_from_db, direct_from_db = store.seed_pages_from_database(
-                        db_assets=db_assets,
-                        targets=targets,
-                        max_pages_total=max_pages_total,
-                        required_sites=required_sites,
-                        keywords=keywords,
-                        min_term_overlap=min_term_overlap,
-                        query_text=query,
-                    )
-
-                    candidate_pages.extend(cand_from_db)
-                    direct_asset_urls.extend(direct_from_db)
-
-                    candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
-                    direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
-
-                    print(f"[db] Execution Plan: Checking {len(direct_asset_urls)} assets "
-                          f"({len(predicted_urls)} predicted) & Crawling {len(candidate_pages)} hubs.")
-
-            # -------- Engine: sites -------- #
-            if engine == "sites" and required_sites:
-                seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
-                    required_sites=required_sites,
-                    queries=queries_to_run,
-                    probe_cap_per_site=max(8, len(queries_to_run) * 3),
-                    sitemap_cap_per_site=12,
-                    hub_cap_per_site=10,
-                )
-                synthetic_search_seeds = syn_seeds
-                explicit_site_seeds = exp_seeds
-
-                per_site_cap = max(5, max_pages_total // max(1, len(required_sites)))
-                global_seen = set()
-
-                # Use a dedicated HTTPSSubmanager just for the “sites” engine
-                ua_http_sites = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                async with submanagers.HTTPSSubmanager(
-                    user_agent=ua_http_sites,
-                    timeout=timeout,
-                    retries=http_retries,
-                    max_conn_per_host=http_max_conn_per_host,
-                    verify=http_verify_tls,
-                    ca_bundle=http_ca_bundle,
-                ) as http_sites:
-
-                    for site in required_sites:
-                        root = f"https://{site.strip().lstrip('.')}".rstrip("/") + "/"
-                        host = urlparse(root).netloc.lower()
-
-                        # --- robots.txt -> sitemap URLs ---
-                        robots_url = root + "robots.txt"
-                        try:
-                            robots_txt = await http_sites.get_text(robots_url)
-                        except Exception:
-                            robots_txt = ""
-                        sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
-
-                        if not sm_urls:
-                            sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:8]
-
-                        # --- Crawl sitemaps for good candidate pages ---
-                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
-                            http=http_sites,
-                            root=root,
-                            sm_urls=sm_urls,
-                            keywords=keywords,
-                            targets=targets,
-                            per_site_cap=per_site_cap,
-                            global_seen=global_seen,
-                        )
-
-                        # --- Expand from internal “search/hub” pages ---
-                        hub_like = [u for u in seed_pages if site in u and _is_search_url(u)]
-                        expanded_from_hubs: list[str] = []
-
-                        for hub in hub_like[:3]:
-                            try:
-                                html_hub = await http_sites.get_text(hub)
-                                soup = BeautifulSoup(html_hub or "", "html.parser")
-
-                                expanded_from_hubs.extend(
-                                    self._extract_internal_result_links(soup, hub, host)
-                                )
-
-                                for nxt in self._extract_next_page_links(soup, hub):
-                                    html_nxt = await http_sites.get_text(nxt)
-                                    soup_nxt = BeautifulSoup(html_nxt or "", "html.parser")
-                                    expanded_from_hubs.extend(
-                                        self._extract_internal_result_links(soup_nxt, nxt, host)
-                                    )
-                            except Exception:
-                                # ignore hub failures; they’re just bonuses
-                                pass
-
-                        expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
-                        expanded_from_hubs.sort(
-                            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
-                        )
-                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
-
-                        merged = list(
-                            dict.fromkeys(
-                                [root]
-                                + best_from_sitemaps
-                                + expanded_from_hubs
-                                + [u for u in seed_pages if site in u]
-                            )
-                        )
-                        merged.sort(
-                            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
-                        )
-
-                        for u in merged:
-                            if len(candidate_pages) >= max_pages_total:
-                                break
-                            if _allowed_by_required_sites(u) and (not keywords or _term_overlap_ok(u)):
-                                candidate_pages.append(u)
-
-                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
-
-            # -------- Engine: duckduckgo -------- #
-            elif engine == "duckduckgo":
-                for qv in queries_to_run:
-                    sq = _augment_search_query(qv, mode, required_sites)
-                    try:
-                        urls = await self._search_duckduckgo(
-                            sq,
-                            max_results=search_results_cap,
-                            ua=ua_search,
-                            timeout=timeout,
-                            page_limit=search_page_limit,
-                            per_page=search_per_page,
-                        )
-                    except Exception as e:
-                        print(f"[search][ddg] error for {sq!r}: {e}")
-                        urls = []
-
-                    for u in urls:
-                        if len(candidate_pages) >= max_pages_total:
-                            break
-                        if not u or u in seen_search_urls:
-                            continue
-                        if not _allowed_by_required_sites(u):
-                            continue
-                        candidate_pages.append(u)
-                        seen_search_urls.add(u)
-
-            # -------- Engine: google_cse -------- #
-            elif engine == "google_cse":
-                for qv in queries_to_run:
-                    sq = _augment_search_query(qv, mode, required_sites)
-                    try:
-                        urls = await self._search_google_cse(
-                            sq,
-                            n=search_results_cap,
-                            timeout=timeout,
-                            page_limit=search_page_limit,
-                        )
-                    except Exception as e:
-                        print(f"[search][cse] error for {sq!r}: {e}")
-                        urls = []
-
-                    for u in urls:
-                        if len(candidate_pages) >= max_pages_total:
-                            break
-                        if not u or u in seen_search_urls:
-                            continue
-                        if not _allowed_by_required_sites(u):
-                            continue
-                        candidate_pages.append(u)
-                        seen_search_urls.add(u)
-            # -------- Engine: searxng -------- #
-            elif engine == "searxng":
-                searxng_url = params.get("searxng_url") or None
-                for qv in queries_to_run:
-                    sq = _augment_search_query(qv, mode, required_sites)
-                    try:
-                        urls = await self._search_searxng(
-                            sq,
-                            max_results=search_results_cap,
-                            timeout=timeout,
-                            base_url=searxng_url,
-                            page_limit=search_page_limit,
-                        )
-                    except Exception as e:
-                        print(f"[search][searxng] error for {sq!r}: {e}")
-                        urls = []
-
-                    for u in urls:
-                        if len(candidate_pages) >= max_pages_total:
-                            break
-                        if not u or u in seen_search_urls:
-                            continue
-                        if not _allowed_by_required_sites(u):
-                            continue
-                        candidate_pages.append(u)
-                        seen_search_urls.add(u)
-        # ---------------- Crawl state ------------------ #
-        found_assets: List[Dict[str, Any]] = []
-        seen_asset_urls: set[str] = set()
-        visited_pages: set[str] = set()
-        inflight_pages: set[str] = set()
-
-        log: List[str] = []
-        all_js_links: List[Dict[str, str]] = []
-        all_network_links: List[Dict[str, str]] = []
-        all_runtime_hits: List[Dict[str, Any]] = []
-        all_react_hits: List[Dict[str, Any]] = []  # [PATCH] New list
-        all_database_hits: List[Dict[str, Any]] = []
-        all_interaction_hits: List[Dict[str, Any]] = []
-        # choose UA for HTTP engine
-        ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-
-        # HTTPSSubmanager handles all HTTP(S) GET/HEAD for this run
-        async with submanagers.HTTPSSubmanager(
-            user_agent=ua_http,
-            timeout=timeout,
-            retries=http_retries,
-            max_conn_per_host=http_max_conn_per_host,
-            verify=http_verify_tls,
-            ca_bundle=http_ca_bundle,
-        ) as http:
-
-            # ---------------- Direct assets ---------------- #
-            if direct_asset_urls:
-                for u in direct_asset_urls:
-                    upath = _clean_path(u)
-
-                    # [PATCH] never treat ignored extensions as assets
-                    if not self._is_mega_link(u):
-                        if any(upath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                            continue
-                        # [PATCH] never treat non-target extensions as assets
-                        if targets and not any(upath.endswith(ext) for ext in targets):
-                            continue
-
-                    if use_database and store and store.asset_exists(u):
-                        log.append(f"Skipping {u} (already in database)")
-                        continue
-                    if u in seen_asset_urls:
-                        continue
-                    seen_asset_urls.add(u)
-
-                    status = "unverified"
-                    size = "?"
-                    if verify_links:
-                        try:
-                            h_status, headers = await http.head(u)
-                            if h_status == 200:
-                                status = "200 OK"
-                                cl = headers.get("Content-Length")
-                                if cl:
-                                    try:
-                                        size = f"{int(cl) // 1024} KB"
-                                    except ValueError:
-                                        size = "?"
-                            else:
-                                status = f"Dead ({h_status})"
-                        except Exception:
-                            status = "Timeout/Error"
-
-                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                        filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
-                        asset = {
-                            "text": filename[:100],
-                            "url": u,
-                            "source": "<urls>",
-                            "size": size,
-                            "status": status,
-                        }
-                        found_assets.append(asset)
-                        if use_database and store:
-                            store.upsert_asset(asset)
-
-            def _should_persist_page(u: str) -> bool:
-                if engine != "sites":
-                    return True
-                if u in explicit_site_seeds or u in synthetic_search_seeds:
-                    return False
-                if _is_search_url(u):
-                    return False
-                return True
-
-            # --- Shared Playwright context, if needed --- #
-            pw_needed = (
-                    use_js or
-                    use_network_sniff or
-                    use_runtime_sniff or
-                    use_react_sniff or
-                    use_database_sniff or
-                    use_interaction_sniff
-            )
-            pw_p = pw_browser = pw_context = None
-            try:
-                if pw_needed:
-                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                        ua=ua_pw,
-                        block_resources=block_resources,
-                        blocked_resource_types=blocked_resource_types,
-                        block_domains=block_domains,
-                        blocked_domains=blocked_domains,
-                        log=log,
-                        use_camoufox=use_camoufox,
-                        camoufox_options=camoufox_options,
-                        pw_launch_args=pw_launch_args,  # NEW
-                        pw_headless=pw_headless,  # NEW
-                        pw_channel=pw_channel,  # NEW
-                        pw_proxy=pw_proxy,  # NEW
-                    )
-            except:
-                # ALWAYS close Camoufox/Playwright if we opened it
-                if pw_needed and (pw_p or pw_browser or pw_context):
-                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
-            async def _process_page(
-                page_url: str,
-                depth: int,
-                http: submanagers.HTTPSSubmanager,
-            ) -> Dict[str, Any]:
-                local_log: List[str] = []
-                local_js_links: List[Dict[str, str]] = []
-                local_network_links: List[Dict[str, str]] = []
-                local_runtime_hits: List[Dict[str, Any]] = []  # NEW
-                local_assets: List[Dict[str, Any]] = []
-                local_react_hits: List[Dict[str, Any]] = []
-                local_database_hits: List[Dict[str, Any]] = []
-                local_interaction_hits: List[Dict[str, Any]] = []
-                next_pages: List[str] = []
-                self.network_sniffer.http = http
-                try:
-                    links_on_page: List[Dict[str, str]] = []
-                    html = ""
-
-                    sniff_items: List[Dict[str, str]] = []
-                    for si in sniff_items:
-                        url_hit = si.get("url", "")
-                        if not url_hit:
-                            continue
-                        links_on_page.append({
-                            "url": url_hit,
-                            "text": si.get("text", ""),
-                            "tag": si.get("tag", "network_sniff"),
-                        })
-                    sniff_parent_pages: List[str] = []
-
-                    # 1) Network sniff (shared PW)
-                    if use_network_sniff and pw_context:
-                        sniff_html = ""
-                        sniff_items = []
-                        sniff_json = None
-
-                        sniff_result = await self._pw_fetch_with_sniff(
-                            pw_context, page_url, timeout, local_log, targets
-                        )
-
-                        # Backwards-compatible: accept (html, items) or (html, items, json_hits)
-                        if isinstance(sniff_result, tuple):
-                            if len(sniff_result) == 3:
-                                sniff_html, sniff_items, sniff_json = sniff_result
-                            elif len(sniff_result) == 2:
-                                sniff_html, sniff_items = sniff_result
-                            elif len(sniff_result) == 1:
-                                sniff_html = sniff_result[0]
-                        else:
-                            # e.g. if you ever change sniff() to return a dict
-                            sniff_html = sniff_result
-
-                        html = sniff_html or html
-
-                        # Archive metadata special-casing
-                        if "archive.org/metadata/" in page_url:
-                            try:
-                                meta = json.loads(html) if html.strip().startswith("{") else {}
-                                files = meta.get("files") or []
-                                identifier = (meta.get("metadata") or {}).get("identifier", "")
-                                for f in files:
-                                    name = f.get("name", "")
-                                    if not name:
-                                        continue
-                                    low = name.lower()
-                                    if any(low.endswith(ext) for ext in targets):
-                                        dl = f"https://archive.org/download/{identifier}/{name}"
-                                        links_on_page.append({
-                                            "url": dl,
-                                            "text": name,
-                                            "tag": "archive_file",
-                                        })
-                            except Exception:
-                                # best-effort only
-                                pass
-
-                        # Pull identifiers from sniffed JSON
-                        try:
-                            if sniff_json:
-                                for hit in sniff_json:
-                                    data = hit.get("json") or {}
-                                    docs = (((data.get("response") or {}).get("docs")) or [])
-                                    for d in docs:
-                                        ident = d.get("identifier")
-                                        if ident:
-                                            for u2 in self._archive_ident_to_downloads(ident):
-                                                if _allowed_by_required_sites(u2):
-                                                    links_on_page.append({
-                                                        "url": u2,
-                                                        "text": "[Archive identifier]",
-                                                        "tag": "archive_ident",
-                                                    })
-                        except Exception as e:
-                            local_log.append(f"JSON sniff parse error on {page_url}: {e}")
-
-                        for si in sniff_items:
-                            url_hit = si.get("url", "")
-                            if not url_hit:
-                                continue
-                            local_network_links.append({
-                                "page": page_url,
-                                "url": url_hit,
-                                "text": si.get("text", ""),
-                                "tag": si.get("tag", "network_sniff"),
-                                "size": si.get("size", "?"),
-                            })
-
-                            try:
-                                parsed = urlparse(url_hit)
-                                path = parsed.path or ""
-                                if "/" in path:
-                                    parent_path = path.rsplit("/", 1)[0] + "/"
-                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
-                                    if _allowed_by_required_sites(parent_url):
-                                        sniff_parent_pages.append(parent_url)
-                            except Exception:
-                                pass
-                    if use_database_sniff and pw_context:
-                        try:
-                            db_html, db_hits = await self._pw_fetch_database_hits(
-                                pw_context,
-                                page_url,
-                                timeout,
-                                local_log,
-                            )
-                            # Use this HTML if previous sniffers failed to get it
-                            if db_html and not html:
-                                html = db_html
-
-                            if db_hits:
-                                local_database_hits.extend(db_hits)
-
-                                # Feed content links back into the processing loop
-                                for hit in db_hits:
-                                    if hit.get("kind") == "content_link":
-                                        u = hit.get("url")
-                                        if u:
-                                            # Add to links_on_page.
-                                            # The subsequent loop will check if 'u' ends with a target extension (.pdf, .zip).
-                                            links_on_page.append({
-                                                "url": u,
-                                                "text": "[DB Content]",
-                                                "tag": "db_link"
-                                            })
-
-                                            # Also add to debug links list for visibility
-                                            local_js_links.append({
-                                                "page": page_url,
-                                                "url": u,
-                                                "text": "[DB Content]",
-                                                "tag": "db_link"
-                                            })
-                        except Exception as e:
-                            local_log.append(f"[LinkTracker][DB] Error on {page_url}: {e}")
-                    # 1b) Runtime sniff (WebSockets, perf, storage, media events, etc.)
-                    if use_runtime_sniff and pw_context:
-                        rt_html = ""
-                        rt_hits: list[dict[str, Any]] = []
-
-                        rt_result = await self._pw_fetch_runtime_hits(
-                            pw_context, page_url, timeout, local_log
-                        )
-
-                        # Accept (html, items, hits) or (html, hits)
-                        if isinstance(rt_result, tuple):
-                            if len(rt_result) == 3:
-                                rt_html, _rt_items, rt_hits = rt_result
-                            elif len(rt_result) == 2:
-                                rt_html, rt_hits = rt_result
-                            elif len(rt_result) == 1:
-                                rt_html = rt_result[0]
-                        else:
-                            rt_html = rt_result
-
-                        if rt_html and not html:
-                            html = rt_html
-                        if rt_hits:
-                            local_runtime_hits.extend(rt_hits)
-
-                    # 2) JS render/gather (shared PW)
-                    if use_js and pw_context:
-                        js_html, js_links = await self._pw_fetch_js_links(
-                            pw_context, page_url, timeout, local_log, extensions=targets
-                        )
-                        if js_html:
-                            html = js_html
-                        links_on_page.extend(js_links)
-
-                        if not js_links:
-                            preview = (html or "")[:2000].replace("\n", " ")
-                            local_log.append(f"[debug] JS DOM preview (first 2000 chars): {preview}")
-
-                        for jl in js_links:
-                            local_js_links.append({
-                                "page": page_url,
-                                "url": jl.get("url", ""),
-                                "text": jl.get("text", ""),
-                                "tag": jl.get("tag", ""),
-                            })
-                    if use_react_sniff and pw_context:
-                        try:
-                            r_html, r_hits = await self._pw_fetch_react_hits(
-                                pw_context, page_url, timeout, local_log
-                            )
-                            # Use React-rendered HTML if we don't have one yet
-                            if r_html and not html:
-                                html = r_html
-
-                            if r_hits:
-                                local_react_hits.extend(r_hits)
-
-                                # Treat found React routes as potential next pages for BFS
-                                for rh in r_hits:
-                                    r_url = rh.get("url")
-                                    if not r_url:
-                                        continue
-
-                                    # Verify site scope before adding to frontier
-                                    if _allowed_by_required_sites(r_url):
-                                        if depth < max_depth:
-                                            next_pages.append(r_url)
-                        except Exception as e:
-                            local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
-
-                    if use_interaction_sniff and pw_context:
-                        try:
-                            i_html, i_hits = await self._pw_fetch_interaction_hits(
-                                pw_context, page_url, timeout, local_log
-                            )
-                            # Use interaction HTML if we don't have a snapshot yet
-                            if i_html and not html:
-                                html = i_html
-
-                            if i_hits:
-                                local_interaction_hits.extend(i_hits)
-                        except Exception as e:
-                            local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
-                    # 3) Plain HTML if PW didn't fill html
-                    if not html:
-                        try:
-                            html = await http.get_text(page_url)
-                            if not html:
-                                raise RuntimeError("Empty HTML")
-                        except Exception as e:
-                            local_log.append(f"Error fetching {page_url}: {e}")
-                            if use_database and self.store and _should_persist_page(page_url):
-                                self.store.mark_scan_complete(page_url)
-                            return {
-                                "page": page_url,
-                                "assets": local_assets,
-                                "next_pages": next_pages,
-                                "js_links": local_js_links,
-                                "network_links": local_network_links,
-                                "runtime_hits": local_runtime_hits,
-                                "react_hits": local_react_hits,
-                                "database_hits": local_database_hits,  # [PATCH] Return hits
-                                "interaction_hits": local_interaction_hits,
-                                "log": local_log,
-                            }
-
-                    soup = BeautifulSoup(html or "", "html.parser")
-
-                    page_title = ""
-                    try:
-                        if soup.title and soup.title.string:
-                            page_title = soup.title.string
-                    except Exception:
-                        page_title = ""
-                    if use_body:
-                        body_text = ""
-                        try:
-                            body_text = soup.get_text(strip=True)[:4000]
-                        except Exception:
-                            pass
-
-                        page_haystack = f"{page_title} {page_url} {body_text}"
-                    else:
-                        page_haystack = f"{page_title} {page_url}"
-                    page_has_keywords = _term_overlap_ok(page_haystack)
-
-                    # Plain <a> links
-                    link_count = 0
-                    for a in soup.find_all("a", href=True):
-                        links_on_page.append({
-                            "url": a["href"],
-                            "text": a.get_text(strip=True),
-                            "tag": "a",
-                        })
-                        link_count += 1
-                        if link_count >= max_links_per_page:
-                            break
-
-                    # Scan links for assets
-                    for link in links_on_page:
-                        raw_link = link["url"]
-                        full_url = urljoin(page_url, raw_link)
-                        path = urlparse(full_url).path.lower()
-
-                        is_mega = self._is_mega_link(full_url)
-
-                        if not is_mega and not any(path.endswith(ext) for ext in targets):
-                            continue
-                        if use_database and store and store.asset_exists(full_url):
-                            local_log.append(f"Skipping asset {full_url} (already in database)")
-                            continue
-
-                        clean_url_for_matching = unquote(full_url).lower()
-                        if keywords and not page_has_keywords:
-                            haystack = f"{page_title} {link.get('text', '')} {clean_url_for_matching}".lower()
-                            if not _term_overlap_ok(haystack):
-                                continue
-
-                        if not _allowed_by_required_sites(full_url):
-                            continue
-
-                        status = "unverified"
-                        size = "?"
-                        if verify_links and not is_mega:
-                            try:
-                                h_status, headers = await http.head(full_url)
-                                if h_status == 200:
-                                    status = "200 OK"
-                                    cl = headers.get("Content-Length")
-                                    if cl:
-                                        try:
-                                            size = f"{int(cl) // 1024} KB"
-                                        except ValueError:
-                                            size = "?"
-                                elif h_status is None:
-                                    status = "Timeout/Error"
-                                else:
-                                    status = f"Dead ({h_status})"
-                            except Exception:
-                                status = "Timeout/Error"
-                        elif is_mega:
-                            status = "MEGA link"
-
-                        if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                            display_text = (link.get("text", "") or path.split("/")[-1])[:100]
-                            tag = "mega" if is_mega else "a"
-                            asset = {
-                                "text": display_text or ("[mega link]" if is_mega else "[asset]"),
-                                "url": full_url,
-                                "source": page_url,
-                                "size": size,
-                                "status": status,
-                                "tag": tag,
-                            }
-                            DEBUG_LOGGER.log_message(
-                                f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})")
-
-                            local_assets.append(asset)
-                            if use_database and store:
-                                store.upsert_asset(asset)
-
-                    # Network-sniffed assets (STRICT)
-                    if sniff_items:
-                        for item in sniff_items:
-                            full_url = item.get("url")
-                            if not full_url:
-                                continue
-                            if not _allowed_by_required_sites(full_url):
-                                continue
-                            if use_database and store and store.asset_exists(full_url):
-                                local_log.append(f"Skipping sniffed asset {full_url} (already in database)")
-                                continue
-
-                            is_mega = self._is_mega_link(full_url)
-                            lpath = urlparse(full_url).path.lower()
-
-                            # [PATCH] hard-block obvious junk always
-                            if not is_mega and any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                                continue
-
-                            head_status = None
-                            head_headers: dict[str, str] = {}
-                            ct = ""
-
-                            # One HEAD only (and reuse it for filtering + status/size)
-                            if verify_links and not is_mega:
-                                try:
-                                    head_status, head_headers = await http.head(full_url)
-                                    ct = (head_headers.get("Content-Type") or head_headers.get(
-                                        "content-type") or "").lower()
-                                except Exception:
-                                    head_status, head_headers, ct = None, {}, ""
-
-                            # [PATCH] accept rules:
-                            # - If URL ends with a target ext: accept
-                            # - Else: ONLY accept if HEAD content-type matches the mode (prevents JS/non-audio)
-                            if not is_mega:
-                                has_target_ext = any(lpath.endswith(ext) for ext in targets)
-
-                                if not has_target_ext:
-                                    # If we can't verify, we do NOT accept extensionless sniffed "assets"
-                                    if not verify_links:
-                                        continue
-
-                                    if mode == "media":
-                                        if not ct.startswith("audio/"):
-                                            continue
-                                    elif mode == "pictures":
-                                        if not ct.startswith("image/"):
-                                            continue
-                                    elif mode == "docs":
-                                        if ("pdf" not in ct) and ("epub" not in ct) and ("msword" not in ct) and (
-                                                "officedocument" not in ct):
-                                            continue
-                                    elif mode == "archives":
-                                        if not any(x in ct for x in ["zip", "rar", "7z", "tar", "gzip"]):
-                                            continue
-                                    else:
-                                        continue
-
-                            # Status/size (reuse HEAD results)
-                            status = "sniffed"
-                            size = item.get("size") or "?"
-
-                            if is_mega:
-                                status = "MEGA link"
-                            elif verify_links:
-                                if head_status == 200:
-                                    status = "200 OK"
-                                    cl = head_headers.get("Content-Length") or head_headers.get("content-length")
-                                    if cl:
-                                        try:
-                                            size = f"{int(cl) // 1024} KB"
-                                        except ValueError:
-                                            size = "?"
-                                elif head_status is None:
-                                    status = "Timeout/Error"
-                                else:
-                                    status = f"Dead ({head_status})"
-
-                            if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                                display_text = (item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]")[
-                                    :100]
-                                asset = {
-                                    "text": display_text,
-                                    "url": full_url,
-                                    "source": page_url,
-                                    "size": size,
-                                    "status": status,
-                                }
-
-                                DEBUG_LOGGER.log_message(
-                                    f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
-                                )
-
-                                local_assets.append(asset)
-                                if use_database and store:
-                                    store.upsert_asset(asset)
-
-                    # Next-level pages
-                    if depth < max_depth:
-                        for link in links_on_page:
-                            raw_link = link.get("url") or ""
-                            if not raw_link:
-                                continue
-                            full_url = urljoin(page_url, raw_link)
-                            if not _allowed_by_required_sites(full_url):
-                                continue
-
-                            lpath = urlparse(full_url).path.lower()
-                            if any(lpath.endswith(ext) for ext in targets):
-                                continue
-
-                            if keywords and not page_has_keywords:
-                                haystack = (link.get("text") or "") + " " + full_url
-                                if not _term_overlap_ok(haystack):
-                                    continue
-
-                            if engine == "sites":
-                                if _is_search_url(full_url) and full_url not in explicit_site_seeds:
-                                    continue
-
-                            next_pages.append(full_url)
-
-                    if depth < max_depth and sniff_parent_pages:
-                        for parent_url in sniff_parent_pages:
-                            if _allowed_by_required_sites(parent_url):
-                                next_pages.append(parent_url)
-
-                    if use_database and store and _should_persist_page(page_url):
-                        store.mark_page_scanned(page_url)
-
-                except Exception as e:
-                    local_log.append(f"Error scanning {page_url}: {e}")
-                    if use_database and store and _should_persist_page(page_url):
-                        try:
-                            store.mark_page_scanned(page_url)
-                        except Exception as ee:
-                            local_log.append(f"Error marking page scanned {page_url}: {ee}")
-
-                return {
-                    "page": page_url,
-                    "assets": local_assets,
-                    "next_pages": next_pages,
-                    "js_links": local_js_links,
-                    "network_links": local_network_links,
-                    "runtime_hits": local_runtime_hits,  # NEW
-                    "react_hits": local_react_hits,
-                    "database_hits": local_database_hits,
-                    "interaction_hits": local_interaction_hits,
-                    "log": local_log,
-                }
-
-            # ---------------- BFS frontier ----------------- #
-            frontier: List[str] = []
-            site_buckets = {s: [] for s in required_sites} if required_sites else {}
-
-            for u in candidate_pages:
-                if not _allowed_by_required_sites(u):
-                    continue
-                if required_sites:
-                    d = _clean_domain(u)
-                    for s in required_sites:
-                        if s in d:
-                            site_buckets[s].append(u)
-                            break
-                else:
-                    frontier.append(u)
-
-            if required_sites:
-                per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
-                for s, bucket in site_buckets.items():
-                    frontier.extend(bucket[:per_site_cap])
-
-            # Initial frontier: only unique URLs
-            frontier = list(dict.fromkeys(frontier))
-
-            current_depth = 0
-            pages_scanned = 0  # metric only
-
-            DEBUG_LOGGER.log_message(
-                f"[LinkTracker][BFS] Starting BFS with max_depth={max_depth}, "
-                f"max_pages_total={max_pages_total}, initial_frontier={len(frontier)}"
-            )
-
-            # New: only log the rescan notice once (for information only)
-            logged_rescan_notice = False
-
-            # BFS over depths
-            # NOTE: we no longer gate on pages_scanned < max_pages_total,
-            # and we no longer **skip** pages based on page_scanned().
-            # Ensure frontier is unique and respects the limit initially
-            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
-            current_depth = 0
-            logged_rescan_notice = False
-
-            # --- BFS LOOP START ---
-            # We check pages_scanned against max_pages_total to ensure global termination
-            # --- BFS LOOP START ---
-            while frontier and current_depth <= max_depth:
-
-                DEBUG_LOGGER.log_message(
-                    f"[BFS] --- Starting Depth {current_depth} | "
-                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} | "
-                    f"Scanned: {pages_scanned}/{max_pages_total} ---"
-                )
-
-                # [PATCH] global termination
-                slots_left = max_pages_total - pages_scanned
-                if slots_left <= 0:
-                    DEBUG_LOGGER.log_message("[BFS] Global max_pages_total reached. Stopping.")
-                    break
-
-                batch: List[str] = []
-
-                for u in frontier:
-                    if len(batch) >= slots_left:
-                        break
-                    if u in visited_pages or u in inflight_pages:
-                        continue
-
-                    if use_database and self.store and self.store.page_scanned(u):
-                        if not logged_rescan_notice:
-                            DEBUG_LOGGER.log_message(
-                                "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
-                            )
-                            logged_rescan_notice = True
-
-                    batch.append(u)
-                    inflight_pages.add(u)
-
-                if not batch:
-                    DEBUG_LOGGER.log_message(
-                        f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
-                    )
-                    break
-
-                DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
-
-                results: List[Dict[str, Any]] = []
-
-                if use_camoufox:
-                    for url in batch:
-                        try:
-                            res = await _process_page(url, current_depth, http)
-                            results.append(res)
-                        except Exception as e:
-                            DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
-                        finally:
-                            # allow retry later if it failed
-                            inflight_pages.discard(url)
-                else:
-                    tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
-                    done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
-
-                    for (url, _t), r in zip(tasks, done):
-                        inflight_pages.discard(url)
-
-                        # count attempts toward global cap (prevents infinite loops)
-                        pages_scanned += 1
-
-                        if isinstance(r, Exception):
-                            DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
-                            # do NOT mark visited -> it can be retried if it shows up again
-                            continue
-
-                        visited_pages.add(url)
-                        results.append(r)
-
-                        if pages_scanned >= max_pages_total:
-                            break
-
-                next_frontier_candidates: List[str] = []
-
-                for res in results:
-                    # Aggregate Logs & Links
-                    all_js_links.extend(res.get("js_links", []))
-                    all_network_links.extend(res.get("network_links", []))
-                    all_runtime_hits.extend(res.get("runtime_hits", []))
-                    all_react_hits.extend(res.get("react_hits", []))
-                    all_database_hits.extend(res.get("database_hits", []))
-                    all_interaction_hits.extend(res.get("interaction_hits", []))
-
-                    # Collect Assets
-                    for asset in res.get("assets", []):
-                        a_url = asset.get("url")
-                        if a_url and a_url not in seen_asset_urls:
-                            seen_asset_urls.add(a_url)
-                            found_assets.append(asset)
-
-                    # Collect Next Pages
-                    if current_depth < max_depth:
-                        next_pages = res.get("next_pages", [])
-                        if next_pages:
-                            next_frontier_candidates.extend(next_pages)
-
-                next_frontier = []
-                seen_in_next = set()
-
-                for url in next_frontier_candidates:
-                    if url in visited_pages or url in inflight_pages or url in seen_in_next:
-                        continue
-                    next_frontier.append(url)
-                    seen_in_next.add(url)
-
-                # [PATCH] don’t exceed remaining global capacity
-                remaining = max_pages_total - pages_scanned
-                frontier = next_frontier[:max(0, remaining)]
-
-                DEBUG_LOGGER.log_message(
-                    f"[BFS] Depth {current_depth} complete. "
-                    f"Discovered {len(frontier)} new unique pages for next depth."
-                )
-
-                current_depth += 1
-
-            # Close shared PW
-            if pw_needed:
-                await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
-
-        # ---------------- Output formatting ------------- #
-        from urllib.parse import urlparse as _urlparse
-
-        if not found_assets:
-            base_text = (
-                "### LinkTracker: No specific assets found.\n"
-                f"Scanned {len(candidate_pages)} pages for extensions: {sorted(list(targets))}.\n"
-                f"Required keywords: {keywords}\n"
-                f"Required sites: {required_sites or '[none]'}\n"
-                f"min_term_overlap: {min_term_overlap}\n"
-                f"Engine: {engine}\n"
-            )
-            lines = [base_text]
-
-            if return_all_js_links and all_js_links:
-                lines.append("\n### All JS-Gathered Links (debug)\n")
-                for jl in all_js_links:
-                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
-                    url = jl["url"]
-                    text = jl["text"] or "(no text)"
-                    tag = jl["tag"] or "a"
-                    lines.append(f"- **[{text}]({url})**")
-                    lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
-
-            if return_network_sniff_links and all_network_links:
-                lines.append("\n### All Network-Sniffed Assets (debug)\n")
-                for nl in all_network_links:
-                    host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
-                    url = nl["url"]
-                    text = nl["text"] or "(no text)"
-                    tag = nl.get("tag", "network_sniff")
-                    size = nl.get("size", "?")
-                    lines.append(f"- **[{text}]({url})**")
-                    lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
-            if return_database_sniff_hits and all_database_hits:
-                lines.append("\n### Database / Content Sniff Hits (debug)\n")
-                for dbh in all_database_hits[:100]:
-                    kind = dbh.get("kind")
-                    url = dbh.get("url")
-                    meta = dbh.get("meta") or {}
-
-                    if kind == "content_link":
-                        src = meta.get("source", "?")
-                        lines.append(f"- `db_link` ({src}) **{url}**")
-                    elif kind == "indexeddb_dump":
-                        db_name = meta.get("name", "?")
-                        stores = meta.get("stores", [])
-                        store_str = ", ".join([f"{s['name']}(~{s.get('approx_count')})" for s in stores])
-                        lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
-                    elif kind == "db_config_detected":
-                        name = meta.get("name")
-                        lines.append(f"- `backend_config` **{name}** detected")
-            return "\n".join(lines), {
-                "count": 0,
-                "keywords_used": keywords,
-                "min_term_overlap": min_term_overlap,
-                "engine": engine,
-                "required_sites": required_sites,
-                "js_links": all_js_links,
-                "network_sniff_links": all_network_links,
-                "runtime_hits": all_runtime_hits,
-                "react_hits": all_react_hits,
-                "database_hits": all_database_hits,
-                "interaction_hits": all_interaction_hits,
-                "log": log,
-                "queries_run": queries_to_run,
-            }
-
-        lines = [f"### LinkTracker Found {len(found_assets)} Assets"]
-        lines.append(
-            f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
-            f"Required Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
-            f"Required Sites: {required_sites or '[none]'}_"
-        )
-        lines.append("")
-
-        for asset in found_assets:
-            lines.append(f"- **[{asset['text']}]({asset['url']})**")
-            lines.append(
-                f"  - *Size: {asset.get('size','?')} | Status: {asset.get('status','?')} | "
-                f"Source: {_urlparse(asset.get('source','')).netloc if asset.get('source') else '(unknown)'}*"
-            )
-
-        if return_all_js_links and all_js_links:
-            lines.append("\n### All JS-Gathered Links (debug)\n")
-            for jl in all_js_links:
-                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
-                url = jl["url"]
-                text = jl["text"] or "(no text)"
-                tag = jl["tag"] or "a"
-                lines.append(f"- **[{text}]({url})**")
-                lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
-
-        if return_network_sniff_links and all_network_links:
-            lines.append("\n### All Network-Sniffed Assets (debug)\n")
-            for nl in all_network_links:
-                host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
-                url = nl["url"]
-                text = nl["text"] or "(no text)"
-                tag = nl.get("tag", "network_sniff")
-                size = nl.get("size", "?")
-                lines.append(f"- **[{text}]({url})**")
-                lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
-        if return_react_sniff_hits and all_react_hits:
-            lines.append("\n### React / SPA Hits (debug)\n")
-            for rh in all_react_hits[:100]:
-                url = rh.get("url") or "(no url)"
-                route = rh.get("route") or ""
-                kind = rh.get("kind") or "react_nav"
-                lines.append(f"- `{kind}` **{route}** → {url}")
-        if return_runtime_sniff_hits and all_runtime_hits:
-            lines.append("\n### Runtime Sniff Hits (debug)\n")
-            # Cap output to prevent massive message overflow (e.g. 100 items)
-            for hit in all_runtime_hits[:100]:
-                url = hit.get("url") or "(no url)"
-                payload = hit.get("json") or {}
-
-                # Format a readable description based on the hit type
-                desc_parts = []
-                if "console" in payload:
-                    desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
-                elif "ws_frame" in payload:
-                    desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
-                elif "request_body" in payload:
-                    desc_parts.append("Request Body (JSON)")
-                elif "media_events" in payload:
-                    evts = payload["media_events"]
-                    desc_parts.append(f"Media Events: {len(evts)}")
-                elif "storage" in payload:
-                    desc_parts.append(f"Storage Items: {len(payload['storage'])}")
-                elif "perf_entries" in payload:
-                    desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
-                else:
-                    # Generic fallback for unknown payloads
-                    import json as _json
-                    try:
-                        dump = _json.dumps(payload)
-                        desc_parts.append(f"Data: {dump[:100]}...")
-                    except:
-                        desc_parts.append("Data: (complex object)")
-
-                desc = " | ".join(desc_parts)
-                lines.append(f"- `{desc}` found on **{url}**")
-        if return_interaction_sniff_hits and all_interaction_hits:
-            lines.append("\n### Interaction / CDP Hits (debug)\n")
-            for ih in all_interaction_hits[:100]:
-                kind = ih.get("kind")
-                meta = ih.get("meta") or {}
-                url = ih.get("url")
-
-                if kind == "event_listener":
-                    node = meta.get("nodeName", "UNK")
-                    types = meta.get("types", [])
-                    lines.append(f"- `listener` **{node}** {types} on {url}")
-                elif kind == "form_definition":
-                    ins = meta.get("input_count", 0)
-                    method = meta.get("method", "get")
-                    lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
-                elif kind == "overlay_detected":
-                    cov = meta.get("coverage", "?")
-                    z = meta.get("zIndex", "?")
-                    lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
-                elif kind == "summary":
-                    lc = meta.get("listener_count", 0)
-                    fc = meta.get("form_count", 0)
-                    lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
-        return "\n".join(lines), {
-            "found": len(found_assets),
-            "scanned_pages": len(visited_pages),
-            "assets": found_assets,
-            "keywords_used": keywords,
-            "min_term_overlap": min_term_overlap,
-            "engine": engine,
-            "required_sites": required_sites,
-            "js_links": all_js_links,
-            "network_sniff_links": all_network_links,
-            "runtime_hits": all_runtime_hits,
-            "react_hits": all_react_hits,
-            "database_hits": all_database_hits,
-            "interaction_hits": all_interaction_hits,
-            "log": log,
-            "queries_run": queries_to_run,
-        }
-
     # ------------------------------------------------------------------ #
-    # Predictive sequencing (unchanged)
+    # Required-site seeding helpers
     # ------------------------------------------------------------------ #
-    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
-        generated = set()
-        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
-
-        for u in urls:
-            match = re_seq.search(u)
-            if match:
-                original_num_str = match.group(1)
-                try:
-                    width = len(original_num_str)
-                    val = int(original_num_str)
-                    for i in range(1, 4):
-                        next_val = val + i
-                        next_str = f"{next_val:0{width}d}"
-                        new_url = u[:match.start(1)] + next_str + u[match.end(1):]
-                        generated.add(new_url)
-                except ValueError:
-                    pass
-
-        return list(generated)
-
-    # ------------------------------------------------------------------ #
-    # Sites seeding helpers (unchanged)
-    # ------------------------------------------------------------------ #
-    def _seed_pages_from_required_sites(
+    def _build_required_site_seeds(
         self,
-        required_sites,
-        queries,
-        probe_cap_per_site=5,
-        sitemap_cap_per_site=8,
-        hub_cap_per_site=6,
-    ):
-        out: List[str] = []
+        required_sites: List[str],
+        queries: List[str],
+        *,
+        sitemap_cap_per_site: int = 6,
+        hub_cap_per_site: int = 12,
+        probe_cap_per_site: int = 12,
+    ) -> tuple[list[str], set[str], set[str]]:
+        out: list[str] = []
         synthetic_search_seeds: set[str] = set()
         explicit_site_seeds: set[str] = set()
 
@@ -9356,18 +7532,20 @@ class LinkTrackerBlock(BaseBlock):
         ]
         for s in norm_sites:
             u = s + "/robots.txt"
-            out.append(u); explicit_site_seeds.add(u)
+            out.append(u)
+            explicit_site_seeds.add(u)
             added = 0
             for sm in common_sitemaps:
                 if added >= sitemap_cap_per_site:
                     break
                 u = s + sm
-                out.append(u); explicit_site_seeds.add(u)
+                out.append(u)
+                explicit_site_seeds.add(u)
                 added += 1
 
         hub_paths = [
             "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
-            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search","/search/"
+            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search", "/search/",
         ]
         for s in norm_sites:
             added = 0
@@ -9375,7 +7553,8 @@ class LinkTrackerBlock(BaseBlock):
                 if added >= hub_cap_per_site:
                     break
                 u = s + hp
-                out.append(u); explicit_site_seeds.add(u)
+                out.append(u)
+                explicit_site_seeds.add(u)
                 added += 1
 
         def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
@@ -9384,8 +7563,10 @@ class LinkTrackerBlock(BaseBlock):
                 return [
                     base + f"/search.php?query={enc_query}",
                     base + f"/advancedsearch.php?q={enc_query}",
-                    base + (f"/advancedsearch.php?q={enc_query}"
-                            f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"),
+                    base + (
+                        f"/advancedsearch.php?q={enc_query}"
+                        f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"
+                    ),
                     base + f"/details/{enc_query}",
                     base + f"/browse.php?field=subject&query={enc_query}",
                 ]
@@ -9429,6 +7610,1213 @@ class LinkTrackerBlock(BaseBlock):
         return urls
 
     # ------------------------------------------------------------------ #
+    # Main execution (Async)
+    # ------------------------------------------------------------------ #
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        text = str(payload or "")
+
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        subpipeline = params.get("subpipeline", None)
+
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
+
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
+
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "link_corpus.db")
+        if use_database:
+            self._initialize_database(db_path, logger=getattr(self, "logger", None))
+        store = self.store
+
+        pipeline_result: Any = query_raw
+        pipeline_queries: List[str] = []
+        pipeline_urls: List[str] = []
+
+        if subpipeline:
+            subpipe_out: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+                collect=True,
+            )
+            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
+                pipeline_result = subpipe_out.get("final")
+                pipeline_queries = list(subpipe_out.get("queries") or [])
+                pipeline_urls = list(subpipe_out.get("urls") or [])
+            else:
+                pipeline_result = subpipe_out
+
+        extra_seed_urls: List[str] = []
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
+        if extra_seed_urls:
+            pipeline_urls.extend(extra_seed_urls)
+
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+                    items = data if isinstance(data, list) else [data]
+                    for item in items:
+                        candidate = None
+                        if isinstance(item, dict):
+                            candidate = item.get("url") or item.get("domain") or item.get("text")
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
+                            pipeline_urls.append(cand_str)
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
+                            pipeline_urls.append(f"https://{cand_str}")
+                        else:
+                            non_url_lex_terms.append(cand_str)
+            except Exception as e:
+                print(f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}")
+
+        mode = str(params.get("mode", "docs")).lower()
+        scan_limit = int(params.get("scan_limit", 5))
+        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
+        timeout = float(params.get("timeout", 5.0))
+        verify_links = bool(params.get("verify", True))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
+        use_body = bool(params.get("use_body", False))
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))
+        search_results_cap = int(params.get("search_results_cap", 256))
+        search_page_limit = int(params.get("search_page_limit", 1))
+        search_per_page = int(params.get("search_per_page", 50))
+
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(params.get("return_database_sniff_hits", False))
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+
+        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
+        min_term_overlap = max(1, min(min_term_overlap_raw, 999))
+
+        custom_ext = str(params.get("extensions", "")).split(",")
+        keywords_in_url = str(params.get("url_keywords", "")).split(",")
+        site_require_raw = str(params.get("site_require", "")).split(",")
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        max_depth = max(0, int(params.get("max_depth", 0)))
+
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
+        http_verify_tls = bool(params.get("http_verify_tls", True))
+        http_ca_bundle = params.get("http_ca_bundle", None)
+
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+        _ = db_allow_rescan  # kept for signature parity / future use
+
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+            t.strip().lower()
+            for t in str(params.get("blocked_resource_types", "")).split(",")
+            if t.strip()
+        } or {"image", "stylesheet", "font"}
+
+        block_domains = bool(params.get("block_domains", True))
+        user_blocked_domains = {
+            d.strip().lower()
+            for d in str(params.get("blocked_domains", "")).split(",")
+            if d.strip()
+        }
+
+        default_blocked_domains = {
+            "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+            "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
+            "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
+            "cloudflareinsights.com", "stats.g.doubleclick.net",
+            "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
+        }
+        blocked_domains: set[str] = set()
+        if block_domains:
+            blocked_domains = default_blocked_domains.union(user_blocked_domains)
+
+        pw_launch_args = params.get("pw_launch_args") or []
+        if isinstance(pw_launch_args, str):
+            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
+        if not isinstance(pw_launch_args, list):
+            pw_launch_args = []
+
+        pw_headless = bool(params.get("pw_headless", True))
+        pw_channel = params.get("pw_channel", None)
+        pw_proxy = params.get("pw_proxy", None)
+
+        targets: set[str] = set()
+        if mode == "media":
+            targets.update([
+                ".mp3", ".wav", ".wave", ".flac", ".m4a", ".ogg", ".opus", ".aac",
+                ".weba", ".alac", ".aiff", ".wma", ".oga",
+            ])
+        elif mode == "pictures":
+            targets.update([
+                ".jpg", ".jpeg", ".png", ".gif", ".webp",
+                ".bmp", ".tiff", ".tif", ".heic", ".heif", ".avif", ".svg",
+            ])
+        elif mode == "docs":
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
+        elif mode == "archives":
+            targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
+
+        for e in custom_ext:
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
+
+        if not targets:
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
+
+        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
+        strict_keywords = bool(params.get("strict_keywords", False))
+        allow_audioish_octet_stream = bool(params.get("allow_audioish_octet_stream", True))
+        trust_sniffed_audio_kind = bool(params.get("trust_sniffed_audio_kind", True))
+
+        audio_hint_terms = [
+            "mp3", "wav", "wave", "flac", "m4a", "aac", "ogg", "opus", "weba",
+            "alac", "aiff", "wma", "oga", "audio", "track", "song", "stem",
+            "instrumental", "acapella", "download", "lossless", "320kbps", "1411kbps",
+        ]
+
+        if query_raw:
+            if strict_keywords:
+                whole = query_raw.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
+                    if qt not in keywords:
+                        keywords.append(qt)
+
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
+
+        def _clean_domain(u: str) -> str:
+            try:
+                return urlparse(u).netloc.lower().split(":")[0]
+            except Exception:
+                return ""
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if not required_sites:
+                return True
+            d = _clean_domain(u)
+            return any(req in d for req in required_sites)
+
+        def _term_overlap_ok(haystack: str) -> bool:
+            if not keywords:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in keywords:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_term_overlap:
+                        return True
+            return False
+
+        def _clean_path(u: str) -> str:
+            try:
+                return urlparse(u).path.lower()
+            except Exception:
+                return ""
+
+        def _clean_query(u: str) -> str:
+            try:
+                return urlparse(u).query.lower()
+            except Exception:
+                return ""
+
+        def _content_disposition_filename(headers: Optional[Dict[str, str]]) -> str:
+            if not headers:
+                return ""
+            try:
+                cd = (headers.get("Content-Disposition") or headers.get("content-disposition") or "")
+            except Exception:
+                cd = ""
+            if not cd:
+                return ""
+
+            m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
+            if m:
+                return unquote(m.group(1)).lower()
+
+            m = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
+            if m:
+                return unquote(m.group(1)).lower()
+
+            return unquote(cd).lower()
+
+        def _looks_like_audioish_text(s: str) -> bool:
+            low = unquote(str(s or "")).lower()
+            if not low:
+                return False
+            return any(tok in low for tok in audio_hint_terms)
+
+        def _looks_like_audioish_url(u: str) -> bool:
+            raw = str(u or "")
+            low = unquote(raw).lower()
+            if not low:
+                return False
+
+            path = _clean_path(low)
+            query = _clean_query(low)
+            audio_exts = (
+                ".mp3", ".wav", ".wave", ".flac", ".m4a", ".aac", ".ogg", ".opus",
+                ".weba", ".alac", ".aiff", ".wma", ".oga",
+            )
+
+            if any(path.endswith(ext) for ext in targets):
+                return True
+            if any(path.endswith(ext) for ext in audio_exts):
+                return True
+            if any(tok in low for tok in (
+                "/audio/", "/download/", "/stream/", "/file/",
+                "audio=", "audio_url=", "source=audio",
+                "format=mp3", "format=wav", "format=flac",
+                "mime=audio", "content_type=audio",
+                "response-content-type=audio%2f",
+                "response-content-disposition=", "content-disposition=",
+                "filename=", "filename*=", "attachment", "download=1", "dl=1",
+            )):
+                return True
+            if "filename=" in query or "filename*=" in query:
+                if any(ext in query for ext in audio_exts):
+                    return True
+            if "response-content-disposition=" in query or "content-disposition=" in query:
+                if any(ext in query for ext in audio_exts):
+                    return True
+            return _looks_like_audioish_text(low)
+
+        def _looks_like_audioish_ct(ct: str, headers: Optional[Dict[str, str]] = None) -> bool:
+            c = (ct or "").lower()
+            if not c:
+                return False
+            if c.startswith("audio/"):
+                return True
+            if any(x in c for x in (
+                "audio/mpeg", "audio/mp3",
+                "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
+                "audio/flac", "audio/x-flac",
+                "audio/aac", "audio/mp4",
+                "audio/ogg", "audio/opus", "application/ogg",
+                "audio/webm", "audio/x-m4a",
+            )):
+                return True
+            if allow_audioish_octet_stream and "octet-stream" in c:
+                fname = _content_disposition_filename(headers)
+                if _looks_like_audioish_text(fname):
+                    return True
+            return False
+
+        def _extract_effective_asset_name(u: str, headers: Optional[Dict[str, str]] = None) -> str:
+            low = unquote(str(u or "")).lower()
+            path_name = _clean_path(low).rsplit("/", 1)[-1]
+            if path_name:
+                return path_name
+
+            query = _clean_query(low)
+            for key in ("filename", "file", "download", "attachment", "name"):
+                m = re.search(rf"(?:^|[?&]){key}=([^&#]+)", query, re.IGNORECASE)
+                if m:
+                    try:
+                        return unquote(m.group(1)).lower()
+                    except Exception:
+                        return m.group(1).lower()
+
+            cd_name = _content_disposition_filename(headers)
+            if cd_name:
+                return cd_name
+            return ""
+
+        def _has_target_extension(u: str, headers: Optional[Dict[str, str]] = None) -> bool:
+            name = _extract_effective_asset_name(u, headers=headers)
+            if not name:
+                return False
+            return any(name.endswith(ext) for ext in targets)
+
+        def _is_asset_link_for_mode(u: str, headers: Optional[Dict[str, str]] = None) -> bool:
+            if self._is_mega_link(u):
+                return True
+            return _has_target_extension(u, headers=headers)
+
+        def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
+            sq = q.strip()
+            site_clauses = []
+            for raw in required_sites or []:
+                s = (raw or "").strip().lower()
+                if not s:
+                    continue
+                if "://" in s:
+                    s = s.split("://", 1)[1]
+                s = s.split("/", 1)[0].lstrip(".")
+                if s:
+                    site_clauses.append(f"site:{s}")
+
+            if site_clauses:
+                sites_expr = " OR ".join(site_clauses)
+                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+            q_lower = sq.lower()
+            if mode == "media":
+                if not any(x in q_lower for x in ["mp3", "wav", "flac", "m4a", "ogg", "opus", "aac", "audio"]):
+                    sq = f"{sq} (mp3 OR wav OR flac OR m4a OR ogg OR opus OR aac OR audio)".strip()
+            elif mode == "docs":
+                if "filetype:pdf" not in q_lower:
+                    sq = f"{sq} filetype:pdf".strip()
+            return sq
+
+        def _is_search_url(u: str) -> bool:
+            try:
+                pu = urlparse(u)
+                path = (pu.path or "").lower()
+                q = (pu.query or "").lower()
+                if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
+                    return True
+                if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        def _dedupe(seq: List[str]) -> List[str]:
+            seen = set()
+            out = []
+            for s in seq:
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
+
+        candidate_pages: List[str] = []
+        direct_asset_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine = False
+
+        if pipeline_urls:
+            skip_search_engine = False
+            unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
+            for u in unique_urls:
+                if not _allowed_by_required_sites(u):
+                    continue
+                path = _clean_path(u)
+
+                if _is_asset_link_for_mode(u):
+                    if _term_overlap_ok(u):
+                        direct_asset_urls.append(u)
+                    continue
+
+                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                    continue
+
+                candidate_pages.append(u)
+
+            candidate_pages = candidate_pages[:max_pages_total]
+
+        if (not skip_search_engine) and pipeline_queries:
+            for qv in pipeline_queries:
+                qv_s = str(qv).strip()
+                if qv_s:
+                    queries_to_run.append(qv_s)
+
+        if not queries_to_run and query_raw:
+            queries_to_run.append(query_raw)
+        if not queries_to_run and core:
+            queries_to_run.append(core)
+
+        queries_to_run = [_augment_search_query(q, mode, required_sites) for q in _dedupe(queries_to_run) if q.strip()]
+
+        found_assets: List[Dict[str, Any]] = []
+        found_pages: List[str] = []
+        debug_log: List[str] = []
+        found_js_links: List[Dict[str, Any]] = []
+        found_network_links: List[Dict[str, Any]] = []
+        found_runtime_hits: List[Dict[str, Any]] = []
+        found_react_hits: List[Dict[str, Any]] = []
+        found_database_hits: List[Dict[str, Any]] = []
+        found_interaction_hits: List[Dict[str, Any]] = []
+
+        seen_asset_urls: set[str] = set()
+        visited_pages: set[str] = set()
+        inflight_pages: set[str] = set()
+
+        ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+
+        async with submanagers.HTTPSSubmanager(
+            user_agent=ua_http,
+            timeout=timeout,
+            retries=http_retries,
+            max_conn_per_host=http_max_conn_per_host,
+            verify=http_verify_tls,
+            ca_bundle=http_ca_bundle,
+        ) as http:
+            if required_sites:
+                site_seed_urls, synthetic_search_seeds, explicit_site_seeds = self._build_required_site_seeds(
+                    required_sites,
+                    queries_to_run,
+                )
+                for u in site_seed_urls:
+                    if u not in candidate_pages:
+                        candidate_pages.append(u)
+            else:
+                synthetic_search_seeds = set()
+                explicit_site_seeds = set()
+
+            if not candidate_pages and queries_to_run:
+                for q in queries_to_run:
+                    try:
+                        if engine == "google_cse":
+                            seeds = await self._search_google_cse(
+                                q,
+                                search_results_cap,
+                                timeout,
+                                page_limit=search_page_limit,
+                            )
+                        elif engine == "searxng":
+                            seeds = await self._search_searxng(
+                                q,
+                                search_results_cap,
+                                timeout,
+                                base_url=params.get("searxng_url"),
+                                page_limit=search_page_limit,
+                            )
+                        elif engine == "sites":
+                            seeds = []
+                        else:
+                            seeds = await self._search_duckduckgo(
+                                q,
+                                search_results_cap,
+                                ua_http,
+                                timeout,
+                                page_limit=search_page_limit,
+                                per_page=search_per_page,
+                            )
+                        for u in seeds:
+                            if _allowed_by_required_sites(u):
+                                candidate_pages.append(u)
+                    except Exception as e:
+                        debug_log.append(f"[search] Error for query {q!r}: {e}")
+
+            if direct_asset_urls:
+                for u in direct_asset_urls:
+                    upath = _clean_path(u)
+                    if not self._is_mega_link(u):
+                        if any(upath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            continue
+
+                    if use_database and store and store.asset_exists(u):
+                        debug_log.append(f"Skipping {u} (already in database)")
+                        continue
+                    if u in seen_asset_urls:
+                        continue
+                    seen_asset_urls.add(u)
+
+                    status = "unverified"
+                    size = "?"
+                    if verify_links:
+                        try:
+                            h_status, headers = await http.head(u)
+                            if not self._is_mega_link(u):
+                                if not _is_asset_link_for_mode(u, headers=headers):
+                                    continue
+                            if h_status == 200:
+                                status = "200 OK"
+                                cl = headers.get("Content-Length") or headers.get("content-length")
+                                if cl:
+                                    try:
+                                        size = f"{int(cl) // 1024} KB"
+                                    except ValueError:
+                                        size = "?"
+                            else:
+                                status = f"Dead ({h_status})"
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                        filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
+                        asset = {
+                            "text": filename[:100],
+                            "url": u,
+                            "source": "<urls>",
+                            "size": size,
+                            "status": status,
+                        }
+                        found_assets.append(asset)
+                        if use_database and store:
+                            store.upsert_asset(asset)
+
+            def _should_persist_page(u: str) -> bool:
+                if engine != "sites":
+                    return True
+                if u in explicit_site_seeds or u in synthetic_search_seeds:
+                    return False
+                if _is_search_url(u):
+                    return False
+                return True
+
+            pw_needed = (
+                use_js or
+                use_network_sniff or
+                use_runtime_sniff or
+                use_react_sniff or
+                use_database_sniff or
+                use_interaction_sniff
+            )
+            pw_p = pw_browser = pw_context = None
+
+            effective_blocked_resource_types = set(blocked_resource_types)
+            if mode == "media" and block_resources:
+                removed = effective_blocked_resource_types & {"media", "video", "audio"}
+                if removed:
+                    effective_blocked_resource_types -= {"media", "video", "audio"}
+                    debug_log.append(
+                        "[LinkTracker][media] removed media/video/audio from blocked_resource_types so audio requests are not aborted before sniffing."
+                    )
+
+            try:
+                if pw_needed:
+                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=effective_blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=debug_log,
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                        pw_launch_args=pw_launch_args,
+                        pw_headless=pw_headless,
+                        pw_channel=pw_channel,
+                        pw_proxy=pw_proxy,
+                    )
+
+                async def _process_page(page_url: str, depth: int, http_mgr) -> Dict[str, Any]:
+                    local_assets: List[Dict[str, Any]] = []
+                    next_pages: List[str] = []
+                    local_js_links: List[Dict[str, Any]] = []
+                    local_network_links: List[Dict[str, Any]] = []
+                    local_runtime_hits: List[Dict[str, Any]] = []
+                    local_react_hits: List[Dict[str, Any]] = []
+                    local_database_hits: List[Dict[str, Any]] = []
+                    local_interaction_hits: List[Dict[str, Any]] = []
+                    local_log: List[str] = []
+                    sniff_parent_pages: List[str] = []
+                    html = ""
+
+                    try:
+                        links_on_page: List[Dict[str, Any]] = []
+
+                        if use_network_sniff and pw_context:
+                            try:
+                                sniff_html, sniff_items = await self._pw_fetch_with_sniff(
+                                    pw_context,
+                                    page_url,
+                                    timeout,
+                                    local_log,
+                                    extensions=targets,
+                                )
+                                if sniff_html:
+                                    html = sniff_html
+                                for item in sniff_items or []:
+                                    full_url = str(item.get("url") or "").strip()
+                                    if not full_url:
+                                        continue
+                                    if not _allowed_by_required_sites(full_url) and mode != "media":
+                                        continue
+
+                                    local_network_links.append({
+                                        "page": page_url,
+                                        "url": full_url,
+                                        "text": item.get("text", ""),
+                                        "tag": item.get("tag", ""),
+                                    })
+
+                                    is_mega = self._is_mega_link(full_url)
+                                    lpath = _clean_path(full_url)
+                                    sniff_ct = str(item.get("content_type") or item.get("mime") or "").lower()
+                                    sniff_tag = str(item.get("tag") or "").lower()
+                                    sniff_kind = str(item.get("kind") or "").lower()
+
+                                    head_status = None
+                                    head_headers: Dict[str, Any] = {}
+                                    ct = ""
+                                    if verify_links and not is_mega:
+                                        try:
+                                            head_status, head_headers = await http_mgr.head(full_url)
+                                            ct = (head_headers.get("Content-Type") or head_headers.get("content-type") or "").lower()
+                                        except Exception:
+                                            head_status = None
+                                            head_headers = {}
+                                            ct = ""
+
+                                    if not is_mega:
+                                        if not _is_asset_link_for_mode(full_url, headers=head_headers if verify_links else None):
+                                            continue
+
+                                    status = "sniffed"
+                                    size = item.get("size") or "?"
+
+                                    if is_mega:
+                                        status = "MEGA link"
+                                    elif verify_links:
+                                        if head_status == 200:
+                                            status = "200 OK"
+                                            cl = head_headers.get("Content-Length") or head_headers.get("content-length")
+                                            if cl:
+                                                try:
+                                                    size = f"{int(cl) // 1024} KB"
+                                                except ValueError:
+                                                    size = "?"
+                                        elif head_status is None:
+                                            status = "Timeout/Error"
+                                        else:
+                                            status = f"Dead ({head_status})"
+
+                                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                                        display_text = (
+                                            item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]"
+                                        )[:100]
+                                        asset = {
+                                            "text": display_text,
+                                            "url": full_url,
+                                            "source": page_url,
+                                            "size": size,
+                                            "status": status,
+                                        }
+                                        DEBUG_LOGGER.log_message(
+                                            f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
+                                        )
+                                        local_assets.append(asset)
+                                        if use_database and store:
+                                            store.upsert_asset(asset)
+
+                                        try:
+                                            parsed = urlparse(full_url)
+                                            parent_path = parsed.path.rsplit("/", 1)[0] + "/"
+                                            parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+                                            if _allowed_by_required_sites(parent_url):
+                                                sniff_parent_pages.append(parent_url)
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                local_log.append(f"[LinkTracker][Network] Error on {page_url}: {e}")
+
+                        if use_database_sniff and pw_context:
+                            try:
+                                db_html, db_hits = await self._pw_fetch_database_hits(
+                                    pw_context,
+                                    page_url,
+                                    timeout,
+                                    local_log,
+                                )
+                                if db_html and not html:
+                                    html = db_html
+
+                                if db_hits:
+                                    local_database_hits.extend(db_hits)
+                                    for hit in db_hits:
+                                        if hit.get("kind") != "content_link":
+                                            continue
+                                        u = hit.get("url")
+                                        if not u:
+                                            continue
+
+                                        if not _is_asset_link_for_mode(u):
+                                            continue
+
+                                        links_on_page.append({
+                                            "url": u,
+                                            "text": "[DB Content]",
+                                            "tag": "db_link",
+                                        })
+                                        local_js_links.append({
+                                            "page": page_url,
+                                            "url": u,
+                                            "text": "[DB Content]",
+                                            "tag": "db_link",
+                                        })
+                            except Exception as e:
+                                local_log.append(f"[LinkTracker][DB] Error on {page_url}: {e}")
+
+                        if use_runtime_sniff and pw_context:
+                            try:
+                                rt_html = ""
+                                rt_hits: list[dict[str, Any]] = []
+                                rt_result = await self._pw_fetch_runtime_hits(pw_context, page_url, timeout, local_log)
+                                if isinstance(rt_result, tuple):
+                                    if len(rt_result) == 3:
+                                        rt_html, _rt_items, rt_hits = rt_result
+                                    elif len(rt_result) == 2:
+                                        rt_html, rt_hits = rt_result
+                                    elif len(rt_result) == 1:
+                                        rt_html = rt_result[0]
+                                else:
+                                    rt_html = rt_result
+                                if rt_html and not html:
+                                    html = rt_html
+                                if rt_hits:
+                                    local_runtime_hits.extend(rt_hits)
+                            except Exception as e:
+                                local_log.append(f"[LinkTracker][Runtime] Error on {page_url}: {e}")
+
+                        if use_js and pw_context:
+                            js_html, js_links = await self._pw_fetch_js_links(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                                extensions=targets,
+                            )
+                            if js_html:
+                                html = js_html
+                            links_on_page.extend(js_links)
+
+                            if not js_links:
+                                preview = (html or "")[:2000].replace("\n", " ")
+                                local_log.append(f"[debug] JS DOM preview (first 2000 chars): {preview}")
+
+                            for jl in js_links:
+                                local_js_links.append({
+                                    "page": page_url,
+                                    "url": jl.get("url", ""),
+                                    "text": jl.get("text", ""),
+                                    "tag": jl.get("tag", ""),
+                                })
+
+                        if use_react_sniff and pw_context:
+                            try:
+                                r_html, r_hits = await self._pw_fetch_react_hits(
+                                    pw_context,
+                                    page_url,
+                                    timeout,
+                                    local_log,
+                                )
+                                if r_html and not html:
+                                    html = r_html
+                                if r_hits:
+                                    local_react_hits.extend(r_hits)
+                                    for rh in r_hits:
+                                        r_url = rh.get("url")
+                                        if not r_url:
+                                            continue
+                                        if _allowed_by_required_sites(r_url) and depth < max_depth:
+                                            next_pages.append(r_url)
+                            except Exception as e:
+                                local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
+
+                        if use_interaction_sniff and pw_context:
+                            try:
+                                i_html, i_hits = await self._pw_fetch_interaction_hits(
+                                    pw_context,
+                                    page_url,
+                                    timeout,
+                                    local_log,
+                                )
+                                if i_html and not html:
+                                    html = i_html
+                                if i_hits:
+                                    local_interaction_hits.extend(i_hits)
+                            except Exception as e:
+                                local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
+
+                        if not html:
+                            try:
+                                html = await http_mgr.get_text(page_url)
+                                if not html:
+                                    raise RuntimeError("Empty HTML")
+                            except Exception as e:
+                                local_log.append(f"Error fetching {page_url}: {e}")
+                                if use_database and self.store and _should_persist_page(page_url):
+                                    self.store.mark_scan_complete(page_url)
+                                return {
+                                    "page": page_url,
+                                    "assets": local_assets,
+                                    "next_pages": next_pages,
+                                    "js_links": local_js_links,
+                                    "network_links": local_network_links,
+                                    "runtime_hits": local_runtime_hits,
+                                    "react_hits": local_react_hits,
+                                    "database_hits": local_database_hits,
+                                    "interaction_hits": local_interaction_hits,
+                                    "log": local_log,
+                                }
+
+                        page_has_keywords = _term_overlap_ok((html or "") + " " + page_url) if keywords else True
+                        soup = BeautifulSoup(html, "html.parser")
+
+                        if use_body:
+                            for a in soup.select("a[href]")[:max_links_per_page]:
+                                href = a.get("href")
+                                if not href:
+                                    continue
+                                links_on_page.append({
+                                    "url": urljoin(page_url, href),
+                                    "text": a.get_text(" ", strip=True)[:200],
+                                    "tag": "html_a",
+                                })
+
+                            for source_tag in soup.select("audio[src], source[src], video[src], track[src], a[href], link[href]")[:max_links_per_page]:
+                                attr = source_tag.get("src") or source_tag.get("href")
+                                if not attr:
+                                    continue
+                                links_on_page.append({
+                                    "url": urljoin(page_url, attr),
+                                    "text": source_tag.get_text(" ", strip=True)[:200],
+                                    "tag": source_tag.name,
+                                })
+
+                        dedup_links = []
+                        seen_link_urls = set()
+                        for link in links_on_page:
+                            lu = str(link.get("url") or "").strip()
+                            if not lu or lu in seen_link_urls:
+                                continue
+                            seen_link_urls.add(lu)
+                            dedup_links.append(link)
+                        links_on_page = dedup_links[:max_links_per_page]
+
+                        for link in links_on_page:
+                            raw_link = link.get("url") or ""
+                            if not raw_link:
+                                continue
+                            full_url = urljoin(page_url, raw_link)
+                            if not full_url.startswith("http"):
+                                continue
+
+                            if any(k in full_url.lower() for k in self.JUNK_FILENAME_KEYWORDS):
+                                continue
+
+                            if full_url in seen_asset_urls:
+                                continue
+
+                            lpath = _clean_path(full_url)
+                            is_mega = self._is_mega_link(full_url)
+                            head_status = None
+                            head_headers: Dict[str, Any] = {}
+                            ct = ""
+
+                            candidate_asset = _is_asset_link_for_mode(full_url)
+
+                            if candidate_asset or verify_links:
+                                if not _allowed_by_required_sites(full_url) and mode != "media":
+                                    continue
+                                if not _term_overlap_ok((link.get("text") or "") + " " + full_url):
+                                    continue
+
+                                if verify_links and not is_mega:
+                                    try:
+                                        head_status, head_headers = await http_mgr.head(full_url)
+                                    except Exception:
+                                        head_status = None
+                                        head_headers = {}
+
+                                candidate_asset = _is_asset_link_for_mode(full_url, headers=head_headers if verify_links else None)
+                                if not candidate_asset:
+                                    continue
+
+                                status = "unverified"
+                                size = "?"
+                                if is_mega:
+                                    status = "MEGA link"
+                                elif verify_links:
+                                    if head_status == 200:
+                                        status = "200 OK"
+                                        cl = head_headers.get("Content-Length") or head_headers.get("content-length")
+                                        if cl:
+                                            try:
+                                                size = f"{int(cl) // 1024} KB"
+                                            except ValueError:
+                                                size = "?"
+                                    elif head_status is None:
+                                        status = "Timeout/Error"
+                                    else:
+                                        status = f"Dead ({head_status})"
+
+                                if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                                    seen_asset_urls.add(full_url)
+                                    asset = {
+                                        "text": (link.get("text") or full_url.rsplit("/", 1)[-1] or "[asset]")[:100],
+                                        "url": full_url,
+                                        "source": page_url,
+                                        "size": size,
+                                        "status": status,
+                                    }
+                                    DEBUG_LOGGER.log_message(
+                                        f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
+                                    )
+                                    local_assets.append(asset)
+                                    if use_database and store:
+                                        store.upsert_asset(asset)
+                                continue
+
+                        if depth < max_depth:
+                            for link in links_on_page:
+                                raw_link = link.get("url") or ""
+                                if not raw_link:
+                                    continue
+                                full_url = urljoin(page_url, raw_link)
+                                if not _allowed_by_required_sites(full_url):
+                                    continue
+
+                                lpath = urlparse(full_url).path.lower()
+                                if any(lpath.endswith(ext) for ext in targets):
+                                    continue
+
+                                if keywords and not page_has_keywords:
+                                    haystack = (link.get("text") or "") + " " + full_url
+                                    if not _term_overlap_ok(haystack):
+                                        continue
+
+                                if engine == "sites":
+                                    if _is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                        continue
+
+                                next_pages.append(full_url)
+
+                        if depth < max_depth and sniff_parent_pages:
+                            for parent_url in sniff_parent_pages:
+                                if _allowed_by_required_sites(parent_url):
+                                    next_pages.append(parent_url)
+
+                        if use_database and store and _should_persist_page(page_url):
+                            store.mark_page_scanned(page_url)
+
+                    except Exception as e:
+                        local_log.append(f"Error scanning {page_url}: {e}")
+                        if use_database and store and _should_persist_page(page_url):
+                            try:
+                                store.mark_page_scanned(page_url)
+                            except Exception as ee:
+                                local_log.append(f"Error marking page scanned {page_url}: {ee}")
+
+                    return {
+                        "page": page_url,
+                        "assets": local_assets,
+                        "next_pages": next_pages,
+                        "js_links": local_js_links,
+                        "network_links": local_network_links,
+                        "runtime_hits": local_runtime_hits,
+                        "react_hits": local_react_hits,
+                        "database_hits": local_database_hits,
+                        "interaction_hits": local_interaction_hits,
+                        "log": local_log,
+                    }
+
+                frontier: List[str] = []
+                site_buckets = {s: [] for s in required_sites} if required_sites else {}
+
+                for u in candidate_pages:
+                    if not _allowed_by_required_sites(u):
+                        continue
+                    if required_sites:
+                        d = _clean_domain(u)
+                        for s in required_sites:
+                            if s in d:
+                                site_buckets[s].append(u)
+                                break
+                    else:
+                        frontier.append(u)
+
+                if required_sites:
+                    per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
+                    for _s, bucket in site_buckets.items():
+                        frontier.extend(bucket[:per_site_cap])
+
+                frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+                current_depth = 0
+                pages_scanned = 0
+                logged_rescan_notice = False
+
+                while frontier and current_depth <= max_depth:
+                    DEBUG_LOGGER.log_message(
+                        f"[BFS] --- Starting Depth {current_depth} | "
+                        f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} | "
+                        f"Scanned: {pages_scanned}/{max_pages_total} ---"
+                    )
+
+                    slots_left = max_pages_total - pages_scanned
+                    if slots_left <= 0:
+                        DEBUG_LOGGER.log_message("[BFS] Global max_pages_total reached. Stopping.")
+                        break
+
+                    batch: List[str] = []
+                    for u in frontier:
+                        if len(batch) >= slots_left:
+                            break
+                        if u in visited_pages or u in inflight_pages:
+                            continue
+
+                        if use_database and self.store and self.store.page_scanned(u):
+                            if not logged_rescan_notice:
+                                DEBUG_LOGGER.log_message(
+                                    "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
+                                )
+                                logged_rescan_notice = True
+
+                        batch.append(u)
+                        inflight_pages.add(u)
+
+                    if not batch:
+                        DEBUG_LOGGER.log_message(
+                            f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
+                        )
+                        break
+
+                    DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
+                    results: List[Dict[str, Any]] = []
+
+                    if use_camoufox:
+                        for url in batch:
+                            try:
+                                res = await _process_page(url, current_depth, http)
+                                results.append(res)
+                                pages_scanned += 1
+                                visited_pages.add(url)
+                            except Exception as e:
+                                DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                            finally:
+                                inflight_pages.discard(url)
+                    else:
+                        tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
+                        done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+                        for (url, _t), r in zip(tasks, done):
+                            inflight_pages.discard(url)
+                            pages_scanned += 1
+                            if isinstance(r, Exception):
+                                DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
+                                continue
+                            visited_pages.add(url)
+                            results.append(r)
+                            if pages_scanned >= max_pages_total:
+                                break
+
+                    next_frontier_candidates: List[str] = []
+                    for res in results:
+                        found_pages.append(res.get("page"))
+                        found_assets.extend(res.get("assets") or [])
+                        found_js_links.extend(res.get("js_links") or [])
+                        found_network_links.extend(res.get("network_links") or [])
+                        found_runtime_hits.extend(res.get("runtime_hits") or [])
+                        found_react_hits.extend(res.get("react_hits") or [])
+                        found_database_hits.extend(res.get("database_hits") or [])
+                        found_interaction_hits.extend(res.get("interaction_hits") or [])
+                        debug_log.extend(res.get("log") or [])
+                        next_frontier_candidates.extend(res.get("next_pages") or [])
+
+                    frontier = []
+                    for u in _dedupe(next_frontier_candidates):
+                        if u in visited_pages or u in inflight_pages:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        if any(_clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            continue
+                        frontier.append(u)
+                        if len(frontier) >= max_pages_total:
+                            break
+
+                    current_depth += 1
+            finally:
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, debug_log)
+
+        text_lines = []
+        for asset in found_assets:
+            text_lines.append(f"[{asset.get('status', '?')}] {asset.get('text', '[asset]')} -> {asset.get('url', '')}")
+        final_text = "\n".join(text_lines[:1000])
+
+        out: Dict[str, Any] = {
+            "query": query_raw,
+            "pipeline_result": pipeline_result,
+            "mode": mode,
+            "assets": found_assets,
+            "pages": _dedupe(found_pages),
+            "log": debug_log,
+        }
+        if return_all_js_links:
+            out["js_links"] = found_js_links
+        if return_network_sniff_links:
+            out["network_links"] = found_network_links
+        if return_runtime_sniff_hits:
+            out["runtime_hits"] = found_runtime_hits
+        if return_react_sniff_hits:
+            out["react_hits"] = found_react_hits
+        if return_database_sniff_hits:
+            out["database_hits"] = found_database_hits
+        if return_interaction_sniff_hits:
+            out["interaction_hits"] = found_interaction_hits
+
+        return final_text, out
+
+    # ------------------------------------------------------------------ #
     # Sync wrapper
     # ------------------------------------------------------------------ #
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
@@ -9444,7 +8832,7 @@ class LinkTrackerBlock(BaseBlock):
             "search_page_limit": 1,
             "search_per_page": 50,
             "verify": True,
-            "extensions": ".pdf,.txt",
+            "extensions": ".pdf,txt",
             "url_keywords": "archive,download",
             "engine": "duckduckgo",
             "site_require": "",
@@ -9452,6 +8840,8 @@ class LinkTrackerBlock(BaseBlock):
             "return_all_js_links": False,
             "max_links_per_page": 500,
             "strict_keywords": False,
+            "allow_audioish_octet_stream": True,
+            "trust_sniffed_audio_kind": True,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
             "use_runtime_sniff": False,
@@ -9479,23 +8869,26 @@ class LinkTrackerBlock(BaseBlock):
             "http_retries": 2,
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
-            "http_ca_bundle": "",   # path to bundled cacert.pem if needed
+            "http_ca_bundle": "",
             "use_body": True,
             "use_camoufox": False,
             "camoufox_options": {},
             "pw_headless": True,
-            "pw_channel": "",  # e.g. "chrome"
-            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
+            "pw_channel": "",
+            "pw_proxy": {},
             "pw_launch_args": [
                 "--disable-quic",
                 "--disable-http3",
-                "--disable-features=UseDnsHttpsSvcb"
+                "--disable-features=UseDnsHttpsSvcb",
             ],
-            "searxng_url": "http://127.0.0.1:8080"
+            "searxng_url": "http://127.0.0.1:8080",
         }
 
 
 BLOCKS.register("linktracker", LinkTrackerBlock)
+
+
+
 
 
 # ======================= YouTubeDataBlock ==================================
@@ -11251,7 +10644,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "--disable-renderer-backgrounding",
             "--metrics-recording-only",
             "--mute-audio",
-            "--js-flags=--max_old_space_size=512"
+            "--js-flags=--max_old_space_size=2048",
         ]
 
         def _merge_args(*arg_lists: list[str]) -> list[str]:
@@ -11360,7 +10753,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
             extensions=extensions,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
         return await asyncio.wait_for(self.js_sniffer.sniff(
@@ -11369,7 +10762,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
             extensions=extensions,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.runtime_sniffer.sniff(
@@ -11377,7 +10770,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.react_sniffer.sniff(
@@ -11385,7 +10778,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
 
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
@@ -11394,7 +10787,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.interaction_sniffer.sniff(
@@ -15535,6 +14928,7 @@ class SocketPipeBlock(BaseBlock):
           • IP addresses
           • Emails (if present in payload)
           • Keywords / search terms
+          • Normalized packet objects
       - Computes aggregate stats (types, protocols, ports, domains, IPs).
       - Writes into Memory:
           • links_key         (list of {url, source, first_seen})
@@ -15543,6 +14937,7 @@ class SocketPipeBlock(BaseBlock):
           • ips_key           (sorted list of IPs)
           • search_terms_key  (top multi-word "search-like" phrases)
           • events_key        (raw recent events, truncated)
+          • packets_key       (normalized packet objects)
     """
 
     _sock: Any = field(default=None, init=False)
@@ -15557,6 +14952,13 @@ class SocketPipeBlock(BaseBlock):
         """Recursively yield all string fields from nested dict/list structures."""
         if isinstance(obj, str):
             yield obj
+        elif isinstance(obj, bytes):
+            try:
+                txt = obj.decode("utf-8", errors="ignore")
+                if txt:
+                    yield txt
+            except Exception:
+                pass
         elif isinstance(obj, dict):
             for v in obj.values():
                 yield from SocketPipeBlock._iter_text_fields(v)
@@ -15571,9 +14973,6 @@ class SocketPipeBlock(BaseBlock):
 
     @staticmethod
     def _extract_ips(text: str) -> list[str]:
-        """
-        Very simple IPv4 extractor; doesn't try to validate ranges deeply.
-        """
         ip_re = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
         return ip_re.findall(text or "")
 
@@ -15584,8 +14983,7 @@ class SocketPipeBlock(BaseBlock):
 
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        # very simple tokenizer
-        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", text.lower())
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", (text or "").lower())
         stopwords = {
             "the", "and", "or", "for", "to", "of", "a", "an", "on", "in", "is",
             "it", "this", "that", "at", "by", "from", "with", "as", "be",
@@ -15597,14 +14995,80 @@ class SocketPipeBlock(BaseBlock):
         return [t for t in tokens if len(t) > 2 and t not in stopwords]
 
     @staticmethod
+    def _dedupe_keep_order(items: list[Any]) -> list[Any]:
+        out = []
+        seen = set()
+        for item in items:
+            key = json.dumps(item, sort_keys=True, ensure_ascii=False) if isinstance(item, (dict, list)) else str(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _json_safe(obj: Any, *, max_depth: int = 5, max_list: int = 64, max_str: int = 1200, _depth: int = 0) -> Any:
+        if _depth >= max_depth:
+            return "[max_depth]"
+        if obj is None or isinstance(obj, (int, float, bool)):
+            return obj
+        if isinstance(obj, str):
+            return obj[:max_str]
+        if isinstance(obj, bytes):
+            try:
+                s = obj.decode("utf-8", errors="ignore")
+            except Exception:
+                s = repr(obj)
+            return s[:max_str]
+        if isinstance(obj, dict):
+            out = {}
+            count = 0
+            for k, v in obj.items():
+                if count >= max_list:
+                    out["__truncated__"] = True
+                    break
+                out[str(k)] = SocketPipeBlock._json_safe(
+                    v,
+                    max_depth=max_depth,
+                    max_list=max_list,
+                    max_str=max_str,
+                    _depth=_depth + 1,
+                )
+                count += 1
+            return out
+        if isinstance(obj, (list, tuple, set)):
+            seq = list(obj)
+            out = []
+            for idx, item in enumerate(seq):
+                if idx >= max_list:
+                    out.append("[truncated]")
+                    break
+                out.append(
+                    SocketPipeBlock._json_safe(
+                        item,
+                        max_depth=max_depth,
+                        max_list=max_list,
+                        max_str=max_str,
+                        _depth=_depth + 1,
+                    )
+                )
+            return out
+        return str(obj)[:max_str]
+
+    @staticmethod
     def _extract_host_candidates(ev: dict) -> list[str]:
-        """
-        Pull likely host/domain fields from event (analysis + metadata).
-        Looks at common keys: host, hostname, sni, server_name, domain, etc.
-        """
         host_keys = {
             "host", "hostname", "server_name", "servername", "sni", "sni_hostname",
-            "domain", "query_name", "qname", "target_host",
+            "domain", "query_name", "qname", "target_host", "dst_host", "src_host",
         }
         hosts: set[str] = set()
 
@@ -15613,7 +15077,9 @@ class SocketPipeBlock(BaseBlock):
                 for k, v in obj.items():
                     kl = str(k).lower()
                     if kl in host_keys and isinstance(v, str):
-                        hosts.add(v.strip())
+                        val = v.strip()
+                        if val:
+                            hosts.add(val)
                     _walk(v)
             elif isinstance(obj, (list, tuple, set)):
                 for v in obj:
@@ -15623,57 +15089,12 @@ class SocketPipeBlock(BaseBlock):
         return list(hosts)
 
     @staticmethod
-    def _domain_from_url_or_host(u: str) -> str:
-        u = (u or "").strip()
-        if not u:
-            return ""
-        try:
-            if u.startswith("http://") or u.startswith("https://"):
-                from urllib.parse import urlparse
-                netloc = urlparse(u).netloc
-            else:
-                # treat as bare hostname
-                netloc = u
-            # Strip port
-            host = netloc.split("@")[-1].split(":", 1)[0].lower()
-            # cheap public-ish suffix trimming: keep last 2-3 labels
-            parts = [p for p in host.split(".") if p]
-            if len(parts) >= 3 and len(parts[-1]) <= 3:
-                return ".".join(parts[-3:])
-            elif len(parts) >= 2:
-                return ".".join(parts[-2:])
-            else:
-                return host
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _looks_like_html(s: str) -> bool:
-        if not s:
-            return False
-        t = s.lstrip().lower()
-        # quick/cheap signals
-        return (
-            "<html" in t
-            or "<!doctype" in t
-            or "<a " in t
-            or "<script" in t
-            or "<link" in t
-            or "<img" in t
-            or ("</" in t and "<" in t)
-        )
-
-    @staticmethod
-    def _extract_base_url(ev: dict) -> str:
-        """
-        Best-effort base URL for resolving relative links.
-        Looks for common keys like url/request_url/response_url in event.
-        Falls back to host candidate -> https://host/
-        """
-        url_keys = {
-            "url", "request_url", "response_url", "page_url", "origin_url", "full_url"
+    def _guess_protocol(ev: dict) -> str:
+        proto_keys = {
+            "protocol", "proto", "transport", "layer4", "l4", "network_protocol",
+            "app_protocol", "application_protocol", "service",
         }
-        found = ""
+        found = None
 
         def _walk(obj: Any):
             nonlocal found
@@ -15681,12 +15102,157 @@ class SocketPipeBlock(BaseBlock):
                 return
             if isinstance(obj, dict):
                 for k, v in obj.items():
-                    if found:
-                        return
                     kl = str(k).lower()
-                    if kl in url_keys and isinstance(v, str) and v.startswith(("http://", "https://")):
-                        found = v.strip()
+                    if kl in proto_keys and isinstance(v, str) and v.strip():
+                        found = v.strip().lower()
                         return
+                    _walk(v)
+            elif isinstance(obj, (list, tuple, set)):
+                for v in obj:
+                    _walk(v)
+
+        _walk(ev)
+        if found:
+            return found
+
+        hay = " ".join(SocketPipeBlock._iter_text_fields(ev)).lower()
+        for probe in ("tcp", "udp", "icmp", "dns", "http", "https", "tls", "quic", "ssh", "ftp", "smtp", "imap", "pop3"):
+            if re.search(rf"\b{re.escape(probe)}\b", hay):
+                return probe
+        return "unknown"
+
+    @staticmethod
+    def _guess_ports(ev: dict) -> tuple[Optional[int], Optional[int]]:
+        src_aliases = {"sport", "src_port", "source_port", "sourceport", "srcport"}
+        dst_aliases = {"dport", "dst_port", "dest_port", "destination_port", "destinationport", "dstport"}
+
+        sport: Optional[int] = None
+        dport: Optional[int] = None
+
+        def _walk(obj: Any):
+            nonlocal sport, dport
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if sport is None and kl in src_aliases:
+                        sport = SocketPipeBlock._safe_int(v)
+                    if dport is None and kl in dst_aliases:
+                        dport = SocketPipeBlock._safe_int(v)
+                    _walk(v)
+            elif isinstance(obj, (list, tuple, set)):
+                for v in obj:
+                    _walk(v)
+
+        _walk(ev)
+        return sport, dport
+
+    @staticmethod
+    def _guess_ips_from_event(ev: dict) -> tuple[Optional[str], Optional[str]]:
+        src_ip_keys = {"src_ip", "source_ip", "ip_src", "client_ip"}
+        dst_ip_keys = {"dst_ip", "dest_ip", "destination_ip", "ip_dst", "server_ip"}
+
+        src_ip: Optional[str] = None
+        dst_ip: Optional[str] = None
+
+        def _walk(obj: Any):
+            nonlocal src_ip, dst_ip
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    kl = str(k).lower()
+                    if src_ip is None and kl in src_ip_keys and isinstance(v, str):
+                        src_ip = v.strip()
+                    if dst_ip is None and kl in dst_ip_keys and isinstance(v, str):
+                        dst_ip = v.strip()
+                    _walk(v)
+            elif isinstance(obj, (list, tuple, set)):
+                for v in obj:
+                    _walk(v)
+
+        _walk(ev)
+
+        if not src_ip or not dst_ip:
+            all_ips = SocketPipeBlock._extract_ips(" ".join(SocketPipeBlock._iter_text_fields(ev)))
+            if not src_ip and len(all_ips) >= 1:
+                src_ip = all_ips[0]
+            if not dst_ip and len(all_ips) >= 2:
+                dst_ip = all_ips[1]
+
+        return src_ip, dst_ip
+
+    @staticmethod
+    def _extract_domains_from_urls(urls: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            try:
+                host = (urlparse(u).netloc or "").strip().lower()
+                if host.startswith("www."):
+                    host = host[4:]
+                if host and host not in seen:
+                    seen.add(host)
+                    out.append(host)
+            except Exception:
+                continue
+        return out
+
+    @staticmethod
+    def _extract_search_like_phrases(texts: list[str], *, limit: int = 32) -> list[str]:
+        phrases: list[str] = []
+        seen: set[str] = set()
+
+        for txt in texts:
+            if not txt:
+                continue
+            compact = re.sub(r"\s+", " ", txt.strip())
+            if not compact:
+                continue
+
+            candidates = []
+
+            # quoted phrases
+            for m in re.finditer(r'"([^"]{4,120})"|\'([^\']{4,120})\'', compact):
+                phrase = (m.group(1) or m.group(2) or "").strip()
+                if phrase:
+                    candidates.append(phrase)
+
+            # query-like / natural search-ish lines
+            low = compact.lower()
+            prefixes = (
+                "search", "query", "find", "look for", "lookup", "google", "bing", "duckduckgo",
+                "search term", "search query", "keywords", "keyword",
+            )
+            if any(low.startswith(p) for p in prefixes):
+                candidates.append(compact[:160])
+
+            # if it looks like a human query
+            word_count = len(re.findall(r"[A-Za-z0-9][A-Za-z0-9_\-]+", compact))
+            if 3 <= word_count <= 12 and len(compact) <= 120 and "http://" not in compact and "https://" not in compact:
+                if any(ch == " " for ch in compact):
+                    candidates.append(compact)
+
+            for cand in candidates:
+                cand = re.sub(r"\s+", " ", cand).strip(" :,-")
+                if len(cand) < 4:
+                    continue
+                key = cand.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                phrases.append(cand)
+                if len(phrases) >= limit:
+                    return phrases
+
+        return phrases[:limit]
+
+    @staticmethod
+    def _best_url_for_event(ev: dict) -> str:
+        found: list[str] = []
+
+        def _walk(obj: Any):
+            if isinstance(obj, str):
+                found.extend(SocketPipeBlock._extract_urls(obj))
+            elif isinstance(obj, dict):
+                for v in obj.values():
                     _walk(v)
             elif isinstance(obj, (list, tuple, set)):
                 for v in obj:
@@ -15695,14 +15261,12 @@ class SocketPipeBlock(BaseBlock):
         _walk(ev)
 
         if found:
-            return found
+            return found[0]
 
-        # fallback: host candidate
         hosts = SocketPipeBlock._extract_host_candidates(ev)
         if hosts:
             h = hosts[0].strip()
             if h:
-                # assume https for modern traffic; adjust if your router knows scheme
                 if not h.startswith(("http://", "https://")):
                     return f"https://{h}/"
                 return h
@@ -15710,26 +15274,17 @@ class SocketPipeBlock(BaseBlock):
 
     @staticmethod
     def _extract_links_from_html(html: str, *, base_url: str = "") -> list[str]:
-        """
-        Extract href/src/action/data-src/srcset/CSS url(...) links from an HTML-ish blob.
-        Resolves relative links using base_url when possible.
-        """
         if not html:
             return []
-
-        from urllib.parse import urljoin
 
         out: list[str] = []
         seen: set[str] = set()
 
-        # 1) raw absolute URLs
         for u in SocketPipeBlock._extract_urls(html):
             if u not in seen:
                 seen.add(u)
                 out.append(u)
 
-        # 2) attribute-style links
-        #    capture quoted OR unquoted until whitespace or >
         attr_re = re.compile(
             r"""(?is)\b(?:href|src|action|data-src)\s*=\s*(?:
                     ["']([^"']+)["'] |
@@ -15742,12 +15297,11 @@ class SocketPipeBlock(BaseBlock):
             if not raw:
                 return
             raw = raw.strip()
-            # ignore anchors / javascript / mailto
             low = raw.lower()
             if low.startswith(("#", "javascript:", "mailto:", "data:")):
                 return
-            # srcset can be "url1 1x, url2 2x"
-            if " " in raw and ("," in raw):
+
+            if " " in raw and "," in raw:
                 parts = [p.strip().split(" ")[0] for p in raw.split(",") if p.strip()]
             else:
                 parts = [raw]
@@ -15760,7 +15314,6 @@ class SocketPipeBlock(BaseBlock):
                 elif base_url:
                     u = urljoin(base_url, p)
                 else:
-                    # no base; keep only if it looks like a domain-ish path
                     u = p
                 if u and u not in seen and u.startswith(("http://", "https://")):
                     seen.add(u)
@@ -15769,38 +15322,30 @@ class SocketPipeBlock(BaseBlock):
         for m in attr_re.finditer(html):
             _push(m.group(1) or m.group(2) or "")
 
-        # 3) srcset explicitly (common)
         srcset_re = re.compile(r"""(?is)\bsrcset\s*=\s*["']([^"']+)["']""")
         for m in srcset_re.finditer(html):
             _push(m.group(1) or "")
 
-        # 4) CSS url(...)
         css_url_re = re.compile(r"""(?is)\burl\(\s*['"]?([^'")]+)['"]?\s*\)""")
         for m in css_url_re.finditer(html):
             _push(m.group(1) or "")
 
         return out
+
     # ------------------- socket setup -------------------
 
     def _ensure_socket(self, host: str, port: int, mode: str, recv_timeout: float, log: list[str]) -> None:
-        """
-        Lazily create/recreate socket if needed.
-
-        mode:
-          - "udp_listen": bind UDP socket to (host, port) and recvfrom()
-          - "tcp_client": connect to TCP server at (host, port) and recv()
-        """
-        import socket
-
         if (
             self._sock is not None
             and self._mode == mode
             and self._addr == (host, port)
         ):
-            self._sock.settimeout(recv_timeout)
+            try:
+                self._sock.settimeout(recv_timeout)
+            except Exception:
+                pass
             return
 
-        # Recreate
         if self._sock is not None:
             try:
                 self._sock.close()
@@ -15811,11 +15356,13 @@ class SocketPipeBlock(BaseBlock):
         try:
             if mode == "udp_listen":
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((host, port))
                 s.settimeout(recv_timeout)
                 self._sock = s
                 self._mode = mode
                 self._addr = (host, port)
+                self._tcp_buffer = b""
                 log.append(f"[SocketPipe] Bound UDP listener on {host}:{port}")
             elif mode == "tcp_client":
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -15824,6 +15371,7 @@ class SocketPipeBlock(BaseBlock):
                 self._sock = s
                 self._mode = mode
                 self._addr = (host, port)
+                self._tcp_buffer = b""
                 log.append(f"[SocketPipe] Connected TCP client to {host}:{port}")
             else:
                 log.append(f"[SocketPipe] Unknown mode={mode!r}; no socket created.")
@@ -15832,6 +15380,62 @@ class SocketPipeBlock(BaseBlock):
             self._sock = None
 
     # ------------------- event reading -------------------
+
+    @staticmethod
+    def _coerce_event_record(obj: Any, *, source: str = "socket") -> Optional[dict]:
+        """
+        Normalize arbitrary received JSON into an event dict.
+        """
+        if obj is None:
+            return None
+
+        if isinstance(obj, dict):
+            ev = dict(obj)
+        elif isinstance(obj, list):
+            ev = {"type": "packet_batch", "items": obj}
+        else:
+            ev = {"type": "packet_event", "payload": obj}
+
+        ev.setdefault("type", "packet_event")
+        ev.setdefault("_socketpipe_source", source)
+        ev.setdefault("_socketpipe_received_at", time.time())
+        return ev
+
+    @staticmethod
+    def _decode_json_or_fallback(raw: bytes, *, source: str = "socket") -> list[dict]:
+        text = raw.decode("utf-8", errors="ignore").strip()
+        if not text:
+            return []
+
+        out: list[dict] = []
+
+        # 1) direct JSON object/array
+        try:
+            obj = json.loads(text)
+            ev = SocketPipeBlock._coerce_event_record(obj, source=source)
+            return [ev] if ev is not None else []
+        except Exception:
+            pass
+
+        # 2) JSONL fallback
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                ev = SocketPipeBlock._coerce_event_record(obj, source=source)
+                if ev is not None:
+                    out.append(ev)
+            except Exception:
+                out.append({
+                    "type": "packet_event",
+                    "summary": line[:240],
+                    "text": line[:4000],
+                    "_socketpipe_source": source,
+                    "_socketpipe_received_at": time.time(),
+                })
+        return out
 
     def _read_events(
         self,
@@ -15843,136 +15447,118 @@ class SocketPipeBlock(BaseBlock):
         max_packets: int,
         log: list[str],
     ) -> list[dict]:
-        import socket
-        import time as _time
-        import json as _json
-
         self._ensure_socket(host, port, mode, recv_timeout, log)
         if self._sock is None:
             return []
 
         events: list[dict] = []
-        start = _time.time()
+        start = time.time()
 
-        def _try_parse_json_line(line_bytes: bytes):
-            try:
-                line = line_bytes.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    return None
-                obj = _json.loads(line)
-                if isinstance(obj, dict):
-                    return obj
-                return None
-            except Exception:
-                return None
-
-        while len(events) < max_packets and (_time.time() - start) < total_timeout:
+        while len(events) < max_packets and (time.time() - start) < total_timeout:
             try:
                 if mode == "udp_listen":
-                    data, addr = self._sock.recvfrom(65535)
-                    if not data:
-                        break
-                    log.append(f"[SocketPipe] UDP packet from {addr[0]}:{addr[1]} ({len(data)} bytes)")
-
-                    for part in data.splitlines():
-                        obj = _try_parse_json_line(part)
-                        if obj is not None:
-                            events.append(obj)
-                            if len(events) >= max_packets:
-                                break
+                    raw, addr = self._sock.recvfrom(1024 * 512)
+                    decoded = self._decode_json_or_fallback(raw, source=f"udp:{addr[0]}:{addr[1]}")
+                    events.extend(decoded)
                 elif mode == "tcp_client":
-                    chunk = self._sock.recv(65535)
+                    chunk = self._sock.recv(1024 * 256)
                     if not chunk:
-                        log.append("[SocketPipe] TCP peer closed connection.")
                         break
                     self._tcp_buffer += chunk
-                    while b"\n" in self._tcp_buffer:
+
+                    while b"\n" in self._tcp_buffer and len(events) < max_packets:
                         line, self._tcp_buffer = self._tcp_buffer.split(b"\n", 1)
-                        obj = _try_parse_json_line(line)
-                        if obj is not None:
-                            events.append(obj)
-                            if len(events) >= max_packets:
-                                break
+                        line = line.strip()
+                        if not line:
+                            continue
+                        decoded = self._decode_json_or_fallback(line, source=f"tcp:{host}:{port}")
+                        events.extend(decoded)
                 else:
                     break
-
             except socket.timeout:
-                # normal: no more data within recv_timeout
-                break
+                continue
             except BlockingIOError:
-                break
+                continue
             except Exception as e:
-                log.append(f"[SocketPipe] Error receiving data: {e}")
+                log.append(f"[SocketPipe] Read failed: {e}")
                 break
 
-        return events
+        return events[:max_packets]
 
-    # ------------------- advanced event summary -------------------
-
-    @staticmethod
-    def _guess_protocol(ev: dict) -> str:
-        """
-        Try to guess a "protocol" label from analysis/metadata fields.
-        """
-        candidates = []
-
-        def _walk(obj: Any):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if kl in {"protocol", "proto", "l7", "l4", "transport", "app_proto"} and isinstance(v, str):
-                        candidates.append(v.lower())
-                    _walk(v)
-            elif isinstance(obj, (list, tuple, set)):
-                for v in obj:
-                    _walk(v)
-
-        _walk(ev)
-        if candidates:
-            # prefer first but normalize a bit
-            c = candidates[0]
-            if "tls" in c:
-                return "tls"
-            if "http" in c:
-                return "http"
-            if "dns" in c:
-                return "dns"
-            if "quic" in c:
-                return "quic"
-            if "tcp" in c:
-                return "tcp"
-            if "udp" in c:
-                return "udp"
-            return c
-        return "unknown"
+    # ------------------- packet normalization -------------------
 
     @staticmethod
-    def _guess_ports(ev: dict) -> tuple[str, str]:
-        """
-        Try to find source/dest port fields from event.
-        """
-        sport_keys = {"sport", "src_port", "source_port", "client_port"}
-        dport_keys = {"dport", "dst_port", "destination_port", "server_port"}
-        sport = dport = ""
+    def _normalize_packet(ev: dict, *, index: int = 0, raw_truncate: int = 4096) -> dict:
+        all_texts = list(SocketPipeBlock._iter_text_fields(ev))
+        joined_text = "\n".join(all_texts)
 
-        def _walk(obj: Any):
-            nonlocal sport, dport
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    kl = str(k).lower()
-                    if isinstance(v, (str, int)):
-                        val = str(v)
-                        if not sport and kl in sport_keys:
-                            sport = val
-                        if not dport and kl in dport_keys:
-                            dport = val
-                    _walk(v)
-            elif isinstance(obj, (list, tuple, set)):
-                for v in obj:
-                    _walk(v)
+        urls = SocketPipeBlock._extract_urls(joined_text)
+        best_url = SocketPipeBlock._best_url_for_event(ev)
+        if best_url and best_url not in urls:
+            urls.insert(0, best_url)
 
-        _walk(ev)
-        return sport, dport
+        host_candidates = SocketPipeBlock._extract_host_candidates(ev)
+        domains = SocketPipeBlock._extract_domains_from_urls(urls)
+
+        for host in host_candidates:
+            h = (host or "").strip().lower()
+            if not h:
+                continue
+            if h.startswith("www."):
+                h = h[4:]
+            if "." in h and " " not in h and h not in domains:
+                domains.append(h)
+
+        src_ip, dst_ip = SocketPipeBlock._guess_ips_from_event(ev)
+        sport, dport = SocketPipeBlock._guess_ports(ev)
+        proto = SocketPipeBlock._guess_protocol(ev)
+        summary = SocketPipeBlock._build_event_summary(ev)
+
+        emails = SocketPipeBlock._extract_emails(joined_text)
+        ips = SocketPipeBlock._extract_ips(joined_text)
+        html_links: list[str] = []
+
+        # Best effort HTML scraping if event seems to carry markup
+        for txt in all_texts[:24]:
+            if "<html" in txt.lower() or "<a " in txt.lower() or "href=" in txt.lower():
+                html_links.extend(SocketPipeBlock._extract_links_from_html(txt, base_url=best_url))
+        for u in html_links:
+            if u not in urls:
+                urls.append(u)
+
+        if joined_text:
+            tokens = SocketPipeBlock._tokenize(joined_text)
+            top_tokens = []
+            counts = Counter(tokens)
+            for tok, _ in counts.most_common(20):
+                top_tokens.append(tok)
+        else:
+            top_tokens = []
+
+        packet = {
+            "packet_index": index,
+            "type": ev.get("type", "packet_event"),
+            "summary": summary,
+            "protocol": proto,
+            "transport": proto,
+            "src_ip": src_ip,
+            "dst_ip": dst_ip,
+            "src_port": sport,
+            "dst_port": dport,
+            "host": host_candidates[0] if host_candidates else "",
+            "domain": domains[0] if domains else "",
+            "url": best_url or "",
+            "urls": SocketPipeBlock._dedupe_keep_order(urls)[:64],
+            "domains": SocketPipeBlock._dedupe_keep_order(domains)[:32],
+            "ips": SocketPipeBlock._dedupe_keep_order(ips)[:32],
+            "emails": SocketPipeBlock._dedupe_keep_order(emails)[:16],
+            "search_terms": SocketPipeBlock._extract_search_like_phrases(all_texts, limit=8),
+            "lexicon_terms": top_tokens[:16],
+            "received_at": ev.get("_socketpipe_received_at", time.time()),
+            "source": ev.get("_socketpipe_source", "socket"),
+            "event": SocketPipeBlock._json_safe(ev, max_str=raw_truncate),
+        }
+        return packet
 
     @staticmethod
     def _build_event_summary(ev: dict) -> str:
@@ -16000,15 +15586,14 @@ class SocketPipeBlock(BaseBlock):
     # ------------------- execute -------------------
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        import time
         from collections import Counter
 
         host = str(params.get("host", "127.0.0.1"))
         port = int(params.get("port", 9999))
-        mode = str(params.get("mode", "udp_listen")).lower()  # udp_listen | tcp_client
+        mode = str(params.get("mode", "udp_listen")).lower()
 
-        recv_timeout = float(params.get("recv_timeout", 0.25))  # per recv
-        total_timeout = float(params.get("total_timeout", 1.0))  # whole block
+        recv_timeout = float(params.get("recv_timeout", 0.25))
+        total_timeout = float(params.get("total_timeout", 1.0))
         max_packets = int(params.get("max_packets", 64))
 
         # Memory keys
@@ -16018,13 +15603,17 @@ class SocketPipeBlock(BaseBlock):
         ips_key = str(params.get("ips_key", "socketpipe_ips"))
         search_terms_key = str(params.get("search_terms_key", "socketpipe_search_terms"))
         events_key = str(params.get("events_key", "socketpipe_last_events"))
+        packets_key = str(params.get("packets_key", "socketpipe_packets"))
 
         max_urls_return = int(params.get("max_urls_return", 32))
         max_lexicon_terms = int(params.get("max_lexicon_terms", 64))
         max_domains_terms = int(params.get("max_domains_terms", 64))
         max_ips_terms = int(params.get("max_ips_terms", 64))
         max_search_terms = int(params.get("max_search_terms", 32))
+        max_links_store = int(params.get("max_links_store", 4096))
         max_events_store = int(params.get("max_events_store", 128))
+        max_packets_store = int(params.get("max_packets_store", 256))
+        packet_raw_truncate = int(params.get("packet_raw_truncate", 4096))
 
         log: list[str] = []
 
@@ -16051,259 +15640,228 @@ class SocketPipeBlock(BaseBlock):
                 "host": host,
                 "port": port,
                 "mode": mode,
+                "packets": [],
+                "packets_count": 0,
+                "packets_key": packets_key,
                 "log": log,
             }
 
-        # ---- deep scrape: collect text, URLs, IPs, emails, hosts, protocols ----
-        all_text_chunks: list[str] = []
         all_urls_set: set[str] = set()
+        all_urls_list: list[str] = []
+        all_domains_set: set[str] = set()
         all_ips_set: set[str] = set()
         all_emails_set: set[str] = set()
-        all_domains_set: set[str] = set()
+        all_texts: list[str] = []
         type_counter: Counter = Counter()
         proto_counter: Counter = Counter()
         dport_counter: Counter = Counter()
+        packet_objs: list[dict] = []
 
-        for ev in events:
-            if not isinstance(ev, dict):
-                continue
-
-            ev_type = ev.get("type", "event")
-            type_counter[ev_type] += 1
-
+        for idx, ev in enumerate(events):
+            type_counter[str(ev.get("type", "event"))] += 1
             proto = self._guess_protocol(ev)
             proto_counter[proto] += 1
 
-            sport, dport = self._guess_ports(ev)
-            if dport:
-                dport_counter[dport] += 1
+            _, dport = self._guess_ports(ev)
+            if dport is not None:
+                dport_counter[int(dport)] += 1
 
-            # Prefer analysis/metadata/summary if present
-            analysis = ev.get("analysis")
-            metadata = ev.get("metadata")
-            summary = ev.get("summary", "")
+            texts = list(self._iter_text_fields(ev))
+            all_texts.extend(texts)
 
-            # Host/domain fields directly from structured data
-            host_candidates = self._extract_host_candidates(ev)
-            for h in host_candidates:
-                d = self._domain_from_url_or_host(h)
-                if d:
-                    all_domains_set.add(d)
-
-            # Walk text fields
-            base_url = self._extract_base_url(ev)
-
-            for t in self._iter_text_fields({"analysis": analysis, "metadata": metadata, "summary": summary}):
-                if not t:
-                    continue
-                all_text_chunks.append(t)
-
-                # URLs (plain text)
-                for u in self._extract_urls(t):
-                    all_urls_set.add(u)
-                    d = self._domain_from_url_or_host(u)
-                    if d:
-                        all_domains_set.add(d)
-
-                # HTML blob link scraping (NEW)
-                if self._looks_like_html(t):
-                    for u in self._extract_links_from_html(t, base_url=base_url):
+            urls = []
+            for txt in texts:
+                for u in self._extract_urls(txt):
+                    if u not in all_urls_set:
                         all_urls_set.add(u)
-                        d = self._domain_from_url_or_host(u)
-                        if d:
-                            all_domains_set.add(d)
+                        all_urls_list.append(u)
+                    urls.append(u)
 
-                # IPs
-                for ip in self._extract_ips(t):
+            # best effort HTML link expansion from text fields
+            for txt in texts[:24]:
+                if "<html" in txt.lower() or "<a " in txt.lower() or "href=" in txt.lower():
+                    base_url = self._best_url_for_event(ev)
+                    for u in self._extract_links_from_html(txt, base_url=base_url):
+                        if u not in all_urls_set:
+                            all_urls_set.add(u)
+                            all_urls_list.append(u)
+
+            for host_candidate in self._extract_host_candidates(ev):
+                hc = (host_candidate or "").strip().lower()
+                if hc.startswith("www."):
+                    hc = hc[4:]
+                if hc and "." in hc and " " not in hc:
+                    all_domains_set.add(hc)
+
+            for domain in self._extract_domains_from_urls(all_urls_list):
+                all_domains_set.add(domain)
+
+            for txt in texts:
+                for ip in self._extract_ips(txt):
                     all_ips_set.add(ip)
-
-                # Emails
-                for em in self._extract_emails(t):
+                for em in self._extract_emails(txt):
                     all_emails_set.add(em)
-        all_text = " ".join(all_text_chunks)
-        tokens = self._tokenize(all_text)
-        word_freq = Counter(tokens)
-        top_terms = [w for (w, _) in word_freq.most_common(max_lexicon_terms)]
 
-        # --- "search terms": multi-word ngrams that look like search queries ---
-        search_terms: list[str] = []
-        if all_text_chunks:
-            # naive: take sentences that contain spaces and some of our top terms
-            import re as _re
-            sent_split = _re.split(r"[\n\r]+|(?<=[.!?])\s+", all_text)
-            candidates = []
-            for s in sent_split:
-                s = s.strip()
-                if not s:
-                    continue
-                if len(s) < 12 or s.count(" ") < 2:
-                    continue
-                # Rough heuristic: must contain at least 1 top term
-                lower = s.lower()
-                if any(t in lower for t in top_terms[:10]):
-                    candidates.append(s)
-            # rank by length and occurrence of top terms
-            def _score(s: str) -> int:
-                base = len(s)
-                lower = s.lower()
-                hit = sum(1 for t in top_terms[:10] if t in lower)
-                return hit * 1000 + base
-
-            ranked = sorted(candidates, key=_score, reverse=True)
-            seen = set()
-            for s in ranked:
-                if s in seen:
-                    continue
-                seen.add(s)
-                search_terms.append(s[:200])
-                if len(search_terms) >= max_search_terms:
-                    break
-
-        # ---- write to Memory for other blocks ----
-        try:
-            store = Memory.load()
-            now_ts = time.time()
-
-            # Links: merge with existing list, keep deduped & bounded
-            existing_links = store.get(links_key)
-            if isinstance(existing_links, list):
-                existing_urls = {str(x.get("url")) for x in existing_links if isinstance(x, dict) and x.get("url")}
-            else:
-                existing_links = []
-                existing_urls = set()
-
-            new_link_objs = []
-            for u in all_urls_set:
-                if u in existing_urls:
-                    continue
-                new_link_objs.append(
-                    {
-                        "url": u,
-                        "source": "socketpipe",
-                        "first_seen": now_ts,
-                    }
-                )
-
-            combined_links = existing_links + new_link_objs
-            max_links_store = int(params.get("max_links_store", 4096))
-            if max_links_store > 0 and len(combined_links) > max_links_store:
-                combined_links = combined_links[-max_links_store:]
-            store[links_key] = combined_links
-
-            # Lexicon
-            store[lexicon_key] = top_terms
-
-            # Domains
-            domains_sorted = sorted(all_domains_set)
-            if max_domains_terms > 0:
-                domains_sorted = domains_sorted[:max_domains_terms]
-            store[domains_key] = domains_sorted
-
-            # IPs
-            ips_sorted = sorted(all_ips_set)
-            if max_ips_terms > 0:
-                ips_sorted = ips_sorted[:max_ips_terms]
-            store[ips_key] = ips_sorted
-
-            # Search-like terms
-            store[search_terms_key] = search_terms
-
-            # Last events (truncated for debug)
-            if max_events_store > 0:
-                if len(events) > max_events_store:
-                    store[events_key] = events[-max_events_store:]
-                else:
-                    store[events_key] = events
-
-            Memory.save(store)
-
-            log.append(
-                f"[SocketPipe] Stored {len(new_link_objs)} new links, "
-                f"{len(top_terms)} lexicon terms, {len(domains_sorted)} domains, "
-                f"{len(ips_sorted)} IPs, {len(search_terms)} search_terms, {len(events)} events."
+            packet_objs.append(
+                self._normalize_packet(ev, index=idx, raw_truncate=packet_raw_truncate)
             )
-        except Exception as e:
-            log.append(f"[SocketPipe] Memory save failed: {e}")
 
-        # ---- human-readable markdown output with rich log ----
-        urls_list = sorted(all_urls_set)
-        shown_urls = urls_list[:max_urls_return]
+        # global lexicon
+        token_counts: Counter = Counter()
+        for txt in all_texts:
+            token_counts.update(self._tokenize(txt))
+        top_terms = [tok for tok, _ in token_counts.most_common(max_lexicon_terms)]
+
+        # search-like phrases
+        search_terms = self._extract_search_like_phrases(all_texts, limit=max_search_terms)
+
+        shown_urls = all_urls_list[:max_urls_return]
         domains_list = sorted(all_domains_set)
         ips_list = sorted(all_ips_set)
+        emails_list = sorted(all_emails_set)
 
-        # Top stats
-        top_types = ", ".join(f"{k}:{v}" for k, v in type_counter.most_common(5))
-        top_protos = ", ".join(f"{k}:{v}" for k, v in proto_counter.most_common(5))
-        top_ports = ", ".join(f"{k}:{v}" for k, v in dport_counter.most_common(5))
+        # memory merge
+        mem = Memory.load()
 
-        # Sample event summaries
-        sample_summaries = [
-            self._build_event_summary(ev)
-            for ev in events[: min(5, len(events))]
+        # links storage: list[dict]
+        existing_links = mem.get(links_key, [])
+        if not isinstance(existing_links, list):
+            existing_links = []
+
+        now_ts = time.time()
+        incoming_links = [{"url": u, "source": "socketpipe", "first_seen": now_ts} for u in all_urls_list]
+        merged_links: list[dict] = []
+        seen_link_urls: set[str] = set()
+
+        for row in existing_links + incoming_links:
+            if not isinstance(row, dict):
+                continue
+            u = str(row.get("url", "")).strip()
+            if not u or u in seen_link_urls:
+                continue
+            seen_link_urls.add(u)
+            merged_links.append({
+                "url": u,
+                "source": row.get("source", "socketpipe"),
+                "first_seen": row.get("first_seen", now_ts),
+            })
+
+        if max_links_store > 0 and len(merged_links) > max_links_store:
+            merged_links = merged_links[-max_links_store:]
+
+        existing_terms = mem.get(lexicon_key, [])
+        if not isinstance(existing_terms, list):
+            existing_terms = []
+        merged_terms, _, _, _ = _merge_bounded(existing_terms, top_terms, max_total=max_lexicon_terms)
+
+        existing_domains = mem.get(domains_key, [])
+        if not isinstance(existing_domains, list):
+            existing_domains = []
+        merged_domains, _, _, _ = _merge_bounded(existing_domains, domains_list, max_total=max_domains_terms)
+
+        existing_ips = mem.get(ips_key, [])
+        if not isinstance(existing_ips, list):
+            existing_ips = []
+        merged_ips, _, _, _ = _merge_bounded(existing_ips, ips_list, max_total=max_ips_terms)
+
+        existing_search_terms = mem.get(search_terms_key, [])
+        if not isinstance(existing_search_terms, list):
+            existing_search_terms = []
+        merged_search_terms, _, _, _ = _merge_bounded(existing_search_terms, search_terms, max_total=max_search_terms)
+
+        existing_events = mem.get(events_key, [])
+        if not isinstance(existing_events, list):
+            existing_events = []
+        incoming_events = [self._json_safe(ev, max_str=packet_raw_truncate) for ev in events]
+        merged_events = existing_events + incoming_events
+        if max_events_store > 0 and len(merged_events) > max_events_store:
+            merged_events = merged_events[-max_events_store:]
+
+        existing_packets = mem.get(packets_key, [])
+        if not isinstance(existing_packets, list):
+            existing_packets = []
+        merged_packets = existing_packets + packet_objs
+        # dedupe by src/dst/proto/summary/url/received_at bucket
+        deduped_packets: list[dict] = []
+        seen_packet_keys: set[str] = set()
+        for pkt in merged_packets:
+            if not isinstance(pkt, dict):
+                continue
+            pkey = json.dumps(
+                {
+                    "protocol": pkt.get("protocol"),
+                    "src_ip": pkt.get("src_ip"),
+                    "dst_ip": pkt.get("dst_ip"),
+                    "src_port": pkt.get("src_port"),
+                    "dst_port": pkt.get("dst_port"),
+                    "summary": pkt.get("summary"),
+                    "url": pkt.get("url"),
+                    "received_at": round(float(pkt.get("received_at", 0.0)), 3),
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            if pkey in seen_packet_keys:
+                continue
+            seen_packet_keys.add(pkey)
+            deduped_packets.append(pkt)
+        if max_packets_store > 0 and len(deduped_packets) > max_packets_store:
+            deduped_packets = deduped_packets[-max_packets_store:]
+
+        mem[links_key] = merged_links
+        mem[lexicon_key] = merged_terms
+        mem[domains_key] = merged_domains
+        mem[ips_key] = merged_ips
+        mem[search_terms_key] = merged_search_terms
+        mem[events_key] = merged_events
+        mem[packets_key] = deduped_packets
+        Memory.save(mem)
+
+        lines = [
+            "### 📡 SocketPipe",
+            f"- events: **{len(events)}**",
+            f"- normalized packets: **{len(packet_objs)}**",
+            f"- mode: `{mode}`",
+            f"- endpoint: `{host}:{port}`",
+            f"- unique urls: **{len(all_urls_set)}**",
+            f"- domains: **{len(domains_list)}**",
+            f"- ips: **{len(ips_list)}**",
+            f"- emails: **{len(emails_list)}**",
         ]
 
-        lines: list[str] = []
-        lines.append(f"### 📡 SocketPipe Ingest")
-        lines.append(
-            f"_Mode: {mode} | Host: {host} | Port: {port} | "
-            f"Events: {len(events)} | Unique URLs: {len(all_urls_set)} | "
-            f"Domains: {len(all_domains_set)} | IPs: {len(all_ips_set)}_"
-        )
-        lines.append("")
-        lines.append(f"**Types:** {top_types or '(none)'}")
-        lines.append(f"**Protocols (guessed):** {top_protos or '(none)'}")
-        lines.append(f"**Dst Ports:** {top_ports or '(none)'}")
-        lines.append("")
-
-        if domains_list:
-            lines.append("**Top domains:**")
-            for d in domains_list[:10]:
-                lines.append(f"- {d}")
-            if len(domains_list) > 10:
-                lines.append(f"... (+{len(domains_list) - 10} more)")
-            lines.append("")
-
-        if ips_list:
-            lines.append("**Top IPs:**")
-            for ip in ips_list[:10]:
-                lines.append(f"- {ip}")
-            if len(ips_list) > 10:
-                lines.append(f"... (+{len(ips_list) - 10} more)")
-            lines.append("")
-
         if shown_urls:
-            lines.append("**Sample URLs:**")
+            lines.append("\n### URLs")
             for u in shown_urls:
                 lines.append(f"- {u}")
-            if len(urls_list) > len(shown_urls):
-                lines.append(f"... (+{len(urls_list) - len(shown_urls)} more)")
-            lines.append("")
+
+        if domains_list[:max_domains_terms]:
+            lines.append("\n### Domains")
+            for d in domains_list[:max_domains_terms]:
+                lines.append(f"- {d}")
+
+        if ips_list[:max_ips_terms]:
+            lines.append("\n### IPs")
+            for ip in ips_list[:max_ips_terms]:
+                lines.append(f"- {ip}")
 
         if search_terms:
-            lines.append("**Search-like strings:**")
-            for s in search_terms[:5]:
-                lines.append(f"- {s}")
-            if len(search_terms) > 5:
-                lines.append(f"... (+{len(search_terms) - 5} more)")
-            lines.append("")
+            lines.append("\n### Search Terms")
+            for st in search_terms:
+                lines.append(f"- {st}")
 
-        if sample_summaries:
-            lines.append("**Sample event summaries:**")
-            for s in sample_summaries:
-                lines.append(f"- {s}")
-            lines.append("")
-
-        if all_emails_set:
-            emails_list = sorted(all_emails_set)
-            lines.append("**Emails seen (first few):**")
-            for em in emails_list[:5]:
-                lines.append(f"- {em}")
-            if len(emails_list) > 5:
-                lines.append(f"... (+{len(emails_list) - 5} more)")
-            lines.append("")
+        if packet_objs:
+            lines.append("\n### Packet Summaries")
+            for pkt in packet_objs[: min(len(packet_objs), 12)]:
+                lines.append(
+                    f"- `{pkt.get('protocol')}` "
+                    f"{pkt.get('src_ip') or '?'}:{pkt.get('src_port') or '?'} -> "
+                    f"{pkt.get('dst_ip') or '?'}:{pkt.get('dst_port') or '?'}"
+                    + (f" | {pkt.get('domain')}" if pkt.get("domain") else "")
+                    + (f" | {pkt.get('summary')}" if pkt.get("summary") else "")
+                )
 
         if log:
-            lines.append("### Internal Log")
+            lines.append("\n### Log")
             lines.extend(log)
 
         out = "\n".join(lines)
@@ -16317,6 +15875,7 @@ class SocketPipeBlock(BaseBlock):
             "urls_sample": shown_urls,
             "domains": domains_list[:max_domains_terms],
             "ips": ips_list[:max_ips_terms],
+            "emails": emails_list[:32],
             "lexicon_terms": top_terms,
             "search_terms": search_terms,
             "links_key": links_key,
@@ -16325,6 +15884,10 @@ class SocketPipeBlock(BaseBlock):
             "ips_key": ips_key,
             "search_terms_key": search_terms_key,
             "events_key": events_key,
+            "packets_key": packets_key,
+            "events": incoming_events,
+            "packets": packet_objs,
+            "packets_count": len(packet_objs),
             "type_counts": dict(type_counter),
             "proto_counts": dict(proto_counter),
             "dport_counts": dict(dport_counter),
@@ -16348,6 +15911,7 @@ class SocketPipeBlock(BaseBlock):
             "ips_key": "socketpipe_ips",
             "search_terms_key": "socketpipe_search_terms",
             "events_key": "socketpipe_last_events",
+            "packets_key": "socketpipe_packets",
 
             # Storage / output bounds
             "max_urls_return": 32,
@@ -16357,11 +15921,12 @@ class SocketPipeBlock(BaseBlock):
             "max_search_terms": 32,
             "max_links_store": 4096,
             "max_events_store": 128,
+            "max_packets_store": 256,
+            "packet_raw_truncate": 4096,
         }
 
 
 BLOCKS.register("socketpipe", SocketPipeBlock)
-
 # ======================= PageTrackerBlock ==================================
 
 @dataclass
@@ -29473,7 +29038,6 @@ BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
 
 
 
-BLOCKS.register("blocknet_texttovec", BlockNetTextToVecBlock)
 @dataclass
 class BlockNetImageToVecBlock(BaseBlock):
     """
@@ -31881,3 +31445,3046 @@ class OpenCLLoaderBlock(BaseBlock):
 
 
 BLOCKS.register("openclloader", OpenCLLoaderBlock)
+
+
+# ================ RouterClient ================
+
+@dataclass
+class RouterClientBlock(BaseBlock):
+    """
+    Query a running PythonServerManager over HTTP and turn packet/log/event data
+    into:
+      - packets : actual matched packet objects for downstream packet clients
+      - links   : real links found inside matched packet/log/event data
+      - lexicon : English-friendly query-aware terms and phrases for chat blocks
+      - context : readable English evidence built from matched packet/log/event data
+
+    Compatibility goals:
+      - Returns a normal block tuple: (out, meta)
+      - Can inject [lexicon] / [context] into the output text
+      - Can export links / lexicon / context into Memory
+      - Emits metadata keys: packets, packet_types, packet_stats, links, lexicon, context,
+        packets_key, links_key, lexicon_key, context_key
+
+    Important behavior:
+      - bundle["packets"] contains ONLY packets that actually matched the query
+      - links/context/lexicon are built from real packet/log/event contents
+      - synthetic raw packet API links are NOT placed into links
+      - lexicon/context are shaped for downstream chat use rather than machine-only diagnostics
+    """
+
+    _URL_RE = re.compile(r"https?://[^\s<>'\"()\\]+", re.IGNORECASE)
+    _HOST_RE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+    _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-./]{1,}")
+    _PHRASE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9_\-]{2,}){1,3})\b")
+    _HEX_RE = re.compile(r"\b[a-fA-F0-9]{16,}\b")
+    _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b")
+    _IP_RE = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+
+    _STOPWORDS = {
+        "the", "a", "an", "and", "or", "but", "if", "on", "in", "to", "for",
+        "from", "of", "at", "by", "with", "as", "is", "are", "was", "were",
+        "be", "been", "being", "that", "this", "these", "those", "it", "its",
+        "into", "about", "over", "under", "up", "down", "out", "so", "than",
+        "then", "too", "very", "can", "cannot", "could", "should", "would",
+        "will", "may", "might", "must", "do", "does", "did", "done", "doing",
+        "have", "has", "had", "having", "not", "no", "yes", "you", "your",
+        "yours", "we", "our", "ours", "they", "their", "theirs", "i", "me",
+        "my", "mine", "he", "she", "him", "her", "his", "hers", "them",
+        "there", "here", "also", "such", "via", "http", "https", "www",
+        "packet", "packets", "raw", "summary", "processing", "router", "client",
+        "event", "events", "log", "logs", "data", "info", "json", "none", "null",
+    }
+
+    _TOPIC_HINTS = {
+        "dns", "http", "https", "tls", "ssh", "ftp", "dhcp", "icmp", "mdns",
+        "ssdp", "radius", "ntp", "ldap", "imap", "smtp", "postgres", "mysql",
+        "mongodb", "redis", "quic", "wireguard", "openvpn", "kerberos", "sip",
+        "rtsp", "modbus", "dnp3", "opcua", "s7", "bacnet", "monero", "levin",
+        "p2pool", "stratum", "rpc", "xmrig",
+    }
+
+    # ---------- logging ----------
+
+    def _log(self, msg: str) -> None:
+        try:
+            DEBUG_LOGGER.log_message(f"[RouterClient] {msg}")
+        except Exception:
+            try:
+                print(f"[RouterClient] {msg}")
+            except Exception:
+                pass
+
+    # ---------- generic helpers ----------
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_json_text(value: Any, max_chars: int = 2000) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            text = str(value)
+        return text[:max_chars]
+
+    @staticmethod
+    def _dedupe(items: List[Any]) -> List[Any]:
+        out: List[Any] = []
+        seen: Set[str] = set()
+        for item in items:
+            key = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _dedupe_dicts(items: List[Dict[str, Any]], key_fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key_obj = {k: item.get(k) for k in key_fields}
+            key = json.dumps(key_obj, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _json_get(session: requests.Session, url: str, *, params: Optional[Dict[str, Any]] = None, timeout: float = 8.0) -> Any:
+        q = {}
+        if params:
+            for k, v in params.items():
+                if v is not None and v != "":
+                    q[k] = v
+        resp = session.get(url, params=q or None, timeout=timeout)
+        resp.raise_for_status()
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "application/json" in ctype or resp.text.strip().startswith("{") or resp.text.strip().startswith("["):
+            return resp.json()
+        return json.loads(resp.text)
+
+    @staticmethod
+    def _clean_token(token: Any) -> str:
+        t = str(token or "").strip().lower()
+        t = t.strip(".,:;!?()[]{}<>\"'`")
+        return t
+
+    def _is_machine_token(self, token: Any) -> bool:
+        t = self._clean_token(token)
+        if not t:
+            return True
+        if t in self._STOPWORDS:
+            return True
+        if len(t) < 3:
+            return True
+        if self._HEX_RE.fullmatch(t):
+            return True
+        if self._UUID_RE.fullmatch(t):
+            return True
+        if self._IP_RE.fullmatch(t):
+            return True
+        if sum(ch.isdigit() for ch in t) > max(4, len(t) // 2):
+            return True
+        return False
+
+    @staticmethod
+    def _iter_texts(obj: Any) -> Iterable[str]:
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            yield obj
+            return
+        if isinstance(obj, bytes):
+            try:
+                txt = obj.decode("utf-8", errors="ignore")
+                if txt:
+                    yield txt
+            except Exception:
+                pass
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k:
+                    yield k
+                yield from RouterClientBlock._iter_texts(v)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                yield from RouterClientBlock._iter_texts(item)
+            return
+        try:
+            yield str(obj)
+        except Exception:
+            return
+
+    def _extract_query_terms(self, query_raw: str, *, top_k: int = 24) -> List[str]:
+        q = str(query_raw or "").strip().lower()
+        raw_terms = self._TOKEN_RE.findall(q)
+        terms: List[str] = []
+        for term in raw_terms:
+            clean = self._clean_token(term)
+            if not clean or self._is_machine_token(clean):
+                continue
+            if clean not in terms:
+                terms.append(clean)
+        return terms[:top_k]
+
+    def _needs_stats_context(self, *, query_raw: str, qterms: List[str]) -> bool:
+        q = f"{query_raw} {' '.join(qterms)}".lower()
+        hints = (
+            "stats", "status", "server", "running", "uptime", "flow", "flows",
+            "count", "counts", "retention", "packet count", "packet counts",
+            "event count", "events", "log count", "overview", "summary",
+        )
+        return any(h in q for h in hints)
+
+    # ---------- inline payload parsing ----------
+
+    @staticmethod
+    def _parse_inline_ctx_lex(payload: Any) -> Tuple[str, List[str], List[str]]:
+        """
+        Supports:
+          - plain text payloads
+          - dict payloads with query/context/lexicon
+          - lightweight inline sections like:
+
+              my query here
+              [context]
+              ...
+              [/context]
+              [lexicon]
+              a, b, c
+              [/lexicon]
+        """
+        if isinstance(payload, dict):
+            core = str(payload.get("query") or payload.get("payload") or payload.get("text") or "").strip()
+            ctx = payload.get("context") or []
+            lex = payload.get("lexicon") or []
+            if isinstance(ctx, str):
+                ctx_list = [ctx]
+            elif isinstance(ctx, list):
+                ctx_list = [str(x) for x in ctx if str(x).strip()]
+            else:
+                ctx_list = []
+            if isinstance(lex, str):
+                lex_list = [x.strip() for x in re.split(r"[,\n]", lex) if x.strip()]
+            elif isinstance(lex, list):
+                lex_list = [str(x).strip() for x in lex if str(x).strip()]
+            else:
+                lex_list = []
+            return core, ctx_list, lex_list
+
+        text = str(payload or "")
+        core = text
+        inline_ctx: List[str] = []
+        inline_lex: List[str] = []
+
+        ctx_match = re.search(r"\[context\](.*?)\[/context\]", text, flags=re.IGNORECASE | re.DOTALL)
+        lex_match = re.search(r"\[lexicon\](.*?)\[/lexicon\]", text, flags=re.IGNORECASE | re.DOTALL)
+
+        if ctx_match:
+            ctx_text = ctx_match.group(1).strip()
+            if ctx_text:
+                inline_ctx.append(ctx_text)
+            core = core.replace(ctx_match.group(0), "").strip()
+
+        if lex_match:
+            lex_text = lex_match.group(1).strip()
+            if lex_text:
+                inline_lex.extend([x.strip() for x in re.split(r"[,\n]", lex_text) if x.strip()])
+            core = core.replace(lex_match.group(0), "").strip()
+
+        return core.strip(), inline_ctx, inline_lex
+
+    # ---------- link extraction ----------
+
+    def _extract_urls_from_text(self, text: str) -> List[str]:
+        return self._URL_RE.findall(text or "")
+
+    def _extract_links_from_html(self, html_text: str, *, base_url: str = "") -> List[str]:
+        if not html_text:
+            return []
+
+        found: List[str] = []
+        seen: Set[str] = set()
+
+        def _push(raw: str) -> None:
+            raw = str(raw or "").strip()
+            if not raw:
+                return
+            low = raw.lower()
+            if low.startswith(("javascript:", "mailto:", "data:", "#")):
+                return
+            if raw.startswith(("http://", "https://")):
+                out = raw
+            elif base_url:
+                try:
+                    out = urljoin(base_url, raw)
+                except Exception:
+                    out = ""
+            else:
+                out = ""
+            if out and out not in seen:
+                seen.add(out)
+                found.append(out)
+
+        for u in self._extract_urls_from_text(html_text):
+            _push(u)
+
+        attr_re = re.compile(r"""(?is)\b(?:href|src|action|data-src)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""")
+        for m in attr_re.finditer(html_text):
+            _push(m.group(1) or m.group(2) or m.group(3) or "")
+
+        srcset_re = re.compile(r"""(?is)\bsrcset\s*=\s*["']([^"']+)["']""")
+        for m in srcset_re.finditer(html_text):
+            parts = [p.strip().split(" ")[0] for p in str(m.group(1) or "").split(",") if p.strip()]
+            for part in parts:
+                _push(part)
+
+        css_re = re.compile(r"""(?is)\burl\(\s*['"]?([^'")]+)['"]?\s*\)""")
+        for m in css_re.finditer(html_text):
+            _push(m.group(1) or "")
+
+        return found
+
+    def _extract_real_links_from_obj(self, obj: Any, *, top_links: int = 80) -> List[str]:
+        """
+        Stronger packet/log/event link extraction:
+          - direct URLs
+          - embedded HTML href/src/srcset/action/data-src/css url(...)
+          - hostnames in fields like host/server_name/domain/qname turned into https://host/
+        """
+        links: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(url: str) -> None:
+            u = str(url or "").strip()
+            if not u:
+                return
+            if not u.startswith(("http://", "https://")):
+                return
+            if u in seen:
+                return
+            seen.add(u)
+            links.append(u)
+
+        def _walk(node: Any, parent_key: str = "") -> None:
+            if len(links) >= top_links:
+                return
+
+            if isinstance(node, str):
+                for u in self._extract_urls_from_text(node):
+                    _add(u)
+
+                if "<html" in node.lower() or "href=" in node.lower() or "<a " in node.lower():
+                    base = links[0] if links else ""
+                    for u in self._extract_links_from_html(node, base_url=base):
+                        _add(u)
+
+                pk = parent_key.lower()
+                if pk in {"host", "hostname", "server_name", "servername", "sni", "domain", "qname", "query_name"}:
+                    h = node.strip().lower()
+                    if h and "." in h and " " not in h:
+                        if h.startswith("www."):
+                            h = h[4:]
+                        _add(f"https://{h}/")
+                return
+
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    _walk(v, str(k))
+                return
+
+            if isinstance(node, (list, tuple, set)):
+                for item in node:
+                    _walk(item, parent_key)
+                return
+
+        _walk(obj)
+
+        return links[:top_links]
+
+    # ---------- matching / packet shaping ----------
+
+    def _record_matches_query(self, record: Any, qterms: List[str], query_raw: str) -> Tuple[bool, str]:
+        texts = [t for t in self._iter_texts(record) if t and str(t).strip()]
+        if not texts:
+            blob = self._safe_json_text(record, max_chars=3000)
+            return (query_raw.lower() in blob.lower(), blob[:500])
+
+        query_l = str(query_raw or "").strip().lower()
+        best_text = ""
+        best_score = 0
+
+        for txt in texts:
+            tl = txt.lower()
+            score = 0
+
+            if query_l and query_l in tl:
+                score += 100
+
+            for qt in qterms:
+                if qt and qt in tl:
+                    score += 10
+
+            if score > best_score:
+                best_score = score
+                best_text = txt
+
+        return best_score > 0, best_text[:1000]
+
+    def _packet_summary_text(self, record: Dict[str, Any]) -> str:
+        bits: List[str] = []
+
+        for key in ("topic", "protocol", "component", "phase", "iface", "summary", "summary_text", "detail"):
+            v = record.get(key)
+            if v:
+                bits.append(str(v))
+
+        src_ip = record.get("src_ip") or record.get("source_ip")
+        dst_ip = record.get("dst_ip") or record.get("dest_ip") or record.get("destination_ip")
+        src_port = record.get("src_port") or record.get("sport")
+        dst_port = record.get("dst_port") or record.get("dport")
+
+        if src_ip or dst_ip:
+            bits.append(f"{src_ip or '?'}:{src_port or '?'} -> {dst_ip or '?'}:{dst_port or '?'}")
+
+        return " | ".join([b for b in bits if b])[:600]
+
+    def _normalize_matched_packet(self, record: Dict[str, Any], *, matched_text: str, links: List[str]) -> Dict[str, Any]:
+        src_ip = record.get("src_ip") or record.get("source_ip")
+        dst_ip = record.get("dst_ip") or record.get("dest_ip") or record.get("destination_ip")
+        src_port = self._safe_int(record.get("src_port") or record.get("sport"))
+        dst_port = self._safe_int(record.get("dst_port") or record.get("dport"))
+        protocol = str(record.get("protocol") or record.get("topic") or record.get("component") or "").strip().lower()
+
+        domain = ""
+        if links:
+            try:
+                domain = (urlparse(links[0]).netloc or "").lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+            except Exception:
+                domain = ""
+
+        pkt = {
+            "id": record.get("id") or record.get("packet_id") or record.get("ts") or record.get("time") or "",
+            "topic": record.get("topic") or "",
+            "protocol": protocol,
+            "component": record.get("component") or "",
+            "phase": record.get("phase") or "",
+            "iface": record.get("iface") or record.get("interface") or "",
+            "src_ip": src_ip or "",
+            "src_port": src_port,
+            "dst_ip": dst_ip or "",
+            "dst_port": dst_port,
+            "summary_text": self._packet_summary_text(record),
+            "matched_text": str(matched_text or "")[:1200],
+            "links": self._dedupe(list(links))[:32],
+            "url": links[0] if links else "",
+            "domain": domain,
+            "domains": self._dedupe([
+                (urlparse(u).netloc or "").lower().removeprefix("www.")
+                for u in links
+                if str(u).startswith(("http://", "https://"))
+            ])[:16],
+            "record": record,
+        }
+        return pkt
+
+    # ---------- lexicon / context ----------
+
+    def _build_lexicon(self, *, qterms: List[str], matched_texts: List[str], links: List[str], top_k: int = 40) -> List[str]:
+        counts: Counter = Counter()
+        phrases: List[str] = []
+
+        for txt in matched_texts:
+            for tok in self._TOKEN_RE.findall(txt or ""):
+                clean = self._clean_token(tok)
+                if not clean or self._is_machine_token(clean):
+                    continue
+                counts[clean] += 1
+
+            for m in self._PHRASE_RE.finditer(txt or ""):
+                phrase = str(m.group(1) or "").strip().lower()
+                if len(phrase) >= 6 and phrase not in phrases:
+                    phrases.append(phrase)
+
+        for qt in qterms:
+            if qt and not self._is_machine_token(qt):
+                counts[qt] += 100
+
+        for link in links[:20]:
+            try:
+                host = (urlparse(link).netloc or "").lower()
+                if host.startswith("www."):
+                    host = host[4:]
+                if host and not self._is_machine_token(host):
+                    counts[host] += 6
+            except Exception:
+                continue
+
+        lex: List[str] = []
+        for tok, _ in counts.most_common(top_k * 2):
+            if tok not in lex:
+                lex.append(tok)
+            if len(lex) >= top_k:
+                break
+
+        for phrase in phrases[: max(8, top_k // 4)]:
+            if phrase not in lex:
+                lex.append(phrase)
+            if len(lex) >= top_k:
+                break
+
+        return lex[:top_k]
+
+    def _build_context(
+        self,
+        *,
+        query_raw: str,
+        inline_ctx: List[str],
+        stats_lines: List[str],
+        matched_packets: List[Dict[str, Any]],
+        matched_logs: List[Dict[str, Any]],
+        matched_events: List[Dict[str, Any]],
+        max_chars: int = 5000,
+    ) -> str:
+        lines: List[str] = []
+
+        if query_raw:
+            lines.append(f"Query: {query_raw}")
+
+        for ctx in inline_ctx:
+            if ctx.strip():
+                lines.append(f"Inline context: {ctx.strip()}")
+
+        if stats_lines:
+            lines.append("Stats:")
+            for line in stats_lines[:12]:
+                lines.append(f"- {line}")
+
+        if matched_packets:
+            lines.append("Matched packets:")
+            for pkt in matched_packets[:20]:
+                line = pkt.get("summary_text") or pkt.get("matched_text") or ""
+                if pkt.get("url"):
+                    line += f" | url={pkt.get('url')}"
+                lines.append(f"- {line[:280]}")
+
+        if matched_logs:
+            lines.append("Matched logs:")
+            for row in matched_logs[:12]:
+                line = row.get("_matched_text") or row.get("message") or row.get("text") or self._safe_json_text(row, 400)
+                lines.append(f"- {str(line)[:280]}")
+
+        if matched_events:
+            lines.append("Matched events:")
+            for row in matched_events[:12]:
+                line = row.get("_matched_text") or row.get("message") or row.get("text") or self._safe_json_text(row, 400)
+                lines.append(f"- {str(line)[:280]}")
+
+        context = "\n".join(lines).strip()
+        return context[:max_chars]
+
+    # ---------- memory export ----------
+
+    def _export_memory(
+        self,
+        *,
+        params: Dict[str, Any],
+        response: Any,
+        packets: List[Dict[str, Any]],
+        packet_types: Dict[str, int],
+        packet_stats: Dict[str, Any],
+        links: List[str],
+        lexicon: List[str],
+        context: str,
+    ) -> Dict[str, str]:
+        exports: Dict[str, str] = {}
+
+        prefix = str(params.get("mem_out_prefix", "") or "").strip()
+        packets_key = str(params.get("packets_key", "") or "").strip()
+        packet_types_key = str(params.get("packet_types_key", "") or "").strip()
+        packet_stats_key = str(params.get("packet_stats_key", "") or "").strip()
+        links_key = str(params.get("links_key", "") or "").strip()
+        lexicon_key = str(params.get("lexicon_key", "") or "").strip()
+        context_key = str(params.get("context_key", "") or "").strip()
+
+        if prefix:
+            packets_key = packets_key or f"{prefix}.packets"
+            packet_types_key = packet_types_key or f"{prefix}.packet_types"
+            packet_stats_key = packet_stats_key or f"{prefix}.packet_stats"
+            links_key = links_key or f"{prefix}.links"
+            lexicon_key = lexicon_key or f"{prefix}.lexicon"
+            context_key = context_key or f"{prefix}.context"
+
+        max_items = int(params.get("mem_out_max_items", 500) or 500)
+        max_packets = int(params.get("mem_out_max_packets", max(50, min(max_items, 250))) or max(50, min(max_items, 250)))
+
+        mem = Memory.load()
+
+        if packets_key:
+            existing_packets = mem.get(packets_key, [])
+            if not isinstance(existing_packets, list):
+                existing_packets = []
+            merged_packets = self._dedupe_dicts(
+                list(existing_packets) + list(packets),
+                key_fields=("id", "src_ip", "src_port", "dst_ip", "dst_port", "summary_text", "matched_text"),
+            )
+            mem[packets_key] = merged_packets[:max_packets]
+            exports["packets"] = packets_key
+            self._log(f"Exported {len(mem[packets_key])} matched packets to Memory[{packets_key}]")
+
+        if packet_types_key:
+            mem[packet_types_key] = dict(packet_types)
+            exports["packet_types"] = packet_types_key
+            self._log(f"Exported packet_types ({len(packet_types)}) to Memory[{packet_types_key}]")
+
+        if packet_stats_key:
+            mem[packet_stats_key] = dict(packet_stats)
+            exports["packet_stats"] = packet_stats_key
+            self._log(f"Exported packet_stats to Memory[{packet_stats_key}]")
+
+        if links_key:
+            existing_links = mem.get(links_key, [])
+            if not isinstance(existing_links, list):
+                existing_links = []
+            merged = self._dedupe(existing_links + list(links))
+            mem[links_key] = merged[:max_items]
+            exports["links"] = links_key
+            self._log(f"Exported {len(mem[links_key])} real links to Memory[{links_key}]")
+
+        if lexicon_key:
+            existing = mem.get(lexicon_key, [])
+            if not isinstance(existing, list):
+                existing = []
+            merged = self._dedupe(existing + list(lexicon))
+            mem[lexicon_key] = merged[:max_items]
+            exports["lexicon"] = lexicon_key
+            self._log(f"Exported {len(mem[lexicon_key])} lexicon terms to Memory[{lexicon_key}]")
+
+        if context_key and context:
+            append_ctx = bool(params.get("append_context", False))
+            if append_ctx and isinstance(mem.get(context_key), str) and mem.get(context_key):
+                existing_ctx = str(mem.get(context_key))
+                if context[:120] not in existing_ctx:
+                    mem[context_key] = existing_ctx.rstrip() + "\n\n" + context
+            else:
+                mem[context_key] = context
+            exports["context"] = context_key
+            self._log(f"Exported context ({len(context)} chars) to Memory[{context_key}]")
+
+        resp_key = str(params.get("mem_out_response_key", "") or "").strip()
+        if prefix and not resp_key:
+            resp_key = f"{prefix}.response"
+        if resp_key:
+            mem[resp_key] = response
+            exports["response"] = resp_key
+            self._log(f"Exported full response to Memory[{resp_key}]")
+
+        Memory.save(mem)
+        return exports
+
+    # ---------- main execute ----------
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        core, inline_ctx, inline_lex = self._parse_inline_ctx_lex(payload)
+
+        query_raw = str(params.get("query", "") or core or payload or "").strip()
+        if not query_raw:
+            self._log("Refusing empty query")
+            return "", {"ok": False, "error": "RouterClientBlock: empty query"}
+
+        scheme = str(params.get("scheme", "http") or "http").strip()
+        host = str(params.get("host", "127.0.0.1") or "127.0.0.1").strip()
+        port = int(params.get("port", 8844) or 8844)
+        base_url = str(params.get("base_url", "") or "").strip().rstrip("/")
+        if not base_url:
+            base_url = f"{scheme}://{host}:{port}"
+
+        timeout = float(params.get("timeout", 8.0) or 8.0)
+        packet_limit = int(params.get("packet_limit", 250) or 250)
+        log_limit = int(params.get("log_limit", 250) or 250)
+        event_limit = int(params.get("event_limit", 250) or 250)
+        top_k = int(params.get("top_k", 20) or 20)
+        top_links = int(params.get("top_links", 80) or 80)
+        lexicon_top_k = int(params.get("lexicon_top_k", 40) or 40)
+        context_max_chars = int(params.get("context_max_chars", 5000) or 5000)
+
+        include_stats = bool(params.get("include_stats", True))
+        include_logs = bool(params.get("include_logs", True))
+        include_packets = bool(params.get("include_packets", True))
+        include_events = bool(params.get("include_events", True))
+        inject_lexicon = bool(params.get("inject_lexicon", True))
+        inject_context = bool(params.get("inject_context", True))
+        emit = str(params.get("emit", "text") or "text").strip().lower()
+
+        qterms = self._extract_query_terms(query_raw, top_k=24)
+        qterms = self._dedupe(
+            qterms + [self._clean_token(x) for x in inline_lex if self._clean_token(x) and not self._is_machine_token(x)]
+        )
+        wants_stats_context = self._needs_stats_context(query_raw=query_raw, qterms=qterms)
+
+        self._log(
+            f"Start query={query_raw!r} base_url={base_url} "
+            f"stats={include_stats} logs={include_logs} packets={include_packets} events={include_events}"
+        )
+        self._log(f"Normalized query terms: {qterms[:24]}")
+        self._log(f"Stats context requested: {wants_stats_context}")
+
+        session = requests.Session()
+        session.headers.update({"User-Agent": "PromptChat/RouterClientBlock"})
+
+        stats_json: Dict[str, Any] = {}
+        logs_json: Dict[str, Any] = {"items": []}
+        packets_json: Dict[str, Any] = {"items": []}
+        events_json: Dict[str, Any] = {"items": []}
+        errors: List[str] = []
+
+        try:
+            if include_stats:
+                try:
+                    stats_json = self._json_get(session, f"{base_url}/api/stats", timeout=timeout) or {}
+                    self._log(f"Loaded stats keys: {list(stats_json.keys())[:16]}")
+                except Exception as e:
+                    errors.append(f"stats: {e}")
+                    self._log(f"Stats fetch failed: {e}")
+
+            if include_logs:
+                try:
+                    logs_json = self._json_get(
+                        session,
+                        f"{base_url}/api/logs",
+                        params={
+                            "limit": log_limit,
+                            "contains": query_raw[:256],
+                            "sort_by": "time_desc",
+                        },
+                        timeout=timeout,
+                    ) or {"items": []}
+                    self._log(f"Loaded logs: {len(logs_json.get('items') or [])}")
+                except Exception as e:
+                    errors.append(f"logs: {e}")
+                    self._log(f"Logs fetch failed: {e}")
+
+            if include_packets:
+                try:
+                    auto_topic = str(params.get("topic", "") or "").strip() or None
+                    if auto_topic is None:
+                        for t in qterms:
+                            if t in self._TOPIC_HINTS:
+                                auto_topic = t
+                                break
+                    packets_json = self._json_get(
+                        session,
+                        f"{base_url}/api/packets",
+                        params={
+                            "limit": packet_limit,
+                            "include_hex_preview": True,
+                            "include_raw": False,
+                            "topic": auto_topic,
+                            "iface": str(params.get("iface", "") or "").strip() or None,
+                            "component": str(params.get("component", "") or "").strip() or None,
+                            "phase": str(params.get("phase", "") or "").strip() or None,
+                        },
+                        timeout=timeout,
+                    ) or {"items": []}
+                    self._log(f"Loaded packets: {len(packets_json.get('items') or [])} auto_topic={auto_topic}")
+                except Exception as e:
+                    errors.append(f"packets: {e}")
+                    self._log(f"Packets fetch failed: {e}")
+
+            if include_events:
+                try:
+                    events_json = self._json_get(
+                        session,
+                        f"{base_url}/api/events",
+                        params={"limit": event_limit},
+                        timeout=timeout,
+                    ) or {"items": []}
+                    self._log(f"Loaded events: {len(events_json.get('items') or [])}")
+                except Exception as e:
+                    errors.append(f"events: {e}")
+                    self._log(f"Events fetch failed: {e}")
+
+        finally:
+            try:
+                session.close()
+                self._log("HTTP session closed")
+            except Exception:
+                pass
+
+        matched_packets: List[Dict[str, Any]] = []
+        matched_logs: List[Dict[str, Any]] = []
+        matched_events: List[Dict[str, Any]] = []
+        real_links: List[str] = []
+        matched_texts: List[str] = []
+        stats_lines: List[str] = []
+
+        if include_stats and isinstance(stats_json, dict) and wants_stats_context:
+            for k in ("server", "packets", "logs", "events", "retention", "flows"):
+                v = stats_json.get(k)
+                if not v:
+                    continue
+                if isinstance(v, dict):
+                    summary_bits = []
+                    for sk, sv in list(v.items())[:12]:
+                        if isinstance(sv, (str, int, float, bool)):
+                            summary_bits.append(f"{sk}={sv}")
+                    if summary_bits:
+                        stats_lines.append(f"{k}: " + ", ".join(summary_bits[:12]))
+                else:
+                    stats_lines.append(f"{k}: {v}")
+
+        for row in list(packets_json.get("items") or []):
+            if not isinstance(row, dict):
+                continue
+            ok, matched_text = self._record_matches_query(row, qterms, query_raw)
+            if not ok:
+                continue
+            links_here = self._extract_real_links_from_obj(row, top_links=top_links)
+            real_links.extend(links_here)
+            if matched_text:
+                matched_texts.append(matched_text)
+            pkt = self._normalize_matched_packet(row, matched_text=matched_text, links=links_here)
+            matched_packets.append(pkt)
+
+        for row in list(logs_json.get("items") or []):
+            if not isinstance(row, dict):
+                continue
+            ok, matched_text = self._record_matches_query(row, qterms, query_raw)
+            if not ok:
+                continue
+            row = dict(row)
+            row["_matched_text"] = matched_text
+            matched_logs.append(row)
+            matched_texts.append(matched_text)
+            real_links.extend(self._extract_real_links_from_obj(row, top_links=max(16, top_links // 2)))
+
+        for row in list(events_json.get("items") or []):
+            if not isinstance(row, dict):
+                continue
+            ok, matched_text = self._record_matches_query(row, qterms, query_raw)
+            if not ok:
+                continue
+            row = dict(row)
+            row["_matched_text"] = matched_text
+            matched_events.append(row)
+            matched_texts.append(matched_text)
+            real_links.extend(self._extract_real_links_from_obj(row, top_links=max(16, top_links // 2)))
+
+        real_links = self._dedupe([u for u in real_links if str(u).startswith(("http://", "https://"))])[:top_links]
+
+        lexicon = self._build_lexicon(
+            qterms=qterms,
+            matched_texts=matched_texts,
+            links=real_links,
+            top_k=lexicon_top_k,
+        )
+
+        context = self._build_context(
+            query_raw=query_raw,
+            inline_ctx=inline_ctx,
+            stats_lines=stats_lines,
+            matched_packets=matched_packets,
+            matched_logs=matched_logs,
+            matched_events=matched_events,
+            max_chars=context_max_chars,
+        )
+
+        packet_types_counter: Counter = Counter()
+        for pkt in matched_packets:
+            for key in ("topic", "protocol", "component"):
+                val = str(pkt.get(key) or "").strip().lower()
+                if val:
+                    packet_types_counter[val] += 1
+
+        domains_counter: Counter = Counter()
+        for link in real_links:
+            try:
+                hostn = (urlparse(link).netloc or "").lower()
+                if hostn.startswith("www."):
+                    hostn = hostn[4:]
+                if hostn:
+                    domains_counter[hostn] += 1
+            except Exception:
+                continue
+
+        packet_stats = {
+            "query": query_raw,
+            "base_url": base_url,
+            "counts": {
+                "matched_packets": len(matched_packets),
+                "matched_logs": len(matched_logs),
+                "matched_events": len(matched_events),
+                "real_links": len(real_links),
+                "lexicon": len(lexicon),
+            },
+            "loaded": {
+                "stats_keys": list(stats_json.keys())[:32] if isinstance(stats_json, dict) else [],
+                "logs": len(logs_json.get("items") or []),
+                "packets": len(packets_json.get("items") or []),
+                "events": len(events_json.get("items") or []),
+            },
+            "packet_types": dict(packet_types_counter),
+            "domains": dict(domains_counter.most_common(32)),
+            "errors": errors,
+        }
+
+        bundle = {
+            "ok": True,
+            "query": query_raw,
+            "base_url": base_url,
+            "packets": matched_packets,
+            "packet_types": dict(packet_types_counter),
+            "packet_stats": packet_stats,
+            "links": real_links,
+            "lexicon": lexicon,
+            "context": context,
+            "logs": matched_logs,
+            "events": matched_events,
+            "stats": stats_json if include_stats else {},
+            "errors": errors,
+        }
+
+        exports: Dict[str, str] = {}
+        if bool(params.get("mem_out_on_ok", True)):
+            exports = self._export_memory(
+                params=params,
+                response=bundle,
+                packets=matched_packets,
+                packet_types=dict(packet_types_counter),
+                packet_stats=packet_stats,
+                links=real_links,
+                lexicon=lexicon,
+                context=context,
+            )
+
+        meta = {
+            "ok": True,
+            "query": query_raw,
+            "base_url": base_url,
+            "packets": matched_packets,
+            "packet_types": dict(packet_types_counter),
+            "packet_stats": packet_stats,
+            "links": real_links,
+            "lexicon": lexicon,
+            "context": context,
+            "logs": matched_logs,
+            "events": matched_events,
+            "errors": errors,
+            "packets_key": exports.get("packets"),
+            "links_key": exports.get("links"),
+            "lexicon_key": exports.get("lexicon"),
+            "context_key": exports.get("context"),
+            "response_key": exports.get("response"),
+        }
+
+        if emit == "bundle":
+            return bundle, meta
+        if emit == "links":
+            return real_links, meta
+        if emit == "context":
+            return context, meta
+        if emit == "packets":
+            return matched_packets, meta
+
+        lines: List[str] = []
+        lines.append("### Router Client")
+        lines.append(f"- query: {query_raw}")
+        lines.append(f"- base_url: {base_url}")
+        lines.append(f"- matched packets: {len(matched_packets)}")
+        lines.append(f"- matched logs: {len(matched_logs)}")
+        lines.append(f"- matched events: {len(matched_events)}")
+        lines.append(f"- real links: {len(real_links)}")
+
+        if real_links:
+            lines.append("\n### Links")
+            for u in real_links[: min(len(real_links), top_k)]:
+                lines.append(f"- {u}")
+
+        if inject_lexicon and lexicon:
+            lines.append("\n### Lexicon")
+            for term in lexicon[:top_k]:
+                lines.append(f"- {term}")
+
+        if inject_context and context:
+            lines.append("\n### Context")
+            lines.append(context)
+
+        out = "\n".join(lines)
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "override query string; defaults to payload text",
+            "scheme": "http",
+            "host": "127.0.0.1",
+            "port": 8844,
+            "base_url": "optional full base URL override, e.g. http://192.168.0.10:8844",
+            "timeout": 8.0,
+
+            "packet_limit": 250,
+            "log_limit": 250,
+            "event_limit": 250,
+
+            "top_k": 20,
+            "top_links": 80,
+            "lexicon_top_k": 40,
+            "context_max_chars": 5000,
+
+            "include_stats": True,
+            "include_logs": True,
+            "include_packets": True,
+            "include_events": True,
+
+            "inject_lexicon": True,
+            "inject_context": True,
+
+            "emit": "text | bundle | links | context | packets",
+
+            "topic": "optional packet topic filter",
+            "iface": "optional interface filter",
+            "component": "optional component filter",
+            "phase": "optional phase filter",
+
+            "mem_out_on_ok": True,
+            "packets_key": "optional Memory key for matched packets",
+            "packet_types_key": "optional Memory key for matched packet types",
+            "packet_stats_key": "optional Memory key for matched packet stats",
+            "links_key": "optional Memory key for links",
+            "lexicon_key": "optional Memory key for lexicon",
+            "context_key": "optional Memory key for context",
+            "mem_out_prefix": "optional prefix to auto-build keys",
+            "mem_out_max_items": 500,
+            "mem_out_max_packets": 250,
+            "append_context": False,
+            "mem_out_response_key": "optional Memory key for full response bundle",
+        }
+
+
+BLOCKS.register("router_client", RouterClientBlock)
+
+# ================ NetworkTracker ================
+
+@dataclass
+class NetworkTrackerBlock(BaseBlock):
+    """
+    Advanced companion block for RouterClientBlock and socket-driven packet flows.
+
+    Inputs:
+      - RouterClientBlock bundle payloads
+      - packet lists / packet dicts
+      - Memory-stored packets
+      - passive libpcap live/offline capture
+      - bounded active TCP/UDP application-layer exchange (optional)
+
+    Outputs:
+      - packets
+      - links
+      - lexicon
+      - context
+      - packet_types
+      - packet_stats
+      - network_state
+      - tracking_decisions
+      - active_exchange
+
+    Major behaviors:
+      - normalizes packet-like objects from many sources
+      - scores packets against the query
+      - extracts real links from packet/log/event/app payload text
+      - builds English-friendly lexicon + context for downstream chat/prompt blocks
+      - exports packets/links/lexicon/context to Memory for other blocks
+      - logs actual socket send/receive actions with DEBUG_LOGGER.log_message(...)
+    """
+
+    _URL_RE = re.compile(r"https?://[^\s<>'\"()\\]+", re.IGNORECASE)
+    _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_\-\./]{1,}")
+    _PHRASE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_\-]{2,}(?:\s+[A-Za-z][A-Za-z0-9_\-]{2,}){1,3})\b")
+    _HEX_RE = re.compile(r"\b[a-fA-F0-9]{16,}\b")
+    _UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}\b")
+    _HOST_RE = re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b")
+    _IP_RE = re.compile(r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b")
+
+    _STOPWORDS = {
+        "the", "a", "an", "and", "or", "but", "if", "on", "in", "to", "for",
+        "from", "of", "at", "by", "with", "as", "is", "are", "was", "were",
+        "be", "been", "being", "that", "this", "these", "those", "it", "its",
+        "into", "about", "over", "under", "up", "down", "out", "so", "than",
+        "then", "too", "very", "can", "cannot", "could", "should", "would",
+        "will", "may", "might", "must", "do", "does", "did", "done", "doing",
+        "have", "has", "had", "having", "not", "no", "yes", "you", "your",
+        "yours", "we", "our", "ours", "they", "their", "theirs", "i", "me",
+        "my", "mine", "he", "she", "him", "her", "his", "hers", "them",
+        "there", "here", "also", "such", "via", "http", "https", "www",
+        "packet", "packets", "raw", "summary", "processing", "network", "tracker",
+        "event", "events", "log", "logs", "data", "json", "none", "null"
+    }
+
+    _TOPIC_HINTS = {
+        "dns", "http", "https", "tls", "ssh", "ftp", "dhcp", "icmp", "mdns",
+        "ssdp", "radius", "ntp", "ldap", "imap", "smtp", "postgres", "mysql",
+        "oracle", "mongodb", "redis", "mqtt", "quic", "udp", "tcp", "arp",
+        "rpc", "kerberos", "wireguard", "openvpn", "monero", "levin", "p2pool",
+        "stratum", "xmrig", "websocket", "llmnr"
+    }
+
+    _COMMON_PORTS = {
+        20: "ftp-data", 21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
+        67: "dhcp", 68: "dhcp", 80: "http", 110: "pop3", 123: "ntp", 135: "rpc",
+        137: "netbios-ns", 138: "netbios-dgm", 139: "netbios-ssn", 143: "imap",
+        161: "snmp", 389: "ldap", 443: "https", 445: "smb", 465: "smtps", 514: "syslog",
+        5353: "mdns", 5355: "llmnr", 5432: "postgres", 587: "submission", 6379: "redis",
+        8080: "http-alt", 8443: "https-alt", 853: "dot", 993: "imaps", 995: "pop3s",
+        3306: "mysql", 3389: "rdp", 37888: "p2pool", 37889: "p2pool",
+        18080: "monero-rpc", 18081: "monero-daemon",
+        3333: "stratum", 4444: "stratum", 5555: "stratum",
+    }
+
+    @dataclass
+    class Config:
+        timeout: float = 8.0
+        top_k: int = 24
+        top_links: int = 80
+        lexicon_top_k: int = 40
+        context_max_chars: int = 7000
+
+        max_capture_packets: int = 128
+        capture_budget_s: float = 2.0
+        pcap_timeout_ms: int = 250
+        pcap_promisc: bool = True
+        pcap_snaplen: int = 65535
+
+        packet_preview_bytes: int = 256
+        english_excerpt_max: int = 700
+        max_payload_text_chars: int = 5000
+        flow_top_k: int = 16
+        device_top_k: int = 12
+        plan_top_k: int = 16
+        max_context_packets: int = 12
+
+        prefer_router_packets: bool = True
+        extract_phrases: bool = True
+
+        active_timeout: float = 2.0
+        active_recv_max_bytes: int = 16384
+        active_recv_chunks: int = 4
+        active_send_max_bytes: int = 4096
+        active_default_protocol: str = "tcp"
+
+    def __init__(self, config: Optional["NetworkTrackerBlock.Config"] = None):
+        self.cfg = config or self.Config()
+
+    # ------------------------- logging ------------------------- #
+
+    def _log(self, message: Any) -> None:
+        try:
+            DEBUG_LOGGER.log_message(f"[NetworkTracker] {str(message)}")
+        except Exception:
+            try:
+                print(f"[NetworkTracker] {str(message)}")
+            except Exception:
+                pass
+
+    def _log_send(self, proto: str, host: str, port: int, data: bytes, extra: str = "") -> None:
+        preview = self._ascii_excerpt(data[: min(len(data), self.cfg.packet_preview_bytes)], limit=180)
+        hex_preview = self._hex_preview(data, limit=32)
+        msg = (
+            f"[NetworkTracker] SEND proto={proto} target={host}:{port} "
+            f"bytes={len(data)} ascii='{preview}' hex={hex_preview}"
+        )
+        if extra:
+            msg += f" {extra}"
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    def _log_recv(self, proto: str, host: str, port: int, data: bytes, extra: str = "") -> None:
+        preview = self._ascii_excerpt(data[: min(len(data), self.cfg.packet_preview_bytes)], limit=180)
+        hex_preview = self._hex_preview(data, limit=32)
+        msg = (
+            f"[NetworkTracker] RECV proto={proto} peer={host}:{port} "
+            f"bytes={len(data)} ascii='{preview}' hex={hex_preview}"
+        )
+        if extra:
+            msg += f" {extra}"
+        try:
+            DEBUG_LOGGER.log_message(msg)
+        except Exception:
+            pass
+
+    # ------------------------- generic helpers ------------------------- #
+
+    def _dedupe_strings(self, items: Iterable[Any]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for item in items:
+            s = str(item or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    def _dedupe_dicts(self, items: Iterable[Dict[str, Any]], *, key_fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            key_obj = {k: item.get(k) for k in key_fields}
+            key = json.dumps(key_obj, ensure_ascii=False, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _safe_json_loads(self, value: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(str(value))
+        except Exception:
+            return value
+
+    def _safe_int(self, value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except Exception:
+            return None
+
+    def _safe_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def _safe_json(self, obj: Any, *, max_depth: int = 5, max_items: int = 64, max_str: int = 1200, _depth: int = 0) -> Any:
+        if _depth >= max_depth:
+            return "[max_depth]"
+        if obj is None or isinstance(obj, (int, float, bool)):
+            return obj
+        if isinstance(obj, str):
+            return obj[:max_str]
+        if isinstance(obj, bytes):
+            try:
+                text = obj.decode("utf-8", errors="ignore")
+            except Exception:
+                text = repr(obj)
+            return text[:max_str]
+        if isinstance(obj, dict):
+            out: Dict[str, Any] = {}
+            count = 0
+            for k, v in obj.items():
+                if count >= max_items:
+                    out["__truncated__"] = True
+                    break
+                out[str(k)] = self._safe_json(v, max_depth=max_depth, max_items=max_items, max_str=max_str, _depth=_depth + 1)
+                count += 1
+            return out
+        if isinstance(obj, (list, tuple, set)):
+            seq = list(obj)
+            out_list = []
+            for idx, item in enumerate(seq):
+                if idx >= max_items:
+                    out_list.append("[truncated]")
+                    break
+                out_list.append(self._safe_json(item, max_depth=max_depth, max_items=max_items, max_str=max_str, _depth=_depth + 1))
+            return out_list
+        return str(obj)[:max_str]
+
+    def _clean_token(self, token: Any) -> str:
+        s = str(token or "").strip().lower().strip(".,:;!?()[]{}<>\"'`")
+        if not s or len(s) < 2:
+            return ""
+        if s in self._STOPWORDS:
+            return ""
+        if s.isdigit():
+            return ""
+        if self._HEX_RE.fullmatch(s) or self._UUID_RE.fullmatch(s):
+            return ""
+        if self._IP_RE.fullmatch(s):
+            return ""
+        if s.startswith("\\device\\npf_"):
+            return ""
+        if sum(ch.isdigit() for ch in s) > max(3, len(s) // 2):
+            return ""
+        return s
+
+    def _extract_terms(self, text: Any, *, top_k: int = 60) -> List[str]:
+        counts: Dict[str, int] = {}
+        src = str(text or "")
+        for raw in self._TOKEN_RE.findall(src):
+            tok = self._clean_token(raw)
+            if not tok:
+                continue
+            counts[tok] = counts.get(tok, 0) + 1
+
+        if self.cfg.extract_phrases:
+            for raw in self._PHRASE_RE.findall(src):
+                phrase = " ".join(self._clean_token(part) for part in raw.split())
+                phrase = re.sub(r"\s+", " ", phrase).strip()
+                if phrase and len(phrase) >= 6:
+                    counts[phrase] = counts.get(phrase, 0) + 2
+
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [k for k, _ in ranked[:top_k]]
+
+    def _iter_texts(self, obj: Any) -> Iterable[str]:
+        if obj is None:
+            return
+        if isinstance(obj, str):
+            yield obj
+            return
+        if isinstance(obj, bytes):
+            try:
+                text = obj.decode("utf-8", errors="ignore")
+                if text:
+                    yield text
+            except Exception:
+                pass
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k:
+                    yield k
+                yield from self._iter_texts(v)
+            return
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                yield from self._iter_texts(item)
+            return
+        try:
+            yield str(obj)
+        except Exception:
+            return
+
+    def _canonicalize_url(self, url: str) -> str:
+        try:
+            return re.sub(r"[\x00-\x1f]+", "", str(url or "").strip())
+        except Exception:
+            return str(url or "").strip()
+
+    def _extract_links_from_html(self, html_text: str, *, base_url: str = "") -> List[str]:
+        if not html_text:
+            return []
+
+        found: List[str] = []
+        seen: Set[str] = set()
+
+        def _push(raw: str) -> None:
+            raw = str(raw or "").strip()
+            if not raw:
+                return
+            low = raw.lower()
+            if low.startswith(("javascript:", "mailto:", "data:", "#")):
+                return
+
+            if raw.startswith(("http://", "https://")):
+                out = raw
+            elif base_url:
+                try:
+                    out = urljoin(base_url, raw)
+                except Exception:
+                    out = ""
+            else:
+                out = ""
+
+            if out:
+                out = self._canonicalize_url(out)
+                if out and out not in seen:
+                    seen.add(out)
+                    found.append(out)
+
+        for u in self._URL_RE.findall(html_text):
+            _push(u)
+
+        attr_re = re.compile(r"""(?is)\b(?:href|src|action|data-src)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))""")
+        for m in attr_re.finditer(html_text):
+            _push(m.group(1) or m.group(2) or m.group(3) or "")
+
+        srcset_re = re.compile(r"""(?is)\bsrcset\s*=\s*["']([^"']+)["']""")
+        for m in srcset_re.finditer(html_text):
+            parts = [p.strip().split(" ")[0] for p in str(m.group(1) or "").split(",") if p.strip()]
+            for part in parts:
+                _push(part)
+
+        css_re = re.compile(r"""(?is)\burl\(\s*['"]?([^'")]+)['"]?\s*\)""")
+        for m in css_re.finditer(html_text):
+            _push(m.group(1) or "")
+
+        return found
+
+    def _extract_urls_any(self, obj: Any, *, limit: int = 200) -> List[str]:
+        found: List[str] = []
+        seen: Set[str] = set()
+
+        def _add(u: str) -> None:
+            url = self._canonicalize_url(u)
+            if url and url not in seen and url.startswith(("http://", "https://")):
+                seen.add(url)
+                found.append(url)
+
+        stack: List[Any] = [obj]
+        while stack and len(found) < limit:
+            cur = stack.pop()
+            if cur is None:
+                continue
+            if isinstance(cur, str):
+                for match in self._URL_RE.findall(cur):
+                    _add(match)
+                if "<html" in cur.lower() or "href=" in cur.lower() or "<a " in cur.lower():
+                    for link in self._extract_links_from_html(cur):
+                        _add(link)
+                continue
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    kl = str(k).lower()
+                    if kl in {"host", "hostname", "server_name", "servername", "sni", "domain", "qname", "query_name"} and isinstance(v, str):
+                        host = v.strip().lower()
+                        if host and "." in host and " " not in host:
+                            if host.startswith("www."):
+                                host = host[4:]
+                            _add(f"https://{host}/")
+                    stack.append(v)
+                continue
+            if isinstance(cur, (list, tuple, set)):
+                stack.extend(cur)
+                continue
+
+        return found[:limit]
+
+    def _ascii_excerpt(self, data: bytes, *, limit: int = 400) -> str:
+        if not data:
+            return ""
+        try:
+            txt = data.decode("utf-8", "ignore")
+        except Exception:
+            try:
+                txt = data.decode("latin-1", "ignore")
+            except Exception:
+                txt = ""
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if len(txt) > limit:
+            txt = txt[:limit].rstrip() + "..."
+        return txt
+
+    def _hex_preview(self, data: bytes, *, limit: int = 48) -> str:
+        if not data:
+            return ""
+        return data[:limit].hex()
+
+    def _service_name(self, port: Any) -> str:
+        try:
+            return self._COMMON_PORTS.get(int(port), "")
+        except Exception:
+            return ""
+
+    def _query_terms(self, query_raw: str, *, top_k: int = 64) -> List[str]:
+        terms = self._extract_terms(query_raw, top_k=top_k)
+        return self._dedupe_strings(terms)
+
+    # ------------------------- router/memory payloads ------------------------- #
+
+    def _coerce_router_payload(self, payload: Any) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+        meta: Dict[str, Any] = {"source_kind": None}
+        if isinstance(payload, dict):
+            if isinstance(payload.get("packets"), list):
+                meta["source_kind"] = "bundle"
+                packets = [p for p in payload.get("packets") or [] if isinstance(p, dict)]
+                return packets, dict(payload), meta
+            meta["source_kind"] = "packet_dict"
+            return [payload], {"packets": [payload]}, meta
+
+        if isinstance(payload, list):
+            packets = [p for p in payload if isinstance(p, dict)]
+            meta["source_kind"] = "packet_list"
+            return packets, {"packets": packets}, meta
+
+        obj = self._safe_json_loads(payload)
+        if isinstance(obj, dict) and isinstance(obj.get("packets"), list):
+            packets = [p for p in obj.get("packets") or [] if isinstance(p, dict)]
+            meta["source_kind"] = "json_bundle"
+            return packets, dict(obj), meta
+
+        if isinstance(obj, list):
+            packets = [p for p in obj if isinstance(p, dict)]
+            meta["source_kind"] = "json_packet_list"
+            return packets, {"packets": packets}, meta
+
+        meta["source_kind"] = "unknown"
+        return [], {}, meta
+
+    def _load_packets_from_memory(self, key: str) -> List[Dict[str, Any]]:
+        if not key:
+            return []
+        try:
+            mem = Memory.load()
+            value = mem.get(key, [])
+            if isinstance(value, list):
+                return [p for p in value if isinstance(p, dict)]
+            return []
+        except Exception:
+            return []
+
+    # ------------------------- passive libpcap decoding ------------------------- #
+
+    def _decode_eth(self, raw: bytes) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if len(raw) < 14:
+            return out
+        dst, src, eth_type = struct.unpack("!6s6sH", raw[:14])
+        out.update({
+            "eth_src": ":".join(f"{b:02x}" for b in src),
+            "eth_dst": ":".join(f"{b:02x}" for b in dst),
+            "eth_type": int(eth_type),
+        })
+        return out
+
+    def _decode_ipv4(self, raw: bytes, offset: int) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if len(raw) < offset + 20:
+            return out
+        ver_ihl = raw[offset]
+        ihl = (ver_ihl & 0x0F) * 4
+        if len(raw) < offset + ihl:
+            return out
+        proto = raw[offset + 9]
+        src = socket.inet_ntoa(raw[offset + 12:offset + 16])
+        dst = socket.inet_ntoa(raw[offset + 16:offset + 20])
+        out.update({
+            "l3": "ipv4",
+            "src_ip": src,
+            "dst_ip": dst,
+            "proto_num": int(proto),
+            "ip_header_len": int(ihl),
+            "l4_offset": offset + ihl,
+            "ttl": int(raw[offset + 8]),
+        })
+        return out
+
+    def _decode_ipv6(self, raw: bytes, offset: int) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if len(raw) < offset + 40:
+            return out
+        next_header = raw[offset + 6]
+        src = socket.inet_ntop(socket.AF_INET6, raw[offset + 8:offset + 24])
+        dst = socket.inet_ntop(socket.AF_INET6, raw[offset + 24:offset + 40])
+        out.update({
+            "l3": "ipv6",
+            "src_ip": src,
+            "dst_ip": dst,
+            "proto_num": int(next_header),
+            "ip_header_len": 40,
+            "l4_offset": offset + 40,
+            "ttl": int(raw[offset + 7]),
+        })
+        return out
+
+    def _decode_tcp_udp_icmp(self, raw: bytes, info: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        proto_num = int(info.get("proto_num") or -1)
+        off = int(info.get("l4_offset") or 0)
+
+        if proto_num == 6 and len(raw) >= off + 20:
+            sport, dport = struct.unpack("!HH", raw[off:off + 4])
+            seq, ack = struct.unpack("!II", raw[off + 4:off + 12])
+            data_offset = (raw[off + 12] >> 4) * 4
+            flags = raw[off + 13]
+            payload = raw[off + data_offset:]
+            flag_str = "".join([
+                "F" if flags & 0x01 else "",
+                "S" if flags & 0x02 else "",
+                "R" if flags & 0x04 else "",
+                "P" if flags & 0x08 else "",
+                "A" if flags & 0x10 else "",
+                "U" if flags & 0x20 else "",
+                "E" if flags & 0x40 else "",
+                "C" if flags & 0x80 else "",
+            ]) or "-"
+            out.update({
+                "proto": "tcp",
+                "l4": "tcp",
+                "src_port": int(sport),
+                "dst_port": int(dport),
+                "tcp_seq": int(seq),
+                "tcp_ack": int(ack),
+                "tcp_flags": flag_str,
+                "payload_bytes": payload,
+            })
+        elif proto_num == 17 and len(raw) >= off + 8:
+            sport, dport, length = struct.unpack("!HHH", raw[off:off + 6])
+            payload = raw[off + 8:off + max(8, int(length))]
+            out.update({
+                "proto": "udp",
+                "l4": "udp",
+                "src_port": int(sport),
+                "dst_port": int(dport),
+                "payload_bytes": payload,
+            })
+        elif proto_num == 1 and len(raw) >= off + 4:
+            out.update({
+                "proto": "icmp",
+                "l4": "icmp",
+                "icmp_type": int(raw[off]),
+                "icmp_code": int(raw[off + 1]),
+                "payload_bytes": raw[off + 4:],
+            })
+        else:
+            out.update({
+                "proto": str(proto_num),
+                "payload_bytes": raw[off:] if off < len(raw) else b"",
+            })
+
+        return out
+
+    def _dns_extract(self, payload: bytes) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if not payload or len(payload) < 12:
+            return out
+        try:
+            qdcount = struct.unpack("!H", payload[4:6])[0]
+            if qdcount < 1:
+                return out
+            idx = 12
+            labels: List[str] = []
+            while idx < len(payload):
+                ln = payload[idx]
+                if ln == 0:
+                    idx += 1
+                    break
+                idx += 1
+                if idx + ln > len(payload):
+                    return out
+                label = payload[idx:idx + ln].decode("ascii", "ignore")
+                if label:
+                    labels.append(label)
+                idx += ln
+            qname = ".".join(labels)
+            if qname:
+                out["dns_qname"] = qname
+                out["topic"] = "dns"
+        except Exception:
+            return out
+        return out
+
+    def _http_extract(self, payload: bytes) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if not payload:
+            return out
+        txt = self._ascii_excerpt(payload, limit=800)
+        if not txt:
+            return out
+        if txt.startswith(("GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ")) or "HTTP/1." in txt:
+            out["topic"] = "http"
+            out["http_preview"] = txt
+            host_m = re.search(r"\bHost:\s*([^\s]+)", txt, flags=re.IGNORECASE)
+            path_m = re.match(r"^(GET|POST|PUT|DELETE|HEAD|OPTIONS)\s+(\S+)", txt)
+            if host_m:
+                out["http_host"] = host_m.group(1).strip()
+            if path_m:
+                out["http_path"] = path_m.group(2).strip()
+        return out
+
+    def _tls_extract(self, payload: bytes) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        if len(payload) < 6:
+            return out
+        if payload[0] == 0x16 and payload[1] == 0x03:
+            out["topic"] = out.get("topic") or "tls"
+            out["tls_record_type"] = int(payload[0])
+            out["tls_version_major"] = int(payload[1])
+            out["tls_version_minor"] = int(payload[2])
+        return out
+
+    def _normalize_captured_packet(self, pkt: Dict[str, Any], *, iface: str = "", source: str = "libpcap") -> Dict[str, Any]:
+        raw: bytes = bytes(pkt.get("raw_bytes") or b"")
+        item: Dict[str, Any] = {
+            "source": source,
+            "iface": iface,
+            "timestamp": float(pkt.get("timestamp") or time.time()),
+            "caplen": int(pkt.get("caplen") or len(raw)),
+            "wirelen": int(pkt.get("wirelen") or len(raw)),
+            "payload_len": int(len(raw)),
+            "hex_preview": self._hex_preview(raw, limit=self.cfg.packet_preview_bytes // 2),
+            "ascii_preview": self._ascii_excerpt(raw[: self.cfg.packet_preview_bytes], limit=280),
+            "summary": "",
+        }
+
+        eth = self._decode_eth(raw)
+        item.update(eth)
+
+        eth_type = int(item.get("eth_type") or 0)
+        if eth_type == 0x0800:
+            item.update(self._decode_ipv4(raw, 14))
+        elif eth_type == 0x86DD:
+            item.update(self._decode_ipv6(raw, 14))
+        elif eth_type == 0x0806:
+            item.update({"l3": "arp", "topic": "arp", "proto": "arp", "l4": "arp"})
+
+        if item.get("l3") in ("ipv4", "ipv6"):
+            item.update(self._decode_tcp_udp_icmp(raw, item))
+            payload = bytes(item.get("payload_bytes") or b"")
+            if item.get("proto") == "udp" and (item.get("src_port") == 53 or item.get("dst_port") == 53):
+                item.update(self._dns_extract(payload))
+            if item.get("proto") == "tcp":
+                item.update(self._http_extract(payload))
+                item.update(self._tls_extract(payload))
+
+        if item.get("src_port"):
+            svc = self._service_name(item["src_port"])
+            if svc:
+                item["src_service"] = svc
+        if item.get("dst_port"):
+            svc = self._service_name(item["dst_port"])
+            if svc:
+                item["dst_service"] = svc
+                if not item.get("topic"):
+                    item["topic"] = svc
+
+        item["matched_links"] = self._extract_urls_any({
+            "ascii_preview": item.get("ascii_preview", ""),
+            "summary": item.get("summary", ""),
+            "http_preview": item.get("http_preview", ""),
+            "dns_qname": item.get("dns_qname", ""),
+        })
+        item["matched_text"] = " | ".join(self._dedupe_strings([
+            item.get("ascii_preview", ""),
+            item.get("http_preview", ""),
+            item.get("dns_qname", ""),
+            item.get("src_service", ""),
+            item.get("dst_service", ""),
+        ]))[: self.cfg.max_payload_text_chars]
+        item["summary"] = self._packet_summary(item)
+
+        if "payload_bytes" in item:
+            del item["payload_bytes"]
+
+        return item
+
+    # ------------------------- active send / receive ------------------------- #
+
+    def _is_private_or_local_target(self, host: str) -> bool:
+        host = str(host or "").strip()
+        if not host:
+            return False
+
+        low = host.lower()
+        if low in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        if low.endswith(".local"):
+            return True
+
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(host)
+            return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+        except Exception:
+            pass
+
+        try:
+            resolved = socket.gethostbyname(host)
+            import ipaddress
+            ip = ipaddress.ip_address(resolved)
+            return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+        except Exception:
+            return False
+
+    def _coerce_active_payload(self, query_raw: str, params: Dict[str, Any]) -> bytes:
+        payload = params.get("active_payload", query_raw)
+        mode = str(params.get("active_payload_mode", "text") or "text").strip().lower()
+
+        if mode == "bytes" and isinstance(payload, (bytes, bytearray)):
+            data = bytes(payload)
+        elif mode == "hex":
+            data = bytes.fromhex(str(payload or "").strip())
+        elif mode == "base64":
+            data = base64.b64decode(str(payload or "").strip())
+        elif mode == "json":
+            if isinstance(payload, (dict, list)):
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            else:
+                try:
+                    obj = json.loads(str(payload))
+                    data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                except Exception:
+                    data = json.dumps({"query": str(payload or "")}, ensure_ascii=False).encode("utf-8")
+        else:
+            if isinstance(payload, (dict, list)):
+                data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            elif isinstance(payload, (bytes, bytearray)):
+                data = bytes(payload)
+            else:
+                data = str(payload or "").encode("utf-8")
+
+        max_send = int(params.get("active_send_max_bytes", self.cfg.active_send_max_bytes) or self.cfg.active_send_max_bytes)
+        if max_send > 0:
+            data = data[:max_send]
+        return data
+
+    def _normalize_active_packet(
+        self,
+        *,
+        direction: str,
+        proto: str,
+        host: str,
+        port: int,
+        local_addr: Tuple[str, int],
+        peer_addr: Tuple[str, int],
+        data: bytes,
+        query_raw: str,
+        exchange_id: str,
+        note: str = "",
+    ) -> Dict[str, Any]:
+        ascii_preview = self._ascii_excerpt(data[: self.cfg.packet_preview_bytes], limit=320)
+        links = self._extract_urls_any(ascii_preview)
+        topic = self._service_name(port) or proto or "active"
+
+        item: Dict[str, Any] = {
+            "source": "active",
+            "direction": direction,
+            "exchange_id": exchange_id,
+            "timestamp": time.time(),
+            "iface": "socket",
+            "topic": topic,
+            "proto": proto,
+            "l4": proto,
+            "src_ip": str(local_addr[0] or ""),
+            "src_port": int(local_addr[1] or 0),
+            "dst_ip": str(peer_addr[0] or host or ""),
+            "dst_port": int(peer_addr[1] or port or 0),
+            "payload_len": int(len(data)),
+            "hex_preview": self._hex_preview(data, limit=64),
+            "ascii_preview": ascii_preview,
+            "matched_links": links,
+            "matched_text": " | ".join(self._dedupe_strings([
+                ascii_preview,
+                topic,
+                query_raw,
+                note,
+            ]))[: self.cfg.max_payload_text_chars],
+        }
+
+        # lightweight application hints
+        if proto == "tcp":
+            item.update(self._http_extract(data))
+            item.update(self._tls_extract(data))
+        if proto == "udp" and (item.get("src_port") == 53 or item.get("dst_port") == 53):
+            item.update(self._dns_extract(data))
+
+        if item.get("src_port"):
+            svc = self._service_name(item["src_port"])
+            if svc:
+                item["src_service"] = svc
+        if item.get("dst_port"):
+            svc = self._service_name(item["dst_port"])
+            if svc:
+                item["dst_service"] = svc
+                if not item.get("topic"):
+                    item["topic"] = svc
+
+        item["summary"] = self._packet_summary(item)
+        return item
+
+    def _run_active_tcp_exchange(self, query_raw: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+        errors: List[str] = []
+        packets: List[Dict[str, Any]] = []
+
+        host = str(params.get("active_host", "") or "").strip()
+        port = int(params.get("active_port", 0) or 0)
+        timeout = float(params.get("active_timeout", self.cfg.active_timeout) or self.cfg.active_timeout)
+        recv_max_bytes = int(params.get("active_recv_max_bytes", self.cfg.active_recv_max_bytes) or self.cfg.active_recv_max_bytes)
+        recv_chunks = int(params.get("active_recv_chunks", self.cfg.active_recv_chunks) or self.cfg.active_recv_chunks)
+        exchange_id = f"tcp-{int(time.time() * 1000)}"
+
+        if not host or not port:
+            return [], {"ok": False, "reason": "missing active_host/active_port"}, []
+
+        if not self._is_private_or_local_target(host):
+            reason = f"active target blocked (not private/local): {host}:{port}"
+            self._log(reason)
+            return [], {"ok": False, "reason": reason}, []
+
+        data = self._coerce_active_payload(query_raw, params)
+        if not data:
+            return [], {"ok": False, "reason": "empty active payload"}, []
+
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                sock.settimeout(timeout)
+
+                local_addr = sock.getsockname()
+                peer_addr = sock.getpeername()
+
+                self._log_send("tcp", host, port, data, extra=f"exchange_id={exchange_id}")
+                sock.sendall(data)
+
+                sent_pkt = self._normalize_active_packet(
+                    direction="outbound",
+                    proto="tcp",
+                    host=host,
+                    port=port,
+                    local_addr=local_addr,
+                    peer_addr=peer_addr,
+                    data=data,
+                    query_raw=query_raw,
+                    exchange_id=exchange_id,
+                    note="active tcp send",
+                )
+                packets.append(sent_pkt)
+
+                chunks: List[bytes] = []
+                total = 0
+
+                for _ in range(max(1, recv_chunks)):
+                    try:
+                        chunk = sock.recv(min(4096, max(1, recv_max_bytes - total)))
+                    except socket.timeout:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    self._log_recv("tcp", peer_addr[0], int(peer_addr[1]), chunk, extra=f"exchange_id={exchange_id}")
+                    if total >= recv_max_bytes:
+                        break
+
+                recv_data = b"".join(chunks)
+                if recv_data:
+                    recv_pkt = self._normalize_active_packet(
+                        direction="inbound",
+                        proto="tcp",
+                        host=host,
+                        port=port,
+                        local_addr=peer_addr,
+                        peer_addr=local_addr,
+                        data=recv_data,
+                        query_raw=query_raw,
+                        exchange_id=exchange_id,
+                        note="active tcp recv",
+                    )
+                    packets.append(recv_pkt)
+
+                meta = {
+                    "ok": True,
+                    "protocol": "tcp",
+                    "host": host,
+                    "port": port,
+                    "exchange_id": exchange_id,
+                    "sent_bytes": len(data),
+                    "recv_bytes": len(recv_data),
+                    "packets": len(packets),
+                }
+                return packets, meta, errors
+
+        except Exception as e:
+            err = f"tcp exchange failed: {e}"
+            self._log(err)
+            errors.append(err)
+            return packets, {"ok": False, "protocol": "tcp", "host": host, "port": port, "exchange_id": exchange_id}, errors
+
+    def _run_active_udp_exchange(self, query_raw: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+        errors: List[str] = []
+        packets: List[Dict[str, Any]] = []
+
+        host = str(params.get("active_host", "") or "").strip()
+        port = int(params.get("active_port", 0) or 0)
+        timeout = float(params.get("active_timeout", self.cfg.active_timeout) or self.cfg.active_timeout)
+        recv_max_bytes = int(params.get("active_recv_max_bytes", self.cfg.active_recv_max_bytes) or self.cfg.active_recv_max_bytes)
+        exchange_id = f"udp-{int(time.time() * 1000)}"
+
+        if not host or not port:
+            return [], {"ok": False, "reason": "missing active_host/active_port"}, []
+
+        if not self._is_private_or_local_target(host):
+            reason = f"active target blocked (not private/local): {host}:{port}"
+            self._log(reason)
+            return [], {"ok": False, "reason": reason}, []
+
+        data = self._coerce_active_payload(query_raw, params)
+        if not data:
+            return [], {"ok": False, "reason": "empty active payload"}, []
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect((host, port))
+
+                local_addr = sock.getsockname()
+                peer_addr = (host, port)
+
+                self._log_send("udp", host, port, data, extra=f"exchange_id={exchange_id}")
+                sock.send(data)
+
+                sent_pkt = self._normalize_active_packet(
+                    direction="outbound",
+                    proto="udp",
+                    host=host,
+                    port=port,
+                    local_addr=local_addr,
+                    peer_addr=peer_addr,
+                    data=data,
+                    query_raw=query_raw,
+                    exchange_id=exchange_id,
+                    note="active udp send",
+                )
+                packets.append(sent_pkt)
+
+                recv_data = b""
+                try:
+                    recv_data = sock.recv(recv_max_bytes)
+                except socket.timeout:
+                    recv_data = b""
+
+                if recv_data:
+                    self._log_recv("udp", host, port, recv_data, extra=f"exchange_id={exchange_id}")
+                    recv_pkt = self._normalize_active_packet(
+                        direction="inbound",
+                        proto="udp",
+                        host=host,
+                        port=port,
+                        local_addr=peer_addr,
+                        peer_addr=local_addr,
+                        data=recv_data,
+                        query_raw=query_raw,
+                        exchange_id=exchange_id,
+                        note="active udp recv",
+                    )
+                    packets.append(recv_pkt)
+
+                meta = {
+                    "ok": True,
+                    "protocol": "udp",
+                    "host": host,
+                    "port": port,
+                    "exchange_id": exchange_id,
+                    "sent_bytes": len(data),
+                    "recv_bytes": len(recv_data),
+                    "packets": len(packets),
+                }
+                return packets, meta, errors
+
+        except Exception as e:
+            err = f"udp exchange failed: {e}"
+            self._log(err)
+            errors.append(err)
+            return packets, {"ok": False, "protocol": "udp", "host": host, "port": port, "exchange_id": exchange_id}, errors
+
+    def _run_active_exchange(self, query_raw: str, params: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any], List[str]]:
+        if not bool(params.get("active_send", False)):
+            return [], {"enabled": False, "ok": False}, []
+
+        proto = str(params.get("active_protocol", self.cfg.active_default_protocol) or self.cfg.active_default_protocol).strip().lower()
+        self._log(f"Active exchange requested proto={proto} target={params.get('active_host', '')}:{params.get('active_port', '')}")
+
+        if proto == "udp":
+            packets, meta, errors = self._run_active_udp_exchange(query_raw, params)
+            meta["enabled"] = True
+            return packets, meta, errors
+
+        packets, meta, errors = self._run_active_tcp_exchange(query_raw, params)
+        meta["enabled"] = True
+        return packets, meta, errors
+
+    # ------------------------- packet normalization ------------------------- #
+
+    def _packet_summary(self, item: Dict[str, Any]) -> str:
+        src_ip = item.get("src_ip") or item.get("src") or ""
+        dst_ip = item.get("dst_ip") or item.get("dst") or ""
+        sport = item.get("src_port") or item.get("sport") or ""
+        dport = item.get("dst_port") or item.get("dport") or ""
+        topic = item.get("topic") or item.get("topic_guess") or item.get("dst_service") or item.get("protocol") or ""
+        proto = item.get("proto") or item.get("l4") or item.get("protocol") or item.get("transport") or ""
+        iface = item.get("iface") or item.get("interface") or ""
+        preview = item.get("ascii_preview") or item.get("payload_preview") or item.get("matched_text") or ""
+        qname = item.get("dns_qname") or ""
+        flags = item.get("tcp_flags") or item.get("flags") or ""
+        direction = item.get("direction") or ""
+
+        parts = [
+            f"topic={topic}" if topic else "",
+            f"proto={proto}" if proto else "",
+            f"{src_ip}:{sport} -> {dst_ip}:{dport}" if (src_ip or dst_ip or sport or dport) else "",
+            f"iface={iface}" if iface else "",
+            f"dir={direction}" if direction else "",
+            f"flags={flags}" if flags else "",
+            str(qname) if qname else "",
+            str(preview)[:180] if preview else "",
+        ]
+        return " | ".join([p for p in parts if p])
+
+    def _packet_type_labels(self, item: Dict[str, Any]) -> List[str]:
+        labels: List[str] = []
+        for field in ("topic", "source", "proto", "l4", "l3", "iface", "src_service", "dst_service", "direction"):
+            value = self._clean_token(item.get(field))
+            if value:
+                labels.append(f"{field}:{value}")
+                labels.append(value)
+
+        if item.get("src_port"):
+            labels.append(f"sport:{int(item['src_port'])}")
+        if item.get("dst_port"):
+            labels.append(f"dport:{int(item['dst_port'])}")
+
+        return self._dedupe_strings(labels)
+
+    def _normalize_external_packet(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        pkt = dict(packet)
+
+        if pkt.get("protocol") and not pkt.get("proto"):
+            pkt["proto"] = str(pkt.get("protocol")).lower()
+        if pkt.get("transport") and not pkt.get("l4"):
+            pkt["l4"] = str(pkt.get("transport")).lower()
+
+        if not pkt.get("src_service") and pkt.get("src_port"):
+            svc = self._service_name(pkt.get("src_port"))
+            if svc:
+                pkt["src_service"] = svc
+
+        if not pkt.get("dst_service") and pkt.get("dst_port"):
+            svc = self._service_name(pkt.get("dst_port"))
+            if svc:
+                pkt["dst_service"] = svc
+                if not pkt.get("topic"):
+                    pkt["topic"] = svc
+
+        links = []
+        if isinstance(pkt.get("links"), list):
+            links.extend([str(x) for x in pkt.get("links") if str(x).strip()])
+        if pkt.get("url"):
+            links.append(str(pkt.get("url")))
+        links.extend(self._extract_urls_any(pkt))
+        pkt["matched_links"] = self._dedupe_strings(links)
+
+        matched_text = " | ".join(self._dedupe_strings([
+            pkt.get("matched_text", ""),
+            pkt.get("summary_text", ""),
+            pkt.get("summary", ""),
+            pkt.get("ascii_preview", ""),
+            pkt.get("http_preview", ""),
+            pkt.get("dns_qname", ""),
+            pkt.get("text", ""),
+            pkt.get("message", ""),
+            pkt.get("detail", ""),
+        ]))[: self.cfg.max_payload_text_chars]
+        pkt["matched_text"] = matched_text
+
+        if not pkt.get("summary"):
+            pkt["summary"] = pkt.get("summary_text") or self._packet_summary(pkt)
+
+        # Make it JSON-safe for Memory export
+        if "raw_bytes" in pkt:
+            del pkt["raw_bytes"]
+        if "record" in pkt:
+            pkt["record"] = self._safe_json(pkt["record"], max_depth=4, max_items=32, max_str=700)
+
+        return pkt
+
+    def _term_overlap(self, text: str, qterms: List[str]) -> int:
+        hay = str(text or "").lower()
+        return sum(1 for term in qterms if term and term in hay)
+
+    def _score_packet(self, item: Dict[str, Any], qterms: List[str], query_raw: str) -> float:
+        text = " ".join([
+            str(item.get("summary") or ""),
+            str(item.get("matched_text") or ""),
+            str(item.get("dns_qname") or ""),
+            str(item.get("http_preview") or ""),
+            str(item.get("src_service") or ""),
+            str(item.get("dst_service") or ""),
+            str(item.get("topic") or ""),
+            str(item.get("proto") or ""),
+        ]).lower()
+
+        if not query_raw.strip():
+            base = 0.5
+        else:
+            base = 0.0
+            ql = query_raw.lower()
+            if ql and ql in text:
+                base += 8.0
+            base += float(self._term_overlap(text, qterms))
+
+        if item.get("matched_links"):
+            base += min(2.0, 0.35 * len(item.get("matched_links") or []))
+        if item.get("dns_qname"):
+            base += 0.35
+        if item.get("http_preview"):
+            base += 0.5
+        if item.get("ascii_preview"):
+            base += min(1.0, len(str(item.get("ascii_preview"))) / 400.0)
+
+        topic_val = self._clean_token(item.get("topic"))
+        if topic_val and topic_val in qterms:
+            base += 1.5
+
+        for hint in self._TOPIC_HINTS:
+            if hint in text:
+                base += 0.15
+
+        direction = str(item.get("direction") or "")
+        if direction == "inbound":
+            base += 0.15
+        elif direction == "outbound":
+            base += 0.10
+
+        return float(base)
+
+    def _dedupe_packets(self, packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in packets:
+            sig = "|".join([
+                str(item.get("exchange_id") or ""),
+                str(item.get("timestamp") or item.get("ts") or ""),
+                str(item.get("source") or ""),
+                str(item.get("direction") or ""),
+                str(item.get("src_ip") or ""),
+                str(item.get("src_port") or ""),
+                str(item.get("dst_ip") or ""),
+                str(item.get("dst_port") or ""),
+                str(item.get("summary") or ""),
+            ])
+            if sig in seen:
+                continue
+            seen.add(sig)
+            out.append(item)
+        return out
+
+    def _summarize_packet_types(self, packets: List[Dict[str, Any]]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for packet in packets:
+            for label in self._packet_type_labels(packet):
+                counts[label] = counts.get(label, 0) + 1
+        return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+    # ------------------------- flows / devices / decisions ------------------------- #
+
+    def _flow_key(self, item: Dict[str, Any]) -> str:
+        proto = str(item.get("proto") or item.get("l4") or item.get("topic") or "unknown")
+        sip = str(item.get("src_ip") or "")
+        sport = str(item.get("src_port") or "")
+        dip = str(item.get("dst_ip") or "")
+        dport = str(item.get("dst_port") or "")
+        return f"{proto}|{sip}:{sport}|{dip}:{dport}"
+
+    def _flow_clusters(self, packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for pkt in packets:
+            key = self._flow_key(pkt)
+            row = buckets.setdefault(key, {
+                "key": key,
+                "proto": str(pkt.get("proto") or pkt.get("l4") or "unknown"),
+                "src_ip": str(pkt.get("src_ip") or ""),
+                "src_port": int(pkt.get("src_port") or 0),
+                "dst_ip": str(pkt.get("dst_ip") or ""),
+                "dst_port": int(pkt.get("dst_port") or 0),
+                "count": 0,
+                "bytes": 0,
+                "topics": collections.Counter(),
+                "services": collections.Counter(),
+                "dirs": collections.Counter(),
+                "first_ts": float(pkt.get("timestamp") or time.time()),
+                "last_ts": float(pkt.get("timestamp") or time.time()),
+                "examples": [],
+            })
+            row["count"] += 1
+            row["bytes"] += int(pkt.get("wirelen") or pkt.get("caplen") or pkt.get("payload_len") or 0)
+            ts = float(pkt.get("timestamp") or time.time())
+            row["first_ts"] = min(row["first_ts"], ts)
+            row["last_ts"] = max(row["last_ts"], ts)
+
+            topic = str(pkt.get("topic") or pkt.get("proto") or "unknown")
+            if topic:
+                row["topics"][topic] += 1
+            for svc in (pkt.get("src_service"), pkt.get("dst_service")):
+                if svc:
+                    row["services"][str(svc)] += 1
+            if pkt.get("direction"):
+                row["dirs"][str(pkt.get("direction"))] += 1
+            if len(row["examples"]) < 3:
+                row["examples"].append(str(pkt.get("summary") or ""))
+
+        out: List[Dict[str, Any]] = []
+        for row in buckets.values():
+            out.append({
+                "key": row["key"],
+                "proto": row["proto"],
+                "src_ip": row["src_ip"],
+                "src_port": row["src_port"],
+                "dst_ip": row["dst_ip"],
+                "dst_port": row["dst_port"],
+                "count": int(row["count"]),
+                "bytes": int(row["bytes"]),
+                "topics": [{"key": k, "count": int(v)} for k, v in row["topics"].most_common(5)],
+                "services": [{"key": k, "count": int(v)} for k, v in row["services"].most_common(5)],
+                "directions": [{"key": k, "count": int(v)} for k, v in row["dirs"].most_common(4)],
+                "first_ts": float(row["first_ts"]),
+                "last_ts": float(row["last_ts"]),
+                "duration_s": max(0.0, float(row["last_ts"]) - float(row["first_ts"])),
+                "examples": list(row["examples"]),
+            })
+
+        out.sort(key=lambda r: (-int(r["count"]), -int(r["bytes"]), str(r["key"])))
+        return out[: self.cfg.flow_top_k]
+
+    def _device_profiles(self, packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        devices: Dict[str, Dict[str, Any]] = {}
+        for pkt in packets:
+            for side in ("src", "dst"):
+                ip = str(pkt.get(f"{side}_ip") or "")
+                if not ip:
+                    continue
+                row = devices.setdefault(ip, {
+                    "ip": ip,
+                    "ports": collections.Counter(),
+                    "peers": collections.Counter(),
+                    "topics": collections.Counter(),
+                    "services": collections.Counter(),
+                    "packets": 0,
+                })
+                row["packets"] += 1
+                port = pkt.get(f"{side}_port")
+                if port:
+                    row["ports"][int(port)] += 1
+                peer = str(pkt.get("dst_ip") if side == "src" else pkt.get("src_ip") or "")
+                if peer:
+                    row["peers"][peer] += 1
+                topic = str(pkt.get("topic") or pkt.get("proto") or "")
+                if topic:
+                    row["topics"][topic] += 1
+                svc = pkt.get(f"{side}_service")
+                if svc:
+                    row["services"][str(svc)] += 1
+
+        out: List[Dict[str, Any]] = []
+        for row in devices.values():
+            out.append({
+                "ip": row["ip"],
+                "packets": int(row["packets"]),
+                "ports": [{"key": int(k), "count": int(v)} for k, v in row["ports"].most_common(6)],
+                "peers": [{"key": k, "count": int(v)} for k, v in row["peers"].most_common(6)],
+                "topics": [{"key": k, "count": int(v)} for k, v in row["topics"].most_common(6)],
+                "services": [{"key": k, "count": int(v)} for k, v in row["services"].most_common(6)],
+            })
+
+        out.sort(key=lambda r: (-int(r["packets"]), str(r["ip"])))
+        return out[: self.cfg.device_top_k]
+
+    def _build_tracking_decisions(
+        self,
+        packets: List[Dict[str, Any]],
+        qterms: List[str],
+        flows: List[Dict[str, Any]],
+        devices: List[Dict[str, Any]],
+        active_exchange: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        by_topic = collections.Counter()
+        by_peer = collections.Counter()
+        by_port = collections.Counter()
+        filters: List[str] = []
+        next_targets: List[Dict[str, Any]] = []
+        steps: List[str] = []
+
+        for p in packets:
+            topic = str(p.get("topic") or p.get("dst_service") or p.get("proto") or p.get("l4") or "unknown")
+            by_topic[topic] += 1
+            src_ip = str(p.get("src_ip") or "")
+            dst_ip = str(p.get("dst_ip") or "")
+            if src_ip:
+                by_peer[src_ip] += 1
+            if dst_ip:
+                by_peer[dst_ip] += 1
+            for port in (p.get("src_port"), p.get("dst_port")):
+                if port:
+                    by_port[int(port)] += 1
+
+        for topic, _count in by_topic.most_common(6):
+            if topic == "dns":
+                filters.append("udp port 53")
+            elif topic in ("http", "http-alt"):
+                filters.append("tcp port 80 or tcp port 8080")
+            elif topic in ("https", "https-alt", "tls"):
+                filters.append("tcp port 443 or tcp port 8443")
+            elif topic == "arp":
+                filters.append("arp")
+            elif topic == "udp":
+                filters.append("udp")
+            elif topic == "tcp":
+                filters.append("tcp")
+            elif topic in ("monero-rpc", "p2pool", "stratum"):
+                port = self._port_for_topic(topic)
+                if port:
+                    filters.append(f"port {port}")
+
+        for peer, count in by_peer.most_common(8):
+            if not peer:
+                continue
+            next_targets.append({
+                "type": "peer",
+                "peer": peer,
+                "count": int(count),
+                "reason": "observed frequently in matched traffic",
+                "suggested_filter": f"host {peer}",
+            })
+
+        for port, count in by_port.most_common(8):
+            next_targets.append({
+                "type": "port",
+                "port": int(port),
+                "count": int(count),
+                "reason": "observed as a frequent transport/service port",
+                "suggested_filter": f"port {int(port)}",
+            })
+
+        for flow in flows[: self.cfg.plan_top_k]:
+            if flow.get("src_ip") and flow.get("dst_ip"):
+                next_targets.append({
+                    "type": "flow",
+                    "flow": flow.get("key"),
+                    "count": int(flow.get("count") or 0),
+                    "reason": "dominant flow in matched traffic",
+                    "suggested_filter": f"host {flow['src_ip']} and host {flow['dst_ip']} and {flow['proto']}",
+                })
+
+        if qterms:
+            filters.extend([f"keyword:{term}" for term in qterms[:8]])
+
+        if flows:
+            steps.append("Start with the top recurring flows so noisy traffic is reduced first.")
+        if devices:
+            steps.append("Compare the busiest peers and their common services to infer device roles.")
+        if active_exchange.get("enabled"):
+            steps.append("Correlate the active exchange send/receive records with passive packet summaries for the same host and port.")
+        if any(t in qterms for t in ("dns", "http", "tls", "https")):
+            steps.append("Preserve application previews, since they usually carry the best English lexicon/context evidence.")
+
+        return {
+            "top_topics": [{"key": k, "count": int(v)} for k, v in by_topic.most_common(8)],
+            "top_peers": [{"key": k, "count": int(v)} for k, v in by_peer.most_common(12)],
+            "top_ports": [{"key": int(k), "count": int(v)} for k, v in by_port.most_common(12)],
+            "suggested_filters": self._dedupe_strings(filters),
+            "next_targets": next_targets[: self.cfg.plan_top_k],
+            "investigation_steps": steps,
+            "active_send_supported": True,
+            "mode": "passive_plus_bounded_active",
+        }
+
+    def _port_for_topic(self, topic: str) -> int:
+        for k, v in self._COMMON_PORTS.items():
+            if v == topic:
+                return int(k)
+        return 0
+
+    # ------------------------- lexicon / context ------------------------- #
+
+    def _build_lexicon(self, qterms: List[str], packets: List[Dict[str, Any]], links: List[str], *, top_k: int) -> List[str]:
+        counts: Dict[str, int] = {}
+
+        def _inc(term: str, n: int = 1) -> None:
+            t = self._clean_token(term)
+            if not t:
+                return
+            counts[t] = counts.get(t, 0) + int(n)
+
+        for qt in qterms:
+            _inc(qt, 100)
+
+        for pkt in packets:
+            for field in ("topic", "proto", "src_service", "dst_service", "dns_qname", "http_host"):
+                value = pkt.get(field)
+                if value:
+                    _inc(str(value), 8)
+
+            for term in self._extract_terms(pkt.get("matched_text", ""), top_k=18):
+                _inc(term, 3)
+
+            for label in self._packet_type_labels(pkt):
+                _inc(label, 2)
+
+        for link in links[:20]:
+            try:
+                host = (urlparse(link).netloc or "").lower()
+                if host.startswith("www."):
+                    host = host[4:]
+                _inc(host, 6)
+            except Exception:
+                continue
+
+        ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [k for k, _ in ranked[:top_k]]
+
+    def _build_context(
+        self,
+        *,
+        query_raw: str,
+        packets_in_count: int,
+        packets: List[Dict[str, Any]],
+        packet_types: Dict[str, int],
+        flows: List[Dict[str, Any]],
+        devices: List[Dict[str, Any]],
+        links: List[str],
+        active_exchange: Dict[str, Any],
+        tracking_decisions: Dict[str, Any],
+        pcap_errors: List[str],
+    ) -> str:
+        lines: List[str] = []
+
+        lines.append("=== Network Tracking Summary ===")
+        lines.append(f"query: {query_raw or '(none)'}")
+        lines.append(f"candidate packets: {int(packets_in_count)}")
+        lines.append(f"matched packets: {int(len(packets))}")
+
+        if active_exchange.get("enabled"):
+            lines.append("=== Active Exchange ===")
+            lines.append(
+                f"enabled={active_exchange.get('enabled')} ok={active_exchange.get('ok')} "
+                f"protocol={active_exchange.get('protocol', '')} "
+                f"target={active_exchange.get('host', '')}:{active_exchange.get('port', '')} "
+                f"sent_bytes={active_exchange.get('sent_bytes', 0)} recv_bytes={active_exchange.get('recv_bytes', 0)}"
+            )
+
+        if packet_types:
+            lines.append("=== Matched Packet Types ===")
+            for key, value in list(packet_types.items())[:20]:
+                lines.append(f"{key}: {value}")
+
+        if flows:
+            lines.append("=== Dominant Flows ===")
+            for flow in flows[: self.cfg.flow_top_k]:
+                lines.append(
+                    f"[flow] {flow['proto']} {flow['src_ip']}:{flow['src_port']} -> "
+                    f"{flow['dst_ip']}:{flow['dst_port']} count={flow['count']} bytes={flow['bytes']}"
+                )
+                if flow.get("topics"):
+                    lines.append("topics: " + ", ".join(f"{x['key']}({x['count']})" for x in flow["topics"][:4]))
+                if flow.get("services"):
+                    lines.append("services: " + ", ".join(f"{x['key']}({x['count']})" for x in flow["services"][:4]))
+                if flow.get("directions"):
+                    lines.append("directions: " + ", ".join(f"{x['key']}({x['count']})" for x in flow["directions"][:4]))
+
+        if devices:
+            lines.append("=== Device Profiles ===")
+            for dev in devices[: self.cfg.device_top_k]:
+                lines.append(f"[device] {dev['ip']} packets={dev['packets']}")
+                if dev.get("services"):
+                    lines.append("services: " + ", ".join(f"{x['key']}({x['count']})" for x in dev["services"][:4]))
+                if dev.get("peers"):
+                    lines.append("peers: " + ", ".join(f"{x['key']}({x['count']})" for x in dev["peers"][:4]))
+
+        if packets:
+            lines.append("=== Top Matched Packets ===")
+            for pkt in packets[: self.cfg.max_context_packets]:
+                lines.append(f"[packet] score={pkt.get('match_score', 0.0):.2f} {pkt.get('summary', '')}")
+                text = str(pkt.get("matched_text") or "").strip()
+                if text:
+                    lines.append(text[: self.cfg.english_excerpt_max])
+                if pkt.get("matched_links"):
+                    lines.append("links: " + ", ".join((pkt.get("matched_links") or [])[:6]))
+
+        if tracking_decisions.get("suggested_filters"):
+            lines.append("=== Suggested Tracking Filters ===")
+            for f in tracking_decisions["suggested_filters"][:16]:
+                lines.append(str(f))
+
+        if tracking_decisions.get("investigation_steps"):
+            lines.append("=== Investigation Steps ===")
+            for step in tracking_decisions["investigation_steps"][:8]:
+                lines.append(str(step))
+
+        if links:
+            lines.append("=== Extracted Links ===")
+            for link in links[:32]:
+                lines.append(link)
+
+        if pcap_errors:
+            lines.append("=== Errors ===")
+            for err in pcap_errors[:12]:
+                lines.append(str(err))
+
+        context = "\n".join([x for x in lines if str(x).strip()]).strip()
+        max_chars = self.cfg.context_max_chars
+        if max_chars > 0 and len(context) > max_chars:
+            context = context[:max_chars].rstrip() + "\n...[truncated]"
+        return context
+
+    # ------------------------- Memory export ------------------------- #
+
+    def _persist_optional_outputs(
+        self,
+        *,
+        ok: bool,
+        params: Dict[str, Any],
+        packets: List[Dict[str, Any]],
+        packet_types: Dict[str, int],
+        packet_stats: Dict[str, Any],
+        links: List[str],
+        lexicon: List[str],
+        context: str,
+        network_state: Dict[str, Any],
+        tracking_decisions: Dict[str, Any],
+        active_exchange: Dict[str, Any],
+        response: Dict[str, Any],
+    ) -> Dict[str, str]:
+        exports: Dict[str, str] = {}
+
+        if bool(params.get("mem_out_on_ok", True)) and not ok:
+            self._log("Skipping Memory export because ok=False and mem_out_on_ok=True")
+            return exports
+
+        packets_key = str(params.get("packets_key", "") or "").strip()
+        packet_types_key = str(params.get("packet_types_key", "") or "").strip()
+        packet_stats_key = str(params.get("packet_stats_key", "") or "").strip()
+        links_key = str(params.get("links_key", "") or "").strip()
+        lexicon_key = str(params.get("lexicon_key", "") or "").strip()
+        context_key = str(params.get("context_key", "") or "").strip()
+        network_state_key = str(params.get("network_state_key", "") or "").strip()
+        tracking_decisions_key = str(params.get("tracking_decisions_key", "") or "").strip()
+        active_exchange_key = str(params.get("active_exchange_key", "") or "").strip()
+
+        prefix = str(params.get("mem_out_prefix", "") or "").strip().rstrip(".")
+        if prefix:
+            packets_key = packets_key or f"{prefix}.packets"
+            packet_types_key = packet_types_key or f"{prefix}.packet_types"
+            packet_stats_key = packet_stats_key or f"{prefix}.packet_stats"
+            links_key = links_key or f"{prefix}.links"
+            lexicon_key = lexicon_key or f"{prefix}.lexicon"
+            context_key = context_key or f"{prefix}.context"
+            network_state_key = network_state_key or f"{prefix}.network_state"
+            tracking_decisions_key = tracking_decisions_key or f"{prefix}.tracking_decisions"
+            active_exchange_key = active_exchange_key or f"{prefix}.active_exchange"
+
+        max_items = int(params.get("mem_out_max_items", 500) or 500)
+        max_packets = int(params.get("mem_out_max_packets", 250) or 250)
+
+        mem = Memory.load()
+
+        safe_packets = [
+            self._safe_json(pkt, max_depth=5, max_items=48, max_str=900)
+            for pkt in packets
+        ]
+
+        if packets_key:
+            existing = mem.get(packets_key, [])
+            if not isinstance(existing, list):
+                existing = []
+            merged = self._dedupe_dicts(list(existing) + safe_packets, key_fields=("source", "direction", "src_ip", "src_port", "dst_ip", "dst_port", "summary"))
+            mem[packets_key] = merged[:max_packets]
+            exports["packets"] = packets_key
+            self._log(f"Exported {len(mem[packets_key])} packets to Memory[{packets_key}]")
+
+        if packet_types_key:
+            mem[packet_types_key] = dict(packet_types)
+            exports["packet_types"] = packet_types_key
+            self._log(f"Exported packet_types to Memory[{packet_types_key}]")
+
+        if packet_stats_key:
+            mem[packet_stats_key] = self._safe_json(packet_stats)
+            exports["packet_stats"] = packet_stats_key
+            self._log(f"Exported packet_stats to Memory[{packet_stats_key}]")
+
+        if links_key:
+            existing = mem.get(links_key, [])
+            if not isinstance(existing, list):
+                existing = []
+            merged = self._dedupe_strings(existing + list(links))
+            mem[links_key] = merged[:max_items]
+            exports["links"] = links_key
+            self._log(f"Exported {len(mem[links_key])} links to Memory[{links_key}]")
+
+        if lexicon_key:
+            existing = mem.get(lexicon_key, [])
+            if not isinstance(existing, list):
+                existing = []
+            merged = self._dedupe_strings(existing + list(lexicon))
+            mem[lexicon_key] = merged[:max_items]
+            exports["lexicon"] = lexicon_key
+            self._log(f"Exported {len(mem[lexicon_key])} lexicon terms to Memory[{lexicon_key}]")
+
+        if context_key and context:
+            append_context = bool(params.get("append_context", False))
+            if append_context and isinstance(mem.get(context_key), str) and mem.get(context_key):
+                existing_ctx = str(mem.get(context_key))
+                if context[:160] not in existing_ctx:
+                    mem[context_key] = existing_ctx.rstrip() + "\n\n" + context
+            else:
+                mem[context_key] = context
+            exports["context"] = context_key
+            self._log(f"Exported context ({len(context)} chars) to Memory[{context_key}]")
+
+        if network_state_key:
+            mem[network_state_key] = self._safe_json(network_state)
+            exports["network_state"] = network_state_key
+            self._log(f"Exported network_state to Memory[{network_state_key}]")
+
+        if tracking_decisions_key:
+            mem[tracking_decisions_key] = self._safe_json(tracking_decisions)
+            exports["tracking_decisions"] = tracking_decisions_key
+            self._log(f"Exported tracking_decisions to Memory[{tracking_decisions_key}]")
+
+        if active_exchange_key:
+            mem[active_exchange_key] = self._safe_json(active_exchange)
+            exports["active_exchange"] = active_exchange_key
+            self._log(f"Exported active_exchange to Memory[{active_exchange_key}]")
+
+        resp_key = str(params.get("mem_out_response_key", "") or "").strip()
+        if prefix and not resp_key:
+            resp_key = f"{prefix}.response"
+        if resp_key:
+            mem[resp_key] = self._safe_json(response)
+            exports["response"] = resp_key
+            self._log(f"Exported full response bundle to Memory[{resp_key}]")
+
+        try:
+            Memory.save(mem)
+        except Exception as e:
+            self._log(f"Memory save failed: {e}")
+
+        return exports
+
+    # ------------------------- execution ------------------------- #
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        query_raw = str(params.get("query", "") or "").strip()
+        if not query_raw and isinstance(payload, str):
+            query_raw = str(payload).strip()
+
+        source = str(params.get("source", "combined") or "combined").strip().lower()
+        emit = str(params.get("emit", "text") or "text").strip().lower()
+
+        include_router_packets = bool(params.get("include_router_packets", True))
+        include_memory_packets = bool(params.get("include_memory_packets", False))
+        include_libpcap = bool(params.get("include_libpcap", False))
+        include_active_send = bool(params.get("active_send", False))
+
+        qterms = self._query_terms(query_raw, top_k=64)
+        self._log(f"Start source={source} query={query_raw!r} qterms={qterms[:20]} active_send={include_active_send}")
+
+        router_packets: List[Dict[str, Any]] = []
+        router_bundle: Dict[str, Any] = {}
+        router_meta: Dict[str, Any] = {}
+        payload_meta: Dict[str, Any] = {}
+
+        if include_router_packets or source in ("router", "payload", "combined"):
+            router_packets, router_bundle, payload_meta = self._coerce_router_payload(payload)
+            router_meta = {
+                "router_bundle_keys": list(router_bundle.keys())[:24],
+                "router_packet_types": dict(router_bundle.get("packet_types") or {}),
+                "router_packet_stats": dict(router_bundle.get("packet_stats") or {}),
+            } if router_bundle else {}
+            self._log(f"Router payload packets={len(router_packets)} source_kind={payload_meta.get('source_kind')}")
+
+        memory_packets: List[Dict[str, Any]] = []
+        memory_key = str(params.get("memory_packets_key", "") or "").strip()
+        if include_memory_packets or source == "memory":
+            memory_packets = self._load_packets_from_memory(memory_key)
+            self._log(f"Memory packets loaded={len(memory_packets)} key={memory_key!r}")
+
+        pcap_packets: List[Dict[str, Any]] = []
+        pcap_errors: List[str] = []
+        if include_libpcap or source in ("live", "offline", "pcap"):
+            iface = str(params.get("iface", "") or "").strip()
+            pcap_path = str(params.get("pcap_path", "") or "").strip()
+            backend = None
+            try:
+                backend = LibpcapCtypesBackend(
+                    timeout_ms=int(params.get("pcap_timeout_ms", self.cfg.pcap_timeout_ms) or self.cfg.pcap_timeout_ms),
+                    snaplen=int(params.get("pcap_snaplen", self.cfg.pcap_snaplen) or self.cfg.pcap_snaplen),
+                    promisc=bool(params.get("pcap_promisc", self.cfg.pcap_promisc)),
+                    logger=DEBUG_LOGGER,
+                )
+                if source == "offline" or pcap_path:
+                    backend.open_offline(pcap_path)
+                else:
+                    backend.open_live(iface)
+
+                raw_pkts = backend.collect(
+                    max_packets=int(params.get("max_capture_packets", self.cfg.max_capture_packets) or self.cfg.max_capture_packets),
+                    budget_s=float(params.get("capture_budget_s", self.cfg.capture_budget_s) or self.cfg.capture_budget_s),
+                )
+                pcap_packets = [
+                    self._normalize_captured_packet(p, iface=iface or pcap_path or "libpcap", source="libpcap")
+                    for p in raw_pkts
+                ]
+                self._log(f"libpcap normalized packets={len(pcap_packets)}")
+            except Exception as e:
+                pcap_errors.append(str(e))
+                self._log(f"libpcap capture failed: {e}")
+            finally:
+                try:
+                    if backend is not None:
+                        backend.close()
+                except Exception:
+                    pass
+
+        active_packets: List[Dict[str, Any]] = []
+        active_exchange: Dict[str, Any] = {"enabled": False, "ok": False}
+        active_errors: List[str] = []
+        if include_active_send:
+            active_packets, active_exchange, active_errors = self._run_active_exchange(query_raw, params)
+            self._log(f"Active exchange packets={len(active_packets)} meta={self._safe_json(active_exchange)}")
+
+        packets_in: List[Dict[str, Any]] = []
+
+        if source == "router":
+            packets_in.extend(router_packets)
+        elif source == "memory":
+            packets_in.extend(memory_packets)
+        elif source in ("live", "offline", "pcap"):
+            packets_in.extend(pcap_packets)
+        elif source == "active":
+            packets_in.extend(active_packets)
+        else:
+            if self.cfg.prefer_router_packets:
+                packets_in.extend(router_packets)
+                packets_in.extend(memory_packets)
+                packets_in.extend(pcap_packets)
+                packets_in.extend(active_packets)
+            else:
+                packets_in.extend(pcap_packets)
+                packets_in.extend(active_packets)
+                packets_in.extend(router_packets)
+                packets_in.extend(memory_packets)
+
+        normalized_packets = [self._normalize_external_packet(p) for p in packets_in if isinstance(p, dict)]
+        normalized_packets = self._dedupe_packets(normalized_packets)
+        self._log(f"Total candidate packets after merge={len(normalized_packets)}")
+
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        all_links: List[str] = []
+
+        for packet in normalized_packets:
+            score = self._score_packet(packet, qterms, query_raw)
+            if query_raw and score <= 0:
+                continue
+
+            packet["match_score"] = float(score)
+            packet["packet_types"] = self._packet_type_labels(packet)
+            scored.append((float(score), packet))
+
+            all_links.extend(packet.get("matched_links") or [])
+
+        scored.sort(key=lambda kv: (-kv[0], str(kv[1].get("summary") or "")))
+        top_k = int(params.get("top_k", self.cfg.top_k) or self.cfg.top_k)
+        matched_packets = [pkt for _, pkt in scored[:top_k]]
+
+        top_links = int(params.get("top_links", self.cfg.top_links) or self.cfg.top_links)
+        links = self._dedupe_strings(all_links)[:top_links]
+
+        lexicon_top_k = int(params.get("lexicon_top_k", self.cfg.lexicon_top_k) or self.cfg.lexicon_top_k)
+        lexicon = self._build_lexicon(qterms, matched_packets, links, top_k=lexicon_top_k)
+
+        packet_types = self._summarize_packet_types(matched_packets)
+        flows = self._flow_clusters(matched_packets)
+        devices = self._device_profiles(matched_packets)
+
+        packet_stats: Dict[str, Any] = {
+            "candidate_packets": int(len(normalized_packets)),
+            "matched_packets": int(len(matched_packets)),
+            "router_packets": int(len(router_packets)),
+            "memory_packets": int(len(memory_packets)),
+            "pcap_packets": int(len(pcap_packets)),
+            "active_packets": int(len(active_packets)),
+            "flows": int(len(flows)),
+            "devices": int(len(devices)),
+            "source": source,
+            "active_exchange": self._safe_json(active_exchange),
+            "pcap_errors": list(pcap_errors),
+            "active_errors": list(active_errors),
+        }
+
+        tracking_decisions = self._build_tracking_decisions(
+            matched_packets,
+            qterms,
+            flows,
+            devices,
+            active_exchange,
+        )
+
+        network_state = {
+            "query": query_raw,
+            "packet_types": packet_types,
+            "packet_stats": packet_stats,
+            "flow_clusters": flows,
+            "devices": devices,
+            "tracking_mode": "passive_plus_bounded_active" if include_active_send else "passive",
+            "tracking_decisions": tracking_decisions,
+            "active_exchange": self._safe_json(active_exchange),
+        }
+
+        context = self._build_context(
+            query_raw=query_raw,
+            packets_in_count=len(normalized_packets),
+            packets=matched_packets,
+            packet_types=packet_types,
+            flows=flows,
+            devices=devices,
+            links=links,
+            active_exchange=active_exchange,
+            tracking_decisions=tracking_decisions,
+            pcap_errors=pcap_errors + active_errors,
+        )
+
+        bundle = {
+            "ok": bool(matched_packets or normalized_packets),
+            "query": query_raw,
+            "packets": matched_packets,
+            "packet_types": packet_types,
+            "packet_stats": packet_stats,
+            "links": links,
+            "lexicon": lexicon,
+            "context": context,
+            "network_state": network_state,
+            "tracking_decisions": tracking_decisions,
+            "active_exchange": self._safe_json(active_exchange),
+            "router_meta": router_meta,
+            "payload_meta": payload_meta,
+            "errors": pcap_errors + active_errors,
+        }
+
+        exports = self._persist_optional_outputs(
+            ok=bundle["ok"],
+            params=params,
+            packets=matched_packets,
+            packet_types=packet_types,
+            packet_stats=packet_stats,
+            links=links,
+            lexicon=lexicon,
+            context=context,
+            network_state=network_state,
+            tracking_decisions=tracking_decisions,
+            active_exchange=active_exchange,
+            response=bundle,
+        )
+
+        if emit == "bundle":
+            out: Any = bundle
+        elif emit == "packets":
+            out = matched_packets
+        elif emit == "links":
+            out = links
+        elif emit == "context":
+            out = context
+        else:
+            parts: List[str] = []
+            base = str(payload) if isinstance(payload, str) else ""
+            if base:
+                parts.append(base)
+            if lexicon:
+                parts.append("[lexicon]\n" + ", ".join(lexicon))
+            if context:
+                parts.append("[context]\n" + context)
+            out = "\n\n".join(parts).strip()
+
+        meta = {
+            "ok": bool(bundle["ok"]),
+            "query": query_raw,
+            "source": source,
+            "packets": matched_packets,
+            "packet_types": packet_types,
+            "packet_stats": packet_stats,
+            "links": links,
+            "lexicon": lexicon,
+            "context": context,
+            "packets_key": exports.get("packets"),
+            "packet_types_key": exports.get("packet_types"),
+            "packet_stats_key": exports.get("packet_stats"),
+            "links_key": exports.get("links"),
+            "lexicon_key": exports.get("lexicon"),
+            "context_key": exports.get("context"),
+            "network_state_key": exports.get("network_state"),
+            "tracking_decisions_key": exports.get("tracking_decisions"),
+            "active_exchange_key": exports.get("active_exchange"),
+            "response_key": exports.get("response"),
+            "memory_exports": exports,
+            "network_state": network_state,
+            "tracking_decisions": tracking_decisions,
+            "active_exchange": self._safe_json(active_exchange),
+            "candidate_packet_count": len(normalized_packets),
+            "matched_packet_count": len(matched_packets),
+            "errors": pcap_errors + active_errors,
+        }
+
+        self._log(
+            f"Finished ok={meta['ok']} source={source} candidate_packets={meta['candidate_packet_count']} "
+            f"matched_packets={meta['matched_packet_count']} active_enabled={active_exchange.get('enabled')} "
+            f"flows={len(flows)} devices={len(devices)} exports={exports}"
+        )
+        if meta["errors"]:
+            self._log(f"Finished with errors: {meta['errors']}")
+
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "override query string; defaults to payload text if payload is str",
+            "source": "combined | router | memory | live | offline | pcap | active",
+            "emit": "text | bundle | links | context | packets",
+
+            "include_router_packets": True,
+            "include_memory_packets": False,
+            "include_libpcap": False,
+
+            "memory_packets_key": "optional Memory key for previously stored packets",
+
+            "iface": "live capture interface name for libpcap",
+            "pcap_path": "offline .pcap/.pcapng file path",
+            "pcap_timeout_ms": 250,
+            "pcap_promisc": True,
+            "pcap_snaplen": 65535,
+            "max_capture_packets": 128,
+            "capture_budget_s": 2.0,
+
+            "active_send": False,
+            "active_protocol": "tcp | udp",
+            "active_host": "private/local target host only",
+            "active_port": 0,
+            "active_payload": "optional outbound payload; defaults to query text",
+            "active_payload_mode": "text | json | hex | base64 | bytes",
+            "active_timeout": 2.0,
+            "active_recv_max_bytes": 16384,
+            "active_recv_chunks": 4,
+            "active_send_max_bytes": 4096,
+
+            "top_k": 24,
+            "top_links": 80,
+            "lexicon_top_k": 40,
+            "context_max_chars": 7000,
+
+            "mem_out_on_ok": True,
+            "packets_key": "optional Memory key for matched packets",
+            "packet_types_key": "optional Memory key for matched packet types",
+            "packet_stats_key": "optional Memory key for matched packet stats",
+            "links_key": "optional Memory key for links",
+            "lexicon_key": "optional Memory key for lexicon",
+            "context_key": "optional Memory key for context",
+            "network_state_key": "optional Memory key for network_state",
+            "tracking_decisions_key": "optional Memory key for tracking_decisions",
+            "active_exchange_key": "optional Memory key for active_exchange",
+            "mem_out_prefix": "optional prefix to auto-build keys",
+            "mem_out_max_items": 500,
+            "mem_out_max_packets": 250,
+            "append_context": False,
+            "mem_out_response_key": "optional Memory key for full response bundle",
+        }
+
+
+BLOCKS.register("networktracker", NetworkTrackerBlock)
