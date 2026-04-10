@@ -1,11 +1,12 @@
 import ctypes
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, Dict, List
 
 
 @dataclass
-class LibpcapCtypesBackend:
+class   LibpcapCtypesBackend:
     """
     Minimal ctypes-backed libpcap wrapper for passive capture.
 
@@ -36,20 +37,43 @@ class LibpcapCtypesBackend:
 
     def _load_library(self) -> None:
         candidates: List[str] = []
-        for name in ("pcap", "wpcap"):
-            libname = ctypes.util.find_library(name)
-            if libname:
-                candidates.append(libname)
+
+        try:
+            for name in ("pcap", "wpcap"):
+                libname = ctypes.util.find_library(name)
+                if libname:
+                    candidates.append(libname)
+        except Exception:
+            pass
+
+        # Windows / Npcap / WinPcap common names and locations
         candidates.extend([
+            "wpcap.dll",
+            "Packet.dll",
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "Npcap", "wpcap.dll"),
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wpcap.dll"),
+
+            # Linux/macOS fallbacks
             "libpcap.so",
             "libpcap.so.1",
-            "wpcap.dll",
             "/usr/lib/libpcap.so",
             "/usr/lib/x86_64-linux-gnu/libpcap.so",
+            "/usr/local/lib/libpcap.so",
+            "libpcap.dylib",
         ])
 
+        # de-dupe while preserving order
+        seen = set()
+        ordered: List[str] = []
+        for c in candidates:
+            s = str(c or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            ordered.append(s)
+
         last_err: Optional[Exception] = None
-        for candidate in candidates:
+        for candidate in ordered:
             try:
                 self.lib = ctypes.CDLL(candidate)
                 self._bind()
@@ -58,6 +82,8 @@ class LibpcapCtypesBackend:
             except Exception as e:
                 last_err = e
                 continue
+
+        raise RuntimeError(f"Unable to load libpcap/wpcap via ctypes: {last_err}")
 
         raise RuntimeError(f"Unable to load libpcap/wpcap via ctypes: {last_err}")
 

@@ -59,6 +59,7 @@ from stores import LinkTrackerStore, VideoTrackerStore, CorpusStore, WebCorpusSt
     LocalCodeCorpusStore
 from loggers import DEBUG_LOGGER
 import ast
+import queue
 from blocknet_client import BlockNetClient
 def get_env_path():
     # If running as a PyInstaller bundle
@@ -34488,3 +34489,1246 @@ class NetworkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("networktracker", NetworkTrackerBlock)
+
+
+
+
+# ======================= Packet Pipeline Helpers =======================
+
+_PACKET_SENTINEL = object()
+
+
+@dataclass
+class _MiniPacketInfo:
+    raw_len: int = 0
+    datalink: Optional[int] = None
+    l2: str = ""
+    l3: str = ""
+    l4: str = ""
+    topic: str = "unknown"
+    src_mac: str = ""
+    dst_mac: str = ""
+    src_ip: str = ""
+    dst_ip: str = ""
+    src_port: Optional[int] = None
+    dst_port: Optional[int] = None
+    tcp_flags: str = ""
+    is_broadcast: bool = False
+    is_multicast: bool = False
+    is_noise_hint: bool = False
+
+
+def _pc_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _pc_int(v: Any, default: int = 0) -> int:
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def _pc_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _pc_mac(raw: bytes) -> str:
+    try:
+        return ":".join(f"{b:02x}" for b in raw[:6])
+    except Exception:
+        return ""
+
+
+def _pc_ipv4(raw: bytes) -> str:
+    if len(raw) != 4:
+        return ""
+    return ".".join(str(int(b)) for b in raw)
+
+
+def _pc_ipv6(raw: bytes) -> str:
+    if len(raw) != 16:
+        return ""
+    try:
+        groups = [f"{int.from_bytes(raw[i:i+2], 'big'):x}" for i in range(0, 16, 2)]
+        return ":".join(groups)
+    except Exception:
+        return ""
+
+
+def _pc_ascii_preview(raw: bytes, limit: int = 96) -> str:
+    if not raw:
+        return ""
+    try:
+        out = []
+        for b in raw[: max(1, int(limit))]:
+            if 32 <= int(b) <= 126:
+                out.append(chr(int(b)))
+            else:
+                out.append(".")
+        return "".join(out)
+    except Exception:
+        return ""
+
+
+def _pc_port_topic(src_port: Optional[int], dst_port: Optional[int], l4: str) -> str:
+    ports = {int(src_port or 0), int(dst_port or 0)}
+    if 53 in ports:
+        return "dns"
+    if 67 in ports or 68 in ports:
+        return "dhcp"
+    if 137 in ports or 138 in ports:
+        return "nbns"
+    if 1900 in ports:
+        return "ssdp"
+    if 5353 in ports:
+        return "mdns"
+    if 3333 in ports or 4444 in ports or 5555 in ports or 7777 in ports:
+        return "stratum"
+    if 37888 in ports or 37889 in ports:
+        return "p2pool"
+    if 18080 in ports or 18081 in ports or 18083 in ports:
+        return "monero"
+    if 80 in ports or 8080 in ports:
+        return "http"
+    if 443 in ports or 8443 in ports:
+        return "https"
+    if l4 == "icmp":
+        return "icmp"
+    if l4 == "icmpv6":
+        return "icmpv6"
+    if l4 == "arp":
+        return "arp"
+    return "unknown"
+
+
+def _pc_parse_packet(raw: bytes, *, datalink: Optional[int] = None) -> _MiniPacketInfo:
+    info = _MiniPacketInfo(raw_len=len(raw or b""), datalink=datalink)
+    if not raw:
+        return info
+
+    try:
+        if len(raw) >= 14:
+            info.dst_mac = _pc_mac(raw[0:6])
+            info.src_mac = _pc_mac(raw[6:12])
+            if raw[0:6] == b"\xff\xff\xff\xff\xff\xff":
+                info.is_broadcast = True
+            if raw[0] & 0x01:
+                info.is_multicast = True
+
+            ether_type = int.from_bytes(raw[12:14], "big")
+            offset = 14
+            if ether_type == 0x8100 and len(raw) >= 18:
+                ether_type = int.from_bytes(raw[16:18], "big")
+                offset = 18
+
+            info.l2 = "ether"
+
+            if ether_type == 0x0806 and len(raw) >= offset + 28:
+                info.l3 = "arp"
+                info.l4 = "arp"
+                info.topic = "arp"
+                info.is_noise_hint = True
+                return info
+
+            if ether_type == 0x0800 and len(raw) >= offset + 20:
+                ihl = (raw[offset] & 0x0F) * 4
+                if ihl < 20 or len(raw) < offset + ihl:
+                    return info
+                proto = int(raw[offset + 9])
+                info.l3 = "ipv4"
+                info.src_ip = _pc_ipv4(raw[offset + 12: offset + 16])
+                info.dst_ip = _pc_ipv4(raw[offset + 16: offset + 20])
+                if info.dst_ip.endswith(".255"):
+                    info.is_broadcast = True
+                first_oct = raw[offset + 16]
+                if 224 <= int(first_oct) <= 239:
+                    info.is_multicast = True
+
+                l4off = offset + ihl
+                if proto == 6 and len(raw) >= l4off + 20:
+                    info.l4 = "tcp"
+                    info.src_port = int.from_bytes(raw[l4off:l4off + 2], "big")
+                    info.dst_port = int.from_bytes(raw[l4off + 2:l4off + 4], "big")
+                    flags = int(raw[l4off + 13])
+                    info.tcp_flags = "".join([
+                        "F" if flags & 0x01 else "",
+                        "S" if flags & 0x02 else "",
+                        "R" if flags & 0x04 else "",
+                        "P" if flags & 0x08 else "",
+                        "A" if flags & 0x10 else "",
+                        "U" if flags & 0x20 else "",
+                    ])
+                elif proto == 17 and len(raw) >= l4off + 8:
+                    info.l4 = "udp"
+                    info.src_port = int.from_bytes(raw[l4off:l4off + 2], "big")
+                    info.dst_port = int.from_bytes(raw[l4off + 2:l4off + 4], "big")
+                elif proto == 1:
+                    info.l4 = "icmp"
+                else:
+                    info.l4 = f"ipproto:{proto}"
+
+                info.topic = _pc_port_topic(info.src_port, info.dst_port, info.l4)
+                info.is_noise_hint = info.topic in {"arp", "nbns", "mdns", "ssdp", "dhcp"} or info.is_broadcast or info.is_multicast
+                return info
+
+            if ether_type == 0x86DD and len(raw) >= offset + 40:
+                info.l3 = "ipv6"
+                next_header = int(raw[offset + 6])
+                info.src_ip = _pc_ipv6(raw[offset + 8: offset + 24])
+                info.dst_ip = _pc_ipv6(raw[offset + 24: offset + 40])
+                if raw[offset + 24] == 0xFF:
+                    info.is_multicast = True
+                l4off = offset + 40
+                if next_header == 6 and len(raw) >= l4off + 20:
+                    info.l4 = "tcp"
+                    info.src_port = int.from_bytes(raw[l4off:l4off + 2], "big")
+                    info.dst_port = int.from_bytes(raw[l4off + 2:l4off + 4], "big")
+                    flags = int(raw[l4off + 13])
+                    info.tcp_flags = "".join([
+                        "F" if flags & 0x01 else "",
+                        "S" if flags & 0x02 else "",
+                        "R" if flags & 0x04 else "",
+                        "P" if flags & 0x08 else "",
+                        "A" if flags & 0x10 else "",
+                        "U" if flags & 0x20 else "",
+                    ])
+                elif next_header == 17 and len(raw) >= l4off + 8:
+                    info.l4 = "udp"
+                    info.src_port = int.from_bytes(raw[l4off:l4off + 2], "big")
+                    info.dst_port = int.from_bytes(raw[l4off + 2:l4off + 4], "big")
+                elif next_header == 58:
+                    info.l4 = "icmpv6"
+                else:
+                    info.l4 = f"ipproto:{next_header}"
+
+                info.topic = _pc_port_topic(info.src_port, info.dst_port, info.l4)
+                info.is_noise_hint = info.topic in {"mdns", "ssdp", "dhcp"} or info.is_multicast
+                return info
+    except Exception:
+        return info
+
+    return info
+
+
+def _pc_decode_raw_bytes(packet: Dict[str, Any]) -> bytes:
+    if not isinstance(packet, dict):
+        return b""
+
+    raw = packet.get("raw_bytes")
+    if isinstance(raw, (bytes, bytearray)):
+        return bytes(raw)
+
+    raw_b64 = packet.get("raw_b64") or packet.get("raw_base64")
+    if raw_b64:
+        try:
+            return base64.b64decode(str(raw_b64), validate=False)
+        except Exception:
+            pass
+
+    raw_hex = packet.get("raw_hex")
+    if raw_hex:
+        try:
+            s = re.sub(r"[^0-9a-fA-F]", "", str(raw_hex))
+            return bytes.fromhex(s)
+        except Exception:
+            pass
+
+    raw_list = packet.get("raw")
+    if isinstance(raw_list, list):
+        try:
+            return bytes(int(x) & 0xFF for x in raw_list)
+        except Exception:
+            pass
+
+    return b""
+
+
+def _pc_has_raw_data(packet: Dict[str, Any]) -> bool:
+    try:
+        return bool(_pc_decode_raw_bytes(packet))
+    except Exception:
+        return False
+
+
+def _pc_packet_signature(packet: Dict[str, Any]) -> str:
+    raw = _pc_decode_raw_bytes(packet)
+    if raw:
+        return raw[:64].hex() + "|" + str(len(raw))
+    return "|".join([
+        str(packet.get("timestamp") or ""),
+        str(packet.get("iface") or packet.get("interface") or ""),
+        str(packet.get("src_ip") or ""),
+        str(packet.get("dst_ip") or ""),
+        str(packet.get("src_port") or ""),
+        str(packet.get("dst_port") or ""),
+        str(packet.get("topic") or ""),
+    ])
+
+
+def _pc_normalize_packet(packet: Dict[str, Any], *, default_iface: str = "") -> Dict[str, Any]:
+    p = dict(packet or {})
+    raw = _pc_decode_raw_bytes(p)
+    info = _pc_parse_packet(raw, datalink=p.get("datalink"))
+
+    iface = str(p.get("iface") or p.get("interface") or p.get("inbound_iface") or default_iface or "").strip()
+    out = {
+        "timestamp": _pc_float(p.get("timestamp"), time.time()),
+        "caplen": _pc_int(p.get("caplen"), len(raw)),
+        "wirelen": _pc_int(p.get("wirelen"), len(raw)),
+        "datalink": p.get("datalink"),
+        "iface": iface,
+        "raw_len": len(raw),
+        "raw_b64": base64.b64encode(raw).decode("ascii") if raw else "",
+        "raw_hex_preview": raw[:64].hex() if raw else "",
+        "raw_ascii_preview": _pc_ascii_preview(raw, limit=96),
+        "src_mac": str(p.get("src_mac") or info.src_mac or ""),
+        "dst_mac": str(p.get("dst_mac") or info.dst_mac or ""),
+        "src_ip": str(p.get("src_ip") or info.src_ip or ""),
+        "dst_ip": str(p.get("dst_ip") or info.dst_ip or ""),
+        "src_port": p.get("src_port") if p.get("src_port") is not None else info.src_port,
+        "dst_port": p.get("dst_port") if p.get("dst_port") is not None else info.dst_port,
+        "l2": str(p.get("l2") or info.l2 or ""),
+        "l3": str(p.get("l3") or info.l3 or ""),
+        "l4": str(p.get("l4") or info.l4 or ""),
+        "topic": str(p.get("topic") or info.topic or "unknown"),
+        "tcp_flags": str(p.get("tcp_flags") or info.tcp_flags or ""),
+        "is_broadcast": bool(p.get("is_broadcast", info.is_broadcast)),
+        "is_multicast": bool(p.get("is_multicast", info.is_multicast)),
+        "is_noise_hint": bool(p.get("is_noise_hint", info.is_noise_hint)),
+        "component": str(p.get("component") or ""),
+        "phase": str(p.get("phase") or ""),
+        "source": str(p.get("source") or p.get("capture_source") or "packet"),
+        "extra": dict(p.get("extra") or {}) if isinstance(p.get("extra"), dict) else {},
+    }
+    return out
+
+
+def _pc_load_memory_packets(key: str) -> List[Dict[str, Any]]:
+    key = str(key or "").strip()
+    if not key:
+        return []
+    try:
+        mem = Memory.load()
+        value = mem.get(key)
+        if isinstance(value, list):
+            return [dict(x) for x in value if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def _pc_save_memory_packets(
+    key: str,
+    items: List[Dict[str, Any]],
+    *,
+    append: bool = False,
+    max_items: int = 5000,
+) -> int:
+    key = str(key or "").strip()
+    if not key:
+        return 0
+    mem = Memory.load()
+    existing = mem.get(key)
+    bucket: List[Dict[str, Any]] = []
+    if append and isinstance(existing, list):
+        bucket.extend([dict(x) for x in existing if isinstance(x, dict)])
+    bucket.extend([dict(x) for x in items if isinstance(x, dict)])
+    if max_items > 0 and len(bucket) > int(max_items):
+        bucket = bucket[-int(max_items):]
+    mem[key] = bucket
+    Memory.save(mem)
+    return len(bucket)
+
+
+def _pc_query_terms(text: str, *, top_k: int = 64) -> List[str]:
+    text = str(text or "").strip().lower()
+    if not text:
+        return []
+    parts = []
+    for raw in re.split(r"\s+", text):
+        tok = raw.strip().strip('"\'')
+        if tok:
+            parts.append(tok)
+    return parts[: max(1, int(top_k))]
+
+
+def _pc_packet_haystack(packet: Dict[str, Any]) -> str:
+    fields = [
+        packet.get("iface"),
+        packet.get("source"),
+        packet.get("component"),
+        packet.get("phase"),
+        packet.get("topic"),
+        packet.get("l2"),
+        packet.get("l3"),
+        packet.get("l4"),
+        packet.get("src_mac"),
+        packet.get("dst_mac"),
+        packet.get("src_ip"),
+        packet.get("dst_ip"),
+        packet.get("src_port"),
+        packet.get("dst_port"),
+        packet.get("tcp_flags"),
+        packet.get("raw_hex_preview"),
+        packet.get("raw_ascii_preview"),
+        packet.get("raw_len"),
+        packet.get("caplen"),
+        packet.get("wirelen"),
+        packet.get("datalink"),
+    ]
+    extra = packet.get("extra") if isinstance(packet.get("extra"), dict) else {}
+    for k, v in extra.items():
+        fields.append(k)
+        fields.append(v)
+    return " ".join(str(x) for x in fields if x is not None).lower()
+
+
+def _pc_packet_matches(packet: Dict[str, Any], query: str, *, require_all: bool = True) -> Tuple[bool, float, List[str]]:
+    terms = _pc_query_terms(query)
+    if not terms:
+        return True, 1.0, []
+
+    hay = _pc_packet_haystack(packet)
+    hits: List[str] = []
+    for term in terms:
+        if term in hay:
+            hits.append(term)
+    if require_all:
+        ok = len(hits) == len(terms)
+    else:
+        ok = len(hits) > 0
+    score = (len(hits) / max(1, len(terms))) if terms else 1.0
+    return ok, score, hits
+
+
+def _pc_noise_decision(packet: Dict[str, Any], *, noisy_topics: Set[str], noisy_ports: Set[int]) -> Tuple[bool, List[str]]:
+    reasons: List[str] = []
+    topic = str(packet.get("topic") or "").lower()
+    src_port = packet.get("src_port")
+    dst_port = packet.get("dst_port")
+    if topic in noisy_topics:
+        reasons.append(f"topic:{topic}")
+    if src_port in noisy_ports:
+        reasons.append(f"src_port:{src_port}")
+    if dst_port in noisy_ports:
+        reasons.append(f"dst_port:{dst_port}")
+    if bool(packet.get("is_broadcast")):
+        reasons.append("broadcast")
+    if bool(packet.get("is_multicast")):
+        reasons.append("multicast")
+    if bool(packet.get("is_noise_hint")):
+        reasons.append("noise_hint")
+    return bool(reasons), reasons
+
+
+# ======================= InterfaceBlock =======================
+
+@dataclass
+class InterfaceBlock(BaseBlock):
+    """
+    Push packets from Memory[packets_key] or payload to PythonServerManager's
+    /api/inject-packet route using a bounded work queue.
+
+    This rewrite is focused on finishing reliably:
+      - prefilters unsendable packets before queueing
+      - uses a producer/consumer queue so memory stays bounded
+      - reuses per-worker HTTP sessions for faster drain
+      - never blocks forever on queue/join paths
+      - supports a total flush deadline and idle watchdog
+      - returns partial success cleanly instead of hanging
+    """
+
+    def _log(self, msg: str) -> None:
+        try:
+            DEBUG_LOGGER.log_message(f"[InterfaceBlock] {msg}")
+        except Exception:
+            pass
+
+    def _normalize_base(self, value: Any) -> str:
+        s = str(value or "").strip()
+        if not s:
+            s = "http://127.0.0.1:8844"
+        if not s.startswith(("http://", "https://")):
+            s = "http://" + s
+        return s.rstrip("/")
+
+    def _collect_packets(self, payload: Any, *, packets_key: str) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if packets_key:
+            items.extend(_pc_load_memory_packets(packets_key))
+        if isinstance(payload, list):
+            items.extend([dict(x) for x in payload if isinstance(x, dict)])
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("packets"), list):
+                items.extend([dict(x) for x in payload.get("packets") if isinstance(x, dict)])
+            elif payload.get("raw_b64") or payload.get("raw_hex") or payload.get("raw_bytes"):
+                items.append(dict(payload))
+        return items
+
+    def _build_request_body(
+        self,
+        *,
+        iface_name: str,
+        delegate_from: Optional[str],
+        packet: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        raw = _pc_decode_raw_bytes(packet)
+        body = {
+            "iface": str(iface_name or "PromptChat").strip() or "PromptChat",
+            "raw_b64": base64.b64encode(raw).decode("ascii"),
+            "extra": {
+                "capture_source": packet.get("source") or "InterfaceBlock",
+                "capture_interface": packet.get("iface") or "",
+                "topic": packet.get("topic") or "",
+                "src_ip": packet.get("src_ip") or "",
+                "dst_ip": packet.get("dst_ip") or "",
+                "src_port": packet.get("src_port"),
+                "dst_port": packet.get("dst_port"),
+                "raw_len": len(raw),
+                "timestamp": packet.get("timestamp"),
+                "l2": packet.get("l2") or "",
+                "l3": packet.get("l3") or "",
+                "l4": packet.get("l4") or "",
+                "tcp_flags": packet.get("tcp_flags") or "",
+            },
+        }
+        if delegate_from:
+            body["delegate_from"] = delegate_from
+        return body
+
+    def _post_one_with_session(
+        self,
+        *,
+        session: requests.Session,
+        base_url: str,
+        token: str,
+        verify_tls: bool,
+        timeout_s: float,
+        iface_name: str,
+        delegate_from: Optional[str],
+        packet: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        raw = _pc_decode_raw_bytes(packet)
+        if not raw:
+            return {"ok": False, "error": "missing_raw_packet_bytes"}
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "PromptChat-InterfaceBlock/3.0",
+            "Connection": "keep-alive",
+        }
+        tok = str(token or "").strip()
+        if tok:
+            headers["X-Router-Token"] = tok
+            headers["Authorization"] = f"Bearer {tok}"
+
+        resp = session.post(
+            f"{base_url}/api/inject-packet",
+            json=self._build_request_body(
+                iface_name=iface_name,
+                delegate_from=delegate_from,
+                packet=packet,
+            ),
+            headers=headers,
+            timeout=max(0.25, float(timeout_s)),
+            verify=bool(verify_tls),
+        )
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"ok": False, "status_code": resp.status_code, "text": resp.text[:1000]}
+        if resp.status_code >= 400 and isinstance(data, dict):
+            data.setdefault("ok", False)
+            data.setdefault("status_code", resp.status_code)
+        return data if isinstance(data, dict) else {"ok": False, "response": data}
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        packets_key = str(params.get("packets_key") or params.get("memory_packets_key") or "packets").strip()
+        base_url = self._normalize_base(params.get("router_base_url") or params.get("base_url") or params.get("server"))
+        ingest_iface = str(params.get("ingest_iface") or params.get("iface") or "PromptChat").strip() or "PromptChat"
+        delegate_from = str(params.get("delegate_from") or "").strip() or None
+        token = str(params.get("token") or params.get("router_token") or "").strip()
+        verify_tls = _pc_bool(params.get("verify_tls"), False)
+        timeout_s = _pc_float(params.get("timeout"), 2.5)
+        queue_maxsize = max(8, _pc_int(params.get("queue_maxsize"), 512))
+        worker_count = max(1, min(12, _pc_int(params.get("worker_count"), 3)))
+        max_packets = max(0, _pc_int(params.get("max_packets"), 0))
+        clear_on_success = _pc_bool(params.get("clear_on_success"), False)
+        remove_sent_from_key = _pc_bool(params.get("remove_sent_from_key"), False)
+        emit = str(params.get("emit") or "summary").strip().lower()
+
+        # finish / watchdog controls
+        flush_timeout_s = max(timeout_s, _pc_float(params.get("flush_timeout_s"), max(10.0, timeout_s * 8.0)))
+        queue_put_timeout_s = max(0.05, _pc_float(params.get("queue_put_timeout_s"), 0.25))
+        queue_get_timeout_s = max(0.05, _pc_float(params.get("queue_get_timeout_s"), 0.25))
+        idle_break_s = max(0.25, _pc_float(params.get("idle_break_s"), 1.5))
+
+        packets = [
+            _pc_normalize_packet(x) for x in self._collect_packets(payload, packets_key=packets_key)
+            if isinstance(x, dict)
+        ]
+        if max_packets > 0:
+            packets = packets[:max_packets]
+
+        if not packets:
+            return payload, {
+                "ok": False,
+                "error": "no_packets",
+                "packets_key": packets_key,
+                "route": f"{base_url}/api/inject-packet",
+            }
+
+        sendable_packets = [p for p in packets if _pc_has_raw_data(p)]
+        unsendable_packets = [p for p in packets if not _pc_has_raw_data(p)]
+
+        if not sendable_packets:
+            return payload, {
+                "ok": False,
+                "error": "no_sendable_packets",
+                "packets_key": packets_key,
+                "route": f"{base_url}/api/inject-packet",
+                "input_count": len(packets),
+                "unsendable_count": len(unsendable_packets),
+                "unsendable_items": unsendable_packets[:64],
+            }
+
+        q: "queue.Queue[Any]" = queue.Queue(maxsize=queue_maxsize)
+        lock = threading.Lock()
+        sent: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        abandoned: List[Dict[str, Any]] = []
+        done_event = threading.Event()
+        start_ts = time.time()
+        deadline_ts = start_ts + flush_timeout_s
+        last_progress_ts = time.time()
+        producer_done = False
+        active_workers = worker_count
+
+        def _mark_progress() -> None:
+            nonlocal last_progress_ts
+            last_progress_ts = time.time()
+
+        def _worker(worker_id: int) -> None:
+            nonlocal active_workers
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            try:
+                while True:
+                    if time.time() >= deadline_ts:
+                        return
+                    try:
+                        item = q.get(timeout=queue_get_timeout_s)
+                    except queue.Empty:
+                        if producer_done and q.empty():
+                            return
+                        if (time.time() - last_progress_ts) >= idle_break_s and producer_done:
+                            return
+                        continue
+                    try:
+                        if item is _PACKET_SENTINEL:
+                            return
+                        idx, pkt = item
+                        res = self._post_one_with_session(
+                            session=session,
+                            base_url=base_url,
+                            token=token,
+                            verify_tls=verify_tls,
+                            timeout_s=timeout_s,
+                            iface_name=ingest_iface,
+                            delegate_from=delegate_from,
+                            packet=pkt,
+                        )
+                        with lock:
+                            entry = {
+                                "index": idx,
+                                "iface": ingest_iface,
+                                "bytes": pkt.get("raw_len"),
+                                "topic": pkt.get("topic"),
+                                "src_ip": pkt.get("src_ip"),
+                                "dst_ip": pkt.get("dst_ip"),
+                                "response": res,
+                            }
+                            if bool(res.get("ok")):
+                                sent.append(entry)
+                            else:
+                                failed.append(entry)
+                        _mark_progress()
+                    except Exception as e:
+                        with lock:
+                            failed.append({
+                                "index": item[0] if isinstance(item, tuple) else -1,
+                                "error": f"{type(e).__name__}: {e}",
+                            })
+                        _mark_progress()
+                    finally:
+                        try:
+                            q.task_done()
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+                with lock:
+                    active_workers = max(0, active_workers - 1)
+                    if producer_done and active_workers <= 0:
+                        done_event.set()
+
+        threads = [threading.Thread(target=_worker, args=(i,), name=f"InterfaceBlockWorker-{i}", daemon=True) for i in range(worker_count)]
+        for t in threads:
+            t.start()
+
+        enqueue_index = 0
+        for idx, pkt in enumerate(sendable_packets):
+            if time.time() >= deadline_ts:
+                abandoned.extend(sendable_packets[idx:])
+                break
+            placed = False
+            while time.time() < deadline_ts:
+                try:
+                    q.put((idx, pkt), timeout=queue_put_timeout_s)
+                    enqueue_index = idx + 1
+                    placed = True
+                    break
+                except queue.Full:
+                    if (time.time() - last_progress_ts) >= idle_break_s and producer_done:
+                        break
+                    continue
+            if not placed:
+                abandoned.extend(sendable_packets[idx:])
+                break
+
+        producer_done = True
+        for _ in threads:
+            while time.time() < deadline_ts:
+                try:
+                    q.put(_PACKET_SENTINEL, timeout=queue_put_timeout_s)
+                    break
+                except queue.Full:
+                    continue
+
+        remaining = max(0.0, deadline_ts - time.time())
+        done_event.wait(timeout=remaining)
+
+        # drain anything that was never processed so the block always finishes cleanly
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                if item is _PACKET_SENTINEL:
+                    pass
+                elif isinstance(item, tuple) and len(item) == 2:
+                    _, pkt = item
+                    abandoned.append(pkt)
+            finally:
+                try:
+                    q.task_done()
+                except Exception:
+                    pass
+
+        for t in threads:
+            t.join(timeout=0.5)
+
+        if packets_key and (clear_on_success or remove_sent_from_key):
+            try:
+                mem = Memory.load()
+                if clear_on_success and not failed and not abandoned:
+                    mem[packets_key] = []
+                elif remove_sent_from_key and isinstance(mem.get(packets_key), list):
+                    original = [dict(x) for x in mem.get(packets_key) if isinstance(x, dict)]
+                    sent_signatures = {
+                        _pc_packet_signature(sendable_packets[x.get("index")])
+                        for x in sent
+                        if isinstance(x, dict) and isinstance(x.get("index"), int) and 0 <= int(x.get("index")) < len(sendable_packets)
+                    }
+                    kept: List[Dict[str, Any]] = []
+                    for item in original:
+                        sig = _pc_packet_signature(item)
+                        if sig in sent_signatures:
+                            continue
+                        kept.append(item)
+                    mem[packets_key] = kept
+                Memory.save(mem)
+            except Exception:
+                pass
+
+        meta = {
+            "ok": bool(sent) and not failed and not abandoned,
+            "packets_key": packets_key,
+            "route": f"{base_url}/api/inject-packet",
+            "ingest_iface": ingest_iface,
+            "delegate_from": delegate_from,
+            "input_count": len(packets),
+            "unsendable_count": len(unsendable_packets),
+            "queued": enqueue_index,
+            "sent": len(sent),
+            "failed": len(failed),
+            "abandoned": len(abandoned),
+            "worker_count": worker_count,
+            "queue_maxsize": queue_maxsize,
+            "flush_timeout_s": flush_timeout_s,
+            "elapsed_s": round(max(0.0, time.time() - start_ts), 3),
+            "responses": sent[:64],
+            "errors": failed[:64],
+            "abandoned_items": abandoned[:64],
+        }
+
+        if emit == "packets":
+            return sent, meta
+        if emit == "bundle":
+            return {"sent": sent, "failed": failed, "abandoned": abandoned}, meta
+        return f"[InterfaceBlock] input={len(packets)} queued={enqueue_index} unsendable={len(unsendable_packets)} sent={len(sent)} failed={len(failed)} abandoned={len(abandoned)} iface={ingest_iface}", meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "packets_key": "packets",
+            "router_base_url": "http://127.0.0.1:8844",
+            "ingest_iface": "PromptChat",
+            "delegate_from": "",
+            "token": "",
+            "verify_tls": False,
+            "timeout": 2.5,
+            "flush_timeout_s": 20.0,
+            "queue_put_timeout_s": 0.25,
+            "queue_get_timeout_s": 0.25,
+            "idle_break_s": 1.5,
+            "queue_maxsize": 512,
+            "worker_count": 3,
+            "max_packets": 0,
+            "clear_on_success": False,
+            "remove_sent_from_key": False,
+            "emit": "summary",  # summary | packets | bundle
+        }
+
+
+BLOCKS.register("interface", InterfaceBlock)
+
+
+# ======================= PacketTrackerBlock =======================
+
+@dataclass
+class PacketTrackerBlock(BaseBlock):
+    """
+    Collect packets from libpcap or from an incoming packet list, match them
+    against a query, normalize them, and export them into Memory[packets_key].
+
+    Query examples:
+      "dns"
+      "p2pool 37889"
+      "udp 5353"
+      "192.168.0.1 53"
+      "https 443"
+    """
+
+    def _log(self, msg: str) -> None:
+        try:
+            DEBUG_LOGGER.log_message(f"[PacketTracker] {msg}")
+        except Exception:
+            pass
+
+    def _collect_from_payload(self, payload: Any) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        if isinstance(payload, list):
+            items.extend([dict(x) for x in payload if isinstance(x, dict)])
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("packets"), list):
+                items.extend([dict(x) for x in payload.get("packets") if isinstance(x, dict)])
+            elif payload.get("raw_b64") or payload.get("raw_hex") or payload.get("raw_bytes"):
+                items.append(dict(payload))
+        return items
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        query = str(params.get("query") or payload if isinstance(payload, str) else params.get("query") or "").strip()
+        packets_key = str(params.get("packets_key") or "packets").strip()
+        append = _pc_bool(params.get("append"), False)
+        max_memory_items = max(32, _pc_int(params.get("max_memory_items"), 5000))
+        require_all_terms = _pc_bool(params.get("require_all_terms"), True)
+        include_payload_packets = _pc_bool(params.get("include_payload_packets"), True)
+        include_memory_packets = _pc_bool(params.get("include_memory_packets"), False)
+        source_packets_key = str(params.get("source_packets_key") or packets_key).strip()
+        include_libpcap = _pc_bool(params.get("include_libpcap"), True)
+        emit = str(params.get("emit") or "summary").strip().lower()
+
+        iface = str(params.get("iface") or params.get("capture_iface") or "").strip()
+        pcap_path = str(params.get("pcap_path") or "").strip()
+        pcap_timeout_ms = _pc_int(params.get("pcap_timeout_ms"), 250)
+        pcap_snaplen = _pc_int(params.get("pcap_snaplen"), 65535)
+        pcap_promisc = _pc_bool(params.get("pcap_promisc"), True)
+        max_capture_packets = max(1, _pc_int(params.get("max_capture_packets"), 128))
+        capture_budget_s = max(0.05, _pc_float(params.get("capture_budget_s"), 2.0))
+        queue_maxsize = max(8, _pc_int(params.get("queue_maxsize"), 512))
+        worker_count = max(1, min(8, _pc_int(params.get("worker_count"), 2)))
+
+        incoming: List[Dict[str, Any]] = []
+        if include_payload_packets:
+            incoming.extend([x for x in self._collect_from_payload(payload) if _pc_has_raw_data(x)])
+        if include_memory_packets and source_packets_key:
+            incoming.extend([x for x in _pc_load_memory_packets(source_packets_key) if _pc_has_raw_data(x)])
+
+        # libpcap capture path
+        if include_libpcap and (iface or pcap_path):
+            backend = None
+            try:
+                backend = LibpcapCtypesBackend(
+                    timeout_ms=pcap_timeout_ms,
+                    snaplen=pcap_snaplen,
+                    promisc=pcap_promisc,
+                    logger=DEBUG_LOGGER,
+                )
+                if pcap_path:
+                    backend.open_offline(pcap_path)
+                else:
+                    backend.open_live(iface)
+
+                q: "queue.Queue[Any]" = queue.Queue(maxsize=queue_maxsize)
+                lock = threading.Lock()
+                matched: List[Dict[str, Any]] = []
+                scanned = 0
+                rejected = 0
+
+                def _producer() -> None:
+                    nonlocal scanned
+                    deadline = time.time() + capture_budget_s
+                    while scanned < max_capture_packets and time.time() < deadline:
+                        pkt = backend.next_packet()
+                        if pkt is None:
+                            continue
+                        scanned += 1
+                        q.put(pkt)
+                    for _ in range(worker_count):
+                        q.put(_PACKET_SENTINEL)
+
+                def _consumer() -> None:
+                    nonlocal rejected
+                    while True:
+                        item = q.get()
+                        try:
+                            if item is _PACKET_SENTINEL:
+                                return
+                            norm = _pc_normalize_packet(item, default_iface=iface or "pcap")
+                            ok, score, hits = _pc_packet_matches(norm, query, require_all=require_all_terms)
+                            norm["match_score"] = round(score, 4)
+                            norm["query_hits"] = hits
+                            if ok:
+                                with lock:
+                                    matched.append(norm)
+                            else:
+                                rejected += 1
+                        finally:
+                            q.task_done()
+
+                producer = threading.Thread(target=_producer, name="PacketTrackerProducer", daemon=True)
+                consumers = [threading.Thread(target=_consumer, name=f"PacketTrackerConsumer-{i}", daemon=True) for i in range(worker_count)]
+                producer.start()
+                for t in consumers:
+                    t.start()
+                producer.join(timeout=max(1.0, capture_budget_s + 1.0))
+                q.join()
+                for t in consumers:
+                    t.join(timeout=1.0)
+
+                incoming.extend(matched)
+                self._log(f"📡 libpcap scanned={scanned} matched={len(matched)} rejected={rejected} query={query!r}")
+            finally:
+                try:
+                    if backend is not None:
+                        backend.close()
+                except Exception:
+                    pass
+
+        normalized: List[Dict[str, Any]] = []
+        seen = set()
+        matched_count = 0
+        rejected_count = 0
+
+        for item in incoming:
+            norm = _pc_normalize_packet(item, default_iface=iface or "")
+            sig = f"{norm.get('raw_hex_preview')}|{norm.get('raw_len')}|{norm.get('src_ip')}|{norm.get('dst_ip')}|{norm.get('topic')}"
+            if sig in seen:
+                continue
+            seen.add(sig)
+            ok, score, hits = _pc_packet_matches(norm, query, require_all=require_all_terms)
+            norm["match_score"] = round(score, 4)
+            norm["query_hits"] = hits
+            if ok:
+                normalized.append(norm)
+                matched_count += 1
+            else:
+                rejected_count += 1
+
+        stored_len = _pc_save_memory_packets(
+            packets_key,
+            normalized,
+            append=append,
+            max_items=max_memory_items,
+        ) if packets_key else 0
+
+        meta = {
+            "ok": True,
+            "query": query,
+            "packets_key": packets_key,
+            "matched": matched_count,
+            "rejected": rejected_count,
+            "stored_count": stored_len,
+            "append": append,
+            "include_libpcap": include_libpcap,
+            "iface": iface,
+            "pcap_path": pcap_path,
+            "worker_count": worker_count,
+            "queue_maxsize": queue_maxsize,
+            "items": normalized[:128],
+        }
+
+        if emit == "packets":
+            return normalized, meta
+        if emit == "bundle":
+            return {"packets": normalized, "packets_key": packets_key}, meta
+        return f"[PacketTracker] query={query!r} matched={matched_count} stored={stored_len} key={packets_key}", meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "",
+            "packets_key": "packets",
+            "append": False,
+            "max_memory_items": 5000,
+            "require_all_terms": True,
+            "include_payload_packets": True,
+            "include_memory_packets": False,
+            "source_packets_key": "packets",
+            "include_libpcap": True,
+            "iface": "",
+            "pcap_path": "",
+            "pcap_timeout_ms": 250,
+            "pcap_snaplen": 65535,
+            "pcap_promisc": True,
+            "max_capture_packets": 128,
+            "capture_budget_s": 2.0,
+            "queue_maxsize": 512,
+            "worker_count": 2,
+            "emit": "summary",  # summary | packets | bundle
+        }
+
+
+BLOCKS.register("packet_tracker", PacketTrackerBlock)
+
+
+# ======================= PacketNoiseBlock =======================
+
+@dataclass
+class PacketNoiseBlock(BaseBlock):
+    """
+    Filter packets in or out of a shared packets key.
+
+    Modes:
+      - drop_noise: remove packets that look noisy
+      - keep_noise: keep only noisy packets
+      - include_query: keep only packets matching include_query
+      - exclude_query: remove packets matching exclude_query
+      - combined: apply noise rules + include/exclude together
+    """
+
+    DEFAULT_NOISY_TOPICS = {"arp", "nbns", "mdns", "ssdp", "dhcp"}
+    DEFAULT_NOISY_PORTS = {53, 67, 68, 137, 138, 1900, 5353}
+
+    def _log(self, msg: str) -> None:
+        try:
+            DEBUG_LOGGER.log_message(f"[PacketNoise] {msg}")
+        except Exception:
+            pass
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        mode = str(params.get("mode") or "drop_noise").strip().lower()
+        packets_key = str(params.get("packets_key") or "packets").strip()
+        out_packets_key = str(params.get("out_packets_key") or packets_key).strip()
+        dropped_packets_key = str(params.get("dropped_packets_key") or "").strip()
+        append_out = _pc_bool(params.get("append_out"), False)
+        append_dropped = _pc_bool(params.get("append_dropped"), False)
+        max_memory_items = max(32, _pc_int(params.get("max_memory_items"), 5000))
+        queue_maxsize = max(8, _pc_int(params.get("queue_maxsize"), 512))
+        worker_count = max(1, min(8, _pc_int(params.get("worker_count"), 2)))
+        require_all_terms = _pc_bool(params.get("require_all_terms"), True)
+        dedupe = _pc_bool(params.get("dedupe"), True)
+        min_bytes = max(0, _pc_int(params.get("min_bytes"), 0))
+        max_bytes = max(0, _pc_int(params.get("max_bytes"), 0))
+        emit = str(params.get("emit") or "summary").strip().lower()
+
+        include_query = str(params.get("include_query") or "").strip()
+        exclude_query = str(params.get("exclude_query") or "").strip()
+
+        noisy_topics = set(self.DEFAULT_NOISY_TOPICS)
+        extra_topics_raw = params.get("noisy_topics")
+        if isinstance(extra_topics_raw, str) and extra_topics_raw.strip():
+            noisy_topics.update(t.strip().lower() for t in extra_topics_raw.split(",") if t.strip())
+        elif isinstance(extra_topics_raw, (list, tuple, set)):
+            noisy_topics.update(str(t).strip().lower() for t in extra_topics_raw if str(t).strip())
+
+        noisy_ports = set(self.DEFAULT_NOISY_PORTS)
+        extra_ports_raw = params.get("noisy_ports")
+        if isinstance(extra_ports_raw, str) and extra_ports_raw.strip():
+            for raw in extra_ports_raw.split(","):
+                try:
+                    noisy_ports.add(int(raw.strip()))
+                except Exception:
+                    pass
+        elif isinstance(extra_ports_raw, (list, tuple, set)):
+            for raw in extra_ports_raw:
+                try:
+                    noisy_ports.add(int(raw))
+                except Exception:
+                    pass
+
+        packets: List[Dict[str, Any]] = []
+        if packets_key:
+            packets.extend(_pc_load_memory_packets(packets_key))
+        if isinstance(payload, list):
+            packets.extend([dict(x) for x in payload if isinstance(x, dict)])
+        elif isinstance(payload, dict):
+            if isinstance(payload.get("packets"), list):
+                packets.extend([dict(x) for x in payload.get("packets") if isinstance(x, dict)])
+
+        if not packets:
+            return payload, {"ok": False, "error": "no_packets", "packets_key": packets_key}
+
+        q: "queue.Queue[Any]" = queue.Queue(maxsize=queue_maxsize)
+        lock = threading.Lock()
+        kept: List[Dict[str, Any]] = []
+        dropped: List[Dict[str, Any]] = []
+        seen = set()
+
+        def _consumer() -> None:
+            while True:
+                item = q.get()
+                try:
+                    if item is _PACKET_SENTINEL:
+                        return
+                    norm = _pc_normalize_packet(item)
+                    sig = f"{norm.get('raw_hex_preview')}|{norm.get('raw_len')}|{norm.get('src_ip')}|{norm.get('dst_ip')}|{norm.get('topic')}"
+                    if dedupe:
+                        with lock:
+                            if sig in seen:
+                                dropped.append({**norm, "noise_reasons": ["duplicate"]})
+                                continue
+                            seen.add(sig)
+
+                    raw_len = _pc_int(norm.get("raw_len"), 0)
+                    is_noise, reasons = _pc_noise_decision(norm, noisy_topics=noisy_topics, noisy_ports=noisy_ports)
+                    if min_bytes > 0 and raw_len < min_bytes:
+                        reasons.append(f"min_bytes:{min_bytes}")
+                        is_noise = True
+                    if max_bytes > 0 and raw_len > max_bytes:
+                        reasons.append(f"max_bytes:{max_bytes}")
+                        is_noise = True
+
+                    include_ok, _, include_hits = _pc_packet_matches(norm, include_query, require_all=require_all_terms)
+                    exclude_ok, _, exclude_hits = _pc_packet_matches(norm, exclude_query, require_all=require_all_terms)
+
+                    keep_it = True
+                    if mode == "drop_noise":
+                        keep_it = not is_noise
+                    elif mode == "keep_noise":
+                        keep_it = is_noise
+                    elif mode == "include_query":
+                        keep_it = include_ok
+                    elif mode == "exclude_query":
+                        keep_it = not exclude_ok
+                    elif mode == "combined":
+                        keep_it = (not is_noise)
+                        if include_query:
+                            keep_it = keep_it and include_ok
+                        if exclude_query:
+                            keep_it = keep_it and (not exclude_ok)
+
+                    norm["noise_reasons"] = reasons
+                    norm["include_hits"] = include_hits
+                    norm["exclude_hits"] = exclude_hits
+
+                    with lock:
+                        if keep_it:
+                            kept.append(norm)
+                        else:
+                            dropped.append(norm)
+                finally:
+                    q.task_done()
+
+        threads = [threading.Thread(target=_consumer, name=f"PacketNoiseConsumer-{i}", daemon=True) for i in range(worker_count)]
+        for t in threads:
+            t.start()
+
+        for pkt in packets:
+            q.put(pkt)
+        for _ in threads:
+            q.put(_PACKET_SENTINEL)
+
+        q.join()
+        for t in threads:
+            t.join(timeout=1.0)
+
+        out_count = _pc_save_memory_packets(out_packets_key, kept, append=append_out, max_items=max_memory_items) if out_packets_key else len(kept)
+        dropped_count = _pc_save_memory_packets(dropped_packets_key, dropped, append=append_dropped, max_items=max_memory_items) if dropped_packets_key else len(dropped)
+
+        meta = {
+            "ok": True,
+            "mode": mode,
+            "packets_key": packets_key,
+            "out_packets_key": out_packets_key,
+            "dropped_packets_key": dropped_packets_key,
+            "input_count": len(packets),
+            "kept": len(kept),
+            "dropped": len(dropped),
+            "stored_out_count": out_count,
+            "stored_dropped_count": dropped_count,
+            "noisy_topics": sorted(noisy_topics),
+            "noisy_ports": sorted(noisy_ports),
+            "worker_count": worker_count,
+            "queue_maxsize": queue_maxsize,
+            "kept_items": kept[:128],
+            "dropped_items": dropped[:128],
+        }
+
+        self._log(f"🔇 mode={mode} input={len(packets)} kept={len(kept)} dropped={len(dropped)} out_key={out_packets_key!r}")
+
+        if emit == "packets":
+            return kept, meta
+        if emit == "bundle":
+            return {"kept": kept, "dropped": dropped}, meta
+        return f"[PacketNoise] mode={mode} input={len(packets)} kept={len(kept)} dropped={len(dropped)} out_key={out_packets_key}", meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "mode": "drop_noise",  # drop_noise | keep_noise | include_query | exclude_query | combined
+            "packets_key": "packets",
+            "out_packets_key": "packets_clean",
+            "dropped_packets_key": "packets_noise",
+            "append_out": False,
+            "append_dropped": False,
+            "max_memory_items": 5000,
+            "queue_maxsize": 512,
+            "worker_count": 2,
+            "require_all_terms": True,
+            "dedupe": True,
+            "min_bytes": 0,
+            "max_bytes": 0,
+            "include_query": "",
+            "exclude_query": "",
+            "noisy_topics": "arp,nbns,mdns,ssdp,dhcp",
+            "noisy_ports": "53,67,68,137,138,1900,5353",
+            "emit": "summary",  # summary | packets | bundle
+        }
+
+
+BLOCKS.register("packet_noise", PacketNoiseBlock)
+
