@@ -16796,21 +16796,21 @@ class PageTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
             extensions=extensions,
-        ), timeout=25)
+        ), timeout=timeout)
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.runtime_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.react_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.database_sniffer.sniff(
@@ -16818,7 +16818,7 @@ class PageTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ), timeout=25)
+        ), timeout=timeout)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.interaction_sniffer.sniff(

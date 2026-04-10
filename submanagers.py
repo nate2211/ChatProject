@@ -12,6 +12,7 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass, field, fields
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 import random  # For random delays
@@ -2462,29 +2463,254 @@ class NetworkSniffer:
         out.sort(key=self._item_rank_tuple, reverse=True)
         return out
 
+    # ------------------ NEW helper: emit any useful URL ------------------ #
+    def _emit_linkish_url(
+            self,
+            url: Any,
+            *,
+            bucket: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+            seen: "NetworkSniffer.Set[str]",
+            tag: str,
+            text: str = "",
+            kind_hint: "NetworkSniffer.Optional[str]" = None,
+            content_type: str = "?",
+            size: Any = "?",
+            extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
+            evidence: str = "",
+            score: Any = None,
+            confidence: str = "",
+    ) -> None:
+        cu = self._canonicalize_url(url)
+        if not cu or cu in seen:
+            return
+        if not self._host_allowed(cu):
+            return
+
+        p = self._safe_urlparse(cu)
+        path = self._to_str(getattr(p, "path", "")).lower()
+        netloc = self._to_str(getattr(p, "netloc", "")).lower()
+        ul = cu.lower()
+        ct = self._to_str(content_type or "")
+
+        if self._looks_like_ad(netloc, path):
+            return
+
+        docish_tags = {
+            "a", "area", "form", "iframe", "frame", "link", "meta",
+            "redirect", "dom_href", "dom_src", "json_url", "mse_url",
+            "param_url", "network_link", "network_doc"
+        }
+
+        # Keep HTML/page-style links for docish tags, but still block obvious junk for other kinds.
+        if self._is_junk_by_extension(path) and tag not in docish_tags and not self._is_mediaish_url(cu):
+            return
+
+        if self._deny_by_content_type(ct) and tag not in docish_tags:
+            # still allow actual media-ish or stream-hinted URLs through
+            if not (
+                    self._classify_by_content_type(ct)
+                    or self._classify_by_stream_hint(ul)
+                    or self._is_mediaish_url(cu)
+            ):
+                return
+
+        kind = (
+                kind_hint
+                or self._classify_by_extension(path)
+                or self._classify_by_content_type(ct)
+                or self._classify_by_stream_hint(ul)
+        )
+
+        if tag in {"a", "area", "form", "iframe", "frame", "link", "meta", "redirect", "dom_href",
+                   "dom_src"} and not kind:
+            kind = "page"
+
+        if not self._is_allowed_by_extensions(cu, extensions, None if kind in (None, "page", "unknown") else kind):
+            return
+
+        bucket.append({
+            "url": cu,
+            "text": self._to_str(text or "[Link]"),
+            "tag": self._to_str(tag or "network_link"),
+            "kind": self._to_str(kind or "unknown"),
+            "content_type": self._to_str(ct or "?"),
+            "size": self._to_str(size if size not in (None, "") else "?"),
+            "score": self._to_str(score if score is not None else ""),
+            "confidence": self._to_str(confidence or ""),
+            "evidence": self._to_str(evidence or ""),
+        })
+        seen.add(cu)
+
+    # ------------------ NEW helper: harvest DOM links directly ------------------ #
+    async def _collect_dom_linkish_items(
+            self,
+            page,
+            base_url: str,
+            *,
+            bucket: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
+            seen: "NetworkSniffer.Set[str]",
+            extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
+            log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]" = None,
+    ) -> None:
+        try:
+            raw_items = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const seen = new Set();
+
+                  const push = (u, t, tag, kind) => {
+                    try {
+                      u = String(u || "").trim();
+                      if (!u) return;
+                      const lu = u.toLowerCase();
+                      if (
+                        lu === "#" ||
+                        lu.startsWith("javascript:") ||
+                        lu.startsWith("mailto:") ||
+                        lu.startsWith("tel:") ||
+                        lu.startsWith("data:")
+                      ) return;
+
+                      const key = `${tag}|${u}`;
+                      if (seen.has(key)) return;
+                      seen.add(key);
+
+                      out.push({
+                        url: u,
+                        text: String(t || "").trim().slice(0, 220),
+                        tag: String(tag || "dom_href"),
+                        kind: String(kind || "")
+                      });
+                    } catch (_) {}
+                  };
+
+                  for (const el of document.querySelectorAll("a[href], area[href]")) {
+                    push(
+                      el.getAttribute("href"),
+                      el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label") || "",
+                      (el.tagName || "").toLowerCase(),
+                      "page"
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("link[href]")) {
+                    const rel = (el.getAttribute("rel") || "").toLowerCase();
+                    push(
+                      el.getAttribute("href"),
+                      rel || el.getAttribute("title") || "",
+                      "link",
+                      rel.includes("icon") ? "image" : (rel.includes("preload") || rel.includes("prefetch") ? "asset" : "page")
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("iframe[src], frame[src]")) {
+                    push(el.getAttribute("src"), el.getAttribute("title") || "", (el.tagName || "").toLowerCase(), "page");
+                  }
+
+                  for (const el of document.querySelectorAll("form[action]")) {
+                    push(el.getAttribute("action"), el.getAttribute("id") || el.getAttribute("name") || "", "form", "page");
+                  }
+
+                  for (const el of document.querySelectorAll("img[src], source[src], video[src], audio[src], track[src], embed[src]")) {
+                    const tag = (el.tagName || "").toLowerCase();
+                    let kind = "";
+                    if (tag === "img") kind = "image";
+                    else if (tag === "audio" || tag === "track") kind = "audio";
+                    else if (tag === "video" || tag === "source" || tag === "embed") kind = "video";
+                    push(el.getAttribute("src"), el.getAttribute("title") || el.getAttribute("alt") || "", tag, kind);
+                  }
+
+                  for (const el of document.querySelectorAll("object[data]")) {
+                    push(el.getAttribute("data"), el.getAttribute("title") || "", "object", "asset");
+                  }
+
+                  for (const el of document.querySelectorAll("meta[content]")) {
+                    const p = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
+                    if (
+                      p.includes("og:video") ||
+                      p.includes("og:image") ||
+                      p.includes("twitter:image") ||
+                      p.includes("twitter:player") ||
+                      p.includes("og:url") ||
+                      p === "canonical"
+                    ) {
+                      push(el.getAttribute("content"), p, "meta", p.includes("image") ? "image" : (p.includes("video") || p.includes("player") ? "video" : "page"));
+                    }
+                  }
+
+                  // dataset / inline attr salvage for JS-heavy sites
+                  for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [onclick]")) {
+                    push(el.getAttribute("data-href"), "", "dom_href", "page");
+                    push(el.getAttribute("data-url"), "", "dom_href", "page");
+                    push(el.getAttribute("data-src"), "", "dom_src", "asset");
+                    push(el.getAttribute("data-video"), "", "dom_src", "video");
+
+                    const onclick = el.getAttribute("onclick") || "";
+                    const m = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig);
+                    if (m) {
+                      for (const u of m) push(u, "", "onclick", "page");
+                    }
+                  }
+
+                  return out.slice(0, 4000);
+                }
+                """
+            ) or []
+        except Exception as e:
+            self._log(f"[NetworkSniffer] DOM link harvest failed: {e}", log)
+            return
+
+        added = 0
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            raw = self._to_str(item.get("url"))
+            if not raw:
+                continue
+            full = self._safe_urljoin(base_url, raw)
+            self._emit_linkish_url(
+                full,
+                bucket=bucket,
+                seen=seen,
+                tag=self._to_str(item.get("tag") or "dom_href"),
+                text=self._to_str(item.get("text") or "[DOM Link]"),
+                kind_hint=(self._to_str(item.get("kind")) or None),
+                content_type="?",
+                size="?",
+                extensions=extensions,
+                evidence="dom-harvest",
+            )
+            added += 1
+
+        self._log(f"[NetworkSniffer] DOM link harvest added {added} candidate link(s).", log)
+
     # ============================== sniff ============================== #
     async def sniff(
-        self,
-        context,
-        page_url: str,
-        *,
-        timeout: "NetworkSniffer.Optional[float]" = None,
-        log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]" = None,
-        extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
+            self,
+            context,
+            page_url: str,
+            *,
+            timeout: "NetworkSniffer.Optional[float]" = None,
+            log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]" = None,
+            extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
     ):
         if context is None:
             self._log("[NetworkSniffer] No Playwright context; skipping sniff.", log)
             return "", [], []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
+        self.cfg.timeout = tmo
         canonical_page_url = self._canonicalize_url(page_url)
 
         found_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
         derived_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
+        page_link_items: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
         json_hits: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
         seen_network: "NetworkSniffer.Set[str]" = set()
         seen_derived: "NetworkSniffer.Set[str]" = set()
+        seen_page_links: "NetworkSniffer.Set[str]" = set()
         seen_mse_urls: "NetworkSniffer.Set[str]" = set()
         seen_binary_sig: "NetworkSniffer.Set[str]" = set()
 
@@ -2505,14 +2731,11 @@ class NetworkSniffer:
         mse_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
         param_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
-        # NEW: response timeline events for correlation
         resp_events: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]" = []
 
-        # NEW: script urls for bundle scanning
         script_urls: "NetworkSniffer.List[str]" = []
         seen_scripts: "NetworkSniffer.Set[str]" = set()
 
-        # binary signature tasks
         binary_tasks: "NetworkSniffer.List[NetworkSniffer.asyncio.Task]" = []
         binary_sem = self.asyncio.Semaphore(int(self.cfg.binary_sniff_concurrency))
 
@@ -2539,13 +2762,20 @@ class NetworkSniffer:
 
         self._log(f"[NetworkSniffer] Start sniff: {canonical_page_url} (timeout={tmo}s)", log)
 
-        # Install init scripts BEFORE goto
         if self.cfg.enable_mse_sniff:
             await self._install_mse_bridge(page, mse_events, log=log)
         if self.cfg.enable_param_sniff:
             await self._install_param_bridge(page, param_events, log=log)
 
-        # ---------------- request handler ---------------- #
+        def _parse_content_length(headers_lc: "NetworkSniffer.Dict[str, str]") -> "NetworkSniffer.Optional[int]":
+            try:
+                raw = self._to_str(headers_lc.get("content-length") or "").strip()
+                if not raw:
+                    return None
+                return int(raw.split(",", 1)[0].strip())
+            except Exception:
+                return None
+
         def handle_request(req):
             try:
                 rurl = self._to_str(getattr(req, "url", None))
@@ -2553,21 +2783,6 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-            # redirect chain
-            try:
-                if self.cfg.enable_redirect_tracking:
-                    prev = getattr(req, "redirected_from", None)
-                    if prev:
-                        prev_url = self._to_str(getattr(prev, "url", None))
-                        cur_url = self._to_str(getattr(req, "url", None))
-                        key = f"{prev_url} -> {cur_url}"
-                        if prev_url and cur_url and key not in seen_redirect:
-                            seen_redirect.add(key)
-                            redirect_events.append({"from": prev_url, "to": cur_url})
-            except Exception:
-                pass
-
-            # request evidence (forensics + salvage header subset)
             try:
                 if self.cfg.enable_forensics:
                     url = self._to_str(getattr(req, "url", None))
@@ -2577,7 +2792,8 @@ class NetworkSniffer:
                             rh_lc = {self._to_str(k).lower(): self._to_str(v) for k, v in rh_raw.items()}
                         except Exception:
                             rh_lc = {}
-                        req_hdr_subset = self._pick_headers_subset(rh_lc, self.cfg.forensics_include_request_headers_subset)
+                        req_hdr_subset = self._pick_headers_subset(rh_lc,
+                                                                   self.cfg.forensics_include_request_headers_subset)
 
                         post_data = getattr(req, "post_data", None)
                         post_hash = self._hash_post_data(post_data, max_bytes=4096)
@@ -2600,7 +2816,6 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-            # collect script URLs (for optional bundle scan)
             try:
                 rt = self._to_str(getattr(req, "resource_type", None))
                 if rt == "script":
@@ -2611,740 +2826,407 @@ class NetworkSniffer:
             except Exception:
                 pass
 
-            # GraphQL sniff
             try:
                 if self.cfg.enable_graphql_sniff and self._to_str(getattr(req, "method", "")).upper() == "POST":
                     url_lower = self._to_str(getattr(req, "url", None)).lower()
                     if self._looks_like_graphql_endpoint(url_lower):
                         body = self._to_str(getattr(req, "post_data", None) or "")
-                        if not body:
-                            return
-                        if len(body) > int(self.cfg.graphql_max_body_kb) * 1024:
-                            return
-                        try:
-                            gql_payload = self.json.loads(body)
-                        except Exception:
-                            return
+                        if body and len(body) <= int(self.cfg.graphql_max_body_kb) * 1024:
+                            try:
+                                gql_payload = self.json.loads(body)
+                            except Exception:
+                                gql_payload = None
 
-                        payloads = gql_payload if isinstance(gql_payload, list) else [gql_payload]
-                        for pay in payloads:
-                            if not isinstance(pay, dict):
-                                continue
-                            op_name = pay.get("operationName")
-                            vars_obj = pay.get("variables")
-                            query = pay.get("query") or ""
-                            is_introspection = isinstance(query, str) and ("__schema" in query or "__type" in query)
-                            var_keys = list(vars_obj.keys()) if isinstance(vars_obj, dict) else None
+                            if gql_payload is not None:
+                                payloads = gql_payload if isinstance(gql_payload, list) else [gql_payload]
+                                for pay in payloads:
+                                    if not isinstance(pay, dict):
+                                        continue
+                                    if len(json_hits) >= max_json:
+                                        break
 
-                            if len(json_hits) >= max_json:
-                                break
+                                    op_name = pay.get("operationName")
+                                    vars_obj = pay.get("variables")
+                                    query = pay.get("query") or ""
+                                    is_introspection = isinstance(query, str) and (
+                                                "__schema" in query or "__type" in query)
+                                    var_keys = list(vars_obj.keys()) if isinstance(vars_obj, dict) else None
 
-                            json_hits.append({
-                                "url": self._to_str(getattr(req, "url", None)),
-                                "json": {
-                                    "graphql": True,
-                                    "operationName": op_name,
-                                    "variable_keys": var_keys,
-                                    "is_introspection": is_introspection,
-                                    "query_preview": query[:2048] if isinstance(query, str) else None,
-                                },
-                                "source_page": canonical_page_url,
-                            })
+                                    json_hits.append({
+                                        "url": self._to_str(getattr(req, "url", None)),
+                                        "json": {
+                                            "graphql": True,
+                                            "operationName": op_name,
+                                            "variable_keys": var_keys,
+                                            "is_introspection": is_introspection,
+                                            "query_preview": query[:2048] if isinstance(query, str) else None,
+                                        },
+                                        "source_page": canonical_page_url,
+                                    })
             except Exception as e:
                 self._log(f"[NetworkSniffer] handle_request GraphQL sniff error: {e}", log)
 
         page.on("request", handle_request)
 
-        # ---------------- header mining ---------------- #
-        def mine_headers(url: str, headers_lc: "NetworkSniffer.Dict[str, str]"):
-            if not self.cfg.enable_header_url_mining:
-                return
-            if len(json_hits) >= max_json:
-                return
-            if int(self.cfg.max_header_url_events) <= 0:
-                return
-            try:
-                for k in (self.cfg.header_url_keys or set()):
-                    kk = self._to_str(k).lower()
-                    v = headers_lc.get(kk)
-                    if not v:
-                        continue
-                    for u in self._extract_urls_from_text(v)[:50]:
-                        if len(json_hits) >= max_json:
-                            return
-                        json_hits.append({
-                            "url": url,
-                            "json": {"header_url": u, "header_key": kk},
-                            "source_page": canonical_page_url,
-                        })
-            except Exception:
-                pass
-
-        async def handle_json(resp, url: str):
-            if len(json_hits) >= max_json:
-                return
-            try:
-                status = getattr(resp, "status", None)
-                if status is not None and 300 <= int(status) < 400:
-                    return
-                # Common for analytics beacons
-                if status in (204, 205):
-                    return
-
-                # Content-Type gate (still allow "application/json; charset=utf-8")
-                try:
-                    hdrs = getattr(resp, "headers", None) or {}
-                    ct = (hdrs.get("content-type") or hdrs.get("Content-Type") or "").lower()
-                except Exception:
-                    ct = ""
-
-                # Read text first so we can verify it looks like JSON
-                body = await resp.body()
-                if not body:
-                    return
-
-                # cheap prefix check without decoding whole binary payload
-                head = body[:4096].lstrip()
-                if not head.startswith((b"{", b"[")):
-                    return
-
-                # decode only if it looks like JSON
-                txt = body.decode("utf-8", "strict")  # or "replace" if you prefer
-                data = self.json.loads(txt)
-
-            except Exception as e:
-                # Downgrade noise: only log if it "should" have been JSON
-                self._log(f"[NetworkSniffer] JSON parse skipped/failed from {url}: {e}", log)
-                return
-
-            json_hits.append({"url": url, "json": data, "source_page": canonical_page_url})
-
-            # mine urls
-            try:
-                mined = 0
-                max_mined = 400  # keep bounded
-
-                for u in self._iter_urls_in_json(data, limit=4000):
-                    ul = (u or "").lower()
-
-                    # Skip obvious noise
-                    if not u.startswith(("http://", "https://", "ws://", "wss://")):
-                        continue
-                    if len(u) > 4096:
-                        continue
-
-                    # Optional: skip analytics-ish URLs (keep this light)
-                    if any(x in ul for x in ("snowplow", "google-analytics", "doubleclick", "/collect", "/tp2")):
-                        continue
-
-                    # Decide a hint (your _emit_media_url will still re-classify)
-                    kind_hint = None
-                    if ul.endswith((".m3u8", ".mpd", ".m4s", ".ts")) or any(
-                            k in ul for k in ("hls", "dash", "manifest", "playlist")):
-                        kind_hint = "video"
-                    elif ul.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi")):
-                        kind_hint = "video"
-                    elif ul.endswith((".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".weba", ".wav")):
-                        kind_hint = "audio"
-                    elif ul.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".heic", ".heif")):
-                        kind_hint = "image"
-
-                    # Emit: _emit_media_url will only keep items that classify as video/audio/image
-                    self._emit_media_url(
-                        u,
-                        tag="json_url_mine",
-                        kind_hint=kind_hint,
-                        found_items=found_items,
-                        seen_network=seen_network,
-                        max_items=max_items,
-                    )
-
-                    mined += 1
-                    if mined >= max_mined:
-                        break
-            except Exception:
-                pass
-
-        # ---------------- binary sniff helpers ---------------- #
-        def req_hdrs_for(u: str) -> "NetworkSniffer.Dict[str, str]":
-            ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
-            return ev.get("headers_subset") or {}
-
-        async def binary_sniff_one(*, url: str, ctype: str, resource_type: str, content_length: "NetworkSniffer.Optional[int]"):
-            async with binary_sem:
-                cu = self._canonicalize_url(url)
-                if not cu or cu in seen_binary_sig:
-                    return
-                if len(seen_binary_sig) >= int(self.cfg.binary_sniff_max_tasks):
-                    return
-                seen_binary_sig.add(cu)
-
-                prefix = await self._get_prefix_bytes(
-                    api_ctx,
-                    cu,
-                    req_hdrs_for(cu),
-                    timeout_ms=int(self.cfg.binary_sniff_timeout_ms),
-                    prefix_bytes=int(self.cfg.binary_sniff_prefix_bytes),
-                )
-
-                kind2, cth, detail = self._guess_kind_from_magic(prefix)
-                if not kind2:
-                    return
-
-                if not self._is_allowed_by_extensions(cu, extensions, kind2):
-                    return
-
-                if len(found_items) < max_items:
-                    found_items.append({
-                        "url": cu,
-                        "text": f"[BinarySig {kind2.capitalize()}] ({detail})",
-                        "tag": "binary_sig_sniff",
-                        "kind": kind2,
-                        "content_type": cth or (ctype or "?"),
-                        "size": str(content_length) if content_length is not None else "?",
-                    })
-
-                if len(json_hits) < max_json:
-                    sha = self.hashlib.sha256(prefix).hexdigest() if prefix else None
-                    json_hits.append({
-                        "url": cu,
-                        "json": {
-                            "binary_signature": True,
-                            "detected_kind": kind2,
-                            "detail": detail,
-                            "content_type_hint": cth,
-                            "prefix_sha256": sha,
-                            "prefix_len": len(prefix) if prefix else 0,
-                        },
-                        "source_page": canonical_page_url,
-                    })
-
-        # ---------------- response handler ---------------- #
-        def handle_response(response):
+        async def handle_response(response):
             try:
                 raw_url = self._to_str(getattr(response, "url", None))
                 canonical_url = self._canonicalize_url(raw_url)
-
-                if not canonical_url or canonical_url in seen_network:
-                    return
-                if not self._host_allowed(canonical_url):
+                if not canonical_url or not self._host_allowed(canonical_url):
                     return
 
-                is_blob = canonical_url.startswith("blob:")
-                resource_type = self._to_str(req_types.get(raw_url, ""))
-
-                if not is_blob:
-                    p = self._safe_urlparse(canonical_url)
-                    path = self._to_str(p.path or "/").lower()
-                    netloc = self._to_str(p.netloc or "")
-                    if self._looks_like_ad(netloc, path):
-                        return
-
-                seen_network.add(canonical_url)
-
-                # timeline event for correlation
                 try:
-                    resp_events.append({
-                        "ts": self._ms_now(),
-                        "type": "resp",
-                        "url": canonical_url,
-                        "resource_type": resource_type,
-                        "status": getattr(response, "status", None),
-                    })
-                except Exception:
-                    pass
-
-                try:
-                    hdr_raw = getattr(response, "headers", None) or {}
-                    headers = {self._to_str(k).lower(): self._to_str(v) for (k, v) in hdr_raw.items()}
+                    hdrs_raw = getattr(response, "headers", None) or {}
+                    headers = {self._to_str(k).lower(): self._to_str(v) for k, v in hdrs_raw.items()}
                 except Exception:
                     headers = {}
 
-                ctype = (headers.get("content-type") or "").lower()
+                status = getattr(response, "status", None)
+                resource_type = self._to_str(req_types.get(raw_url) or req_types.get(canonical_url) or "")
+                content_type = self._to_str(headers.get("content-type") or "")
+                content_length = _parse_content_length(headers)
+
+                if len(resp_events) < 4000:
+                    resp_events.append({
+                        "ts": self.time.time(),
+                        "url": canonical_url,
+                        "status": status,
+                        "content_type": content_type,
+                        "resource_type": resource_type,
+                    })
+
+                parsed = self._safe_urlparse(canonical_url)
+                path = self._to_str(getattr(parsed, "path", "")).lower()
+                netloc = self._to_str(getattr(parsed, "netloc", "")).lower()
                 url_lower = canonical_url.lower()
 
-                mine_headers(canonical_url, headers)
-
-                try:
-                    if self.cfg.enable_redirect_tracking:
-                        loc = self._to_str(headers.get("location"))
-                        if loc:
-                            key = f"{canonical_url} -> {loc}"
-                            if key not in seen_redirect and len(redirect_events) < int(self.cfg.max_redirect_events):
-                                seen_redirect.add(key)
-                                redirect_events.append({"from": canonical_url, "to": loc, "status": getattr(response, "status", None)})
-                except Exception:
-                    pass
-
-                cl_header = self._to_str(headers.get("content-length") or "")
-                content_length: "NetworkSniffer.Optional[int]" = None
-                try:
-                    if cl_header.isdigit():
-                        content_length = int(cl_header)
-                except Exception:
-                    content_length = None
-
-                p = self._safe_urlparse(canonical_url)
-                path = self._to_str(p.path or "/").lower()
-                is_junk_ext = self._is_junk_by_extension(path)
-
-                if (not is_blob) and resource_type and self._deny_by_resource_type(resource_type):
-                    # If URL/content-type strongly suggests media, keep it.
-                    ul_tmp = canonical_url.lower()
-                    p_tmp = self._safe_urlparse(canonical_url)
-                    path_tmp = self._to_str(p_tmp.path or "").lower()
-                    looks_media = (
-                            self._classify_by_extension(path_tmp) is not None
-                            or self._classify_by_stream_hint(ul_tmp) is not None
-                            or (("video/" in (ctype or "")) or ("audio/" in (ctype or "")))
-                            or (ctype in self.cfg.hls_types)
-                            or (ctype in self.cfg.dash_types)
-                            or self._looks_like_segment(ul_tmp, ctype, content_length, headers) is not None
-                    )
-                    if not looks_media:
-                        return
-
-                if (not is_blob) and self._should_sniff_json(url_lower, ctype, content_length):
-                    self.asyncio.create_task(handle_json(response, canonical_url))
-                    return
-                # Loose JSON sniff (ctype lies): try if URL looks hinty and body is small enough
-                if self.cfg.enable_json_sniff and getattr(self.cfg, "json_loose_body_sniff", True):
-                    ct0 = (ctype or "").lower().split(";")[0].strip()
-
-                    hinty = (
-                            any(h in url_lower for h in (self.cfg.json_url_hints or set())) or
-                            any(x in url_lower for x in
-                                ("video", "videos", "media", "api", "manifest", "playlist", "stream", "cdn"))
-                    )
-
-                    small = (content_length is not None and content_length <= int(self.cfg.json_loose_max_kb) * 1024)
-
-                    if hinty and small and ("json" not in ct0) and (not self._deny_by_content_type(ct0)):
-                        async def loose_parse():
-                            try:
-                                txt = await response.text()
-                                t = (txt or "").lstrip()
-                                if not t or not (t.startswith("{") or t.startswith("[")):
-                                    return
-
-                                data = self.json.loads(t)
-
-                                if len(json_hits) < max_json:
-                                    json_hits.append(
-                                        {"url": canonical_url, "json": data, "source_page": canonical_page_url})
-
-                                # mine urls from the parsed data (ANY CDN / ANY HOST)
-                                mined = 0
-                                max_mined = 400
-
-                                for u in self._iter_urls_in_json(data, limit=4000):
-                                    if not isinstance(u, str):
-                                        continue
-                                    s = u.strip()
-                                    if not s.startswith(("http://", "https://", "ws://", "wss://")):
-                                        continue
-                                    if len(s) > 4096:
-                                        continue
-
-                                    sl = s.lower()
-
-                                    # optional noise filter (analytics/beacons)
-                                    if any(x in sl for x in (
-                                            "snowplow", "google-analytics", "doubleclick", "/collect", "/tp2",
-                                            "segment.io", "sentry.io", "datadog", "newrelic"
-                                    )):
-                                        continue
-
-                                    # weak kind hint (emit still re-classifies)
-                                    kind_hint = None
-                                    if sl.endswith((".m3u8", ".mpd", ".m4s", ".ts")) or any(
-                                            k in sl for k in ("hls", "dash", "manifest", "playlist")):
-                                        kind_hint = "video"
-                                    elif sl.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi")):
-                                        kind_hint = "video"
-                                    elif sl.endswith(
-                                            (".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".weba", ".wav")):
-                                        kind_hint = "audio"
-                                    elif sl.endswith(
-                                            (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".heic",
-                                             ".heif")):
-                                        kind_hint = "image"
-
-                                    self._emit_media_url(
-                                        s,
-                                        tag="json_url_mine",
-                                        kind_hint=kind_hint,
-                                        found_items=found_items,
-                                        seen_network=seen_network,
-                                        max_items=max_items,
-                                    )
-
-                                    mined += 1
-                                    if mined >= max_mined:
-                                        break
-
-                            except Exception:
-                                return
-
-                        self.asyncio.create_task(loose_parse())
-                        return
-
-                if is_blob:
-                    if resource_type == "media":
-                        blob_placeholders.append({
-                            "url": canonical_url,
-                            "text": "[Network Video Blob]",
-                            "tag": "network_sniff",
-                            "kind": "video",
-                            "content_type": ctype or "?",
-                            "size": headers.get("content-length", "?"),
-                        })
-                        if len(json_hits) < max_json:
-                            json_hits.append({
-                                "url": canonical_url,
-                                "json": {"blob_media": canonical_url, "reason": "blob-media-detected"},
-                                "source_page": canonical_page_url
-                            })
+                if self._looks_like_ad(netloc, path):
                     return
 
                 kind = (
-                    self._classify_by_extension(path)
-                    or (self._classify_by_content_type(ctype) if ctype else None)
-                    or self._classify_by_stream_hint(url_lower)
+                        self._classify_by_content_type(content_type)
+                        or self._classify_by_extension(path)
+                        or self._classify_by_stream_hint(url_lower)
                 )
 
-                if not kind:
-                    seg_kind = self._looks_like_segment(url_lower, ctype, content_length, headers)
-                    if seg_kind:
-                        kind = seg_kind
+                manifest_kind = self._is_manifest(canonical_url, content_type)
+                seg_kind = self._looks_like_segment(url_lower, content_type, content_length, headers)
+                if not kind and seg_kind:
+                    kind = seg_kind
 
-                # Binary signature sniff scheduling
-                if self.cfg.enable_binary_signature_sniff:
-                    should_probe = self._is_binary_suspect(
-                        canonical_url,
-                        ctype=ctype,
-                        resource_type=resource_type,
-                        content_length=content_length,
+                # Redirect / location mining
+                location = self._to_str(headers.get("location") or "").strip()
+                if location:
+                    dest = self._canonicalize_url(self._safe_urljoin(canonical_url, location))
+                    if dest and dest not in seen_redirect:
+                        seen_redirect.add(dest)
+                        redirect_events.append({
+                            "from": canonical_url,
+                            "to": dest,
+                            "status": status,
+                        })
+                        self._emit_linkish_url(
+                            dest,
+                            bucket=page_link_items,
+                            seen=seen_page_links,
+                            tag="redirect",
+                            text="[Redirect]",
+                            kind_hint="page",
+                            content_type="?",
+                            size="?",
+                            extensions=extensions,
+                            evidence=f"redirect:{status}",
+                        )
+
+                # Emit useful response URL even if it is not classic media.
+                if not self._deny_by_resource_type(resource_type):
+                    tag = "network_sniff" if kind in ("video", "audio",
+                                                      "image") or manifest_kind or seg_kind else "network_link"
+                    label = (
+                        f"[Network {kind.capitalize()}]" if kind in ("video", "audio", "image")
+                        else ("[Network Manifest]" if manifest_kind else "[Network Link]")
                     )
-                    if should_probe:
-                        if (not self.cfg.binary_sniff_only_if_unknown_kind) or (kind is None):
-                            if len(binary_tasks) < int(self.cfg.binary_sniff_max_tasks):
-                                binary_tasks.append(self.asyncio.create_task(
-                                    binary_sniff_one(
-                                        url=canonical_url,
-                                        ctype=ctype,
-                                        resource_type=resource_type,
-                                        content_length=content_length,
-                                    )
-                                ))
+                    self._emit_linkish_url(
+                        canonical_url,
+                        bucket=(found_items if tag == "network_sniff" else page_link_items),
+                        seen=(seen_network if tag == "network_sniff" else seen_page_links),
+                        tag=tag,
+                        text=label,
+                        kind_hint=(kind or ("video" if manifest_kind else None)),
+                        content_type=content_type,
+                        size=content_length if content_length is not None else "?",
+                        extensions=extensions,
+                        evidence=f"response:{status}:{resource_type or 'unknown'}",
+                    )
 
-                if not kind:
-                    return
+                if manifest_kind and len(manifests_to_expand) < max_manifests:
+                    manifests_to_expand.append((response, manifest_kind, canonical_url))
 
-                if not self._is_allowed_by_extensions(canonical_url, extensions, kind):
-                    return
-
-                mkind = self._is_manifest(canonical_url, ctype)
-                if mkind and kind == "video" and len(manifests_to_expand) < max_manifests:
-                    manifests_to_expand.append((response, mkind, canonical_url))
-                    if self.cfg.prefer_master_manifests:
-                        manifests_to_expand.sort(key=lambda t: (0 if "master" in self._to_str(t[2]).lower() else 1))
-
-                if len(found_items) < max_items:
-                    cd = self._to_str(headers.get("content-disposition") or "")
-                    filename = None
-                    if cd:
-                        m = self.re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd, self.re.I)
-                        if m:
-                            filename = self._to_str(m.group(1))
-
-                    item: "NetworkSniffer.Dict[str, Any]" = {
-                        "url": canonical_url,
-                        "text": f"[Network {kind.capitalize()}]",
-                        "tag": "network_sniff",
-                        "kind": kind,
-                        "content_type": ctype or "?",
-                        "size": headers.get("content-length", "?"),
-                    }
-                    if filename:
-                        item["text"] = f"[Network {kind.capitalize()}] {filename}"
-                    found_items.append(item)
-
-                if self.cfg.enable_forensics and len(forensics) < int(self.cfg.max_forensics_events):
-                    req_ev = request_evidence.get(raw_url) or request_evidence.get(canonical_url) or {}
-                    req_hdr_subset = (req_ev.get("headers_subset") or {})
-                    resp_hdr_subset = self._pick_headers_subset(headers, self.cfg.forensics_include_headers_subset)
-
-                    timing = None
+                # JSON body sniff
+                if self._should_sniff_json(url_lower, content_type, content_length):
+                    body_text = ""
                     try:
-                        rreq = getattr(response, "request", None)
-                        if rreq is not None:
-                            timing = getattr(rreq, "timing", None)
-                            if callable(timing):
-                                timing = timing()
+                        body_text = self._to_str(await response.text())
                     except Exception:
+                        body_text = ""
+
+                    data = None
+                    if body_text:
+                        try:
+                            data = self.json.loads(body_text)
+                        except Exception:
+                            data = None
+
+                    if data is not None and len(json_hits) < max_json:
+                        json_hits.append({
+                            "url": canonical_url,
+                            "json": data,
+                            "source_page": canonical_page_url,
+                        })
+
+                        for u in self._iter_urls_in_json(data, limit=2500):
+                            self._emit_linkish_url(
+                                u,
+                                bucket=page_link_items,
+                                seen=seen_page_links,
+                                tag="json_url",
+                                text="[JSON URL]",
+                                kind_hint=None,
+                                content_type="?",
+                                size="?",
+                                extensions=extensions,
+                                evidence="json-body",
+                            )
+
+                # Forensics bundle
+                try:
+                    if self.cfg.enable_forensics:
+                        req_ev = request_evidence.get(raw_url) or request_evidence.get(canonical_url) or {}
+                        req_hdr_subset = req_ev.get("headers_subset") or {}
+                        resp_hdr_subset = self._pick_headers_subset(headers, self.cfg.forensics_include_headers_subset)
+
                         timing = None
+                        try:
+                            rreq = getattr(response, "request", None)
+                            if rreq is not None:
+                                timing = getattr(rreq, "timing", None)
+                                if callable(timing):
+                                    timing = timing()
+                        except Exception:
+                            timing = None
 
-                    bundle = {
-                        "url": canonical_url,
-                        "final_url": canonical_url,
-                        "status": getattr(response, "status", None),
-                        "content_type": headers.get("content-type"),
-                        "content_length": headers.get("content-length"),
-                        "discovered_at": self.time.time(),
-                        "source_page": canonical_page_url,
-                        "initiator_frame": req_ev.get("frame_url"),
-                        "resource_type": req_ev.get("resource_type") or resource_type,
-                        "request_method": req_ev.get("method"),
-                        "request_headers_subset": req_hdr_subset,
-                        "request_post_data_hash": req_ev.get("post_data_hash"),
-                        "response_headers_subset": resp_hdr_subset,
-                        "timing": timing,
-                        "sha256_body_prefix": None,
-                    }
-                    k = f"{bundle.get('url')}|{bundle.get('status')}|{bundle.get('content_type')}|{bundle.get('content_length')}"
-                    if k not in seen_forensics:
-                        seen_forensics.add(k)
-                        forensics.append(bundle)
+                        bundle = {
+                            "url": canonical_url,
+                            "final_url": canonical_url,
+                            "status": status,
+                            "content_type": headers.get("content-type"),
+                            "content_length": headers.get("content-length"),
+                            "discovered_at": self.time.time(),
+                            "source_page": canonical_page_url,
+                            "initiator_frame": req_ev.get("frame_url"),
+                            "resource_type": req_ev.get("resource_type") or resource_type,
+                            "request_method": req_ev.get("method"),
+                            "request_headers_subset": req_hdr_subset,
+                            "request_post_data_hash": req_ev.get("post_data_hash"),
+                            "response_headers_subset": resp_hdr_subset,
+                            "timing": timing,
+                            "sha256_body_prefix": None,
+                        }
+                        k = f"{bundle.get('url')}|{bundle.get('status')}|{bundle.get('content_type')}|{bundle.get('content_length')}"
+                        if k not in seen_forensics:
+                            seen_forensics.add(k)
+                            forensics.append(bundle)
+                except Exception:
+                    pass
 
-                if self.cfg.enable_url_salvage:
-                    status = getattr(response, "status", None)
-                    if self._salvage_should_target(canonical_url, status=status, kind=kind):
-                        host = self._to_str(self._safe_urlparse(canonical_url).netloc).lower()
-                        if host:
-                            cnt = salvage_host_counts.get(host, 0)
-                            if cnt >= int(self.cfg.salvage_max_targets_per_host):
-                                return
-                        score = self._salvage_score(canonical_url, status=status, kind=kind)
-                        prev = salvage_info.get(canonical_url)
-                        if (prev is None) or (float(prev.get("score", 0.0)) < score):
-                            salvage_info[canonical_url] = {"url": canonical_url, "score": score, "status": status, "kind": kind}
+                # Salvage targeting
+                try:
+                    if self.cfg.enable_url_salvage:
+                        if self._salvage_should_target(canonical_url, status=status, kind=kind):
+                            host = self._to_str(self._safe_urlparse(canonical_url).netloc).lower()
                             if host:
-                                salvage_host_counts[host] = salvage_host_counts.get(host, 0) + 1
+                                cnt = salvage_host_counts.get(host, 0)
+                                if cnt < int(self.cfg.salvage_max_targets_per_host):
+                                    score = self._salvage_score(canonical_url, status=status, kind=kind)
+                                    prev = salvage_info.get(canonical_url)
+                                    if (prev is None) or (float(prev.get("score", 0.0)) < score):
+                                        salvage_info[canonical_url] = {
+                                            "url": canonical_url,
+                                            "score": score,
+                                            "status": status,
+                                            "kind": kind,
+                                        }
+                                        salvage_host_counts[host] = salvage_host_counts.get(host, 0) + 1
+                except Exception:
+                    pass
 
             except Exception as e:
                 self._log(
-                    f"[NetworkSniffer][handle_response] Error processing {self._to_str(getattr(response,'url',None))}: {self._to_str(e)}",
+                    f"[NetworkSniffer][handle_response] Error processing {self._to_str(getattr(response, 'url', None))}: {self._to_str(e)}",
                     log
                 )
 
         page.on("response", handle_response)
 
-        # ---------------- run page ---------------- #
         try:
+            nav_modes = []
+            for mode in (wait_mode, "commit", "domcontentloaded", "load"):
+                mode = self._to_str(mode or "").strip() or "domcontentloaded"
+                if mode not in nav_modes:
+                    nav_modes.append(mode)
+
             sniff_goto_timeout = max(15000, int(tmo * 1000))
-            try:
-                await page.goto(canonical_page_url, wait_until=wait_mode, timeout=sniff_goto_timeout)
-            except Exception as e:
-                self._log(f"[NetworkSniffer] goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
+            navigated = False
+            for mode in nav_modes:
+                try:
+                    await page.goto(canonical_page_url, wait_until=mode, timeout=sniff_goto_timeout)
+                    navigated = True
+                    if mode != wait_mode:
+                        self._log(f"[NetworkSniffer] goto recovered using wait_until={mode} on {canonical_page_url}",
+                                  log)
+                    break
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] goto timeout on {canonical_page_url} (wait_until={mode}): {e}", log)
 
             await self._auto_scroll(page, tmo, log)
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
-            # allow param bridge to flush
             if self.cfg.enable_param_sniff:
                 try:
                     await page.wait_for_timeout(max(80, int(self.cfg.param_flush_interval_ms)))
                 except Exception:
                     pass
 
-            # wait for pending binary-sniff tasks (bounded)
-            if self.cfg.enable_binary_signature_sniff and binary_tasks:
-                try:
-                    await self.asyncio.wait_for(
-                        self.asyncio.gather(*binary_tasks, return_exceptions=True),
-                        timeout=max(0.25, min(2.5, tmo * 0.25)),
-                    )
-                except Exception:
-                    pass
-
-            if self.cfg.enable_redirect_tracking and redirect_events and len(json_hits) < max_json:
-                json_hits.append({
-                    "url": canonical_page_url,
-                    "json": {"redirect_chain": redirect_events[: int(self.cfg.max_redirect_events)]},
-                    "source_page": canonical_page_url,
-                })
-
-            if manifests_to_expand:
-                async def expand_one(resp, mkind: str, murl: str):
-                    derived_urls = await self._expand_manifest(resp, mkind, murl, log)
-                    if not derived_urls:
-                        return
-                    for u in derived_urls[:max_derived_per_manifest]:
-                        if not u:
-                            continue
-                        if u in seen_derived or u in seen_network:
-                            continue
-                        if not self._host_allowed(u):
-                            continue
-                        seen_derived.add(u)
-                        dk = self._classify_by_extension(self._to_str(self._safe_urlparse(u).path)) or "video"
-                        if not self._is_allowed_by_extensions(u, extensions, dk):
-                            continue
-                        derived_items.append({
-                            "url": u,
-                            "text": f"[Network {dk.capitalize()} Segment]",
-                            "tag": "network_sniff",
-                            "kind": dk,
-                            "content_type": mkind,
-                            "size": "?",
-                        })
-                        if len(json_hits) < max_json:
-                            json_hits.append({
-                                "url": u,
-                                "json": {"derived_from": murl, "manifest_type": mkind},
-                                "source_page": canonical_page_url
-                            })
-
-                await self.asyncio.gather(*[
-                    expand_one(resp, mkind, murl)
-                    for (resp, mkind, murl) in manifests_to_expand
-                ])
-
-            if self.cfg.enable_forensics and self.cfg.forensics_hash_via_probe and api_ctx is not None and forensics:
-                sem = self.asyncio.Semaphore(8)
-
-                async def guard_hash(bundle: "NetworkSniffer.Dict[str, Any]"):
-                    async with sem:
-                        hp = await self._hash_body_prefix_via_probe(
-                            api_ctx,
-                            bundle["url"],
-                            bundle.get("request_headers_subset") or {},
-                            timeout_ms=int(self.cfg.forensics_probe_timeout_ms),
-                            prefix_bytes=int(self.cfg.forensics_body_prefix_bytes),
-                        )
-                        bundle["sha256_body_prefix"] = hp
-
-                await self.asyncio.gather(*[guard_hash(b) for b in forensics])
-
-            if self.cfg.enable_url_salvage and api_ctx is not None and salvage_info:
-                targets = list(salvage_info.values())
-                targets.sort(key=lambda d: float(d.get("score", 0.0)), reverse=True)
-                targets = targets[: int(self.cfg.salvage_max_targets_total)]
-
-                sem = self.asyncio.Semaphore(int(self.cfg.salvage_probe_concurrency))
-
-                def req_hdrs_for_salvage(u: str) -> "NetworkSniffer.Dict[str, str]":
-                    ev = request_evidence.get(u) or request_evidence.get(self._canonicalize_url(u)) or {}
-                    return ev.get("headers_subset") or {}
-
-                async def salvage_guard(info: "NetworkSniffer.Dict[str, Any]"):
-                    async with sem:
-                        u = self._to_str(info.get("url"))
-                        return await self._salvage_one(
-                            api_ctx,
-                            u,
-                            req_hdrs_for_salvage(u),
-                            log=log,
-                            observed_status=info.get("status"),
-                            observed_kind=info.get("kind"),
-                        )
-
-                salvage_bundles = await self.asyncio.gather(*[salvage_guard(i) for i in targets])
-
-            # --- MSE post-processing (same spirit as your version) ---
-            if self.cfg.enable_mse_sniff and mse_events:
-                # Keep your existing MSE interpretation minimal here (you can expand further if you want)
-                if len(json_hits) < max_json:
-                    json_hits.append({
-                        "url": canonical_page_url,
-                        "json": {"mse_bundle": {
-                            "source_page": canonical_page_url,
-                            "count": len(mse_events),
-                            "items": mse_events[: int(self.cfg.mse_max_events)],
-                        }},
-                        "source_page": canonical_page_url,
-                    })
-
-            # --- PARAM post-processing + correlation ---
-            param_summary = self._postprocess_param_events(param_events)
-            if self.cfg.enable_param_sniff and len(json_hits) < max_json:
-                json_hits.append({
-                    "url": canonical_page_url,
-                    "json": {"param_bundle": {
-                        "source_page": canonical_page_url,
-                        "counts_top": param_summary.get("top_keys", [])[:80],
-                        "nav_urls": param_summary.get("nav_urls", [])[:200],
-                        "total_events": param_summary.get("total_events", 0),
-                        "capture_values": bool(self.cfg.param_capture_values),
-                    }},
-                    "source_page": canonical_page_url,
-                })
-
-            # --- router boot snapshot (truncated) ---
-            boot = None
-            try:
-                boot = await page.evaluate("""() => {
-                  try {
-                    return {
-                      next: window.__NEXT_DATA__ || null,
-                      nuxt: window.__NUXT__ || null,
-                      apollo: window.__APOLLO_STATE__ || null
-                    };
-                  } catch(e) { return { next:null, nuxt:null, apollo:null }; }
-                }""")
-            except Exception:
-                boot = None
-
-            if boot and len(json_hits) < max_json:
-                # truncate big objects safely
-                def _truncate_obj(o, max_chars=120000):
-                    try:
-                        s = self.json.dumps(o)
-                        if len(s) > max_chars:
-                            return {"truncated": True, "preview": s[:max_chars]}
-                        return o
-                    except Exception:
-                        return {"truncated": True, "preview": self._to_str(o)[:max_chars]}
-
-                json_hits.append({
-                    "url": canonical_page_url,
-                    "json": {"boot_state": _truncate_obj(boot)},
-                    "source_page": canonical_page_url,
-                })
-
-            # --- get HTML (needed for script src extraction + return) ---
             try:
                 html = await page.content()
             except Exception as e:
-                self._log(f"[NetworkSniffer] Failed to get page content: {e}", log)
+                self._log(f"[NetworkSniffer] page.content failed on {canonical_page_url}: {e}", log)
                 html = ""
 
-            # --- Bundle scan (optional) ---
-            if self.cfg.enable_bundle_param_scan and api_ctx is not None:
-                # extend scripts with <script src> parsed from HTML
-                for u in self._extract_script_srcs_from_html(html, canonical_page_url):
-                    cu = self._canonicalize_url(u)
-                    if cu and cu not in seen_scripts and self._host_allowed(cu):
-                        seen_scripts.add(cu)
-                        script_urls.append(cu)
+            # Direct DOM link harvest so plain page links finally get returned.
+            await self._collect_dom_linkish_items(
+                page,
+                canonical_page_url,
+                bucket=page_link_items,
+                seen=seen_page_links,
+                extensions=extensions,
+                log=log,
+            )
 
-                bundle_scan = await self._bundle_param_scan(api_ctx, script_urls, log=log)
-                if len(json_hits) < max_json:
-                    json_hits.append({
-                        "url": canonical_page_url,
-                        "json": {"bundle_param_scan": bundle_scan},
-                        "source_page": canonical_page_url,
-                    })
+            # Also mine any raw absolute URLs visible in the HTML snapshot.
+            try:
+                for u in self._extract_urls_from_text(html)[:500]:
+                    self._emit_linkish_url(
+                        u,
+                        bucket=page_link_items,
+                        seen=seen_page_links,
+                        tag="html_url",
+                        text="[HTML URL]",
+                        kind_hint=None,
+                        content_type="?",
+                        size="?",
+                        extensions=extensions,
+                        evidence="html-regex",
+                    )
+            except Exception:
+                pass
 
-            # --- Param-to-endpoint correlation ---
+            # Expand manifests
+            for resp, manifest_kind, manifest_url in manifests_to_expand[:max_manifests]:
+                try:
+                    derived = await self._expand_manifest(resp, manifest_kind, manifest_url, log)
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] Manifest expansion failed for {manifest_url}: {e}", log)
+                    derived = []
+
+                for du in derived[:max_derived_per_manifest]:
+                    self._emit_linkish_url(
+                        du,
+                        bucket=derived_items,
+                        seen=seen_derived,
+                        tag=f"{manifest_kind}_derived",
+                        text=f"[{manifest_kind.upper()} Derived]",
+                        kind_hint="video",
+                        content_type="?",
+                        size="?",
+                        extensions=extensions,
+                        evidence=f"{manifest_kind}-expand",
+                    )
+
+            # Salvage probing
+            if self.cfg.enable_url_salvage and salvage_info:
+                top_salvage = sorted(
+                    salvage_info.values(),
+                    key=lambda x: float(x.get("score", 0.0)),
+                    reverse=True,
+                )[: int(self.cfg.salvage_max_targets_total)]
+
+                for s in top_salvage:
+                    try:
+                        ev = request_evidence.get(s.get("url")) or {}
+                        req_hdrs = ev.get("headers_subset") or {}
+                        bundle = await self._salvage_one(
+                            api_ctx,
+                            s.get("url"),
+                            req_hdrs,
+                            log=log,
+                            observed_status=s.get("status"),
+                            observed_kind=s.get("kind"),
+                        )
+                        if bundle:
+                            salvage_bundles.append(bundle)
+                            for okv in bundle.get("ok_variants") or []:
+                                self._emit_linkish_url(
+                                    okv.get("url"),
+                                    bucket=derived_items,
+                                    seen=seen_derived,
+                                    tag="salvaged",
+                                    text="[Salvaged URL]",
+                                    kind_hint=s.get("kind"),
+                                    content_type=okv.get("content_type") or "?",
+                                    size=okv.get("content_length") or "?",
+                                    extensions=extensions,
+                                    evidence=self._to_str(okv.get("variant_kind") or "salvage"),
+                                )
+                    except Exception as e:
+                        self._log(f"[NetworkSniffer] Salvage failed for {s.get('url')}: {e}", log)
+
+            # Param-to-endpoint correlation
             if self.cfg.enable_param_sniff:
-                corr = self._correlate_params_to_endpoints(
-                    param_events,
-                    resp_events,
-                    window_ms=int(self.cfg.correlate_window_ms),
-                    max_per_key=int(self.cfg.correlate_max_per_key),
-                )
-                if corr and len(json_hits) < max_json:
-                    json_hits.append({
-                        "url": canonical_page_url,
-                        "json": {"param_endpoint_correlation": {
-                            "window_ms": int(self.cfg.correlate_window_ms),
-                            "items": corr[:250],
-                        }},
-                        "source_page": canonical_page_url,
-                    })
+                try:
+                    corr = self._correlate_params_to_endpoints(
+                        param_events,
+                        resp_events,
+                        window_ms=int(self.cfg.correlate_window_ms),
+                        max_per_key=int(self.cfg.correlate_max_per_key),
+                    )
+                    if corr and len(json_hits) < max_json:
+                        json_hits.append({
+                            "url": canonical_page_url,
+                            "json": {"param_endpoint_correlation": {
+                                "window_ms": int(self.cfg.correlate_window_ms),
+                                "items": corr[:250],
+                            }},
+                            "source_page": canonical_page_url,
+                        })
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] param correlation failed: {e}", log)
+                    corr = []
 
+            # Bundle scan
+            if self.cfg.enable_bundle_param_scan and api_ctx is not None and script_urls:
+                try:
+                    bundle_scan = await self._bundle_param_scan(api_ctx, script_urls, log=log)
+                    if len(json_hits) < max_json:
+                        json_hits.append({
+                            "url": canonical_page_url,
+                            "json": {"bundle_param_scan": bundle_scan},
+                            "source_page": canonical_page_url,
+                        })
+                except Exception as e:
+                    self._log(f"[NetworkSniffer] bundle scan failed: {e}", log)
+
+            # Candidate promotion still kept
             if self.cfg.enable_candidate_promotion:
                 try:
                     promoted_items = await self._promote_secondary_candidates(
@@ -3361,6 +3243,80 @@ class NetworkSniffer:
                 except Exception as e:
                     self._log(f"[NetworkSniffer] Candidate promotion failed: {e}", log)
                     promoted_items = []
+
+            # Secondary harvesting from all the side-channels
+            try:
+                for hit in json_hits:
+                    for u in self._iter_urls_in_json(hit.get("json") or {}, limit=2500):
+                        self._emit_linkish_url(
+                            u,
+                            bucket=page_link_items,
+                            seen=seen_page_links,
+                            tag="json_url",
+                            text="[JSON URL]",
+                            kind_hint=None,
+                            content_type="?",
+                            size="?",
+                            extensions=extensions,
+                            evidence="json-hit",
+                        )
+            except Exception:
+                pass
+
+            try:
+                for ev in redirect_events:
+                    self._emit_linkish_url(
+                        ev.get("to"),
+                        bucket=page_link_items,
+                        seen=seen_page_links,
+                        tag="redirect",
+                        text="[Redirect]",
+                        kind_hint="page",
+                        content_type="?",
+                        size="?",
+                        extensions=extensions,
+                        evidence=f"redirect:{ev.get('status')}",
+                    )
+            except Exception:
+                pass
+
+            try:
+                for ev in mse_events:
+                    u = self._to_str(ev.get("url") or ev.get("src") or ev.get("request_url") or ev.get("mediaUrl"))
+                    if not u:
+                        continue
+                    self._emit_linkish_url(
+                        u,
+                        bucket=page_link_items,
+                        seen=seen_page_links,
+                        tag="mse_url",
+                        text="[MSE URL]",
+                        kind_hint=None,
+                        content_type=self._to_str(ev.get("content_type") or ""),
+                        size="?",
+                        extensions=extensions,
+                        evidence=self._to_str(ev.get("event") or ev.get("type") or "mse"),
+                    )
+            except Exception:
+                pass
+
+            try:
+                for ev in param_events:
+                    for u in self._iter_urls_in_json(ev, limit=20):
+                        self._emit_linkish_url(
+                            u,
+                            bucket=page_link_items,
+                            seen=seen_page_links,
+                            tag="param_url",
+                            text="[Param URL]",
+                            kind_hint=None,
+                            content_type="?",
+                            size="?",
+                            extensions=extensions,
+                            evidence="param-event",
+                        )
+            except Exception:
+                pass
 
             if self.cfg.enable_forensics and forensics and len(json_hits) < max_json:
                 json_hits.append({
@@ -3398,27 +3354,40 @@ class NetworkSniffer:
 
         finally:
             try:
+                # make sure we don't leave probe tasks behind
+                if binary_tasks:
+                    done, pending = await self.asyncio.wait(binary_tasks, timeout=max(0.1, min(2.0, tmo * 0.25)))
+                    for task in pending:
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
+                    if pending:
+                        await self.asyncio.gather(*pending, return_exceptions=True)
+            except Exception:
+                pass
+
+            try:
                 await self.asyncio.wait_for(page.close(), timeout=3.0)
             except Exception:
                 pass
 
-        merged_items_any = found_items + derived_items + promoted_items + blob_placeholders
+        merged_items_any = found_items + derived_items + promoted_items + blob_placeholders + page_link_items
         merged_items_any = self._dedupe_and_rank_items([it for it in merged_items_any if it.get("url")])
         merged_items = [self._normalize_item(it) for it in merged_items_any if it.get("url")]
 
         summary = (
             f"[NetworkSniffer] Finished sniff for {canonical_page_url}: "
             f"media={len(found_items)} derived={len(derived_items)} promoted={len(promoted_items)} "
-            f"blob={len(blob_placeholders)} json_hits={len(json_hits)} "
-            f"forensics={len(forensics)} salvage={len(salvage_bundles)} mse={len(mse_events)} "
-            f"param_events={len(param_events)} scripts={len(script_urls)} "
+            f"blob={len(blob_placeholders)} page_links={len(page_link_items)} "
+            f"json_hits={len(json_hits)} forensics={len(forensics)} salvage={len(salvage_bundles)} "
+            f"mse={len(mse_events)} param_events={len(param_events)} scripts={len(script_urls)} "
             f"binary_sig_tasks={len(binary_tasks)} "
             f"(Total output: {len(merged_items)})"
         )
         self._log(summary, log)
 
         return html, merged_items, json_hits
-
 # ======================================================================
 # JSSniffer
 # ======================================================================
@@ -3465,7 +3434,7 @@ class JSSniffer:
         watchdog_multiplier: float = 1.25        # whole sniff hard-cap multiplier
 
         # newly emphasized anti-stall controls
-        max_nav_timeout_s: float = 10.0
+        max_nav_timeout_s: float = 30
         preflight_timeout_s: float = 1.25
         pass_guard_s: float = 2.2
         min_seconds_reserved_for_close: float = 0.60
@@ -3492,7 +3461,7 @@ class JSSniffer:
         # Optional click simulation
         enable_click_simulation: bool = False
         max_click_targets: int = 6
-        click_timeout_ms: int = 2500
+        click_timeout_ms: int = 10500
         click_target_selectors: List[str] = field(default_factory=lambda: [
             "button", "[role=button]", "[onclick]", "div[role=link]", "span[role=link]"
         ])
@@ -4585,6 +4554,7 @@ class JSSniffer:
             return "", []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
+        self.cfg.timeout = tmo
         canonical_page_url = self._canonicalize_local(page_url)
 
         html: str = ""
@@ -6478,17 +6448,267 @@ class RuntimeSniffer:
         })
         self._log(f"WebRTC events captured: {len(events)}", log)
 
+    # ------------------------------ NEW: link promotion helpers ------------------------------ #
+
+    def _push_link_hit(
+            self,
+            out: List[Dict[str, Any]],
+            seen: Set[str],
+            *,
+            url: Any,
+            source_page: str,
+            tag: str,
+            meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            u = _canonicalize_url(str(url or "").strip())
+        except Exception:
+            u = str(url or "").strip()
+
+        if not u:
+            return
+
+        low = u.lower()
+        if low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:")):
+            return
+
+        key = f"{tag}|{u}"
+        if key in seen:
+            return
+        seen.add(key)
+
+        out.append({
+            "url": u,
+            "tag": tag,
+            "source_page": source_page,
+            "json": meta or {},
+        })
+
+    def _deep_collect_urls(self, obj: Any, *, limit: int = 2500) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        stack: List[Any] = [obj]
+
+        while stack and len(out) < limit:
+            cur = stack.pop()
+            if cur is None:
+                continue
+
+            if isinstance(cur, str):
+                s = cur.strip()
+                if s.startswith(("http://", "https://", "ws://", "wss://")):
+                    cu = _canonicalize_url(s)
+                    if cu and cu not in seen:
+                        seen.add(cu)
+                        out.append(cu)
+                else:
+                    for u in self._extract_urls_from_text(s):
+                        cu = _canonicalize_url(u)
+                        if cu and cu not in seen:
+                            seen.add(cu)
+                            out.append(cu)
+                continue
+
+            if isinstance(cur, dict):
+                stack.extend(cur.values())
+                continue
+
+            if isinstance(cur, (list, tuple, set)):
+                stack.extend(list(cur))
+                continue
+
+        return out
+
+    async def _collect_dom_linkish_hits(
+            self,
+            page: "Page",
+            canonical_page_url: str,
+            out: List[Dict[str, Any]],
+            seen: Set[str],
+            log: Optional[List[str]],
+    ) -> None:
+        try:
+            items = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const seen = new Set();
+
+                  function push(url, tag, text) {
+                    try {
+                      url = String(url || "").trim();
+                      if (!url) return;
+                      const low = url.toLowerCase();
+                      if (
+                        low === "#" ||
+                        low.startsWith("javascript:") ||
+                        low.startsWith("mailto:") ||
+                        low.startsWith("tel:") ||
+                        low.startsWith("data:")
+                      ) return;
+
+                      const key = `${tag}|${url}`;
+                      if (seen.has(key)) return;
+                      seen.add(key);
+                      out.push({
+                        url,
+                        tag,
+                        text: String(text || "").trim().slice(0, 200)
+                      });
+                    } catch (_) {}
+                  }
+
+                  for (const el of document.querySelectorAll("a[href], area[href]")) {
+                    push(
+                      el.getAttribute("href"),
+                      (el.tagName || "").toLowerCase(),
+                      el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("iframe[src], frame[src], img[src], video[src], audio[src], source[src], embed[src]")) {
+                    push(
+                      el.getAttribute("src"),
+                      (el.tagName || "").toLowerCase(),
+                      el.getAttribute("title") || el.getAttribute("alt") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("form[action]")) {
+                    push(
+                      el.getAttribute("action"),
+                      "form",
+                      el.getAttribute("name") || el.getAttribute("id") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("link[href]")) {
+                    push(
+                      el.getAttribute("href"),
+                      "link",
+                      el.getAttribute("rel") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("meta[content]")) {
+                    const p = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
+                    if (
+                      p.includes("og:url") ||
+                      p.includes("og:image") ||
+                      p.includes("og:video") ||
+                      p.includes("twitter:image") ||
+                      p.includes("twitter:player") ||
+                      p === "canonical"
+                    ) {
+                      push(el.getAttribute("content"), "meta", p);
+                    }
+                  }
+
+                  for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [onclick]")) {
+                    push(el.getAttribute("data-href"), "data-href", "");
+                    push(el.getAttribute("data-url"), "data-url", "");
+                    push(el.getAttribute("data-src"), "data-src", "");
+                    push(el.getAttribute("data-video"), "data-video", "");
+
+                    const onclick = el.getAttribute("onclick") || "";
+                    const matches = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
+                    for (const u of matches) push(u, "onclick", "");
+                  }
+
+                  return out.slice(0, 4000);
+                }
+                """
+            ) or []
+        except Exception as e:
+            self._log(f"DOM link harvest failed: {e}", log)
+            return
+
+        added = 0
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            raw = str(it.get("url") or "").strip()
+            if not raw:
+                continue
+            full = urljoin(canonical_page_url, raw)
+
+            before = len(out)
+            self._push_link_hit(
+                out,
+                seen,
+                url=full,
+                source_page=canonical_page_url,
+                tag=str(it.get("tag") or "dom"),
+                meta={"text": str(it.get("text") or ""), "reason": "dom-harvest"},
+            )
+            if len(out) > before:
+                added += 1
+
+        self._log(f"DOM link harvest added {added} link(s).", log)
+
+    def _promote_runtime_hits_to_links(
+            self,
+            runtime_hits: List[Dict[str, Any]],
+            canonical_page_url: str,
+            out: List[Dict[str, Any]],
+            seen: Set[str],
+    ) -> None:
+        for hit in runtime_hits:
+            if not isinstance(hit, dict):
+                continue
+
+            # 1) direct top-level url
+            top_url = str(hit.get("url") or "").strip()
+            if top_url and top_url != canonical_page_url:
+                self._push_link_hit(
+                    out,
+                    seen,
+                    url=top_url,
+                    source_page=canonical_page_url,
+                    tag=str(hit.get("tag") or "runtime"),
+                    meta={"reason": "top-level-runtime-hit"},
+                )
+
+            # 2) nested payload urls
+            payload = hit.get("json")
+            for u in self._deep_collect_urls(payload, limit=250):
+                self._push_link_hit(
+                    out,
+                    seen,
+                    url=u,
+                    source_page=canonical_page_url,
+                    tag="runtime_nested",
+                    meta={"reason": "nested-runtime-url"},
+                )
+
+            # 3) special-case response header miner shape:
+            #    {"url": resp.url, "json": {"header": k, "url": u}}
+            if isinstance(payload, dict):
+                nested_u = str(payload.get("url") or "").strip()
+                if nested_u and nested_u != top_url:
+                    self._push_link_hit(
+                        out,
+                        seen,
+                        url=nested_u,
+                        source_page=canonical_page_url,
+                        tag=str(payload.get("header") or "runtime_header"),
+                        meta={"reason": "promoted-nested-url"},
+                    )
+    # =====================================================================
+    # Main entry
+    # =====================================================================
+
     # =====================================================================
     # Main entry
     # =====================================================================
 
     async def sniff(
-        self,
-        context: "BrowserContext",
-        page_url: str,
-        *,
-        timeout: Optional[float] = None,
-        log: Optional[List[str]] = None,
+            self,
+            context: "BrowserContext",
+            page_url: str,
+            *,
+            timeout: Optional[float] = None,
+            log: Optional[List[str]] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
 
         if context is None:
@@ -6499,8 +6719,12 @@ class RuntimeSniffer:
             return "", []
 
         tmo = float(timeout if timeout is not None else self.cfg.timeout)
+        self.cfg.timeout = tmo
         canonical_page_url = _canonicalize_url(page_url)
+
         runtime_hits: List[Dict[str, Any]] = []
+        promoted_links: List[Dict[str, Any]] = []
+        seen_links: Set[str] = set()
 
         # ------------------------------------------------------------
         # Context-level hooks (MUST run before new_page / navigation)
@@ -6519,7 +6743,7 @@ class RuntimeSniffer:
         page: Page = await context.new_page()
         html: str = ""
         wait_mode = getattr(self.cfg, "goto_wait_until", "domcontentloaded")
-        goto_timeout_ms = max(15000, int(tmo * 1000))
+        goto_timeout_ms = max(35000, int(tmo * 1000))
 
         # Attach page-level hooks BEFORE navigation
         self._attach_console_sniffer(page, runtime_hits, canonical_page_url, log)
@@ -6531,19 +6755,29 @@ class RuntimeSniffer:
         self._log(f"Start runtime sniff: {canonical_page_url} timeout={tmo}s", log)
 
         try:
-            try:
-                await page.goto(
-                    canonical_page_url,
-                    wait_until=wait_mode,
-                    timeout=goto_timeout_ms,
-                )
-            except Exception as e:
-                self._log(f"goto timeout on {canonical_page_url} (wait_until={wait_mode}): {e}", log)
+            nav_modes: List[str] = []
+            for mode in (wait_mode, "commit", "domcontentloaded", "load"):
+                mode = str(mode or "").strip() or "domcontentloaded"
+                if mode not in nav_modes:
+                    nav_modes.append(mode)
+
+            for mode in nav_modes:
+                try:
+                    await page.goto(
+                        canonical_page_url,
+                        wait_until=mode,
+                        timeout=goto_timeout_ms,
+                    )
+                    if mode != wait_mode:
+                        self._log(f"goto recovered using wait_until={mode}", log)
+                    break
+                except Exception as e:
+                    self._log(f"goto timeout on {canonical_page_url} (wait_until={mode}): {e}", log)
 
             # Let page settle a bit
             await page.wait_for_timeout(int(tmo * 1000 * 0.2))
 
-            # Best-effort "play" poke (kept from your code)
+            # Best-effort "play" poke
             try:
                 await page.click('button[title="Play"], button[aria-label="Play"]', timeout=1500)
             except Exception:
@@ -6589,6 +6823,37 @@ class RuntimeSniffer:
                 self._log(f"Failed to get page content: {e}", log)
                 html = ""
 
+            # NEW: direct DOM href/src/action/meta harvest
+            await self._collect_dom_linkish_hits(
+                page,
+                canonical_page_url,
+                promoted_links,
+                seen_links,
+                log,
+            )
+
+            # NEW: raw absolute URL harvest from HTML snapshot
+            try:
+                for u in self._extract_urls_from_text(html)[:500]:
+                    self._push_link_hit(
+                        promoted_links,
+                        seen_links,
+                        url=u,
+                        source_page=canonical_page_url,
+                        tag="html_url",
+                        meta={"reason": "html-regex"},
+                    )
+            except Exception:
+                pass
+
+            # NEW: flatten runtime hits into real top-level links
+            self._promote_runtime_hits_to_links(
+                runtime_hits,
+                canonical_page_url,
+                promoted_links,
+                seen_links,
+            )
+
         except Exception as e:
             self._log(f"Unexpected error during runtime sniff: {e}", log)
         finally:
@@ -6600,9 +6865,34 @@ class RuntimeSniffer:
             except Exception as e:
                 self._log(f"Failed to close page: {e}", log)
 
-        self._log(f"Finished runtime sniff for {canonical_page_url}: hits={len(runtime_hits)}", log)
-        return html, runtime_hits
+        merged_hits: List[Dict[str, Any]] = []
+        seen_merged: Set[str] = set()
 
+        # Keep original rich runtime hits first
+        for hit in runtime_hits:
+            if not isinstance(hit, dict):
+                continue
+            key = f"orig|{str(hit.get('url') or '')}|{str(hit.get('json') or '')[:256]}"
+            if key in seen_merged:
+                continue
+            seen_merged.add(key)
+            merged_hits.append(hit)
+
+        # Then append promoted real links
+        for hit in promoted_links:
+            if not isinstance(hit, dict):
+                continue
+            key = f"link|{str(hit.get('tag') or '')}|{str(hit.get('url') or '')}"
+            if key in seen_merged:
+                continue
+            seen_merged.add(key)
+            merged_hits.append(hit)
+
+        self._log(
+            f"Finished runtime sniff for {canonical_page_url}: raw_hits={len(runtime_hits)} promoted_links={len(promoted_links)} total={len(merged_hits)}",
+            log,
+        )
+        return html, merged_hits
 # ======================================================================
 # ReactSniffer (Advanced: Fiber + Router + State URLs)
 # ======================================================================
@@ -6740,15 +7030,241 @@ class ReactSniffer:
         self._summary: Optional[ReactSniffer.DevtoolsSummary] = None
 
     # ------------------------------------------------------------------ #
+    # NEW helpers: URL promotion / normalization
+    # ------------------------------------------------------------------ #
+    def _extract_urls_from_text(self, s: str) -> List[str]:
+        import re
+
+        if not s:
+            return []
+        rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+        out: List[str] = []
+        seen: Set[str] = set()
+        for m in rx.findall(s):
+            if m not in seen:
+                seen.add(m)
+                out.append(m)
+        return out
+
+    def _absolutize_url(self, page_url: str, raw_url: str) -> str:
+        from urllib.parse import urljoin
+
+        raw = str(raw_url or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith(("javascript:", "mailto:", "tel:", "data:")):
+            return ""
+        try:
+            return urljoin(page_url, raw)
+        except Exception:
+            return raw
+
+    def _route_from_url(self, url: str) -> str:
+        from urllib.parse import urlparse
+
+        try:
+            return str(urlparse(url).path or "")
+        except Exception:
+            return ""
+
+    def _normalize_hit_urls(self, page_url: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+
+            h = dict(hit)
+            raw_url = str(h.get("url") or "").strip()
+            raw_route = str(h.get("route") or "").strip()
+
+            candidate = raw_url or raw_route or page_url
+            abs_url = self._absolutize_url(page_url, candidate) or candidate or page_url
+            route = raw_route or self._route_from_url(abs_url)
+
+            h["url"] = abs_url
+            h["route"] = route
+            out.append(h)
+        return out
+
+    def _dedupe_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str]] = set()
+
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+            key = (
+                str(hit.get("tag") or ""),
+                str(hit.get("kind") or ""),
+                str(hit.get("url") or ""),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(hit)
+        return out
+
+    async def _collect_dom_link_hits(self, page, page_url: str, log: List[str]) -> List[Dict[str, Any]]:
+        dom_hits: List[Dict[str, Any]] = []
+
+        try:
+            raw_items = await page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const seen = new Set();
+
+                  function push(url, kind, text) {
+                    try {
+                      url = String(url || "").trim();
+                      if (!url) return;
+                      const low = url.toLowerCase();
+                      if (
+                        low === "#" ||
+                        low.startsWith("javascript:") ||
+                        low.startsWith("mailto:") ||
+                        low.startsWith("tel:") ||
+                        low.startsWith("data:")
+                      ) return;
+
+                      const key = `${kind}|${url}`;
+                      if (seen.has(key)) return;
+                      seen.add(key);
+
+                      out.push({
+                        url,
+                        kind,
+                        text: String(text || "").trim().slice(0, 200)
+                      });
+                    } catch (_) {}
+                  }
+
+                  for (const el of document.querySelectorAll("a[href], area[href]")) {
+                    push(
+                      el.getAttribute("href"),
+                      "dom_href",
+                      el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("iframe[src], frame[src], img[src], video[src], audio[src], source[src], embed[src]")) {
+                    push(
+                      el.getAttribute("src"),
+                      "dom_src",
+                      el.getAttribute("title") || el.getAttribute("alt") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("form[action]")) {
+                    push(
+                      el.getAttribute("action"),
+                      "dom_action",
+                      el.getAttribute("name") || el.getAttribute("id") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("link[href]")) {
+                    push(
+                      el.getAttribute("href"),
+                      "dom_link_tag",
+                      el.getAttribute("rel") || ""
+                    );
+                  }
+
+                  for (const el of document.querySelectorAll("meta[content]")) {
+                    const p = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
+                    if (
+                      p.includes("og:url") ||
+                      p.includes("og:image") ||
+                      p.includes("og:video") ||
+                      p.includes("twitter:image") ||
+                      p.includes("twitter:player") ||
+                      p === "canonical"
+                    ) {
+                      push(el.getAttribute("content"), "dom_meta", p);
+                    }
+                  }
+
+                  for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [onclick]")) {
+                    push(el.getAttribute("data-href"), "dom_data_href", "");
+                    push(el.getAttribute("data-url"), "dom_data_url", "");
+                    push(el.getAttribute("data-src"), "dom_data_src", "");
+                    push(el.getAttribute("data-video"), "dom_data_video", "");
+
+                    const onclick = el.getAttribute("onclick") || "";
+                    const matches = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
+                    for (const u of matches) push(u, "dom_onclick", "");
+                  }
+
+                  return out.slice(0, 4000);
+                }
+                """
+            ) or []
+        except Exception as e:
+            self._log(f"DOM link harvest error on {page_url}: {e}", log)
+            return dom_hits
+
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+
+            raw = str(item.get("url") or "").strip()
+            if not raw:
+                continue
+
+            full = self._absolutize_url(page_url, raw)
+            if not full:
+                continue
+
+            dom_hits.append(
+                {
+                    "page": page_url,
+                    "url": full,
+                    "route": self._route_from_url(full),
+                    "tag": "react_link",
+                    "kind": str(item.get("kind") or "dom_link"),
+                    "meta": {
+                        "text": str(item.get("text") or ""),
+                        "source": "dom_harvest",
+                    },
+                }
+            )
+
+        self._log(f"DOM link harvest found {len(dom_hits)} link(s) on {page_url}", log)
+        return dom_hits
+
+    def _collect_html_url_hits(self, page_url: str, html: str) -> List[Dict[str, Any]]:
+        hits: List[Dict[str, Any]] = []
+
+        for u in self._extract_urls_from_text(html)[:500]:
+            full = self._absolutize_url(page_url, u)
+            if not full:
+                continue
+            hits.append(
+                {
+                    "page": page_url,
+                    "url": full,
+                    "route": self._route_from_url(full),
+                    "tag": "react_link",
+                    "kind": "html_url",
+                    "meta": {
+                        "source": "html_regex",
+                    },
+                }
+            )
+
+        return hits
+
+    # ------------------------------------------------------------------ #
     # Public API (matches other sniffers)
     # ------------------------------------------------------------------ #
     async def sniff(
-        self,
-        context,              # Playwright BrowserContext
-        page_url: str,
-        timeout: float,
-        log: List[str],
-        extensions=None,      # kept for signature compatibility; usually unused
+            self,
+            context,  # Playwright BrowserContext
+            page_url: str,
+            timeout: float,
+            log: List[str],
+            extensions=None,  # kept for signature compatibility; usually unused
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
         Main entrypoint.
@@ -6768,17 +7284,38 @@ class ReactSniffer:
         page = None
         hits: List[Dict[str, Any]] = []
         html: str = ""
+        self.cfg.timeout = timeout
 
         try:
             page = await context.new_page()
-            await page.goto(
-                page_url,
-                wait_until="domcontentloaded",
-                timeout=int(timeout * 1000),
-            )
 
-            # Install instrumentation before SPA settles
-            await self._install_instrumentation(page, page_url, log)
+            # Install instrumentation BEFORE first navigation so early SPA boot is captured
+            try:
+                await self._install_instrumentation(page, page_url, log)
+            except Exception as e:
+                self._log(f"Pre-navigation instrumentation error on {page_url}: {e}", log)
+
+            nav_modes: List[str] = []
+            for mode in ("domcontentloaded", "commit", "load"):
+                if mode not in nav_modes:
+                    nav_modes.append(mode)
+
+            loaded = False
+            for mode in nav_modes:
+                try:
+                    await page.goto(
+                        page_url,
+                        wait_until=mode,
+                        timeout=max(15000, int(timeout * 1000)),
+                    )
+                    loaded = True
+                    if mode != "domcontentloaded":
+                        self._log(f"goto recovered using wait_until={mode} for {page_url}", log)
+                    break
+                except PWTimeoutError:
+                    self._log(f"Timeout while loading {page_url} with wait_until={mode}", log)
+                except Exception as e:
+                    self._log(f"Error loading {page_url} with wait_until={mode}: {e}", log)
 
             # Give React / SPA some time to bootstrap & navigate
             await page.wait_for_timeout(self.cfg.wait_after_load_ms)
@@ -6789,13 +7326,33 @@ class ReactSniffer:
             except Exception as e:
                 self._log(f"Error getting HTML for {page_url}: {e}", log)
 
-            # Extract SPA / React hints into memory
+            # Extract JS / React instrumentation hits into memory
             try:
                 raw_hits = await self._collect_raw_hits(page, page_url, log)
                 self._ingest_raw_hits(raw_hits, page_url, log)
                 hits = self._materialize_hits(page_url)
             except Exception as e:
-                self._log(f"Error collecting hits for {page_url}: {e}", log)
+                self._log(f"Error collecting instrumentation hits for {page_url}: {e}", log)
+
+            # NEW: direct DOM link harvest
+            try:
+                dom_hits = await self._collect_dom_link_hits(page, page_url, log)
+                hits.extend(dom_hits)
+            except Exception as e:
+                self._log(f"Error collecting DOM links for {page_url}: {e}", log)
+
+            # NEW: raw absolute URLs from HTML snapshot
+            try:
+                html_hits = self._collect_html_url_hits(page_url, html or "")
+                hits.extend(html_hits)
+            except Exception as e:
+                self._log(f"Error collecting HTML URLs for {page_url}: {e}", log)
+
+            # Normalize relative routes/URLs into absolute URLs
+            hits = self._normalize_hit_urls(page_url, hits)
+
+            # Dedupe final output
+            hits = self._dedupe_hits(hits)
 
         except PWTimeoutError:
             self._log(f"Timeout while loading {page_url}", log)
@@ -7784,18 +8341,28 @@ class DatabaseSniffer:
             return ""
 
         low = raw.lower()
-        if low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:")):
+        if low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:", "#")):
             return ""
 
         # schemeless -> https
         if raw.startswith("//"):
             raw = "https:" + raw
 
-        # relative -> absolute
-        if raw.startswith("/") or raw.startswith("./") or raw.startswith("../"):
-            raw = urljoin(base_url, raw)
+        try:
+            parsed = urlparse(raw)
+            has_scheme = bool(parsed.scheme)
+        except Exception:
+            has_scheme = False
 
-        # canonicalize (your global helper)
+        # relative / query-only / bare path -> absolute
+        if not has_scheme:
+            if raw.startswith(("/", "./", "../", "?")):
+                raw = urljoin(base_url, raw)
+            elif " " not in raw and ("/" in raw or "." in raw):
+                raw = urljoin(base_url, raw)
+            else:
+                return ""
+
         try:
             return _canonicalize_url(raw)  # noqa: F821
         except Exception:
@@ -8254,12 +8821,7 @@ class DatabaseSniffer:
                 if nlow == "srcset":
                     collected_srcset.extend(self._extract_srcset_urls(page_url, val))
                 else:
-                    collected.extend(self._extract_urls_from_text(page_url, val))
-                    # also allow relative endpoints in these attrs
-                    if val.startswith(("/", "./", "../")):
-                        u = self._normalize_candidate(page_url, val)
-                        if u and self._is_allowed_scheme(u):
-                            collected.append(u)
+                    collected.extend(self._extract_value_urls(page_url, val, direct=True))
 
             # Handle also explicit srcset list harvested separately
             for ss in (payload.get("srcsets") or []):
@@ -8268,7 +8830,6 @@ class DatabaseSniffer:
 
             buckets["dom_attrs"] = list(dict.fromkeys(collected))
             buckets["dom_srcset"] = list(dict.fromkeys(collected_srcset))
-
         # --- Inline styles + <style> tags
         if self.cfg.enable_dom_style_scan and payload:
             css_urls: List[str] = []
@@ -8285,11 +8846,7 @@ class DatabaseSniffer:
             meta_urls: List[str] = []
             for c in (payload.get("metaContents") or []):
                 if isinstance(c, str):
-                    meta_urls.extend(self._extract_urls_from_text(page_url, c))
-                    if c.startswith(("/", "./", "../")):
-                        u = self._normalize_candidate(page_url, c)
-                        if u and self._is_allowed_scheme(u):
-                            meta_urls.append(u)
+                    meta_urls.extend(self._extract_value_urls(page_url, c, direct=True))
             buckets["dom_meta"] = list(dict.fromkeys(meta_urls))
 
         # --- JSON-LD
@@ -8318,22 +8875,97 @@ class DatabaseSniffer:
 
         return buckets
 
+    def _dedupe_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[Tuple[str, str, str, str]] = set()
+
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+
+            meta = hit.get("meta") or {}
+            source = str(meta.get("source") or "")
+            key = (
+                str(hit.get("tag") or ""),
+                str(hit.get("kind") or ""),
+                str(hit.get("url") or ""),
+                source,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(hit)
+
+        return out
+    def _extract_value_urls(self, base_url: str, value: str, *, direct: bool = False) -> List[str]:
+        """
+        Extract URLs from a single DOM/backend value.
+
+        direct=True is for href/src/action/content-like fields where the whole value
+        may itself be a relative URL such as:
+          "watch"
+          "api/v1/items"
+          "?page=2"
+          "./video.mp4"
+        """
+        raw = (value or "").strip()
+        if not raw:
+            return []
+
+        seen: Set[str] = set()
+        out: List[str] = []
+
+        def add_candidate(candidate: str) -> None:
+            try:
+                u = self._normalize_candidate(base_url, candidate)
+            except Exception:
+                u = ""
+            if not u or not self._is_allowed_scheme(u):
+                return
+            if u in seen:
+                return
+            seen.add(u)
+            out.append(u)
+
+        # absolute / schemeless URLs embedded in text
+        for u in self._extract_urls_from_text(base_url, raw):
+            add_candidate(u)
+
+        if direct:
+            low = raw.lower()
+
+            if not low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:", "#")):
+                # explicit relative/query/schemeless
+                if raw.startswith(("//", "/", "./", "../", "?")):
+                    add_candidate(raw)
+
+                # bare relative path/file/endpoint
+                elif " " not in raw:
+                    if (
+                            "/" in raw
+                            or "." in raw
+                            or raw.lower().startswith(("api", "graphql", "rest", "rpc", "v1/", "v2/"))
+                    ):
+                        add_candidate(raw)
+
+        return out
     # ------------------------------------------------------------------ #
     # Public API (matches other sniffers)
     # ------------------------------------------------------------------ #
     async def sniff(
-        self,
-        context,              # Playwright BrowserContext
-        page_url: str,
-        timeout: float,
-        log: List[str],
-        extensions=None,      # signature compatibility; unused
+            self,
+            context,  # Playwright BrowserContext
+            page_url: str,
+            timeout: float,
+            log: List[str],
+            extensions=None,  # signature compatibility; unused
     ) -> Tuple[str, List[Dict[str, Any]]]:
         if not context:
             self._log("No BrowserContext supplied; skipping.", log)
             return "", []
 
         tmo = float(timeout or self.cfg.timeout)
+        self.cfg.timeout = tmo
         hits: List[Dict[str, Any]] = []
         html: str = ""
         page = None
@@ -8349,8 +8981,27 @@ class DatabaseSniffer:
             if self.cfg.enable_network_capture:
                 await self._attach_network_collectors(page, page_url, net_urls, log)
 
-            # Navigate
-            await page.goto(page_url, wait_until="domcontentloaded", timeout=int(tmo * 1000))
+            # Navigate with small fallback ladder
+            nav_modes: List[str] = []
+            for mode in ("domcontentloaded", "commit", "load"):
+                if mode not in nav_modes:
+                    nav_modes.append(mode)
+
+            loaded = False
+            for mode in nav_modes:
+                try:
+                    await page.goto(
+                        page_url,
+                        wait_until=mode,
+                        timeout=max(15000, int(tmo * 1000)),
+                    )
+                    loaded = True
+                    if mode != "domcontentloaded":
+                        self._log(f"goto recovered using wait_until={mode} for {page_url}", log)
+                    break
+                except Exception as e:
+                    self._log(f"goto timeout/error on {page_url} (wait_until={mode}): {e}", log)
+
             await page.wait_for_timeout(800)
 
             # --- Backend fingerprint (window globals) ---
@@ -8498,12 +9149,12 @@ class DatabaseSniffer:
                 dom_buckets = await self._dom_harvest_urls(page, page_url, log)
 
             # --- Emit hits ---
-            # 1) legacy “html scan” fallback: still worth keeping
+            # 1) legacy regex scan
             if self.cfg.enable_html_link_scan and html:
                 html_links = self._extract_urls_from_text(page_url, html)
                 await self._add_link_hits_async(page_url, html_links, hits, source="html_regex", log=log)
 
-            # 2) advanced DOM buckets (attributes/srcset/css/meta/jsonld/inline_js)
+            # 2) advanced DOM buckets
             for k, urls in (dom_buckets or {}).items():
                 if urls:
                     await self._add_link_hits_async(page_url, urls, hits, source=k, log=log)
@@ -8516,6 +9167,9 @@ class DatabaseSniffer:
             if self.cfg.enable_network_capture and net_urls:
                 urls = list(net_urls)[: int(self.cfg.max_network_urls)]
                 await self._add_link_hits_async(page_url, urls, hits, source="network", log=log)
+
+            # final dedupe
+            hits = self._dedupe_hits(hits)
 
         except Exception as e:
             self._log(f"Fatal error during DB sniff on {page_url}: {e}", log)
@@ -8735,6 +9389,11 @@ class InteractionSniffer:
         redact_name_regex: str = r"(csrf|token|auth|bearer|secret|key|session|jwt)"
         emit_summary_hit: bool = True
 
+        enable_dom_link_extraction: bool = True
+        max_link_hits: int = 72
+        max_html_regex_link_hits: int = 180
+
+
         # AX / accessibility
         enable_ax_tree_scan: bool = True
         ax_roles: Set[str] = field(default_factory=lambda: {
@@ -8898,20 +9557,196 @@ class InteractionSniffer:
         )
         return probe if isinstance(probe, dict) else {"ok": False}
 
+    def _extract_urls_from_text(self, s: str) -> List[str]:
+        if not s:
+            return []
+        rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+        out: List[str] = []
+        seen: Set[str] = set()
+        for u in rx.findall(s):
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _absolutize_url(self, base_url: str, raw_url: str) -> str:
+        raw = str(raw_url or "").strip()
+        if not raw:
+            return ""
+
+        low = raw.lower()
+        if low.startswith(("javascript:", "mailto:", "tel:", "data:", "blob:", "#")):
+            return ""
+
+        try:
+            return urljoin(base_url, raw)
+        except Exception:
+            return raw
+
+    async def _collect_dom_link_hits(self, page, page_url: str, log: Optional[List[str]], *, phase: str) -> None:
+        if not getattr(self.cfg, "enable_dom_link_extraction", True):
+            return
+
+        payload = await self._safe_eval(
+            page,
+            """
+            (cfg) => {
+                const out = [];
+                const seen = new Set();
+                const maxHits = cfg.maxHits || 72;
+
+                function push(url, kind, text, selector) {
+                    try {
+                        url = String(url || "").trim();
+                        if (!url) return;
+
+                        const low = url.toLowerCase();
+                        if (
+                            low === "#" ||
+                            low.startsWith("javascript:") ||
+                            low.startsWith("mailto:") ||
+                            low.startsWith("tel:") ||
+                            low.startsWith("data:") ||
+                            low.startsWith("blob:")
+                        ) return;
+
+                        const key = `${kind}|${url}|${selector || ""}`;
+                        if (seen.has(key)) return;
+                        seen.add(key);
+
+                        out.push({
+                            url,
+                            kind,
+                            text: String(text || "").trim().slice(0, 140),
+                            selector: String(selector || "").trim().slice(0, 120),
+                        });
+                    } catch (_) {}
+                }
+
+                function selOf(el) {
+                    try {
+                        if (!el) return "";
+                        if (el.id) return `#${CSS.escape(el.id)}`;
+                        const cls = (typeof el.className === "string" ? el.className : "");
+                        const c1 = cls.split(/\\s+/).filter(Boolean)[0];
+                        if (c1) return `${el.tagName.toLowerCase()}.${CSS.escape(c1)}`;
+                        return el.tagName.toLowerCase();
+                    } catch {
+                        return "";
+                    }
+                }
+
+                // href/action/src-style values
+                const linkish = Array.from(document.querySelectorAll(
+                    "a[href], area[href], iframe[src], frame[src], form[action], link[href], img[src], video[src], audio[src], source[src], embed[src]"
+                )).slice(0, 600);
+
+                for (const el of linkish) {
+                    if (out.length >= maxHits) break;
+                    const tag = (el.tagName || "").toLowerCase();
+
+                    if ((tag === "a" || tag === "area") && el.getAttribute("href")) {
+                        push(el.getAttribute("href"), "dom_href", el.innerText || el.textContent || el.getAttribute("title") || "", selOf(el));
+                        continue;
+                    }
+                    if (tag === "form" && el.getAttribute("action")) {
+                        push(el.getAttribute("action"), "dom_action", el.getAttribute("name") || el.getAttribute("id") || "", selOf(el));
+                        continue;
+                    }
+                    if (el.getAttribute("src")) {
+                        push(el.getAttribute("src"), "dom_src", el.getAttribute("alt") || el.getAttribute("title") || "", selOf(el));
+                        continue;
+                    }
+                    if (el.getAttribute("href")) {
+                        push(el.getAttribute("href"), "dom_link_tag", el.getAttribute("rel") || "", selOf(el));
+                        continue;
+                    }
+                }
+
+                // meta URLs
+                const metas = Array.from(document.querySelectorAll("meta[content]")).slice(0, 120);
+                for (const m of metas) {
+                    if (out.length >= maxHits) break;
+                    const p = (m.getAttribute("property") || m.getAttribute("name") || "").toLowerCase();
+                    if (
+                        p.includes("og:url") ||
+                        p.includes("og:image") ||
+                        p.includes("og:video") ||
+                        p.includes("twitter:image") ||
+                        p.includes("twitter:player") ||
+                        p === "canonical"
+                    ) {
+                        push(m.getAttribute("content"), "dom_meta", p, "meta");
+                    }
+                }
+
+                // data-* and onclick URLs
+                const extras = Array.from(document.querySelectorAll("[data-href], [data-url], [data-src], [data-action], [onclick]")).slice(0, 400);
+                for (const el of extras) {
+                    if (out.length >= maxHits) break;
+                    push(el.getAttribute("data-href"), "dom_data_href", "", selOf(el));
+                    push(el.getAttribute("data-url"), "dom_data_url", "", selOf(el));
+                    push(el.getAttribute("data-src"), "dom_data_src", "", selOf(el));
+                    push(el.getAttribute("data-action"), "dom_data_action", "", selOf(el));
+
+                    const onclick = el.getAttribute("onclick") || "";
+                    const matches = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
+                    for (const u of matches) {
+                        if (out.length >= maxHits) break;
+                        push(u, "dom_onclick", "", selOf(el));
+                    }
+                }
+
+                return out.slice(0, maxHits);
+            }
+            """,
+            {"maxHits": int(getattr(self.cfg, "max_link_hits", 72))},
+            log,
+        )
+
+        if not isinstance(payload, list):
+            return
+
+        added = 0
+        for item in payload[: int(getattr(self.cfg, "max_link_hits", 72))]:
+            if not isinstance(item, dict):
+                continue
+
+            raw = str(item.get("url") or "").strip()
+            full = self._absolutize_url(page_url, raw)
+            if not full:
+                continue
+
+            self._emit_hit(
+                page_url,
+                "derived_link",
+                {
+                    "phase": phase,
+                    "source": str(item.get("kind") or "dom_link"),
+                    "selector_hint": str(item.get("selector") or ""),
+                    "text_preview": str(item.get("text") or ""),
+                    "evidence": "dom_link_harvest",
+                },
+                url=full,
+            )
+            added += 1
+
+        if added:
+            self._log(f"[{phase}] DOM links: +{added}", log)
     # ------------------------------------------------------------------ #
     # public API
     # ------------------------------------------------------------------ #
 
     async def sniff(
-        self,
-        context,
-        page_url: str,
-        timeout: float,
-        log: List[str],
-        extensions=None,
+            self,
+            context,
+            page_url: str,
+            timeout: float,
+            log: List[str],
+            extensions=None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         from playwright.async_api import TimeoutError as PWTimeoutError
-
+        self.cfg.timeout = timeout
         self._reset_memory()
         html = ""
 
@@ -8935,7 +9770,6 @@ class InteractionSniffer:
             log,
         )
 
-        # Early skip for obvious low-value asset-like targets
         if self.cfg.skip_asset_paths and profile["is_asset_like"]:
             self._emit_hit(
                 page_url,
@@ -8952,16 +9786,32 @@ class InteractionSniffer:
         page = None
         try:
             page = await context.new_page()
-            goto_timeout_ms = min(
+
+            nav_modes: List[str] = []
+            for mode in ("domcontentloaded", "commit", "load"):
+                if mode not in nav_modes:
+                    nav_modes.append(mode)
+
+            response = None
+            goto_base_timeout = min(
                 int(self.cfg.goto_timeout_ms),
                 max(900, int(self._remaining_budget(deadline) * 1000) - 200),
             )
 
-            response = await page.goto(
-                page_url,
-                wait_until="domcontentloaded",
-                timeout=goto_timeout_ms,
-            )
+            for mode in nav_modes:
+                try:
+                    response = await page.goto(
+                        page_url,
+                        wait_until=mode,
+                        timeout=max(900, goto_base_timeout),
+                    )
+                    if mode != "domcontentloaded":
+                        self._log(f"goto recovered using wait_until={mode} for {page_url}", log)
+                    break
+                except PWTimeoutError:
+                    self._log(f"Timeout while loading {page_url} with wait_until={mode}", log)
+                except Exception as e:
+                    self._log(f"goto error on {page_url} (wait_until={mode}): {e}", log)
 
             if response is not None and not self._is_html_response(response):
                 try:
@@ -8979,7 +9829,12 @@ class InteractionSniffer:
             if self._remaining_budget(deadline) <= 0.15:
                 return "", self._hits[: self.cfg.max_hits]
 
-            await page.wait_for_timeout(min(int(self.cfg.wait_after_load_ms), max(50, int(self._remaining_budget(deadline) * 250))))
+            await page.wait_for_timeout(
+                min(
+                    int(self.cfg.wait_after_load_ms),
+                    max(50, int(self._remaining_budget(deadline) * 250)),
+                )
+            )
 
             probe = await self._cheap_dom_probe(page, log)
             if probe.get("ok"):
@@ -8994,38 +9849,33 @@ class InteractionSniffer:
                 self._log("DOM probe failed; returning partial hits.", log)
                 return "", self._hits[: self.cfg.max_hits]
 
-            # Low-value tiny pages or challenge pages: only cheap scans
             degraded = bool(
                 profile["is_challenge_like"] or
                 int(probe.get("nodes") or 0) <= 6 or
                 int(probe.get("textLen") or 0) <= 40
             )
 
-            # PRE phase
             await self._collect_phase(page, page_url, log, phase="pre", deadline=deadline)
 
-            # CDP listeners
             if (
-                self.cfg.enable_cdp_listeners
-                and not degraded
-                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_cdp_s
+                    self.cfg.enable_cdp_listeners
+                    and not degraded
+                    and self._remaining_budget(deadline) >= self.cfg.min_budget_for_cdp_s
             ):
                 await self._collect_cdp_listeners(context, page, page_url, log, deadline=deadline)
 
-            # AX
             if (
-                self.cfg.enable_ax_tree_scan
-                and not degraded
-                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_ax_s
+                    self.cfg.enable_ax_tree_scan
+                    and not degraded
+                    and self._remaining_budget(deadline) >= self.cfg.min_budget_for_ax_s
             ):
                 await self._collect_ax_tree(context, page, page_url, log, deadline=deadline)
 
-            # Dynamic simulation
             if (
-                self.cfg.enable_dynamic_simulation
-                and not degraded
-                and not self._should_skip_dynamic(profile)
-                and self._remaining_budget(deadline) >= self.cfg.min_budget_for_dynamic_s
+                    self.cfg.enable_dynamic_simulation
+                    and not degraded
+                    and not self._should_skip_dynamic(profile)
+                    and self._remaining_budget(deadline) >= self.cfg.min_budget_for_dynamic_s
             ):
                 await self._simulate_and_rescan(context, page, page_url, log, deadline=deadline)
 
@@ -9036,15 +9886,34 @@ class InteractionSniffer:
                     self._log(f"Error getting HTML for {page_url}: {e}", log)
                     html = ""
 
+            # final raw URL harvest from html snapshot
+            if html:
+                added = 0
+                for u in self._extract_urls_from_text(html)[: int(getattr(self.cfg, "max_html_regex_link_hits", 180))]:
+                    self._emit_hit(
+                        page_url,
+                        "derived_link",
+                        {
+                            "phase": "html",
+                            "source": "html_regex",
+                            "selector_hint": "",
+                            "text_preview": "",
+                            "evidence": "html_regex",
+                        },
+                        url=u,
+                    )
+                    added += 1
+                if added:
+                    self._log(f"[html] Regex links: +{added}", log)
+
         except PWTimeoutError:
             self._log(f"Timeout while loading {page_url}", log)
         except Exception as e:
             msg = str(e)
-            # Fail fast on obviously unrecoverable navigation errors
             if (
-                "ERR_NAME_NOT_RESOLVED" in msg
-                or "Cannot navigate to invalid URL" in msg
-                or "ERR_INVALID_URL" in msg
+                    "ERR_NAME_NOT_RESOLVED" in msg
+                    or "Cannot navigate to invalid URL" in msg
+                    or "ERR_INVALID_URL" in msg
             ):
                 self._emit_hit(page_url, "navigation_error", {"error": msg[:240], "fatal": True})
                 self._log(f"Fatal navigation failure on {page_url}: {e}", log)
@@ -9066,9 +9935,13 @@ class InteractionSniffer:
     # collectors
     # ------------------------------------------------------------------ #
 
-    async def _collect_phase(self, page, page_url: str, log: Optional[List[str]], *, phase: str, deadline: float) -> None:
+    async def _collect_phase(self, page, page_url: str, log: Optional[List[str]], *, phase: str,
+                             deadline: float) -> None:
         if self._remaining_budget(deadline) <= 0.15:
             return
+
+        if getattr(self.cfg, "enable_dom_link_extraction", True) and self._remaining_budget(deadline) > 0.20:
+            await self._collect_dom_link_hits(page, page_url, log, phase=phase)
 
         if self.cfg.enable_form_extraction and self._remaining_budget(deadline) > 0.25:
             await self._collect_forms(page, page_url, log, phase=phase)
@@ -10326,6 +11199,33 @@ class HLSSubManager:
             segment_paths=seg_paths,
         )
 
+# Drop-in rewrite for the HTTPS section.
+# External call signatures are preserved.
+# Focus: keep sniffers from getting stuck on the same link, the same body,
+# or the same parse shape over and over.
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from html import unescape
+import asyncio
+import hashlib
+import math
+import random
+import re
+import ssl
+import time
+import zlib
+
+import aiohttp
+from aiohttp import ClientTimeout
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+
 # ======================================================================
 # HTTPS
 # ======================================================================
@@ -10340,23 +11240,452 @@ class _HTTPResult:
     error: str = ""
 
 
-class HTTPSSubmanager:
+@dataclass
+class _LinkIntel:
+    url: str
+    canonical_url: str
+    host: str
+    path: str
+    source: str
+    parent: str = ""
+    score: float = 0.0
+    hits: int = 0
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    content_type: str = ""
+    status: Optional[int] = None
+    kind: str = "unknown"
+    tokens: Tuple[str, ...] = field(default_factory=tuple)
+    evidence: Tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass
+class _GuidanceBundle:
+    seed_url: str
+    canonical_seed: str
+    referer: Optional[str]
+    accept: Optional[str]
+    candidates: List[Dict[str, Any]]
+
+
+@dataclass
+class _PastLinkState:
+    canonical_url: str
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    last_success: float = 0.0
+    last_status: Optional[int] = None
+    last_error: str = ""
+    hits: int = 0
+    successes: int = 0
+    failures: int = 0
+    consecutive_failures: int = 0
+    timeout_hits: int = 0
+    deep_parses: int = 0
+    deep_parse_skips: int = 0
+    memo_hits: int = 0
+    cooldown_until: float = 0.0
+    body_cooldown_until: float = 0.0
+    parse_cooldown_until: float = 0.0
+    latency_ema_ms: float = 0.0
+    last_fingerprint: str = ""
+    same_fingerprint_hits: int = 0
+    last_child_digest: str = ""
+    same_child_digest_hits: int = 0
+    consecutive_zero_child_parses: int = 0
+    last_parse_mode: str = ""
+
+
+@dataclass
+class _ResponseMemo:
+    fingerprint: str
+    final_url: str
+    status: Optional[int]
+    content_type: str
+    extracted_urls: Tuple[str, ...] = field(default_factory=tuple)
+    mode: str = "full"
+    hits: int = 0
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+
+
+class _PastLinkGuard:
     """
-    Industrial-grade shared HTTPS engine (aiohttp-only), with:
-      - Freeze prevention: strict timeouts, redirect caps, early-exit for heavy MIME.
-      - Secure Gateway: magic-byte verification, entropy heuristics, decompression bomb guard.
-      - Optional domain reputation filter (local heuristics / denylist).
+    Learns which exact URLs are runtime traps.
+
+    Main idea:
+    - repeated request failures become cheap
+    - repeated giant/same-body parses downgrade from full -> light -> skip
+    - repeated pages that produce the same exact child set get parse-cooled down
+    - body-level penalties do not have to block HEAD requests forever
     """
 
-    # --- Magic byte signatures (first bytes) ---
-    _MAGIC_EXE = (b"MZ",)  # Windows PE
+    _HARD_ERRORS = {
+        "chunk_timeout",
+        "decompression_failed",
+        "decompression_ratio_blocked",
+        "decompression_hard_cap_blocked",
+        "magic_byte_blocked",
+        "entropy_blocked",
+    }
+
+    def __init__(self, *, max_entries: int = 8192):
+        self.max_entries = int(max(256, max_entries))
+        self._states: Dict[str, _PastLinkState] = {}
+
+    def clear(self) -> None:
+        self._states.clear()
+
+    def _get(self, canonical_url: str) -> _PastLinkState:
+        state = self._states.get(canonical_url)
+        if state is None:
+            state = _PastLinkState(canonical_url=canonical_url)
+            self._states[canonical_url] = state
+            self._prune_if_needed()
+        return state
+
+    def _prune_if_needed(self) -> None:
+        if len(self._states) <= self.max_entries:
+            return
+        drop_n = max(32, len(self._states) - self.max_entries)
+        oldest = sorted(self._states.items(), key=lambda kv: kv[1].last_seen)[:drop_n]
+        for key, _ in oldest:
+            self._states.pop(key, None)
+
+    def allow_request(self, canonical_url: str, *, method: str = "GET", want_body: bool = True) -> Tuple[bool, str]:
+        if not canonical_url:
+            return True, ""
+        state = self._states.get(canonical_url)
+        if not state:
+            return True, ""
+
+        now = time.time()
+        state.last_seen = now
+
+        if state.cooldown_until > now:
+            return False, f"url_cooldown:{round(state.cooldown_until - now, 2)}"
+
+        if want_body and method.upper() != "HEAD" and state.body_cooldown_until > now:
+            return False, f"body_cooldown:{round(state.body_cooldown_until - now, 2)}"
+
+        return True, ""
+
+    def note_success(self, canonical_url: str, *, status: Optional[int], elapsed_ms: float) -> None:
+        if not canonical_url:
+            return
+        state = self._get(canonical_url)
+        now = time.time()
+        state.last_seen = now
+        state.last_success = now
+        state.last_status = status
+        state.last_error = ""
+        state.hits += 1
+        state.successes += 1
+        state.consecutive_failures = 0
+        state.cooldown_until = 0.0
+        state.body_cooldown_until = 0.0
+        if elapsed_ms > 0:
+            if state.latency_ema_ms <= 0:
+                state.latency_ema_ms = float(elapsed_ms)
+            else:
+                state.latency_ema_ms = (state.latency_ema_ms * 0.82) + (float(elapsed_ms) * 0.18)
+
+    def note_failure(self, canonical_url: str, *, error: str, status: Optional[int] = None, want_body: bool = True) -> None:
+        if not canonical_url:
+            return
+
+        state = self._get(canonical_url)
+        now = time.time()
+        err = str(error or "request_failed")
+
+        state.last_seen = now
+        state.last_status = status
+        state.last_error = err
+        state.hits += 1
+        state.failures += 1
+        state.consecutive_failures += 1
+        if "timeout" in err:
+            state.timeout_hits += 1
+
+        penalty = 0.0
+        body_penalty = 0.0
+
+        if status in {404, 410}:
+            penalty = 240.0
+        elif status in {401, 403, 416, 429}:
+            penalty = 90.0
+        elif err in self._HARD_ERRORS:
+            body_penalty = 300.0 if want_body else 120.0
+        elif err.startswith("body_cooldown"):
+            body_penalty = 30.0
+        elif "timeout" in err:
+            body_penalty = min(180.0, 25.0 * state.timeout_hits)
+        elif state.consecutive_failures >= 3:
+            penalty = min(180.0, 15.0 * (state.consecutive_failures - 2))
+
+        if penalty > 0.0:
+            state.cooldown_until = max(state.cooldown_until, now + penalty)
+        if body_penalty > 0.0:
+            state.body_cooldown_until = max(state.body_cooldown_until, now + body_penalty)
+
+    def select_parse_mode(
+        self,
+        canonical_url: str,
+        *,
+        fingerprint: str,
+        body_size: int,
+        content_type: str,
+    ) -> str:
+        if not canonical_url:
+            return "full"
+
+        state = self._get(canonical_url)
+        now = time.time()
+        state.last_seen = now
+
+        if state.parse_cooldown_until > now:
+            state.deep_parse_skips += 1
+            return "skip"
+
+        if fingerprint and state.last_fingerprint == fingerprint:
+            state.same_fingerprint_hits += 1
+        else:
+            state.last_fingerprint = fingerprint
+            state.same_fingerprint_hits = 1
+            state.same_child_digest_hits = 0
+            state.consecutive_zero_child_parses = 0
+
+        ct = (content_type or "").lower()
+        is_htmlish = ("html" in ct) or ("xml" in ct) or (not ct)
+        large = body_size >= 250_000
+        huge = body_size >= 700_000
+        giant = body_size >= 1_500_000
+
+        if state.same_fingerprint_hits >= 4 and (large or huge):
+            state.deep_parse_skips += 1
+            state.parse_cooldown_until = max(state.parse_cooldown_until, now + 240.0)
+            return "skip"
+
+        if state.same_fingerprint_hits >= 3 and huge:
+            state.deep_parse_skips += 1
+            state.parse_cooldown_until = max(state.parse_cooldown_until, now + 120.0)
+            return "light"
+
+        if giant:
+            return "light"
+
+        if large and is_htmlish and state.deep_parses >= 1 and state.same_fingerprint_hits >= 2:
+            return "light"
+
+        if state.latency_ema_ms >= 4500 and large:
+            return "light"
+
+        return "full"
+
+    def note_parse(self, canonical_url: str, *, mode: str, extracted_urls: Optional[Iterable[str]] = None) -> None:
+        if not canonical_url:
+            return
+
+        state = self._get(canonical_url)
+        now = time.time()
+        state.last_seen = now
+        state.last_parse_mode = str(mode or "")
+
+        if mode == "skip":
+            state.deep_parse_skips += 1
+            return
+        if mode == "memo":
+            state.memo_hits += 1
+            return
+
+        state.deep_parses += 1
+
+        urls = [str(u).strip() for u in (extracted_urls or ()) if str(u).strip()]
+        if not urls:
+            state.consecutive_zero_child_parses += 1
+            if state.consecutive_zero_child_parses >= 2:
+                state.parse_cooldown_until = max(state.parse_cooldown_until, now + min(180.0, 30.0 * state.consecutive_zero_child_parses))
+            return
+
+        state.consecutive_zero_child_parses = 0
+        digest = hashlib.sha1("\n".join(sorted(set(urls))[:256]).encode("utf-8", errors="ignore")).hexdigest()
+        if digest and digest == state.last_child_digest:
+            state.same_child_digest_hits += 1
+        else:
+            state.last_child_digest = digest
+            state.same_child_digest_hits = 1
+
+        if state.same_child_digest_hits >= 3:
+            state.parse_cooldown_until = max(state.parse_cooldown_until, now + 180.0)
+
+
+class _ResponseMemoStore:
+    """
+    Caches extraction work for repeated identical bodies/final URLs.
+    """
+
+    def __init__(self, *, max_entries: int = 2048, max_urls_per_entry: int = 300):
+        self.max_entries = int(max(64, max_entries))
+        self.max_urls_per_entry = int(max(8, max_urls_per_entry))
+        self._items: Dict[str, _ResponseMemo] = {}
+
+    def clear(self) -> None:
+        self._items.clear()
+
+    def make_fingerprint(
+        self,
+        *,
+        final_url: str,
+        status: Optional[int],
+        content_type: str,
+        body: bytes,
+    ) -> str:
+        h = hashlib.sha1()
+        h.update((final_url or "").encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update(str(status).encode("ascii", errors="ignore"))
+        h.update(b"\0")
+        h.update((content_type or "").lower().encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+        h.update(str(len(body)).encode("ascii", errors="ignore"))
+        if body:
+            h.update(body[:131072])
+        return h.hexdigest()
+
+    def get(self, fingerprint: str) -> Optional[_ResponseMemo]:
+        item = self._items.get(fingerprint)
+        if item is None:
+            return None
+        item.hits += 1
+        item.last_seen = time.time()
+        return item
+
+    def remember(
+        self,
+        *,
+        fingerprint: str,
+        final_url: str,
+        status: Optional[int],
+        content_type: str,
+        extracted_urls: Iterable[str],
+        mode: str,
+    ) -> _ResponseMemo:
+        now = time.time()
+        urls: List[str] = []
+        seen: Set[str] = set()
+        for raw in extracted_urls:
+            s = str(raw or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            urls.append(s)
+            if len(urls) >= self.max_urls_per_entry:
+                break
+
+        item = self._items.get(fingerprint)
+        if item is None:
+            item = _ResponseMemo(
+                fingerprint=fingerprint,
+                final_url=final_url,
+                status=status,
+                content_type=content_type,
+                extracted_urls=tuple(urls),
+                mode=mode,
+                hits=1,
+                first_seen=now,
+                last_seen=now,
+            )
+            self._items[fingerprint] = item
+            self._prune_if_needed()
+            return item
+
+        item.final_url = final_url or item.final_url
+        item.status = status if status is not None else item.status
+        item.content_type = content_type or item.content_type
+        if urls:
+            merged = list(item.extracted_urls)
+            for u in urls:
+                if u not in merged:
+                    merged.append(u)
+            item.extracted_urls = tuple(merged[: self.max_urls_per_entry])
+        item.mode = mode or item.mode
+        item.hits += 1
+        item.last_seen = now
+        return item
+
+    def _prune_if_needed(self) -> None:
+        if len(self._items) <= self.max_entries:
+            return
+        drop_n = max(16, len(self._items) - self.max_entries)
+        oldest = sorted(self._items.items(), key=lambda kv: kv[1].last_seen)[:drop_n]
+        for key, _ in oldest:
+            self._items.pop(key, None)
+
+
+class _RelationBudget:
+    def __init__(self, *, max_parents: int = 2500, max_children_per_parent: int = 192, max_referers_per_host: int = 64):
+        self.max_parents = int(max(32, max_parents))
+        self.max_children_per_parent = int(max(8, max_children_per_parent))
+        self.max_referers_per_host = int(max(8, max_referers_per_host))
+
+    def add_child(self, mapping: Dict[str, Set[str]], parent: str, child: str, *, intel: Dict[str, _LinkIntel]) -> None:
+        if not parent or not child or parent == child:
+            return
+        bucket = mapping.setdefault(parent, set())
+        bucket.add(child)
+        if len(bucket) > self.max_children_per_parent:
+            ranked = sorted(
+                bucket,
+                key=lambda u: (
+                    getattr(intel.get(u), "score", 0.0),
+                    getattr(intel.get(u), "hits", 0),
+                    getattr(intel.get(u), "last_seen", 0.0),
+                ),
+                reverse=True,
+            )
+            mapping[parent] = set(ranked[: self.max_children_per_parent])
+        if len(mapping) > self.max_parents:
+            ranked_parents = sorted(
+                mapping.items(),
+                key=lambda kv: max((getattr(intel.get(u), "last_seen", 0.0) for u in kv[1]), default=0.0),
+                reverse=True,
+            )
+            keep = dict(ranked_parents[: self.max_parents])
+            mapping.clear()
+            mapping.update(keep)
+
+    def add_referer(self, host_buckets: Dict[str, Dict[str, float]], host: str, referer: str, weight: float) -> None:
+        if not host or not referer:
+            return
+        bucket = host_buckets.setdefault(host, {})
+        bucket[referer] = float(bucket.get(referer, 0.0)) + float(weight)
+        if len(bucket) > self.max_referers_per_host:
+            ranked = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[: self.max_referers_per_host]
+            host_buckets[host] = dict(ranked)
+
+
+class HTTPSSubmanager:
+    """
+    Industrial-grade shared HTTPS engine (aiohttp-only), now with built-in link intelligence:
+      - keeps the existing request surface used by the rest of the codebase
+      - learns from redirects, HTML, text payloads, Link/Location headers, and prior success
+      - scores related URLs by similarity and can guide follow-up fetches automatically
+      - improves per-request headers (referer / accept) using its own observed context
+
+    Small internal additions in this rewrite:
+      - per-request coalescing for identical in-flight fetches
+      - stronger body/parse cooldowns for repeated trap links
+      - same-child-set detection so giant pages stop being reparsed forever
+      - slightly stricter canonicalization and HTML extraction caps
+    """
+
+    _MAGIC_EXE = (b"MZ",)
     _MAGIC_PDF = (b"%PDF",)
     _MAGIC_PNG = (b"\x89PNG\r\n\x1a\n",)
     _MAGIC_JPG = (b"\xff\xd8\xff",)
     _MAGIC_GIF = (b"GIF87a", b"GIF89a")
     _MAGIC_ZIP = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
-    # quick “script-like” / “text-like” types
     _TEXTLIKE_MIME_HINTS = (
         "text/",
         "application/json",
@@ -10368,6 +11697,38 @@ class HTTPSSubmanager:
         "application/xhtml+xml",
         "application/x-www-form-urlencoded",
     )
+
+    _TRACKING_QS = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_name", "utm_reader", "utm_viz_id",
+        "gclid", "dclid", "gbraid", "wbraid", "fbclid", "msclkid", "ttclid", "twclid", "yclid",
+        "mc_cid", "mc_eid", "ref", "referrer",
+    }
+
+    _URL_RE = re.compile(r"\bhttps?://[^\s\"'<>]+", re.I)
+    _HTML_ATTR_RE = re.compile(
+        r"(?:href|src|data-src|data-href|poster|content)=[\"']([^\"']+)[\"']",
+        re.I,
+    )
+    _TOKEN_RE = re.compile(r"[a-z0-9]{2,}", re.I)
+
+    _ASSETISH_HINTS = (
+        ".m3u8", ".mpd", ".m4s", ".mp4", ".webm", ".ts", ".mkv", ".jpg", ".jpeg", ".png", ".gif",
+        "manifest", "playlist", "stream", "segment", "chunk", "frag", "download", "media", "video", "audio",
+        "cdn", "playback", "thumb", "poster", "graphql", "api",
+    )
+
+    _MEDIA_ACCEPTS = {
+        "video": "video/*,application/vnd.apple.mpegurl,application/dash+xml;q=0.9,*/*;q=0.5",
+        "audio": "audio/*,application/octet-stream;q=0.8,*/*;q=0.5",
+        "image": "image/avif,image/webp,image/apng,image/*,*/*;q=0.5",
+        "json": "application/json,text/plain,*/*",
+        "html": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "generic": "*/*",
+    }
+
+    _RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+    _MAX_INTEL_URLS = 6000
 
     def __init__(
         self,
@@ -10391,35 +11752,35 @@ class HTTPSSubmanager:
         allow_redirects: bool = True,
 
         # ------------------ Freeze prevention ------------------
-        max_redirects: int = 5,                # hard cap
-        total_timeout_s: float = 15.0,         # DNS+connect+first byte+body, etc.
+        max_redirects: int = 5,
+        total_timeout_s: float = 15.0,
         connect_timeout_s: float = 5.0,
-        sock_read_timeout_s: float = 7.0,      # overall socket-read budget
-        chunk_timeout_s: float = 5.0,          # “silence” timeout between chunks
+        sock_read_timeout_s: float = 7.0,
+        chunk_timeout_s: float = 5.0,
         chunk_size: int = 64 * 1024,
 
         # MIME early exit
         heavy_mime_hints: Tuple[str, ...] = ("video/", "audio/", "application/octet-stream"),
-        heavy_snippet_cap: int = 1_000_000,    # if max_bytes > this and MIME is heavy => bail
+        heavy_snippet_cap: int = 1_000_000,
 
         # ------------------ Secure Gateway ------------------
         enable_magic_byte_verification: bool = True,
         magic_pe_kill_mime_allow: Tuple[str, ...] = ("application/x-msdownload", "application/octet-stream"),
         magic_pe_kill_ext_block: Tuple[str, ...] = (".js", ".mjs", ".css", ".json", ".xml", ".txt", ".html", ".htm"),
         enable_entropy_filter: bool = True,
-        entropy_sample_bytes: int = 64_000,    # only sample first N bytes of text
-        entropy_threshold: float = 7.25,       # near 8 => very “random”
-        min_printable_ratio: float = 0.75,     # text should mostly be printable
+        entropy_sample_bytes: int = 64_000,
+        entropy_threshold: float = 7.25,
+        min_printable_ratio: float = 0.75,
         enable_decompression_bomb_guard: bool = True,
-        decompress_ratio_limit: float = 120.0, # uncompressed_bytes / compressed_bytes
-        decompress_hard_cap_bytes: int = 12_000_000,  # absolute decoded cap during decompress
+        decompress_ratio_limit: float = 120.0,
+        decompress_hard_cap_bytes: int = 12_000_000,
 
         # ------------------ Domain reputation (optional) ------------------
         enable_domain_reputation_filter: bool = False,
         domain_denylist: Optional[Tuple[str, ...]] = None,
         parked_domain_hints: Tuple[str, ...] = (
             "sedoparking", "parkingcrew", "bodis", "domainparking", "namebright",
-            "dan.com", "hugedomains", "afternic", "parking", "buythisdomain"
+            "dan.com", "hugedomains", "afternic", "parking", "buythisdomain",
         ),
     ):
         self.ua = user_agent
@@ -10427,68 +11788,66 @@ class HTTPSSubmanager:
         self.retries = int(retries)
         self.backoff_base = float(backoff_base)
         self.backoff_cap = float(backoff_cap)
-
         self.max_conn_per_host = int(max_conn_per_host)
         self.max_total_conn = int(max_total_conn)
-
         self.proxy = proxy
         self.proxy_pool = proxy_pool or []
-
         self.verify = bool(verify)
         self.ca_bundle = ca_bundle
-
         self.max_bytes = int(max_bytes)
         self.max_html_chars = int(max_html_chars)
         self.respect_retry_after = bool(respect_retry_after)
+        self.enable_cookies = bool(enable_cookies)
         self.allow_redirects = bool(allow_redirects)
-
-        # freeze prevention
         self.max_redirects = int(max_redirects)
         self.total_timeout_s = float(total_timeout_s)
         self.connect_timeout_s = float(connect_timeout_s)
         self.sock_read_timeout_s = float(sock_read_timeout_s)
         self.chunk_timeout_s = float(chunk_timeout_s)
         self.chunk_size = int(chunk_size)
-
         self.heavy_mime_hints = tuple(str(x).lower() for x in heavy_mime_hints)
         self.heavy_snippet_cap = int(heavy_snippet_cap)
-
-        # secure gateway
         self.enable_magic_byte_verification = bool(enable_magic_byte_verification)
         self.magic_pe_kill_mime_allow = tuple(str(x).lower() for x in magic_pe_kill_mime_allow)
         self.magic_pe_kill_ext_block = tuple(str(x).lower() for x in magic_pe_kill_ext_block)
-
         self.enable_entropy_filter = bool(enable_entropy_filter)
         self.entropy_sample_bytes = int(entropy_sample_bytes)
         self.entropy_threshold = float(entropy_threshold)
         self.min_printable_ratio = float(min_printable_ratio)
-
         self.enable_decompression_bomb_guard = bool(enable_decompression_bomb_guard)
         self.decompress_ratio_limit = float(decompress_ratio_limit)
         self.decompress_hard_cap_bytes = int(decompress_hard_cap_bytes)
-
-        # domain reputation
         self.enable_domain_reputation_filter = bool(enable_domain_reputation_filter)
-        self.domain_denylist = tuple(d.lower() for d in (domain_denylist or ()))
+        self.domain_denylist = tuple((domain_denylist or ()))
         self.parked_domain_hints = tuple(x.lower() for x in parked_domain_hints)
-
-        self.enable_cookies = bool(enable_cookies)
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
-
         self._host_sem: Dict[str, asyncio.Semaphore] = {}
         self._host_cooldown_until: Dict[str, float] = {}
         self._host_last_ok_url: Dict[str, str] = {}
         self._cooldown_lock = asyncio.Lock()
 
-    # ------------------------------------------------------------- #
-    # Context manager
-    # ------------------------------------------------------------- #
+        # intelligence / self-guidance
+        self._intel_by_url: Dict[str, _LinkIntel] = {}
+        self._children_by_parent: Dict[str, Set[str]] = {}
+        self._seed_to_candidates: Dict[str, Set[str]] = {}
+        self._host_accept_bias: Dict[str, str] = {}
+        self._host_referers: Dict[str, Dict[str, float]] = {}
+        self._intel_lock = asyncio.Lock()
+
+        # runtime helpers for long-lived sniffers
+        self._past_link_guard = _PastLinkGuard()
+        self._response_memo = _ResponseMemoStore()
+        self._relation_budget = _RelationBudget()
+
+        # identical in-flight request coalescing
+        self._inflight: Dict[str, asyncio.Task] = {}
+        self._inflight_lock = asyncio.Lock()
+
     async def __aenter__(self):
         self._ssl_context = self._build_ssl_context()
-
         self._connector = aiohttp.TCPConnector(
             ssl=self._ssl_context,
             limit=(self.max_total_conn if self.max_total_conn > 0 else 0),
@@ -10498,16 +11857,11 @@ class HTTPSSubmanager:
             keepalive_timeout=30,
             happy_eyeballs_delay=0.25,
         )
-
         jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
-        base_headers = self._base_browser_headers()
-
-        # IMPORTANT:
-        # auto_decompress=False lets us enforce decompression ratio/caps ourselves.
         self._session = aiohttp.ClientSession(
             connector=self._connector,
             cookie_jar=jar,
-            headers=base_headers,
+            headers=self._base_browser_headers(),
             auto_decompress=False,
             trust_env=True,
         )
@@ -10522,47 +11876,106 @@ class HTTPSSubmanager:
         self._host_sem.clear()
         self._host_cooldown_until.clear()
         self._host_last_ok_url.clear()
+        self._host_accept_bias.clear()
+        self._host_referers.clear()
+        self._past_link_guard.clear()
+        self._response_memo.clear()
+        async with self._inflight_lock:
+            self._inflight.clear()
+
+    # ------------------------------------------------------------------
+    # Public additions for sniffers / trackers (optional, no caller changes required)
+    # ------------------------------------------------------------------
+
+    async def register_sniffer_candidates(
+        self,
+        page_url: str,
+        items: Sequence[Dict[str, Any]],
+        *,
+        source: str = "sniffer",
+    ) -> None:
+        seed = self._canonicalize_url(page_url)
+        if not seed or not items:
+            return
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = self._canonicalize_url(str(item.get("url") or ""))
+            if not url:
+                continue
+            kind = self._classify_url_kind(url, str(item.get("content_type") or ""))
+            score = 2.0 + self._score_url_similarity(seed, url)
+            if kind in ("video", "audio", "image", "manifest", "json"):
+                score += 1.0
+            await self._remember_candidate(
+                url=url,
+                source=source,
+                parent=seed,
+                score=score,
+                kind=kind,
+                content_type=str(item.get("content_type") or ""),
+                evidence=(str(item.get("tag") or source), str(item.get("kind") or kind)),
+            )
+
+    async def get_guidance(self, seed_url: str, *, limit: int = 24) -> Dict[str, Any]:
+        bundle = await self._build_guidance_bundle(seed_url, limit=limit)
+        return {
+            "seed_url": bundle.seed_url,
+            "canonical_seed": bundle.canonical_seed,
+            "referer": bundle.referer,
+            "accept": bundle.accept,
+            "candidates": bundle.candidates,
+        }
+
+    async def head(self, url: str, *, allow_redirects: Optional[bool] = None, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], Dict[str, str]]:
+        r = await self._request("HEAD", url, want_body=False, allow_redirects=allow_redirects, headers=headers)
+        return r.status, r.headers
+
+    async def get_bytes(
+        self,
+        url: str,
+        *,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+    ) -> bytes:
+        r = await self._request("GET", url, want_body=True, allow_redirects=allow_redirects, headers=headers, max_bytes=max_bytes)
+        return bytes(r.body or b"") if r.ok else b""
+
+    async def get_text(
+        self,
+        url: str,
+        *,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+    ) -> str:
+        raw = await self.get_bytes(url, allow_redirects=allow_redirects, headers=headers, max_bytes=max_bytes)
+        if not raw:
+            return ""
+        return self._decode_body(raw)
 
     async def get_prefix(
-            self,
-            url: str,
-            *,
-            size: int = 8192,
-            timeout_ms: Optional[int] = None,
-            headers: Optional[Dict[str, str]] = None,
-            allow_redirects: bool = True,
+        self,
+        url: str,
+        *,
+        size: int = 8192,
+        timeout_ms: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
     ) -> bytes:
-        """
-        Fetches only the first `size` bytes of a resource (best-effort),
-        using a Range request and the Secure Gateway protections.
-
-        Returns: bytes (possibly shorter than requested).
-        """
         url = str(url or "")
         size = max(0, int(size))
         if not url or size <= 0:
             return b""
-
-        # Range header for prefix fetch
         h = dict(headers or {})
-        if not any(k.lower() == "range" for k in h.keys()):
+        if not any(k.lower() == "range" for k in h):
             h["Range"] = f"bytes=0-{max(0, size - 1)}"
 
-        # NOTE: We don't plumb timeout_ms into aiohttp per-request here because your engine
-        # already enforces strict total/connect/sock_read/chunk timeouts globally.
-        # But we *can* guard the whole operation with asyncio.wait_for if you want.
         async def _do() -> bytes:
-            r = await self._request(
-                "GET",
-                url,
-                want_body=True,
-                allow_redirects=allow_redirects,
-                headers=h,
-                max_bytes=size,
-            )
+            r = await self._request("GET", url, want_body=True, allow_redirects=allow_redirects, headers=h, max_bytes=size)
             if not r.ok or not r.body:
                 return b""
-            # r.body is already bounded by max_bytes and passed through your secure reader.
             return bytes(r.body[:size])
 
         if timeout_ms and timeout_ms > 0:
@@ -10570,29 +11983,21 @@ class HTTPSSubmanager:
                 return await asyncio.wait_for(_do(), timeout=float(timeout_ms) / 1000.0)
             except Exception:
                 return b""
-
         try:
             return await _do()
         except Exception:
             return b""
 
     async def probe(
-            self,
-            url: str,
-            *,
-            range_bytes: int = 8192,
-            timeout_ms: Optional[int] = None,
-            headers: Optional[Dict[str, str]] = None,
-            allow_redirects: bool = True,
-            hash_algo: str = "sha256",
+        self,
+        url: str,
+        *,
+        range_bytes: int = 8192,
+        timeout_ms: Optional[int] = None,
+        headers: Optional[Dict[str, str]] = None,
+        allow_redirects: bool = True,
+        hash_algo: str = "sha256",
     ) -> Dict[str, Any]:
-        """
-        Convenience probe for sniffers:
-          - HEAD for status + headers
-          - bounded GET prefix for hashing / verification
-
-        Returns a dict shaped similarly to what NetworkSniffer._probe_url() builds.
-        """
         url = str(url or "")
         out: Dict[str, Any] = {
             "url": url,
@@ -10612,11 +12017,8 @@ class HTTPSSubmanager:
         try:
             status, hdrs = await self.head(url)
             out["status"] = status
-            # Your head() returns the response headers dict from _request
-            ct = (hdrs.get("Content-Type") or hdrs.get("content-type") or None)
-            cl = (hdrs.get("Content-Length") or hdrs.get("content-length") or None)
-            out["content_type"] = ct
-            out["content_length"] = cl
+            out["content_type"] = hdrs.get("Content-Type") or hdrs.get("content-type") or None
+            out["content_length"] = hdrs.get("Content-Length") or hdrs.get("content-length") or None
         except Exception as e:
             out["error"] = f"head_failed:{e}"
 
@@ -10629,364 +12031,24 @@ class HTTPSSubmanager:
                 allow_redirects=allow_redirects,
             )
             if prefix:
-                if (hash_algo or "").lower() == "sha1":
+                algo = (hash_algo or "sha256").lower()
+                if algo == "sha1":
                     out["hash_prefix"] = hashlib.sha1(prefix).hexdigest()
-                elif (hash_algo or "").lower() == "md5":
+                elif algo == "md5":
                     out["hash_prefix"] = hashlib.md5(prefix).hexdigest()
                 else:
                     out["hash_prefix"] = hashlib.sha256(prefix).hexdigest()
         except Exception as e:
-            # don’t clobber prior error unless empty
             if not out["error"]:
                 out["error"] = f"prefix_failed:{e}"
 
-        try:
-            if out["status"] is not None and 200 <= int(out["status"]) < 300:
-                out["ok"] = True
-        except Exception:
-            pass
-
+        out["ok"] = bool(out.get("status") and 200 <= int(out["status"]) < 300)
         return out
-    # ------------------------------------------------------------- #
-    # SSL / TLS helpers
-    # ------------------------------------------------------------- #
-    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
-        if self.verify and not self.ca_bundle:
-            return None
-        if self.verify:
-            return ssl.create_default_context(cafile=self.ca_bundle if self.ca_bundle else None)
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
 
-    # ------------------------------------------------------------- #
-    # Host helpers
-    # ------------------------------------------------------------- #
-    def _host(self, url: str) -> str:
-        try:
-            return urlparse(url).netloc.lower()
-        except Exception:
-            return ""
+    # ------------------------------------------------------------------
+    # Core request path
+    # ------------------------------------------------------------------
 
-    def _path(self, url: str) -> str:
-        try:
-            return urlparse(url).path or ""
-        except Exception:
-            return ""
-
-    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
-        if not host:
-            host = "_"
-        return self._host_sem.setdefault(host, asyncio.Semaphore(self.max_conn_per_host))
-
-    async def _respect_host_cooldown(self, host: str):
-        if not host:
-            return
-        until = self._host_cooldown_until.get(host, 0.0)
-        now = time.time()
-        if until > now:
-            await asyncio.sleep(min(5.0, until - now))
-
-    async def _set_host_cooldown(self, host: str, seconds: float):
-        if not host or seconds <= 0:
-            return
-        async with self._cooldown_lock:
-            now = time.time()
-            cur = self._host_cooldown_until.get(host, 0.0)
-            self._host_cooldown_until[host] = max(cur, now + seconds)
-
-    # ------------------------------------------------------------- #
-    # Proxy + headers
-    # ------------------------------------------------------------- #
-    def _choose_proxy(self) -> Optional[str]:
-        if self.proxy:
-            return self.proxy
-        if self.proxy_pool:
-            return random.choice(self.proxy_pool)
-        return None
-
-    def _base_browser_headers(self) -> Dict[str, str]:
-        return {
-            "User-Agent": self.ua,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "DNT": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "none",
-            "Sec-Fetch-User": "?1",
-        }
-
-    def _per_request_headers(self, url: str) -> Dict[str, str]:
-        host = self._host(url)
-        last_ok = self._host_last_ok_url.get(host, "")
-        h: Dict[str, str] = {}
-        if last_ok:
-            h["Referer"] = last_ok
-            h["Sec-Fetch-Site"] = "same-origin"
-        if random.random() < 0.10:
-            h["Accept-Language"] = "en-US,en;q=0.8"
-        return h
-
-    # ------------------------------------------------------------- #
-    # Retry policy
-    # ------------------------------------------------------------- #
-    def _is_retryable_status(self, status: int) -> bool:
-        return status in (408, 425, 429, 500, 502, 503, 504)
-
-    def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
-        if server_hint is not None and server_hint > 0:
-            return min(self.backoff_cap, float(server_hint))
-        base = self.backoff_base * (2 ** attempt)
-        jitter = random.uniform(0.0, base * 0.25)
-        return min(self.backoff_cap, base + jitter)
-
-    def _parse_retry_after(self, hdrs: Dict[str, str]) -> Optional[float]:
-        ra = (hdrs.get("Retry-After") or hdrs.get("retry-after") or "").strip()
-        if not ra:
-            return None
-        try:
-            return float(ra)
-        except Exception:
-            return None
-
-    # ------------------------------------------------------------- #
-    # Domain reputation filter (optional)
-    # ------------------------------------------------------------- #
-    def _is_toxic_domain(self, host: str) -> bool:
-        if not host:
-            return False
-        h = host.lower()
-
-        # explicit denylist (exact or suffix match)
-        for d in self.domain_denylist:
-            if h == d or h.endswith("." + d):
-                return True
-
-        # cheap “parked” / “toxic” heuristics
-        for hint in self.parked_domain_hints:
-            if hint in h:
-                return True
-
-        # extremely short / weird netlocs can be junk in bulk crawls
-        if len(h) <= 3 and "." not in h:
-            return True
-
-        return False
-
-    # ------------------------------------------------------------- #
-    # Secure Gateway helpers
-    # ------------------------------------------------------------- #
-    def _content_type(self, hdrs: Dict[str, str]) -> str:
-        return (hdrs.get("Content-Type") or hdrs.get("content-type") or "").lower()
-
-    def _content_encoding(self, hdrs: Dict[str, str]) -> str:
-        return (hdrs.get("Content-Encoding") or hdrs.get("content-encoding") or "").lower()
-
-    def _looks_textlike(self, ctype: str) -> bool:
-        if not ctype:
-            return False
-        return any(h in ctype for h in self._TEXTLIKE_MIME_HINTS)
-
-    def _should_early_exit_heavy(self, ctype: str, max_bytes: int) -> bool:
-        if not ctype:
-            return False
-        if any(h in ctype for h in self.heavy_mime_hints) and max_bytes > self.heavy_snippet_cap:
-            return True
-        return False
-
-    def _starts_with_any(self, data: bytes, sigs: Tuple[bytes, ...]) -> bool:
-        for s in sigs:
-            if data.startswith(s):
-                return True
-        return False
-
-    def _magic_byte_violation(self, url: str, ctype: str, first: bytes) -> bool:
-        """
-        If a response is effectively a PE (MZ) but it "looks like" text/script,
-        kill it early. This is deliberately conservative to avoid false positives.
-        """
-        if not first or len(first) < 2:
-            return False
-        if not self._starts_with_any(first, self._MAGIC_EXE):
-            return False
-
-        path = self._path(url).lower()
-
-        # If file extension suggests text/script or page-like content -> suspicious
-        if any(path.endswith(ext) for ext in self.magic_pe_kill_ext_block):
-            return True
-
-        # If content-type says textlike -> suspicious
-        if self._looks_textlike(ctype):
-            return True
-
-        # If content-type is not in the small “allowed” list -> suspicious
-        if ctype and not any(a in ctype for a in self.magic_pe_kill_mime_allow):
-            return True
-
-        return False
-
-    def _shannon_entropy(self, data: bytes) -> float:
-        """
-        Shannon entropy in bits/byte on the given byte sample.
-        """
-        if not data:
-            return 0.0
-        # frequency
-        counts = [0] * 256
-        for b in data:
-            counts[b] += 1
-        n = float(len(data))
-        ent = 0.0
-        for c in counts:
-            if c:
-                p = c / n
-                ent -= p * math.log2(p)
-        return ent
-
-    def _printable_ratio(self, data: bytes) -> float:
-        if not data:
-            return 1.0
-        printable = 0
-        for b in data:
-            # allow common whitespace + ASCII printable
-            if b in (9, 10, 13) or 32 <= b <= 126:
-                printable += 1
-        return printable / max(1, len(data))
-
-    # ------------------------------------------------------------- #
-    # Read + Decompress (bounded, timeouted, guarded)
-    # ------------------------------------------------------------- #
-    async def _read_bounded_secure(self, resp: aiohttp.ClientResponse, url: str, max_bytes: int) -> Tuple[bytes, str]:
-        """
-        Returns (body_bytes, error_string). error_string non-empty => treat as blocked/error.
-        Notes:
-          - Reads compressed bytes from the socket (auto_decompress=False).
-          - If encoding gzip/deflate -> incremental decompress with ratio + cap checks.
-          - Enforces per-chunk “silence” timeout to prevent slowloris/zombies.
-          - Does magic-byte check on the *decompressed* first bytes (best signal).
-          - Does entropy heuristic on text-like content (first N bytes).
-        """
-        hdrs = dict(resp.headers) if resp.headers else {}
-        ctype = self._content_type(hdrs)
-        enc = self._content_encoding(hdrs)
-
-        # MIME-type early exit for heavy blobs
-        if self._should_early_exit_heavy(ctype, max_bytes):
-            return b"", "early_exit_heavy_mime"
-
-        # incremental decompressor (gzip/deflate only; br is left as raw)
-        decompressor = None
-        if self.enable_decompression_bomb_guard:
-            if "gzip" in enc:
-                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)  # gzip wrapper
-            elif "deflate" in enc:
-                decompressor = zlib.decompressobj()
-
-        compressed_read = 0
-        out = bytearray()
-        first_probe_done = False
-        entropy_probe = bytearray()
-
-        it = resp.content.iter_chunked(self.chunk_size).__aiter__()
-
-        while True:
-            try:
-                chunk = await asyncio.wait_for(it.__anext__(), timeout=self.chunk_timeout_s)
-            except StopAsyncIteration:
-                break
-            except asyncio.TimeoutError:
-                # chunk silence timeout: return what we have (do NOT freeze caller)
-                break
-            except Exception:
-                break
-
-            if not chunk:
-                break
-
-            compressed_read += len(chunk)
-
-            # Decompress if we can; otherwise treat as plain bytes stream.
-            produced = chunk
-            if decompressor is not None:
-                try:
-                    produced = decompressor.decompress(chunk, self.decompress_hard_cap_bytes)
-                except Exception:
-                    return bytes(out), "decompress_error"
-
-                # ratio guard (only meaningful if we have some compressed bytes)
-                if compressed_read > 0:
-                    ratio = (len(out) + len(produced)) / max(1, compressed_read)
-                    if ratio > self.decompress_ratio_limit:
-                        return bytes(out), "decompression_ratio_blocked"
-
-                if (len(out) + len(produced)) > self.decompress_hard_cap_bytes:
-                    return bytes(out), "decompression_hard_cap_blocked"
-
-            # magic-byte verification on the first produced bytes
-            if self.enable_magic_byte_verification and not first_probe_done:
-                probe = produced[:16]
-                first_probe_done = True
-                if self._magic_byte_violation(url, ctype, probe):
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
-                    return b"", "magic_byte_blocked"
-
-            out.extend(produced)
-
-            # entropy probe (only for text-like)
-            if self.enable_entropy_filter and self._looks_textlike(ctype) and len(entropy_probe) < self.entropy_sample_bytes:
-                take = produced[: max(0, self.entropy_sample_bytes - len(entropy_probe))]
-                entropy_probe.extend(take)
-
-            # bounded output read (caller budget)
-            if len(out) >= max_bytes:
-                try:
-                    resp.close()  # early close to avoid lingering
-                except Exception:
-                    pass
-                out = out[:max_bytes]
-                break
-
-        # flush decompressor
-        if decompressor is not None:
-            try:
-                tail = decompressor.flush()
-                if tail:
-                    # enforce guards on flush too
-                    if compressed_read > 0:
-                        ratio = (len(out) + len(tail)) / max(1, compressed_read)
-                        if ratio > self.decompress_ratio_limit:
-                            return bytes(out), "decompression_ratio_blocked"
-                    if (len(out) + len(tail)) > self.decompress_hard_cap_bytes:
-                        return bytes(out), "decompression_hard_cap_blocked"
-
-                    out.extend(tail)
-                    if len(out) > max_bytes:
-                        out = out[:max_bytes]
-            except Exception:
-                # ignore flush failures
-                pass
-
-        # entropy check (cheap heuristic; block only if strongly suspicious)
-        if self.enable_entropy_filter and self._looks_textlike(ctype) and entropy_probe:
-            ent = self._shannon_entropy(bytes(entropy_probe))
-            pr = self._printable_ratio(bytes(entropy_probe))
-            if ent >= self.entropy_threshold and pr < self.min_printable_ratio:
-                return bytes(out), f"entropy_blocked(ent={ent:.2f},printable={pr:.2f})"
-
-        return bytes(out), ""
-
-    # ------------------------------------------------------------- #
-    # Core request
-    # ------------------------------------------------------------- #
     async def _request(
         self,
         method: str,
@@ -10997,30 +12059,82 @@ class HTTPSSubmanager:
         headers: Optional[Dict[str, str]] = None,
         max_bytes: Optional[int] = None,
     ) -> _HTTPResult:
-        if not self._session:
-            raise RuntimeError("HTTPSSubmanager must be used in an async context (async with HTTPSSubmanager(...) as http).")
-
         method = (method or "GET").upper().strip()
         allow_redirects = self.allow_redirects if allow_redirects is None else bool(allow_redirects)
         max_bytes = self.max_bytes if max_bytes is None else int(max_bytes)
 
-        host = self._host(url)
+        key = self._request_coalesce_key(
+            method=method,
+            url=url,
+            want_body=want_body,
+            allow_redirects=allow_redirects,
+            headers=headers,
+            max_bytes=max_bytes,
+        )
 
-        # optional reputation filter
+        # Coalesce only body-bearing GET requests or HEADs with the same request shape.
+        async with self._inflight_lock:
+            existing = self._inflight.get(key)
+            if existing is not None:
+                try:
+                    return await existing
+                except Exception as e:
+                    return _HTTPResult(False, None, {}, str(url or ""), b"", error=str(e) or "request_failed")
+
+            task = asyncio.create_task(
+                self._request_uncached(
+                    method,
+                    url,
+                    want_body=want_body,
+                    allow_redirects=allow_redirects,
+                    headers=headers,
+                    max_bytes=max_bytes,
+                )
+            )
+            self._inflight[key] = task
+
+        try:
+            return await task
+        finally:
+            async with self._inflight_lock:
+                if self._inflight.get(key) is task:
+                    self._inflight.pop(key, None)
+
+    async def _request_uncached(
+        self,
+        method: str,
+        url: str,
+        *,
+        want_body: bool,
+        allow_redirects: bool,
+        headers: Optional[Dict[str, str]],
+        max_bytes: int,
+    ) -> _HTTPResult:
+        if not self._session:
+            raise RuntimeError("HTTPSSubmanager must be used in an async context (async with HTTPSSubmanager(...) as http).")
+
+        host = self._host(url)
+        canonical_req = self._canonicalize_url(url)
+
         if self.enable_domain_reputation_filter and self._is_toxic_domain(host):
-            return _HTTPResult(False, None, {}, url, b"", error="domain_reputation_blocked")
+            return _HTTPResult(False, None, {}, str(url or ""), b"", error="domain_reputation_blocked")
+
+        allowed, reason = self._past_link_guard.allow_request(canonical_req or str(url or ""), method=method, want_body=want_body)
+        if not allowed:
+            return _HTTPResult(False, None, {}, str(url or ""), b"", error=reason)
 
         sem = self._get_host_semaphore(host)
+        last_exc = ""
 
         for attempt in range(self.retries + 1):
             await self._respect_host_cooldown(host)
-
             proxy = self._choose_proxy()
             req_headers: Dict[str, str] = {}
             req_headers.update(self._per_request_headers(url))
             if headers:
                 req_headers.update(headers)
 
+            started = time.perf_counter()
             try:
                 async with sem:
                     timeout = ClientTimeout(
@@ -11028,7 +12142,6 @@ class HTTPSSubmanager:
                         connect=self.connect_timeout_s,
                         sock_read=self.sock_read_timeout_s,
                     )
-
                     async with self._session.request(
                         method,
                         url,
@@ -11038,12 +12151,11 @@ class HTTPSSubmanager:
                         timeout=timeout,
                         headers=req_headers,
                     ) as resp:
-
                         final_url = str(resp.url)
+                        final_canonical = self._canonicalize_url(final_url) or canonical_req or str(url or "")
                         status = int(resp.status)
                         hdrs = dict(resp.headers) if resp.headers else {}
 
-                        # cooldown on 429/503 with Retry-After
                         if self.respect_retry_after and status in (429, 503):
                             ra = self._parse_retry_after(hdrs)
                             if ra:
@@ -11051,17 +12163,36 @@ class HTTPSSubmanager:
 
                         body = b""
                         err = ""
-
                         if want_body:
                             body, err = await self._read_bounded_secure(resp, url=final_url, max_bytes=max_bytes)
                             if err:
+                                self._past_link_guard.note_failure(final_canonical, error=err, status=status, want_body=True)
+                                await self._learn_from_response(
+                                    requested_url=str(url or ""),
+                                    final_url=final_url,
+                                    status=status,
+                                    headers=hdrs,
+                                    body=b"",
+                                    request_headers=req_headers,
+                                )
                                 return _HTTPResult(False, status, hdrs, final_url, b"", error=err)
 
-                        # last-ok for referer mimicry
+                        elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
                         if 200 <= status < 300:
                             self._host_last_ok_url[host] = final_url
+                            self._past_link_guard.note_success(final_canonical, status=status, elapsed_ms=elapsed_ms)
+                        else:
+                            self._past_link_guard.note_failure(final_canonical, error=f"http_status:{status}", status=status, want_body=want_body)
 
-                        # retryable statuses
+                        await self._learn_from_response(
+                            requested_url=str(url or ""),
+                            final_url=final_url,
+                            status=status,
+                            headers=hdrs,
+                            body=body,
+                            request_headers=req_headers,
+                        )
+
                         if self._is_retryable_status(status) and attempt < self.retries:
                             server_hint = self._parse_retry_after(hdrs) if self.respect_retry_after else None
                             await asyncio.sleep(self._retry_delay(attempt, server_hint=server_hint))
@@ -11075,49 +12206,819 @@ class HTTPSSubmanager:
                             body=body,
                             error="",
                         )
-
-            except aiohttp.TooManyRedirects:
-                return _HTTPResult(False, None, {}, url, b"", error="too_many_redirects")
-            except (
-                aiohttp.ClientConnectorError,
-                aiohttp.ClientOSError,
-                aiohttp.ServerDisconnectedError,
-                aiohttp.ClientPayloadError,
-                asyncio.TimeoutError,
-                ssl.SSLError,
-            ) as e:
-                if attempt >= self.retries:
-                    return _HTTPResult(False, None, {}, url, b"", error=str(e))
-                await asyncio.sleep(self._retry_delay(attempt))
-                continue
+            except asyncio.TimeoutError:
+                last_exc = "timeout"
+                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
+            except aiohttp.ClientError as e:
+                last_exc = f"client_error:{e}"
+                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
             except Exception as e:
-                return _HTTPResult(False, None, {}, url, b"", error=str(e))
+                last_exc = str(e)
+                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
 
-        return _HTTPResult(False, None, {}, url, b"", error="exhausted_retries")
+            if attempt < self.retries:
+                await asyncio.sleep(self._retry_delay(attempt))
 
-    # ------------------------------------------------------------- #
-    # Public helpers
-    # ------------------------------------------------------------- #
-    async def get_text(self, url: str) -> str:
-        r = await self._request("GET", url, want_body=True)
-        if not r.ok or not r.body:
-            return ""
+        return _HTTPResult(False, None, {}, str(url or ""), b"", error=last_exc or "request_failed")
+
+    # ------------------------------------------------------------------
+    # Link intelligence / self-guidance
+    # ------------------------------------------------------------------
+
+    async def _learn_from_response(
+        self,
+        *,
+        requested_url: str,
+        final_url: str,
+        status: Optional[int],
+        headers: Dict[str, str],
+        body: bytes,
+        request_headers: Dict[str, str],
+    ) -> None:
+        req_c = self._canonicalize_url(requested_url)
+        fin_c = self._canonicalize_url(final_url)
+        if not req_c and not fin_c:
+            return
+
+        seed = fin_c or req_c
+        ctype = self._header_get(headers, "content-type")
+        kind = self._classify_url_kind(seed, ctype)
+
+        base_score = 1.0
+        if status and 200 <= status < 300:
+            base_score += 1.5
+        if req_c and fin_c and req_c != fin_c:
+            base_score += 0.5
+
+        await self._remember_candidate(
+            url=seed,
+            source="response_final",
+            parent=req_c,
+            score=base_score,
+            kind=kind,
+            status=status,
+            content_type=ctype,
+            evidence=(f"status:{status}",),
+        )
+
+        location = self._header_get(headers, "location")
+        if location:
+            loc_abs = self._canonicalize_url(urljoin(final_url or requested_url, location))
+            if loc_abs:
+                await self._remember_candidate(
+                    url=loc_abs,
+                    source="response_location",
+                    parent=seed,
+                    score=1.5 + self._score_url_similarity(seed, loc_abs),
+                    kind=self._classify_url_kind(loc_abs, ""),
+                    status=status,
+                    evidence=("header:location",),
+                )
+
+        for link_url in self._extract_header_links(headers, base_url=final_url or requested_url):
+            await self._remember_candidate(
+                url=link_url,
+                source="response_link_header",
+                parent=seed,
+                score=1.4 + self._score_url_similarity(seed, link_url),
+                kind=self._classify_url_kind(link_url, ""),
+                status=status,
+                evidence=("header:link",),
+            )
+
+        accept_kind = self._classify_url_kind(seed, ctype)
+        if accept_kind != "unknown":
+            self._host_accept_bias[self._host(seed)] = accept_kind
+        if request_headers.get("Referer"):
+            self._note_referer(seed, request_headers["Referer"], weight=1.0)
+
+        if not body:
+            return
+        if not self._looks_textlike(ctype) and kind not in {"html", "json"}:
+            return
+
+        fingerprint = self._response_memo.make_fingerprint(
+            final_url=seed,
+            status=status,
+            content_type=ctype,
+            body=body,
+        )
+        memo = self._response_memo.get(fingerprint)
+        if memo is not None:
+            self._past_link_guard.note_parse(seed, mode="memo", extracted_urls=memo.extracted_urls)
+            await self._remember_children_from_cache(seed, memo.extracted_urls)
+            return
+
+        mode = self._past_link_guard.select_parse_mode(
+            seed,
+            fingerprint=fingerprint,
+            body_size=len(body),
+            content_type=ctype,
+        )
+        if mode == "skip":
+            self._response_memo.remember(
+                fingerprint=fingerprint,
+                final_url=seed,
+                status=status,
+                content_type=ctype,
+                extracted_urls=(),
+                mode=mode,
+            )
+            self._past_link_guard.note_parse(seed, mode="skip", extracted_urls=())
+            return
+
+        extracted_urls = self._mine_body_urls(
+            body=body,
+            content_type=ctype,
+            base_url=final_url or requested_url,
+            kind=kind,
+            mode=mode,
+        )
+        self._response_memo.remember(
+            fingerprint=fingerprint,
+            final_url=seed,
+            status=status,
+            content_type=ctype,
+            extracted_urls=extracted_urls,
+            mode=mode,
+        )
+        self._past_link_guard.note_parse(seed, mode=mode, extracted_urls=extracted_urls)
+        await self._remember_children_from_cache(seed, extracted_urls)
+
+    async def _remember_children_from_cache(self, seed: str, urls: Iterable[str]) -> None:
+        seed_c = self._canonicalize_url(seed)
+        if not seed_c:
+            return
+        for child in list(urls)[:300]:
+            c_child = self._canonicalize_url(child)
+            if not c_child or c_child == seed_c:
+                continue
+            score = 0.75 + self._score_url_similarity(seed_c, c_child)
+            child_kind = self._classify_url_kind(c_child, "")
+            if child_kind in {"video", "audio", "image", "manifest", "json"}:
+                score += 0.6
+            await self._remember_candidate(
+                url=c_child,
+                source="body_extract",
+                parent=seed_c,
+                score=score,
+                kind=child_kind,
+                status=None,
+                evidence=("cached/memo extract",),
+            )
+
+    def _mine_body_urls(
+        self,
+        *,
+        body: bytes,
+        content_type: str,
+        base_url: str,
+        kind: str,
+        mode: str,
+    ) -> List[str]:
+        text = self._decode_body(body)
+        if not text:
+            return []
+
+        text_cap = self.max_html_chars
+        if mode == "light":
+            text_cap = min(text_cap, 180_000)
+        text = text[:text_cap]
+
+        urls: Set[str] = set(self._extract_urls_from_text(text))
+        lowered = (content_type or "").lower()
+        htmlish = ("html" in lowered) or (text[:256].lower().count("<html") > 0) or (text[:2048].lower().count("href=") > 0)
+        jsonish = (kind == "json") or self._looks_jsonish(text)
+
+        if htmlish:
+            if mode == "full":
+                urls.update(self._extract_asset_urls_from_html(text, base_url, max_assets=300))
+            else:
+                for m in self._HTML_ATTR_RE.finditer(text):
+                    raw = (m.group(1) or "").strip()
+                    if raw and not raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+                        full = self._canonicalize_url(urljoin(base_url, raw))
+                        if full:
+                            urls.add(full)
+                            if len(urls) >= 300:
+                                break
+        elif jsonish:
+            urls.update(self._extract_urls_from_jsonish(text, base_url, limit=300))
+
+        # Stable return order reduces churn in child-digest tracking.
+        return list(sorted(urls))[:300]
+
+    async def _build_guidance_bundle(self, seed_url: str, *, limit: int = 24) -> _GuidanceBundle:
+        seed = self._canonicalize_url(seed_url)
+        host = self._host(seed)
+        referer = self._pick_best_referer(seed)
+        accept_kind = self._host_accept_bias.get(host) or self._classify_url_kind(seed, "")
+        accept = self._MEDIA_ACCEPTS.get(accept_kind, self._MEDIA_ACCEPTS["generic"])
+
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
+        for cand_url in self._seed_to_candidates.get(seed, set()):
+            intel = self._intel_by_url.get(cand_url)
+            if not intel:
+                continue
+            sim = self._score_url_similarity(seed, cand_url)
+            total = float(intel.score) + sim + min(1.5, 0.2 * intel.hits)
+            if intel.kind in {"video", "audio", "manifest", "json", "image"}:
+                total += 0.6
+            candidates.append((
+                total,
+                {
+                    "url": intel.canonical_url,
+                    "score": round(total, 3),
+                    "kind": intel.kind,
+                    "source": intel.source,
+                    "hits": intel.hits,
+                    "content_type": intel.content_type or "",
+                    "status": intel.status,
+                    "parent": intel.parent,
+                    "evidence": list(intel.evidence[:8]),
+                },
+            ))
+
+        candidates.sort(key=lambda x: (x[0], x[1]["hits"]), reverse=True)
+        return _GuidanceBundle(
+            seed_url=seed_url,
+            canonical_seed=seed,
+            referer=referer,
+            accept=accept,
+            candidates=[row for _, row in candidates[: max(1, int(limit))]],
+        )
+
+    async def _remember_candidate(
+        self,
+        *,
+        url: str,
+        source: str,
+        parent: str = "",
+        score: float = 0.0,
+        kind: str = "unknown",
+        status: Optional[int] = None,
+        content_type: str = "",
+        evidence: Iterable[str] = (),
+    ) -> None:
+        cu = self._canonicalize_url(url)
+        if not cu:
+            return
+        parent_c = self._canonicalize_url(parent) if parent else ""
+        if parent_c and parent_c == cu:
+            parent_c = ""
+
+        async with self._intel_lock:
+            now = time.time()
+            host = self._host(cu)
+            path = urlparse(cu).path or "/"
+            tokens = tuple(self._url_tokens(cu))
+            ev = tuple(str(x) for x in evidence if str(x).strip())[:12]
+            existing = self._intel_by_url.get(cu)
+            if existing is None:
+                self._intel_by_url[cu] = _LinkIntel(
+                    url=url,
+                    canonical_url=cu,
+                    host=host,
+                    path=path,
+                    source=source,
+                    parent=parent_c,
+                    score=float(score),
+                    hits=1,
+                    first_seen=now,
+                    last_seen=now,
+                    content_type=content_type,
+                    status=status,
+                    kind=kind,
+                    tokens=tokens,
+                    evidence=ev,
+                )
+            else:
+                existing.last_seen = now
+                existing.hits += 1
+                existing.score = max(float(existing.score), float(score))
+                if content_type and not existing.content_type:
+                    existing.content_type = content_type
+                if status is not None:
+                    existing.status = status
+                if kind and existing.kind == "unknown":
+                    existing.kind = kind
+                if parent_c and not existing.parent:
+                    existing.parent = parent_c
+                if ev:
+                    merged = list(existing.evidence)
+                    for one in ev:
+                        if one not in merged:
+                            merged.append(one)
+                    existing.evidence = tuple(merged[:12])
+
+            if parent_c:
+                self._relation_budget.add_child(self._children_by_parent, parent_c, cu, intel=self._intel_by_url)
+                self._relation_budget.add_child(self._seed_to_candidates, parent_c, cu, intel=self._intel_by_url)
+                self._note_referer(cu, parent_c, weight=max(0.5, score))
+
+            self._prune_intel_if_needed()
+
+    def _prune_intel_if_needed(self) -> None:
+        if len(self._intel_by_url) <= self._MAX_INTEL_URLS:
+            return
+        drop_n = max(64, len(self._intel_by_url) - self._MAX_INTEL_URLS)
+        oldest = sorted(
+            self._intel_by_url.items(),
+            key=lambda kv: (kv[1].last_seen, kv[1].hits, kv[1].score),
+        )[:drop_n]
+        dead = {k for k, _ in oldest}
+        for k in dead:
+            self._intel_by_url.pop(k, None)
+        for mapping in (self._children_by_parent, self._seed_to_candidates):
+            for parent in list(mapping.keys()):
+                mapping[parent].difference_update(dead)
+                if not mapping[parent]:
+                    mapping.pop(parent, None)
+
+    def _note_referer(self, url: str, referer: str, *, weight: float) -> None:
+        u = self._canonicalize_url(url)
+        r = self._canonicalize_url(referer)
+        if not u or not r or u == r:
+            return
+        host = self._host(u)
+        self._relation_budget.add_referer(self._host_referers, host, r, max(0.1, weight))
+
+    def _pick_best_referer(self, url: str) -> Optional[str]:
+        cu = self._canonicalize_url(url)
+        if not cu:
+            return None
+        intel = self._intel_by_url.get(cu)
+        if intel and intel.parent:
+            return intel.parent
+        host = self._host(cu)
+        bucket = self._host_referers.get(host) or {}
+        if bucket:
+            return max(bucket.items(), key=lambda kv: kv[1])[0]
+        return self._host_last_ok_url.get(host)
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _request_coalesce_key(
+        self,
+        *,
+        method: str,
+        url: str,
+        want_body: bool,
+        allow_redirects: bool,
+        headers: Optional[Dict[str, str]],
+        max_bytes: int,
+    ) -> str:
+        canon = self._canonicalize_url(url) or str(url or "")
+        h = []
+        for k, v in sorted((headers or {}).items(), key=lambda kv: str(kv[0]).lower()):
+            kl = str(k).lower()
+            if kl in {"range", "accept", "referer"}:
+                h.append(f"{kl}={v}")
+        return "|".join([
+            method.upper().strip(),
+            "1" if want_body else "0",
+            "1" if allow_redirects else "0",
+            str(int(max_bytes)),
+            canon,
+            "&".join(h),
+        ])
+
+    def _build_ssl_context(self) -> ssl.SSLContext:
+        if self.verify:
+            ctx = ssl.create_default_context(cafile=self.ca_bundle or None)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            return ctx
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+
+    def _base_browser_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": self.ua,
+            "Accept": self._MEDIA_ACCEPTS["html"],
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+    def _per_request_headers(self, url: str) -> Dict[str, str]:
+        out: Dict[str, str] = {"User-Agent": self.ua}
+        kind = self._host_accept_bias.get(self._host(url)) or self._classify_url_kind(url, "")
+        out["Accept"] = self._MEDIA_ACCEPTS.get(kind, self._MEDIA_ACCEPTS["generic"])
+        referer = self._pick_best_referer(url)
+        if referer and referer != self._canonicalize_url(url):
+            out["Referer"] = referer
+        return out
+
+    def _host(self, url: str) -> str:
         try:
-            txt = r.body.decode("utf-8", errors="ignore")
+            return urlparse(str(url or "")).netloc.lower().split(":")[0]
         except Exception:
             return ""
-        if len(txt) > self.max_html_chars:
-            txt = txt[: self.max_html_chars]
-        return txt
 
-    async def get_bytes(self, url: str) -> bytes:
-        r = await self._request("GET", url, want_body=True)
-        if not r.ok:
-            return b""
-        return r.body or b""
+    def _choose_proxy(self) -> Optional[str]:
+        if self.proxy_pool:
+            try:
+                return random.choice(self.proxy_pool)
+            except Exception:
+                return self.proxy
+        return self.proxy
 
-    async def head(self, url: str) -> Tuple[Optional[int], Dict[str, str]]:
-        r = await self._request("HEAD", url, want_body=False, allow_redirects=True)
-        if r.status is None:
-            return None, {}
-        return r.status, r.headers
+    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
+        sem = self._host_sem.get(host)
+        if sem is None:
+            sem = asyncio.Semaphore(max(1, self.max_conn_per_host))
+            self._host_sem[host] = sem
+        return sem
+
+    async def _respect_host_cooldown(self, host: str) -> None:
+        while True:
+            until = self._host_cooldown_until.get(host, 0.0)
+            remaining = until - time.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(remaining, 0.5))
+
+    async def _set_host_cooldown(self, host: str, seconds: float) -> None:
+        async with self._cooldown_lock:
+            self._host_cooldown_until[host] = max(self._host_cooldown_until.get(host, 0.0), time.time() + max(0.0, seconds))
+
+    def _parse_retry_after(self, headers: Dict[str, str]) -> Optional[float]:
+        raw = self._header_get(headers, "retry-after")
+        if not raw:
+            return None
+        raw = raw.strip()
+        if raw.isdigit():
+            return float(int(raw))
+        return None
+
+    def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
+        if server_hint is not None:
+            return max(0.0, float(server_hint))
+        base = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
+        return base + random.random() * min(0.25, base / 3.0)
+
+    def _is_retryable_status(self, status: Optional[int]) -> bool:
+        return bool(status in self._RETRYABLE_STATUS)
+
+    def _is_toxic_domain(self, host: str) -> bool:
+        host = (host or "").lower()
+        if not host:
+            return False
+        if any(d and (host == d.lower() or host.endswith("." + d.lower())) for d in self.domain_denylist):
+            return True
+        return any(h in host for h in self.parked_domain_hints)
+
+    def _header_get(self, headers: Dict[str, str], key: str) -> str:
+        key_l = key.lower()
+        for k, v in (headers or {}).items():
+            if str(k).lower() == key_l:
+                return str(v)
+        return ""
+
+    def _looks_textlike(self, ctype: str) -> bool:
+        ct = (ctype or "").lower()
+        return any(ct.startswith(p) or p in ct for p in self._TEXTLIKE_MIME_HINTS)
+
+    def _looks_jsonish(self, text: str) -> bool:
+        s = (text or "").lstrip()
+        return s.startswith("{") or s.startswith("[")
+
+    def _decode_body(self, body: bytes) -> str:
+        try:
+            return body.decode("utf-8", errors="ignore")[: self.max_html_chars]
+        except Exception:
+            try:
+                return body.decode("latin-1", errors="ignore")[: self.max_html_chars]
+            except Exception:
+                return ""
+
+    def _magic_byte_violation(self, url: str, ctype: str, probe: bytes) -> bool:
+        ct = (ctype or "").lower()
+        path = (urlparse(url).path or "").lower()
+        if probe.startswith(self._MAGIC_EXE):
+            if any(ct.startswith(ok) for ok in self.magic_pe_kill_mime_allow):
+                return False
+            if any(path.endswith(ext) for ext in self.magic_pe_kill_ext_block):
+                return True
+        return False
+
+    def _shannon_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+        counts = [0] * 256
+        for b in data:
+            counts[b] += 1
+        total = float(len(data))
+        ent = 0.0
+        for c in counts:
+            if c:
+                p = c / total
+                ent -= p * math.log2(p)
+        return ent
+
+    def _printable_ratio(self, data: bytes) -> float:
+        if not data:
+            return 1.0
+        printable = sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126)
+        return printable / max(1, len(data))
+
+    async def _read_bounded_secure(self, resp, *, url: str, max_bytes: int) -> Tuple[bytes, str]:
+        headers = dict(resp.headers or {})
+        ctype = self._header_get(headers, "content-type")
+        encoding = self._header_get(headers, "content-encoding").lower().strip()
+
+        content_length_raw = self._header_get(headers, "content-length")
+        try:
+            content_length = int(content_length_raw) if content_length_raw else 0
+        except Exception:
+            content_length = 0
+
+        if any(h in (ctype or "").lower() for h in self.heavy_mime_hints) and max_bytes > self.heavy_snippet_cap:
+            max_bytes = min(max_bytes, self.heavy_snippet_cap)
+
+        if content_length > 0 and self.enable_decompression_bomb_guard:
+            if content_length > max(self.decompress_hard_cap_bytes, max_bytes * 4):
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return b"", "content_length_hard_cap_blocked"
+
+        decompressor = None
+        if self.enable_decompression_bomb_guard:
+            try:
+                if encoding == "gzip":
+                    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                elif encoding == "deflate":
+                    decompressor = zlib.decompressobj()
+            except Exception:
+                decompressor = None
+
+        out = bytearray()
+        entropy_probe = bytearray()
+        first_probe_done = False
+        compressed_read = 0
+
+        while True:
+            try:
+                chunk = await asyncio.wait_for(resp.content.read(self.chunk_size), timeout=self.chunk_timeout_s)
+            except asyncio.TimeoutError:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return bytes(out), "chunk_timeout"
+            except Exception as e:
+                return bytes(out), f"read_error:{e}"
+
+            if not chunk:
+                break
+
+            compressed_read += len(chunk)
+            produced = chunk
+            if decompressor is not None:
+                try:
+                    produced = decompressor.decompress(chunk)
+                except Exception:
+                    return bytes(out), "decompression_failed"
+
+                if self.enable_decompression_bomb_guard and compressed_read > 0:
+                    ratio = (len(out) + len(produced)) / max(1, compressed_read)
+                    if ratio > self.decompress_ratio_limit:
+                        return bytes(out), "decompression_ratio_blocked"
+                    if (len(out) + len(produced)) > self.decompress_hard_cap_bytes:
+                        return bytes(out), "decompression_hard_cap_blocked"
+
+            if self.enable_magic_byte_verification and not first_probe_done:
+                first_probe_done = True
+                if self._magic_byte_violation(url, ctype, produced[:16]):
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+                    return b"", "magic_byte_blocked"
+
+            out.extend(produced)
+
+            if self.enable_entropy_filter and self._looks_textlike(ctype) and len(entropy_probe) < self.entropy_sample_bytes:
+                entropy_probe.extend(produced[: max(0, self.entropy_sample_bytes - len(entropy_probe))])
+
+            if len(out) >= max_bytes:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                del out[max_bytes:]
+                break
+
+        if decompressor is not None:
+            try:
+                tail = decompressor.flush()
+                if tail:
+                    if self.enable_decompression_bomb_guard and compressed_read > 0:
+                        ratio = (len(out) + len(tail)) / max(1, compressed_read)
+                        if ratio > self.decompress_ratio_limit:
+                            return bytes(out), "decompression_ratio_blocked"
+                        if (len(out) + len(tail)) > self.decompress_hard_cap_bytes:
+                            return bytes(out), "decompression_hard_cap_blocked"
+                    out.extend(tail)
+                    if len(out) > max_bytes:
+                        del out[max_bytes:]
+            except Exception:
+                pass
+
+        if self.enable_entropy_filter and self._looks_textlike(ctype) and entropy_probe:
+            ent = self._shannon_entropy(bytes(entropy_probe))
+            pr = self._printable_ratio(bytes(entropy_probe))
+            if ent >= self.entropy_threshold and pr < self.min_printable_ratio:
+                return bytes(out), "entropy_blocked"
+
+        return bytes(out), ""
+
+    def _canonicalize_url(self, u: str) -> str:
+        try:
+            p = urlparse(str(u or "").strip())
+            if p.scheme not in ("http", "https") or not p.netloc:
+                return ""
+            host = p.netloc.lower().split(":")[0]
+            path = p.path or "/"
+            if not path.startswith("/"):
+                path = "/" + path
+            qs = [
+                (k, v)
+                for (k, v) in parse_qsl(p.query, keep_blank_values=False)
+                if k.lower() not in self._TRACKING_QS
+            ]
+            query = urlencode(qs, doseq=True)
+            return urlunparse((p.scheme.lower(), host, path, p.params, query, ""))
+        except Exception:
+            return ""
+
+    def _url_tokens(self, url: str) -> List[str]:
+        parsed = urlparse(str(url or ""))
+        base = f"{parsed.netloc} {parsed.path} {parsed.query}".lower().replace("-", " ").replace("_", " ")
+        toks = [m.group(0).lower() for m in self._TOKEN_RE.finditer(base)]
+        out: List[str] = []
+        seen: Set[str] = set()
+        for t in toks:
+            if len(t) < 2:
+                continue
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+        return out[:64]
+
+    def _score_url_similarity(self, seed_url: str, cand_url: str) -> float:
+        seed = self._canonicalize_url(seed_url)
+        cand = self._canonicalize_url(cand_url)
+        if not seed or not cand:
+            return 0.0
+        if seed == cand:
+            return 4.0
+        ps = urlparse(seed)
+        pc = urlparse(cand)
+        score = 0.0
+        if ps.netloc == pc.netloc:
+            score += 1.4
+        else:
+            hs = ps.netloc.split(".")
+            hc = pc.netloc.split(".")
+            if len(hs) >= 2 and len(hc) >= 2 and hs[-2:] == hc[-2:]:
+                score += 0.7
+        if ps.path and pc.path:
+            if pc.path.startswith(ps.path.rsplit("/", 1)[0]):
+                score += 0.8
+            if ps.path.split("/")[-1] and ps.path.split("/")[-1] in pc.path:
+                score += 0.35
+        ts = set(self._url_tokens(seed))
+        tc = set(self._url_tokens(cand))
+        if ts and tc:
+            inter = len(ts & tc)
+            union = len(ts | tc)
+            if union:
+                score += 2.4 * (inter / union)
+            if any(tok in tc for tok in ("manifest", "playlist", "segment", "stream", "cdn", "video", "audio", "download")):
+                score += 0.4
+        return round(score, 4)
+
+    def _classify_url_kind(self, url: str, content_type: str) -> str:
+        ul = (url or "").lower()
+        ct = (content_type or "").lower()
+        if "text/html" in ct:
+            return "html"
+        if "application/json" in ct:
+            return "json"
+        if any(x in ct for x in ("application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")):
+            return "manifest"
+        if any(x in ul for x in (".m3u8", ".mpd")):
+            return "manifest"
+        if ct.startswith("video/") or any(x in ul for x in (".mp4", ".webm", ".mkv", ".ts", ".m4s")):
+            return "video"
+        if ct.startswith("audio/") or any(x in ul for x in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav")):
+            return "audio"
+        if ct.startswith("image/") or any(x in ul for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
+            return "image"
+        if "json" in ct or "/api/" in ul or "graphql" in ul:
+            return "json"
+        if any(x in ul for x in self._ASSETISH_HINTS):
+            return "asset"
+        return "unknown"
+
+    def _extract_urls_from_text(self, text: str) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for m in self._URL_RE.finditer(text or ""):
+            raw = m.group(0).strip().rstrip(")],.;:'\"")
+            u = self._canonicalize_url(unescape(raw))
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_urls_from_jsonish(self, text: str, base_url: str, *, limit: int) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for u in self._extract_urls_from_text(text):
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+                if len(out) >= limit:
+                    return out
+        for m in re.finditer(r'"(?:url|src|href|manifest|playlist|download|file)"\s*:\s*"([^\"]+)"', text or "", re.I):
+            raw = m.group(1)
+            cand = self._canonicalize_url(urljoin(base_url, raw.replace("\\/", "/")))
+            if cand and cand not in seen:
+                seen.add(cand)
+                out.append(cand)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _extract_asset_urls_from_html(self, html: str, base_url: str, *, max_assets: int) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        if not html:
+            return out
+
+        def _add(raw: str) -> None:
+            if len(out) >= max_assets:
+                return
+            raw = (raw or "").strip()
+            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
+                return
+            full = self._canonicalize_url(urljoin(base_url, raw))
+            if full and full not in seen:
+                seen.add(full)
+                out.append(full)
+
+        parse_cap = min(self.max_html_chars, 250_000)
+        html_slice = html[:parse_cap]
+
+        if BeautifulSoup is not None and len(html_slice) <= 250_000:
+            try:
+                soup = BeautifulSoup(html_slice, "html.parser")
+                for tag in soup.find_all(["a", "img", "video", "audio", "source", "link", "meta", "iframe"]):
+                    for attr in ("href", "src", "data-src", "data-href", "poster", "content"):
+                        val = tag.get(attr)
+                        if isinstance(val, str):
+                            _add(val)
+                        if len(out) >= max_assets:
+                            return out
+            except Exception:
+                pass
+
+        if len(out) < max_assets:
+            for m in self._HTML_ATTR_RE.finditer(html_slice):
+                _add(m.group(1))
+                if len(out) >= max_assets:
+                    return out
+
+        if len(out) < max_assets:
+            for u in self._extract_urls_from_text(html_slice):
+                if u not in seen:
+                    seen.add(u)
+                    out.append(u)
+                    if len(out) >= max_assets:
+                        return out
+        return out
+
+    def _extract_header_links(self, headers: Dict[str, str], *, base_url: str) -> List[str]:
+        raw = self._header_get(headers, "link")
+        if not raw:
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+        for part in raw.split(","):
+            m = re.search(r"<([^>]+)>", part)
+            if not m:
+                continue
+            u = self._canonicalize_url(urljoin(base_url, m.group(1).strip()))
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
