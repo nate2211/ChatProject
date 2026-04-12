@@ -15530,7 +15530,7 @@ class SocketPipeBlock(BaseBlock):
         if joined_text:
             tokens = SocketPipeBlock._tokenize(joined_text)
             top_tokens = []
-            counts = Counter(tokens)
+            counts = collections.Counter(tokens)
             for tok, _ in counts.most_common(20):
                 top_tokens.append(tok)
         else:
@@ -31908,7 +31908,7 @@ class RouterClientBlock(BaseBlock):
     # ---------- lexicon / context ----------
 
     def _build_lexicon(self, *, qterms: List[str], matched_texts: List[str], links: List[str], top_k: int = 40) -> List[str]:
-        counts: Counter = Counter()
+        counts: Counter = collections.Counter()
         phrases: List[str] = []
 
         for txt in matched_texts:
@@ -32306,14 +32306,14 @@ class RouterClientBlock(BaseBlock):
             max_chars=context_max_chars,
         )
 
-        packet_types_counter: Counter = Counter()
+        packet_types_counter: Counter = collections.Counter()
         for pkt in matched_packets:
             for key in ("topic", "protocol", "component"):
                 val = str(pkt.get(key) or "").strip().lower()
                 if val:
                     packet_types_counter[val] += 1
 
-        domains_counter: Counter = Counter()
+        domains_counter: Counter = collections.Counter()
         for link in real_links:
             try:
                 hostn = (urlparse(link).netloc or "").lower()
@@ -34492,7 +34492,6 @@ BLOCKS.register("networktracker", NetworkTrackerBlock)
 
 
 
-
 # ======================= Packet Pipeline Helpers =======================
 
 _PACKET_SENTINEL = object()
@@ -34928,22 +34927,21 @@ def _pc_noise_decision(packet: Dict[str, Any], *, noisy_topics: Set[str], noisy_
         reasons.append("noise_hint")
     return bool(reasons), reasons
 
-
+# Requires: import json, socket, threading, queue
 # ======================= InterfaceBlock =======================
+
 
 @dataclass
 class InterfaceBlock(BaseBlock):
     """
-    Push packets from Memory[packets_key] or payload to PythonServerManager's
-    /api/inject-packet route using a bounded work queue.
+    Dispatch packets to PythonServerManager /api/inject-packet using the exact
+    JSON route contract, but without blocking on the full synchronous response.
 
-    This rewrite is focused on finishing reliably:
-      - prefilters unsendable packets before queueing
-      - uses a producer/consumer queue so memory stays bounded
-      - reuses per-worker HTTP sessions for faster drain
-      - never blocks forever on queue/join paths
-      - supports a total flush deadline and idle watchdog
-      - returns partial success cleanly instead of hanging
+    Important semantic change:
+      - "sent" means the full HTTP request body was successfully dispatched to
+        PythonServer over TCP.
+      - This is intentionally different from waiting for the JSON echo, because
+        the route only responds after router.process_packet(...) finishes.
     """
 
     def _log(self, msg: str) -> None:
@@ -34964,6 +34962,7 @@ class InterfaceBlock(BaseBlock):
         items: List[Dict[str, Any]] = []
         if packets_key:
             items.extend(_pc_load_memory_packets(packets_key))
+
         if isinstance(payload, list):
             items.extend([dict(x) for x in payload if isinstance(x, dict)])
         elif isinstance(payload, dict):
@@ -34973,111 +34972,455 @@ class InterfaceBlock(BaseBlock):
                 items.append(dict(payload))
         return items
 
-    def _build_request_body(
+    def _resolve_delegate_from(
+        self,
+        *,
+        iface_name: str,
+        packet: Dict[str, Any],
+        explicit_delegate_from: Optional[str],
+        delegate_from_mode: str,
+    ) -> Optional[str]:
+        explicit = str(explicit_delegate_from or "").strip()
+        if explicit:
+            return explicit
+
+        mode = str(delegate_from_mode or "packet_iface").strip().lower()
+        if mode == "none":
+            return None
+
+        candidate = str(
+            packet.get("iface")
+            or packet.get("interface")
+            or packet.get("inbound_iface")
+            or ""
+        ).strip()
+
+        if not candidate:
+            return None
+        if candidate == str(iface_name or "").strip() and mode != "allow_same":
+            return None
+        return candidate
+
+    def _make_trace_id(self, packet: Dict[str, Any], idx: int) -> str:
+        try:
+            raw = _pc_decode_raw_bytes(packet)
+            basis = raw[:128] if raw else _pc_packet_signature(packet).encode("utf-8", errors="ignore")
+            return f"promptchat-{hashlib.sha1(basis + str(idx).encode('ascii')).hexdigest()[:20]}"
+        except Exception:
+            return f"promptchat-{idx:08x}"
+
+    def _packet_topic(self, packet: Dict[str, Any]) -> str:
+        return str(packet.get("topic") or "unknown").strip().lower()
+
+    def _skip_packet(
+        self,
+        packet: Dict[str, Any],
+        *,
+        skip_broadcast: bool,
+        skip_multicast: bool,
+        skip_non_ip: bool,
+        skip_unknown_small_udp: bool,
+        noisy_topics: Set[str],
+        noisy_ports: Set[int],
+        min_raw_bytes: int,
+    ) -> Tuple[bool, str]:
+        topic = self._packet_topic(packet)
+        src_port = _pc_int(packet.get("src_port"), 0)
+        dst_port = _pc_int(packet.get("dst_port"), 0)
+        raw = _pc_decode_raw_bytes(packet)
+        l3 = str(packet.get("l3") or "").strip().lower()
+        l4 = str(packet.get("l4") or "").strip().lower()
+
+        if min_raw_bytes > 0 and len(raw) < min_raw_bytes:
+            return True, f"too_small:{len(raw)}"
+        if skip_broadcast and bool(packet.get("is_broadcast")):
+            return True, "broadcast"
+        if skip_multicast and bool(packet.get("is_multicast")):
+            return True, "multicast"
+        if skip_non_ip and l3 not in ("ip", "ipv4", "ipv6", "", "arp"):
+            return True, f"non_ip:{l3}"
+        if topic and topic in noisy_topics:
+            return True, f"topic:{topic}"
+        if src_port in noisy_ports:
+            return True, f"src_port:{src_port}"
+        if dst_port in noisy_ports:
+            return True, f"dst_port:{dst_port}"
+        if skip_unknown_small_udp and l4 == "udp" and topic in ("", "unknown") and len(raw) <= 192:
+            return True, f"unknown_small_udp:{len(raw)}"
+        return False, ""
+
+    def _build_extra(
+        self,
+        *,
+        packet: Dict[str, Any],
+        trace_id: str,
+        iface_name: str,
+        delegate_from: Optional[str],
+        attempt: int,
+    ) -> Dict[str, Any]:
+        raw = _pc_decode_raw_bytes(packet)
+        extra = {
+            "remote_api": True,
+            "promptchat": True,
+            "promptchat_trace": trace_id,
+            "trace_id": trace_id,
+            "frame_attempt": int(attempt),
+            "transport_mode": "dispatch_json_adaptive",
+            "iface": iface_name,
+            "ingest_iface": iface_name,
+            "delegate_from": delegate_from,
+            "capture_source": packet.get("source") or "InterfaceBlock",
+            "capture_interface": packet.get("iface") or packet.get("interface") or "",
+            "topic": packet.get("topic") or "",
+            "src_ip": packet.get("src_ip") or "",
+            "dst_ip": packet.get("dst_ip") or "",
+            "src_port": packet.get("src_port"),
+            "dst_port": packet.get("dst_port"),
+            "raw_len": len(raw),
+            "bytes": len(raw),
+            "timestamp": packet.get("timestamp"),
+            "l2": packet.get("l2") or "",
+            "l3": packet.get("l3") or "",
+            "l4": packet.get("l4") or "",
+            "tcp_flags": packet.get("tcp_flags") or "",
+            "hex_preview": raw[:64].hex(),
+        }
+
+        packet_extra = packet.get("extra") if isinstance(packet.get("extra"), dict) else {}
+        if packet_extra:
+            merged = dict(packet_extra)
+            merged.update({k: v for k, v in extra.items() if v is not None})
+            extra = merged
+        return extra
+
+    def _build_json_request_body(
         self,
         *,
         iface_name: str,
         delegate_from: Optional[str],
         packet: Dict[str, Any],
+        trace_id: str,
+        attempt: int,
     ) -> Dict[str, Any]:
         raw = _pc_decode_raw_bytes(packet)
-        body = {
+        body: Dict[str, Any] = {
             "iface": str(iface_name or "PromptChat").strip() or "PromptChat",
             "raw_b64": base64.b64encode(raw).decode("ascii"),
-            "extra": {
-                "capture_source": packet.get("source") or "InterfaceBlock",
-                "capture_interface": packet.get("iface") or "",
-                "topic": packet.get("topic") or "",
-                "src_ip": packet.get("src_ip") or "",
-                "dst_ip": packet.get("dst_ip") or "",
-                "src_port": packet.get("src_port"),
-                "dst_port": packet.get("dst_port"),
-                "raw_len": len(raw),
-                "timestamp": packet.get("timestamp"),
-                "l2": packet.get("l2") or "",
-                "l3": packet.get("l3") or "",
-                "l4": packet.get("l4") or "",
-                "tcp_flags": packet.get("tcp_flags") or "",
-            },
+            "extra": self._build_extra(
+                packet=packet,
+                trace_id=trace_id,
+                iface_name=iface_name,
+                delegate_from=delegate_from,
+                attempt=attempt,
+            ),
         }
         if delegate_from:
             body["delegate_from"] = delegate_from
         return body
 
-    def _post_one_with_session(
+    def _build_http_headers(
         self,
         *,
-        session: requests.Session,
-        base_url: str,
         token: str,
-        verify_tls: bool,
-        timeout_s: float,
-        iface_name: str,
-        delegate_from: Optional[str],
-        packet: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        raw = _pc_decode_raw_bytes(packet)
-        if not raw:
-            return {"ok": False, "error": "missing_raw_packet_bytes"}
-
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "PromptChat-InterfaceBlock/3.0",
-            "Connection": "keep-alive",
-        }
+        host_header: str,
+        content_length: int,
+        connection_close: bool,
+    ) -> List[str]:
+        headers = [
+            f"Host: {host_header}",
+            "Accept: application/json",
+            "Content-Type: application/json",
+            "User-Agent: PromptChat-InterfaceBlock/19.0",
+            f"Content-Length: {content_length}",
+            f"Connection: {'close' if connection_close else 'keep-alive'}",
+        ]
         tok = str(token or "").strip()
         if tok:
-            headers["X-Router-Token"] = tok
-            headers["Authorization"] = f"Bearer {tok}"
+            headers.append(f"X-Router-Token: {tok}")
+            headers.append(f"Authorization: Bearer {tok}")
+        return headers
 
-        resp = session.post(
-            f"{base_url}/api/inject-packet",
-            json=self._build_request_body(
-                iface_name=iface_name,
-                delegate_from=delegate_from,
-                packet=packet,
-            ),
-            headers=headers,
-            timeout=max(0.25, float(timeout_s)),
-            verify=bool(verify_tls),
+    def _send_http_request_bytes(
+        self,
+        sock: socket.socket,
+        data: bytes,
+        *,
+        write_timeout_s: float,
+        chunk_size: int,
+    ) -> None:
+        view = memoryview(data)
+        sent = 0
+        deadline = time.time() + max(0.10, float(write_timeout_s))
+
+        while sent < len(data):
+            if time.time() >= deadline:
+                raise TimeoutError("dispatch_write_deadline_exceeded")
+            end = min(len(data), sent + max(512, int(chunk_size)))
+            try:
+                wrote = sock.send(view[sent:end])
+            except socket.timeout:
+                continue
+            if wrote <= 0:
+                raise OSError("socket_send_returned_zero")
+            sent += wrote
+
+    def _effective_write_timeout(self, *, payload_len: int, attempt: int, base_timeout_s: float) -> float:
+        timeout_s = max(1.0, float(base_timeout_s))
+        timeout_s += min(3.0, float(max(0, payload_len)) / 2048.0)
+        timeout_s += min(1.5, 0.40 * float(max(0, attempt)))
+        return round(timeout_s, 3)
+
+    def _classify_dispatch_result(self, result: Dict[str, Any]) -> Tuple[bool, bool, str]:
+        if not isinstance(result, dict):
+            return False, False, "non_dict_result"
+
+        if not bool(result.get("ok")):
+            reason = str(result.get("error") or "dispatch_failed")
+            low = reason.lower()
+            permanent = any(x in low for x in [
+                "dispatch_http_requires_http_not_",
+                "401", "403", "404", "405", "413",
+            ])
+            return False, permanent, reason
+
+        status_code = result.get("status_code")
+        if isinstance(status_code, int) and status_code >= 400:
+            permanent = status_code in {400, 401, 403, 404, 405, 413}
+            return False, permanent, f"http_{status_code}"
+
+        return True, False, "json_dispatched_to_pythonserver"
+
+    def _prioritize_sendable_packets(self, packets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        indexed = list(enumerate(packets))
+        indexed.sort(
+            key=lambda item: (
+                1 if str(item[1].get("topic") or "").lower() in {"monero", "http", "https", "arp", "icmp"} else 2,
+                len(_pc_decode_raw_bytes(item[1])),
+                item[0],
+            )
         )
+        return [pkt for _, pkt in indexed]
+
+    def _dispatch_json_once(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        body: Dict[str, Any],
+        connect_timeout_s: float,
+        write_timeout_s: float,
+        header_peek_timeout_s: float,
+        chunk_size: int,
+        connection_close: bool,
+    ) -> Dict[str, Any]:
+        parts = urlsplit(base_url)
+        scheme = (parts.scheme or "http").lower()
+        if scheme != "http":
+            return {"ok": False, "error": f"dispatch_http_requires_http_not_{scheme}"}
+
+        host = parts.hostname or "127.0.0.1"
+        port = int(parts.port or 80)
+        host_header = f"{host}:{port}"
+        path = "/api/inject-packet"
+
+        body_bytes = json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        request_lines = [f"POST {path} HTTP/1.1"]
+        request_lines.extend(
+            self._build_http_headers(
+                token=token,
+                host_header=host_header,
+                content_length=len(body_bytes),
+                connection_close=connection_close,
+            )
+        )
+        request_bytes = ("\r\n".join(request_lines) + "\r\n\r\n").encode("utf-8") + body_bytes
+
+        sock: Optional[socket.socket] = None
         try:
-            data = resp.json()
-        except Exception:
-            data = {"ok": False, "status_code": resp.status_code, "text": resp.text[:1000]}
-        if resp.status_code >= 400 and isinstance(data, dict):
-            data.setdefault("ok", False)
-            data.setdefault("status_code", resp.status_code)
-        return data if isinstance(data, dict) else {"ok": False, "response": data}
+            sock = socket.create_connection((host, port), timeout=max(0.10, float(connect_timeout_s)))
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+
+            effective_timeout = self._effective_write_timeout(
+                payload_len=len(request_bytes),
+                attempt=int(body.get("extra", {}).get("frame_attempt", 0) or 0),
+                base_timeout_s=write_timeout_s,
+            )
+            sock.settimeout(max(0.10, float(effective_timeout)))
+
+            self._send_http_request_bytes(
+                sock,
+                request_bytes,
+                write_timeout_s=effective_timeout,
+                chunk_size=chunk_size,
+            )
+
+            status_code = None
+            status_line = ""
+            try:
+                sock.settimeout(max(0.01, float(header_peek_timeout_s)))
+                buf = b""
+                while b"\r\n" not in buf and len(buf) < 256:
+                    part = sock.recv(64)
+                    if not part:
+                        break
+                    buf += part
+                if buf:
+                    first_line = buf.split(b"\r\n", 1)[0].decode("latin1", errors="ignore").strip()
+                    status_line = first_line
+                    pieces = first_line.split()
+                    if len(pieces) >= 2 and pieces[1].isdigit():
+                        status_code = int(pieces[1])
+            except Exception:
+                pass
+
+            return {
+                "ok": True,
+                "bytes": len(body_bytes),
+                "status_code": status_code,
+                "status_line": status_line,
+                "dispatch_only": True,
+                "effective_timeout": effective_timeout,
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": f"{type(e).__name__}: {e}",
+            }
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    def _prepare_packets(
+        self,
+        packets: List[Dict[str, Any]],
+        *,
+        skip_broadcast: bool,
+        skip_multicast: bool,
+        skip_non_ip: bool,
+        skip_unknown_small_udp: bool,
+        noisy_topics: Set[str],
+        noisy_ports: Set[int],
+        max_packets: int,
+        max_bytes: int,
+        max_per_topic: int,
+        min_raw_bytes: int,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], int]:
+        deduped_sendable: List[Dict[str, Any]] = []
+        skipped_packets: List[Dict[str, Any]] = []
+        unsendable_packets: List[Dict[str, Any]] = []
+
+        seen_signatures: Set[str] = set()
+        duplicate_count = 0
+        topic_counts: Dict[str, int] = defaultdict(int)
+        total_bytes = 0
+
+        for pkt in packets:
+            sig = _pc_packet_signature(pkt)
+            if sig in seen_signatures:
+                duplicate_count += 1
+                continue
+            seen_signatures.add(sig)
+
+            if not _pc_has_raw_data(pkt):
+                unsendable_packets.append(pkt)
+                continue
+
+            skip_it, skip_reason = self._skip_packet(
+                pkt,
+                skip_broadcast=skip_broadcast,
+                skip_multicast=skip_multicast,
+                skip_non_ip=skip_non_ip,
+                skip_unknown_small_udp=skip_unknown_small_udp,
+                noisy_topics=noisy_topics,
+                noisy_ports=noisy_ports,
+                min_raw_bytes=min_raw_bytes,
+            )
+            if skip_it:
+                p2 = dict(pkt)
+                p2["_skip_reason"] = skip_reason
+                skipped_packets.append(p2)
+                continue
+
+            topic = self._packet_topic(pkt)
+            if max_per_topic > 0 and topic_counts[topic] >= max_per_topic:
+                p2 = dict(pkt)
+                p2["_skip_reason"] = f"topic_cap:{topic}"
+                skipped_packets.append(p2)
+                continue
+
+            raw = _pc_decode_raw_bytes(pkt)
+            if max_bytes > 0 and (total_bytes + len(raw)) > max_bytes:
+                p2 = dict(pkt)
+                p2["_skip_reason"] = f"byte_budget:{max_bytes}"
+                skipped_packets.append(p2)
+                continue
+
+            deduped_sendable.append(pkt)
+            topic_counts[topic] += 1
+            total_bytes += len(raw)
+
+            if max_packets > 0 and len(deduped_sendable) >= max_packets:
+                break
+
+        return deduped_sendable, skipped_packets, unsendable_packets, duplicate_count
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         packets_key = str(params.get("packets_key") or params.get("memory_packets_key") or "packets").strip()
         base_url = self._normalize_base(params.get("router_base_url") or params.get("base_url") or params.get("server"))
         ingest_iface = str(params.get("ingest_iface") or params.get("iface") or "PromptChat").strip() or "PromptChat"
-        delegate_from = str(params.get("delegate_from") or "").strip() or None
+        explicit_delegate_from = str(params.get("delegate_from") or "").strip() or None
+        delegate_from_mode = str(params.get("delegate_from_mode") or "packet_iface").strip().lower()
         token = str(params.get("token") or params.get("router_token") or "").strip()
-        verify_tls = _pc_bool(params.get("verify_tls"), False)
-        timeout_s = _pc_float(params.get("timeout"), 2.5)
-        queue_maxsize = max(8, _pc_int(params.get("queue_maxsize"), 512))
-        worker_count = max(1, min(12, _pc_int(params.get("worker_count"), 3)))
+
+        connect_timeout_s = max(0.10, _pc_float(params.get("connect_timeout_s"), 0.75))
+        write_timeout_s = max(0.10, _pc_float(params.get("write_timeout_s"), 1.25))
+        header_peek_timeout_s = max(0.01, _pc_float(params.get("header_peek_timeout_s"), 0.03))
+        retry_backoff_s = max(0.0, _pc_float(params.get("retry_backoff_s"), 0.20))
+        send_retry_count = max(0, _pc_int(params.get("send_retry_count"), 2))
+        worker_count = max(1, _pc_int(params.get("worker_count"), 3))
+        per_packet_pause_s = max(0.0, _pc_float(params.get("per_packet_pause_s"), 0.002))
+        burst_pause_s = max(0.0, _pc_float(params.get("burst_pause_s"), 0.05))
+        burst_packets = max(1, _pc_int(params.get("burst_packets"), 16))
+        chunk_size = max(512, _pc_int(params.get("chunk_size"), 8192))
+        connection_close = _pc_bool(params.get("connection_close"), True)
+        drain_timeout_s = max(1.0, _pc_float(params.get("drain_timeout_s"), 240.0))
+        hard_batch_cap = max(1, _pc_int(params.get("hard_batch_cap"), 256))
+        stop_after_consecutive_failures = max(0, _pc_int(params.get("stop_after_consecutive_failures"), 0))
+
         max_packets = max(0, _pc_int(params.get("max_packets"), 0))
-        clear_on_success = _pc_bool(params.get("clear_on_success"), False)
-        remove_sent_from_key = _pc_bool(params.get("remove_sent_from_key"), False)
+        max_bytes = max(0, _pc_int(params.get("max_bytes"), 0))
+        max_per_topic = max(0, _pc_int(params.get("max_per_topic"), 0))
+        min_raw_bytes = max(0, _pc_int(params.get("min_raw_bytes"), 1))
+
+        skip_broadcast = _pc_bool(params.get("skip_broadcast"), True)
+        skip_multicast = _pc_bool(params.get("skip_multicast"), True)
+        skip_non_ip = _pc_bool(params.get("skip_non_ip"), False)
+        skip_unknown_small_udp = _pc_bool(params.get("skip_unknown_small_udp"), True)
+
+        noisy_topics = {
+            str(x).strip().lower()
+            for x in (params.get("noisy_topics") or ["mdns", "nbns", "llmnr", "ssdp", "dhcp", "dhcpv6", "stun", "igmp"])
+            if str(x).strip()
+        }
+        noisy_ports = {
+            int(x)
+            for x in (params.get("noisy_ports") or [67, 68, 137, 138, 1900, 5353, 5355])
+            if str(x).strip()
+        }
+
         emit = str(params.get("emit") or "summary").strip().lower()
 
-        # finish / watchdog controls
-        flush_timeout_s = max(timeout_s, _pc_float(params.get("flush_timeout_s"), max(10.0, timeout_s * 8.0)))
-        queue_put_timeout_s = max(0.05, _pc_float(params.get("queue_put_timeout_s"), 0.25))
-        queue_get_timeout_s = max(0.05, _pc_float(params.get("queue_get_timeout_s"), 0.25))
-        idle_break_s = max(0.25, _pc_float(params.get("idle_break_s"), 1.5))
-
         packets = [
-            _pc_normalize_packet(x) for x in self._collect_packets(payload, packets_key=packets_key)
+            _pc_normalize_packet(x)
+            for x in self._collect_packets(payload, packets_key=packets_key)
             if isinstance(x, dict)
         ]
-        if max_packets > 0:
-            packets = packets[:max_packets]
 
         if not packets:
             return payload, {
@@ -35087,211 +35430,361 @@ class InterfaceBlock(BaseBlock):
                 "route": f"{base_url}/api/inject-packet",
             }
 
-        sendable_packets = [p for p in packets if _pc_has_raw_data(p)]
-        unsendable_packets = [p for p in packets if not _pc_has_raw_data(p)]
+        sendable_packets, skipped_packets, unsendable_packets, duplicate_count = self._prepare_packets(
+            packets,
+            skip_broadcast=skip_broadcast,
+            skip_multicast=skip_multicast,
+            skip_non_ip=skip_non_ip,
+            skip_unknown_small_udp=skip_unknown_small_udp,
+            noisy_topics=noisy_topics,
+            noisy_ports=noisy_ports,
+            max_packets=max_packets,
+            max_bytes=max_bytes,
+            max_per_topic=max_per_topic,
+            min_raw_bytes=min_raw_bytes,
+        )
+
+        if hard_batch_cap > 0:
+            sendable_packets = sendable_packets[:hard_batch_cap]
+
+        sendable_packets = self._prioritize_sendable_packets(sendable_packets)
 
         if not sendable_packets:
             return payload, {
                 "ok": False,
-                "error": "no_sendable_packets",
+                "error": "no_sendable_packets_after_filtering",
                 "packets_key": packets_key,
                 "route": f"{base_url}/api/inject-packet",
                 "input_count": len(packets),
                 "unsendable_count": len(unsendable_packets),
-                "unsendable_items": unsendable_packets[:64],
+                "skipped_count": len(skipped_packets),
+                "duplicate_count": duplicate_count,
             }
 
-        q: "queue.Queue[Any]" = queue.Queue(maxsize=queue_maxsize)
-        lock = threading.Lock()
+        self._log(
+            f"🚚 start input={len(packets)} sendable={len(sendable_packets)} skipped={len(skipped_packets)} "
+            f"unsendable={len(unsendable_packets)} dupes={duplicate_count} iface={ingest_iface} "
+            f"route={base_url}/api/inject-packet mode=json_dispatch workers={worker_count}"
+        )
+
+        start_ts = time.time()
+        deadline_ts = start_ts + drain_timeout_s
+
+        queue_items = collections.deque(
+            {
+                "packet": pkt,
+                "index": idx,
+                "attempt": 0,
+            }
+            for idx, pkt in enumerate(sendable_packets)
+        )
+
         sent: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
         abandoned: List[Dict[str, Any]] = []
-        done_event = threading.Event()
-        start_ts = time.time()
-        deadline_ts = start_ts + flush_timeout_s
-        last_progress_ts = time.time()
-        producer_done = False
-        active_workers = worker_count
 
-        def _mark_progress() -> None:
-            nonlocal last_progress_ts
-            last_progress_ts = time.time()
+        shadow_registered_count = 0
+        timeout_count = 0
+        connect_fail_count = 0
+        recycled_count = 0
+        consecutive_failures = 0
 
-        def _worker(worker_id: int) -> None:
-            nonlocal active_workers
-            session = requests.Session()
-            adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8, max_retries=0)
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            try:
-                while True:
-                    if time.time() >= deadline_ts:
-                        return
-                    try:
-                        item = q.get(timeout=queue_get_timeout_s)
-                    except queue.Empty:
-                        if producer_done and q.empty():
-                            return
-                        if (time.time() - last_progress_ts) >= idle_break_s and producer_done:
-                            return
-                        continue
-                    try:
-                        if item is _PACKET_SENTINEL:
-                            return
-                        idx, pkt = item
-                        res = self._post_one_with_session(
-                            session=session,
-                            base_url=base_url,
-                            token=token,
-                            verify_tls=verify_tls,
-                            timeout_s=timeout_s,
-                            iface_name=ingest_iface,
-                            delegate_from=delegate_from,
-                            packet=pkt,
-                        )
-                        with lock:
-                            entry = {
-                                "index": idx,
-                                "iface": ingest_iface,
-                                "bytes": pkt.get("raw_len"),
-                                "topic": pkt.get("topic"),
-                                "src_ip": pkt.get("src_ip"),
-                                "dst_ip": pkt.get("dst_ip"),
-                                "response": res,
-                            }
-                            if bool(res.get("ok")):
-                                sent.append(entry)
-                            else:
-                                failed.append(entry)
-                        _mark_progress()
-                    except Exception as e:
-                        with lock:
-                            failed.append({
-                                "index": item[0] if isinstance(item, tuple) else -1,
-                                "error": f"{type(e).__name__}: {e}",
-                            })
-                        _mark_progress()
-                    finally:
-                        try:
-                            q.task_done()
-                        except Exception:
-                            pass
-            finally:
-                try:
-                    session.close()
-                except Exception:
-                    pass
-                with lock:
-                    active_workers = max(0, active_workers - 1)
-                    if producer_done and active_workers <= 0:
-                        done_event.set()
+        current_window = 1
+        success_streak = 0
+        pass_no = 0
+        local_counter = 0
 
-        threads = [threading.Thread(target=_worker, args=(i,), name=f"InterfaceBlockWorker-{i}", daemon=True) for i in range(worker_count)]
-        for t in threads:
-            t.start()
-
-        enqueue_index = 0
-        for idx, pkt in enumerate(sendable_packets):
+        while queue_items:
             if time.time() >= deadline_ts:
-                abandoned.extend(sendable_packets[idx:])
+                abandoned.extend([entry["packet"] for entry in queue_items])
+                self._log(f"⏱️ drain deadline reached; abandoning remaining={len(queue_items)}")
                 break
-            placed = False
-            while time.time() < deadline_ts:
-                try:
-                    q.put((idx, pkt), timeout=queue_put_timeout_s)
-                    enqueue_index = idx + 1
-                    placed = True
-                    break
-                except queue.Full:
-                    if (time.time() - last_progress_ts) >= idle_break_s and producer_done:
+
+            pass_no += 1
+            wave: List[Dict[str, Any]] = []
+            while queue_items and len(wave) < current_window:
+                wave.append(queue_items.popleft())
+
+            self._log(f"📦 pass={pass_no} window={current_window} wave={len(wave)} remaining={len(queue_items)}")
+
+            results: Dict[int, Dict[str, Any]] = {}
+
+            def _run_one(slot: int, item: Dict[str, Any]) -> None:
+                pkt = item["packet"]
+                idx = int(item["index"])
+                attempt = int(item["attempt"])
+                raw = _pc_decode_raw_bytes(pkt)
+                topic = str(pkt.get("topic") or "unknown")
+                trace_id = self._make_trace_id(pkt, idx)
+                delegate_from = self._resolve_delegate_from(
+                    iface_name=ingest_iface,
+                    packet=pkt,
+                    explicit_delegate_from=explicit_delegate_from,
+                    delegate_from_mode=delegate_from_mode,
+                )
+
+                last_reason = "dispatch_failed"
+                last_result: Dict[str, Any] = {"ok": False, "error": "dispatch_failed"}
+                permanent = False
+                ok = False
+
+                for try_idx in range(attempt, send_retry_count + 1):
+                    if time.time() >= deadline_ts:
                         break
-                    continue
-            if not placed:
-                abandoned.extend(sendable_packets[idx:])
-                break
 
-        producer_done = True
-        for _ in threads:
-            while time.time() < deadline_ts:
-                try:
-                    q.put(_PACKET_SENTINEL, timeout=queue_put_timeout_s)
-                    break
-                except queue.Full:
-                    continue
+                    body = self._build_json_request_body(
+                        iface_name=ingest_iface,
+                        delegate_from=delegate_from,
+                        packet=pkt,
+                        trace_id=trace_id,
+                        attempt=try_idx,
+                    )
+                    result = self._dispatch_json_once(
+                        base_url=base_url,
+                        token=token,
+                        body=body,
+                        connect_timeout_s=connect_timeout_s,
+                        write_timeout_s=write_timeout_s,
+                        header_peek_timeout_s=header_peek_timeout_s,
+                        chunk_size=chunk_size,
+                        connection_close=connection_close,
+                    )
+                    ok, permanent, last_reason = self._classify_dispatch_result(result)
+                    last_result = result
 
-        remaining = max(0.0, deadline_ts - time.time())
-        done_event.wait(timeout=remaining)
+                    if ok or permanent:
+                        attempt = try_idx
+                        break
 
-        # drain anything that was never processed so the block always finishes cleanly
-        while True:
-            try:
-                item = q.get_nowait()
-            except queue.Empty:
-                break
-            try:
-                if item is _PACKET_SENTINEL:
-                    pass
-                elif isinstance(item, tuple) and len(item) == 2:
-                    _, pkt = item
-                    abandoned.append(pkt)
-            finally:
-                try:
-                    q.task_done()
-                except Exception:
-                    pass
+                    if retry_backoff_s > 0 and try_idx < send_retry_count:
+                        time.sleep(retry_backoff_s * (try_idx + 1))
+                    attempt = try_idx
 
-        for t in threads:
-            t.join(timeout=0.5)
+                results[slot] = {
+                    "ok": ok,
+                    "permanent": permanent,
+                    "reason": last_reason,
+                    "result": last_result,
+                    "index": idx,
+                    "trace_id": trace_id,
+                    "iface": ingest_iface,
+                    "delegate_from": delegate_from,
+                    "topic": topic,
+                    "bytes": len(raw),
+                    "attempt": attempt,
+                    "packet": pkt,
+                }
 
-        if packets_key and (clear_on_success or remove_sent_from_key):
-            try:
-                mem = Memory.load()
-                if clear_on_success and not failed and not abandoned:
-                    mem[packets_key] = []
-                elif remove_sent_from_key and isinstance(mem.get(packets_key), list):
-                    original = [dict(x) for x in mem.get(packets_key) if isinstance(x, dict)]
-                    sent_signatures = {
-                        _pc_packet_signature(sendable_packets[x.get("index")])
-                        for x in sent
-                        if isinstance(x, dict) and isinstance(x.get("index"), int) and 0 <= int(x.get("index")) < len(sendable_packets)
+            threads: List[threading.Thread] = []
+            if len(wave) == 1:
+                _run_one(0, wave[0])
+            else:
+                for slot, item in enumerate(wave):
+                    t = threading.Thread(target=_run_one, args=(slot, item), daemon=True)
+                    threads.append(t)
+                    t.start()
+                for t in threads:
+                    remaining = max(0.0, deadline_ts - time.time())
+                    t.join(timeout=remaining)
+
+            deferred_retry: List[Dict[str, Any]] = []
+            wave_failures = 0
+            fatal_stop = False
+
+            for slot in range(len(wave)):
+                res = results.get(slot)
+                if not isinstance(res, dict):
+                    pkt = wave[slot]["packet"]
+                    raw = _pc_decode_raw_bytes(pkt)
+                    res = {
+                        "ok": False,
+                        "permanent": False,
+                        "reason": "missing_worker_result",
+                        "result": {"ok": False, "error": "missing_worker_result"},
+                        "index": int(wave[slot]["index"]),
+                        "trace_id": self._make_trace_id(pkt, int(wave[slot]["index"])),
+                        "iface": ingest_iface,
+                        "delegate_from": self._resolve_delegate_from(
+                            iface_name=ingest_iface,
+                            packet=pkt,
+                            explicit_delegate_from=explicit_delegate_from,
+                            delegate_from_mode=delegate_from_mode,
+                        ),
+                        "topic": str(pkt.get("topic") or "unknown"),
+                        "bytes": len(raw),
+                        "attempt": int(wave[slot]["attempt"]),
+                        "packet": pkt,
                     }
-                    kept: List[Dict[str, Any]] = []
-                    for item in original:
-                        sig = _pc_packet_signature(item)
-                        if sig in sent_signatures:
-                            continue
-                        kept.append(item)
-                    mem[packets_key] = kept
-                Memory.save(mem)
-            except Exception:
-                pass
+
+                if bool(res.get("ok")):
+                    sent.append({
+                        "index": res["index"],
+                        "trace_id": res["trace_id"],
+                        "iface": res["iface"],
+                        "delegate_from": res["delegate_from"],
+                        "topic": res["topic"],
+                        "bytes": res["bytes"],
+                        "status": "dispatched",
+                        "reason": res["reason"],
+                        "attempt": res["attempt"],
+                        "response": res["result"],
+                    })
+                    consecutive_failures = 0
+                    success_streak += 1
+                    self._log(
+                        f"📨 dispatched idx={res['index']} topic={res['topic']} bytes={res['bytes']} "
+                        f"trace={res['trace_id']} attempt={res['attempt']}"
+                    )
+                else:
+                    wave_failures += 1
+                    success_streak = 0
+                    consecutive_failures += 1
+                    reason = str(res.get("reason") or "dispatch_failed")
+                    low = reason.lower()
+
+                    if "timeout" in low:
+                        timeout_count += 1
+                    if "connecttimeout" in low or "connectionerror" in low or "refused" in low:
+                        connect_fail_count += 1
+
+                    self._log(
+                        f"❌ dispatch-failed idx={res['index']} topic={res['topic']} bytes={res['bytes']} "
+                        f"reason={reason}"
+                    )
+
+                    if bool(res.get("permanent")):
+                        failed.append({
+                            "index": res["index"],
+                            "trace_id": res["trace_id"],
+                            "iface": res["iface"],
+                            "delegate_from": res["delegate_from"],
+                            "topic": res["topic"],
+                            "bytes": res["bytes"],
+                            "status": "failed",
+                            "reason": reason,
+                            "attempt": res["attempt"],
+                        })
+                        if "401" in low or "403" in low:
+                            fatal_stop = True
+                    else:
+                        if int(res["attempt"]) < send_retry_count and time.time() < deadline_ts:
+                            deferred_retry.append({
+                                "packet": res["packet"],
+                                "index": res["index"],
+                                "attempt": int(res["attempt"]) + 1,
+                            })
+                        else:
+                            failed.append({
+                                "index": res["index"],
+                                "trace_id": res["trace_id"],
+                                "iface": res["iface"],
+                                "delegate_from": res["delegate_from"],
+                                "topic": res["topic"],
+                                "bytes": res["bytes"],
+                                "status": "failed",
+                                "reason": reason,
+                                "attempt": res["attempt"],
+                            })
+
+                local_counter += 1
+                if per_packet_pause_s > 0:
+                    time.sleep(per_packet_pause_s)
+                if burst_pause_s > 0 and local_counter >= burst_packets:
+                    time.sleep(burst_pause_s)
+                    local_counter = 0
+
+            if deferred_retry:
+                recycled_count += len(deferred_retry)
+                for item in deferred_retry:
+                    queue_items.append(item)
+
+            if fatal_stop:
+                abandoned.extend([entry["packet"] for entry in queue_items])
+                self._log("🛑 permanent auth/request failure detected; stopping")
+                queue_items.clear()
+                break
+
+            if wave_failures == 0:
+                if current_window < max(1, worker_count) and success_streak >= 6:
+                    current_window += 1
+                    success_streak = 0
+                    self._log(f"📈 ramp-up window={current_window}")
+            else:
+                if current_window > 1:
+                    current_window = max(1, current_window - 1)
+                    self._log(f"📉 backoff window={current_window}")
+                if retry_backoff_s > 0:
+                    time.sleep(retry_backoff_s)
+
+            if stop_after_consecutive_failures > 0 and consecutive_failures >= stop_after_consecutive_failures:
+                abandoned.extend([entry["packet"] for entry in queue_items])
+                self._log(f"🛑 stopping after consecutive failures={consecutive_failures}")
+                queue_items.clear()
+                break
+
+        elapsed_s = round(max(0.0, time.time() - start_ts), 3)
 
         meta = {
-            "ok": bool(sent) and not failed and not abandoned,
+            "ok": bool(sent),
             "packets_key": packets_key,
             "route": f"{base_url}/api/inject-packet",
             "ingest_iface": ingest_iface,
-            "delegate_from": delegate_from,
+            "delegate_from": explicit_delegate_from,
+            "delegate_from_mode": delegate_from_mode,
             "input_count": len(packets),
+            "duplicate_count": duplicate_count,
             "unsendable_count": len(unsendable_packets),
-            "queued": enqueue_index,
+            "skipped_count": len(skipped_packets),
+            "queued": len(sendable_packets),
             "sent": len(sent),
+            "accepted": 0,
+            "dispatched": len(sent),
             "failed": len(failed),
             "abandoned": len(abandoned),
+            "shadow_registered": shadow_registered_count,
+            "mode": "dispatch",
+            "transport_mode": "json",
+            "connect_timeout_s": connect_timeout_s,
+            "write_timeout_s": write_timeout_s,
+            "header_peek_timeout_s": header_peek_timeout_s,
+            "send_retry_count": send_retry_count,
+            "retry_backoff_s": retry_backoff_s,
+            "burst_packets": burst_packets,
+            "burst_pause_s": burst_pause_s,
             "worker_count": worker_count,
-            "queue_maxsize": queue_maxsize,
-            "flush_timeout_s": flush_timeout_s,
-            "elapsed_s": round(max(0.0, time.time() - start_ts), 3),
-            "responses": sent[:64],
-            "errors": failed[:64],
+            "chunk_size": chunk_size,
+            "drain_timeout_s": drain_timeout_s,
+            "hard_batch_cap": hard_batch_cap,
+            "recycled_count": recycled_count,
+            "timeout_count": timeout_count,
+            "connect_fail_count": connect_fail_count,
+            "elapsed_s": elapsed_s,
+            "sent_items": sent[:64],
+            "failed_items": failed[:64],
             "abandoned_items": abandoned[:64],
         }
+
+        self._log(
+            f"🏁 finish input={len(packets)} sendable={len(sendable_packets)} skipped={len(skipped_packets)} "
+            f"unsendable={len(unsendable_packets)} dispatched={len(sent)} failed={len(failed)} "
+            f"abandoned={len(abandoned)} iface={ingest_iface}"
+        )
 
         if emit == "packets":
             return sent, meta
         if emit == "bundle":
-            return {"sent": sent, "failed": failed, "abandoned": abandoned}, meta
-        return f"[InterfaceBlock] input={len(packets)} queued={enqueue_index} unsendable={len(unsendable_packets)} sent={len(sent)} failed={len(failed)} abandoned={len(abandoned)} iface={ingest_iface}", meta
+            return {
+                "sent": sent,
+                "failed": failed,
+                "abandoned": abandoned,
+                "skipped": skipped_packets,
+            }, meta
+
+        return (
+            f"[InterfaceBlock] input={len(packets)} sendable={len(sendable_packets)} skipped={len(skipped_packets)} "
+            f"unsendable={len(unsendable_packets)} dupes={duplicate_count} dispatched={len(sent)} "
+            f"failed={len(failed)} abandoned={len(abandoned)} iface={ingest_iface}"
+        ), meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
@@ -35299,44 +35792,298 @@ class InterfaceBlock(BaseBlock):
             "router_base_url": "http://127.0.0.1:8844",
             "ingest_iface": "PromptChat",
             "delegate_from": "",
+            "delegate_from_mode": "packet_iface",
             "token": "",
-            "verify_tls": False,
-            "timeout": 2.5,
-            "flush_timeout_s": 20.0,
-            "queue_put_timeout_s": 0.25,
-            "queue_get_timeout_s": 0.25,
-            "idle_break_s": 1.5,
-            "queue_maxsize": 512,
+            "connect_timeout_s": 0.75,
+            "write_timeout_s": 2.25,
+            "header_peek_timeout_s": 0.03,
+            "send_retry_count": 2,
+            "retry_backoff_s": 0.20,
             "worker_count": 3,
+            "per_packet_pause_s": 0.002,
+            "burst_pause_s": 0.05,
+            "connection_close": True,
+            "chunk_size": 8192,
             "max_packets": 0,
-            "clear_on_success": False,
-            "remove_sent_from_key": False,
-            "emit": "summary",  # summary | packets | bundle
+            "max_bytes": 0,
+            "max_per_topic": 0,
+            "min_raw_bytes": 1,
+            "burst_packets": 16,
+            "drain_timeout_s": 240.0,
+            "hard_batch_cap": 256,
+            "stop_after_consecutive_failures": 0,
+            "skip_broadcast": True,
+            "skip_multicast": True,
+            "skip_non_ip": False,
+            "skip_unknown_small_udp": True,
+            "noisy_topics": ["mdns", "nbns", "llmnr", "ssdp", "dhcp", "dhcpv6", "stun", "igmp"],
+            "noisy_ports": [67, 68, 137, 138, 1900, 5353, 5355],
+            "emit": "summary",
         }
 
 
 BLOCKS.register("interface", InterfaceBlock)
-
-
 # ======================= PacketTrackerBlock =======================
 
 @dataclass
 class PacketTrackerBlock(BaseBlock):
     """
-    Collect packets from libpcap or from an incoming packet list, match them
-    against a query, normalize them, and export them into Memory[packets_key].
+    Stateful packet tracker that behaves more like LinkTracker / VideoTracker /
+    PageTracker than a one-shot matcher.
 
-    Query examples:
-      "dns"
-      "p2pool 37889"
-      "udp 5353"
-      "192.168.0.1 53"
-      "https 443"
+    Design goals:
+      - sniff/capture packets through the existing libpcap path
+      - normalize + classify packets into long-lived telecom-style records
+      - maintain packet, host, flow, ARP, DNS, NAT, alert, and index state
+      - log meaningful events while learning so packet tracking is observable
+      - keep the public block shape the same (`packet_tracker`)
     """
+
+    @dataclass
+    class HostRecord:
+        host_id: str
+        ip: str = ""
+        macs: List[str] = field(default_factory=list)
+        ifaces: List[str] = field(default_factory=list)
+        topics: List[str] = field(default_factory=list)
+        peers: List[str] = field(default_factory=list)
+        packet_count: int = 0
+        byte_count: int = 0
+        inbound_count: int = 0
+        outbound_count: int = 0
+        dns_queries: List[str] = field(default_factory=list)
+        dns_answers: List[str] = field(default_factory=list)
+        services: List[str] = field(default_factory=list)
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+        zone: str = "unknown"
+        importance: float = 0.0
+        notes: List[str] = field(default_factory=list)
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "host_id": self.host_id,
+                "ip": self.ip,
+                "macs": list(self.macs),
+                "ifaces": list(self.ifaces),
+                "topics": list(self.topics),
+                "peers": list(self.peers),
+                "packet_count": int(self.packet_count),
+                "byte_count": int(self.byte_count),
+                "inbound_count": int(self.inbound_count),
+                "outbound_count": int(self.outbound_count),
+                "dns_queries": list(self.dns_queries),
+                "dns_answers": list(self.dns_answers),
+                "services": list(self.services),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+                "zone": self.zone,
+                "importance": round(float(self.importance), 4),
+                "notes": list(self.notes),
+            }
+
+    @dataclass
+    class FlowRecord:
+        flow_id: str
+        src_ip: str = ""
+        dst_ip: str = ""
+        src_port: Optional[int] = None
+        dst_port: Optional[int] = None
+        topic: str = "unknown"
+        l3: str = ""
+        l4: str = ""
+        ifaces: List[str] = field(default_factory=list)
+        packet_count: int = 0
+        byte_count: int = 0
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+        tcp_syn: int = 0
+        tcp_ack: int = 0
+        tcp_fin: int = 0
+        tcp_rst: int = 0
+        query_hits: List[str] = field(default_factory=list)
+        dns_names: List[str] = field(default_factory=list)
+        nat_hits: int = 0
+        score: float = 0.0
+        state: str = "seen"
+        zone_pair: str = ""
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "flow_id": self.flow_id,
+                "src_ip": self.src_ip,
+                "dst_ip": self.dst_ip,
+                "src_port": self.src_port,
+                "dst_port": self.dst_port,
+                "topic": self.topic,
+                "l3": self.l3,
+                "l4": self.l4,
+                "ifaces": list(self.ifaces),
+                "packet_count": int(self.packet_count),
+                "byte_count": int(self.byte_count),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+                "tcp_syn": int(self.tcp_syn),
+                "tcp_ack": int(self.tcp_ack),
+                "tcp_fin": int(self.tcp_fin),
+                "tcp_rst": int(self.tcp_rst),
+                "query_hits": list(self.query_hits),
+                "dns_names": list(self.dns_names),
+                "nat_hits": int(self.nat_hits),
+                "score": round(float(self.score), 4),
+                "state": self.state,
+                "zone_pair": self.zone_pair,
+            }
+
+    @dataclass
+    class DNSRecord:
+        dns_id: str
+        qname: str = ""
+        qtype: str = ""
+        query_count: int = 0
+        response_count: int = 0
+        nx_count: int = 0
+        clients: List[str] = field(default_factory=list)
+        servers: List[str] = field(default_factory=list)
+        answer_ips: List[str] = field(default_factory=list)
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+        score: float = 0.0
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "dns_id": self.dns_id,
+                "qname": self.qname,
+                "qtype": self.qtype,
+                "query_count": int(self.query_count),
+                "response_count": int(self.response_count),
+                "nx_count": int(self.nx_count),
+                "clients": list(self.clients),
+                "servers": list(self.servers),
+                "answer_ips": list(self.answer_ips),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+                "score": round(float(self.score), 4),
+            }
+
+    @dataclass
+    class ARPRecord:
+        arp_id: str
+        sender_ip: str = ""
+        sender_mac: str = ""
+        target_ip: str = ""
+        target_mac: str = ""
+        operation: str = ""
+        iface: str = ""
+        count: int = 0
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+        notes: List[str] = field(default_factory=list)
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "arp_id": self.arp_id,
+                "sender_ip": self.sender_ip,
+                "sender_mac": self.sender_mac,
+                "target_ip": self.target_ip,
+                "target_mac": self.target_mac,
+                "operation": self.operation,
+                "iface": self.iface,
+                "count": int(self.count),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+                "notes": list(self.notes),
+            }
+
+    @dataclass
+    class NATRecord:
+        nat_id: str
+        private_ip: str = ""
+        public_ip: str = ""
+        remote_ip: str = ""
+        private_port: Optional[int] = None
+        public_port: Optional[int] = None
+        remote_port: Optional[int] = None
+        direction: str = "unknown"
+        topic: str = "unknown"
+        count: int = 0
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+        ifaces: List[str] = field(default_factory=list)
+        evidence: List[str] = field(default_factory=list)
+        score: float = 0.0
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "nat_id": self.nat_id,
+                "private_ip": self.private_ip,
+                "public_ip": self.public_ip,
+                "remote_ip": self.remote_ip,
+                "private_port": self.private_port,
+                "public_port": self.public_port,
+                "remote_port": self.remote_port,
+                "direction": self.direction,
+                "topic": self.topic,
+                "count": int(self.count),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+                "ifaces": list(self.ifaces),
+                "evidence": list(self.evidence),
+                "score": round(float(self.score), 4),
+            }
+
+    @dataclass
+    class AlertRecord:
+        alert_id: str
+        category: str = ""
+        severity: str = "info"
+        message: str = ""
+        packet_refs: List[str] = field(default_factory=list)
+        hosts: List[str] = field(default_factory=list)
+        flows: List[str] = field(default_factory=list)
+        count: int = 0
+        first_seen: float = 0.0
+        last_seen: float = 0.0
+
+        def to_dict(self) -> Dict[str, Any]:
+            return {
+                "alert_id": self.alert_id,
+                "category": self.category,
+                "severity": self.severity,
+                "message": self.message,
+                "packet_refs": list(self.packet_refs),
+                "hosts": list(self.hosts),
+                "flows": list(self.flows),
+                "count": int(self.count),
+                "first_seen": float(self.first_seen),
+                "last_seen": float(self.last_seen),
+            }
+
+    class _TrackerState:
+        def __init__(self) -> None:
+            self.hosts: Dict[str, "PacketTrackerBlock.HostRecord"] = {}
+            self.flows: Dict[str, "PacketTrackerBlock.FlowRecord"] = {}
+            self.dns: Dict[str, "PacketTrackerBlock.DNSRecord"] = {}
+            self.arp: Dict[str, "PacketTrackerBlock.ARPRecord"] = {}
+            self.nat: Dict[str, "PacketTrackerBlock.NATRecord"] = {}
+            self.alerts: Dict[str, "PacketTrackerBlock.AlertRecord"] = {}
+            self.packet_signatures: Set[str] = set()
+            self.topic_counts: Dict[str, int] = collections.defaultdict(int)
+            self.iface_counts: Dict[str, int] = collections.defaultdict(int)
+            self.term_counts: Dict[str, int] = collections.defaultdict(int)
+            self.timeline: "collections.deque[Dict[str, Any]]" = collections.deque(maxlen=512)
+            self.activity_counts: Dict[str, int] = collections.defaultdict(int)
+            self.logs_emitted: Set[str] = set()
+            self.capture_scanned: int = 0
+            self.capture_matched: int = 0
+            self.capture_rejected: int = 0
 
     def _log(self, msg: str) -> None:
         try:
-            DEBUG_LOGGER.log_message(f"[PacketTracker] {msg}")
+            if hasattr(DEBUG_LOGGER, "log_message"):
+                DEBUG_LOGGER.log_message(f"[PacketTracker] {msg}")
+            elif hasattr(DEBUG_LOGGER, "log"):
+                DEBUG_LOGGER.log(f"[PacketTracker] {msg}")
         except Exception:
             pass
 
@@ -35351,17 +36098,811 @@ class PacketTrackerBlock(BaseBlock):
                 items.append(dict(payload))
         return items
 
+    def _bounded_add(self, bucket: List[Any], value: Any, *, max_items: int = 32) -> None:
+        if value is None:
+            return
+        s = str(value).strip()
+        if not s:
+            return
+        if s in {str(x) for x in bucket}:
+            return
+        bucket.append(value)
+        if max_items > 0 and len(bucket) > max_items:
+            del bucket[:-max_items]
+
+    def _dedupe_dicts(self, items: List[Dict[str, Any]], *, key_name: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for item in items:
+            k = str(item.get(key_name) or "")
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(item)
+        return out
+
+    def _zone_for_ip(self, ip: str) -> str:
+        s = str(ip or "").strip()
+        if not s:
+            return "unknown"
+        low = s.lower()
+        if ":" in low:
+            if low.startswith("fe80:"):
+                return "link_local"
+            if low.startswith("ff"):
+                return "multicast"
+            if low.startswith("fc") or low.startswith("fd"):
+                return "private"
+            if low == "::1":
+                return "loopback"
+            return "public"
+        parts = s.split(".")
+        if len(parts) != 4:
+            return "unknown"
+        try:
+            a, b, c, d = [int(x) for x in parts]
+        except Exception:
+            return "unknown"
+        if a == 127:
+            return "loopback"
+        if a == 169 and b == 254:
+            return "link_local"
+        if a == 10:
+            return "private"
+        if a == 172 and 16 <= b <= 31:
+            return "private"
+        if a == 192 and b == 168:
+            return "private"
+        if a == 100 and 64 <= b <= 127:
+            return "carrier_nat"
+        if 224 <= a <= 239:
+            return "multicast"
+        if a == 255:
+            return "broadcast"
+        return "public"
+
+    def _is_privateish(self, ip: str) -> bool:
+        return self._zone_for_ip(ip) in {"private", "link_local", "loopback", "carrier_nat"}
+
+    def _host_key(self, ip: str, mac: str = "") -> str:
+        ip_s = str(ip or "").strip()
+        mac_s = str(mac or "").strip().lower()
+        if ip_s:
+            return f"ip:{ip_s}"
+        if mac_s:
+            return f"mac:{mac_s}"
+        return "host:unknown"
+
+    def _flow_key(self, packet: Dict[str, Any]) -> str:
+        return "|".join([
+            str(packet.get("l3") or ""),
+            str(packet.get("l4") or ""),
+            str(packet.get("src_ip") or ""),
+            str(packet.get("src_port") if packet.get("src_port") is not None else ""),
+            str(packet.get("dst_ip") or ""),
+            str(packet.get("dst_port") if packet.get("dst_port") is not None else ""),
+            str(packet.get("topic") or ""),
+        ])
+
+    def _packet_ref(self, packet: Dict[str, Any]) -> str:
+        return _pc_packet_signature(packet)
+
+    def _decode_raw_from_norm(self, packet: Dict[str, Any]) -> bytes:
+        return _pc_decode_raw_bytes(packet)
+
+    def _extract_arp_observation(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        raw = self._decode_raw_from_norm(packet)
+        if not raw:
+            return {}
+        try:
+            if len(raw) < 14:
+                return {}
+            ether_type = int.from_bytes(raw[12:14], "big")
+            offset = 14
+            if ether_type == 0x8100 and len(raw) >= 18:
+                ether_type = int.from_bytes(raw[16:18], "big")
+                offset = 18
+            if ether_type != 0x0806 or len(raw) < offset + 28:
+                return {}
+            oper = int.from_bytes(raw[offset + 6: offset + 8], "big")
+            sha = raw[offset + 8: offset + 14]
+            spa = raw[offset + 14: offset + 18]
+            tha = raw[offset + 18: offset + 24]
+            tpa = raw[offset + 24: offset + 28]
+            return {
+                "operation": "reply" if oper == 2 else "request" if oper == 1 else str(oper),
+                "sender_mac": _pc_mac(sha),
+                "sender_ip": _pc_ipv4(spa),
+                "target_mac": _pc_mac(tha),
+                "target_ip": _pc_ipv4(tpa),
+            }
+        except Exception:
+            return {}
+
+    def _read_dns_name(self, buf: bytes, offset: int, *, max_jumps: int = 8) -> Tuple[str, int]:
+        labels: List[str] = []
+        i = int(offset)
+        jumped = False
+        end_offset = i
+        jumps = 0
+        try:
+            while i < len(buf):
+                ln = int(buf[i])
+                if ln == 0:
+                    if not jumped:
+                        end_offset = i + 1
+                    break
+                if ln & 0xC0 == 0xC0:
+                    if i + 1 >= len(buf):
+                        break
+                    ptr = ((ln & 0x3F) << 8) | int(buf[i + 1])
+                    if not jumped:
+                        end_offset = i + 2
+                    i = ptr
+                    jumped = True
+                    jumps += 1
+                    if jumps > max_jumps:
+                        break
+                    continue
+                i += 1
+                if i + ln > len(buf):
+                    break
+                label = buf[i:i + ln].decode("utf-8", errors="ignore").strip()
+                if label:
+                    labels.append(label)
+                i += ln
+                if not jumped:
+                    end_offset = i
+            return ".".join(labels).strip("."), end_offset
+        except Exception:
+            return "", offset
+
+    def _extract_dns_observation(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        raw = self._decode_raw_from_norm(packet)
+        if not raw:
+            return {}
+        try:
+            topic = str(packet.get("topic") or "").lower()
+            l4 = str(packet.get("l4") or "").lower()
+            if topic != "dns" or l4 != "udp":
+                return {}
+            if len(raw) < 14:
+                return {}
+            ether_type = int.from_bytes(raw[12:14], "big")
+            offset = 14
+            if ether_type == 0x8100 and len(raw) >= 18:
+                ether_type = int.from_bytes(raw[16:18], "big")
+                offset = 18
+            udp_off = None
+            if ether_type == 0x0800 and len(raw) >= offset + 20:
+                ihl = (raw[offset] & 0x0F) * 4
+                udp_off = offset + ihl
+            elif ether_type == 0x86DD and len(raw) >= offset + 40:
+                udp_off = offset + 40
+            if udp_off is None or len(raw) < udp_off + 8 + 12:
+                return {}
+            dns = raw[udp_off + 8:]
+            flags = int.from_bytes(dns[2:4], "big")
+            qdcount = int.from_bytes(dns[4:6], "big")
+            ancount = int.from_bytes(dns[6:8], "big")
+            qr = 1 if (flags & 0x8000) else 0
+            rcode = flags & 0x000F
+            qname = ""
+            qtype = ""
+            answer_ips: List[str] = []
+            pos = 12
+            if qdcount > 0:
+                qname, pos = self._read_dns_name(dns, pos)
+                if pos + 4 <= len(dns):
+                    qtype_num = int.from_bytes(dns[pos:pos + 2], "big")
+                    qtype = {1: "A", 28: "AAAA", 5: "CNAME", 15: "MX", 16: "TXT"}.get(qtype_num, str(qtype_num))
+                    pos += 4
+            answer_pos = pos
+            for _ in range(min(ancount, 4)):
+                _, answer_pos = self._read_dns_name(dns, answer_pos)
+                if answer_pos + 10 > len(dns):
+                    break
+                atype = int.from_bytes(dns[answer_pos:answer_pos + 2], "big")
+                rdlen = int.from_bytes(dns[answer_pos + 8:answer_pos + 10], "big")
+                rdata_pos = answer_pos + 10
+                rdata_end = rdata_pos + rdlen
+                if rdata_end > len(dns):
+                    break
+                rdata = dns[rdata_pos:rdata_end]
+                if atype == 1 and rdlen == 4:
+                    answer_ips.append(_pc_ipv4(rdata))
+                elif atype == 28 and rdlen == 16:
+                    answer_ips.append(_pc_ipv6(rdata))
+                answer_pos = rdata_end
+            if not qname:
+                for key in ("dns_name", "domain", "hostname", "query"):
+                    value = str((packet.get("extra") or {}).get(key) or "").strip()
+                    if value:
+                        qname = value
+                        break
+            return {
+                "qname": qname.lower(),
+                "qtype": qtype,
+                "is_response": bool(qr),
+                "rcode": int(rcode),
+                "ancount": int(ancount),
+                "answer_ips": [x for x in answer_ips if x],
+            }
+        except Exception:
+            return {}
+
+    def _packet_score(self, packet: Dict[str, Any], *, query: str) -> float:
+        score = 0.0
+        topic = str(packet.get("topic") or "").lower()
+        zone_src = self._zone_for_ip(str(packet.get("src_ip") or ""))
+        zone_dst = self._zone_for_ip(str(packet.get("dst_ip") or ""))
+        raw_len = _pc_int(packet.get("raw_len"), 0)
+        score += min(2.0, raw_len / 256.0)
+        if topic not in {"unknown", ""}:
+            score += 0.75
+        if topic in {"dns", "arp", "http", "https", "p2pool", "monero", "stratum"}:
+            score += 0.75
+        if zone_src != zone_dst and "unknown" not in {zone_src, zone_dst}:
+            score += 0.75
+        if packet.get("src_port") or packet.get("dst_port"):
+            score += 0.25
+        ok, query_score, _ = _pc_packet_matches(packet, query, require_all=False)
+        if ok:
+            score += query_score * 2.0
+        if bool(packet.get("is_broadcast")) or bool(packet.get("is_multicast")):
+            score += 0.1
+        return round(score, 4)
+
+    def _merge_terms_from_packet(self, state: "_TrackerState", packet: Dict[str, Any]) -> None:
+        for value in (
+            packet.get("topic"),
+            packet.get("l3"),
+            packet.get("l4"),
+            packet.get("iface"),
+            packet.get("src_ip"),
+            packet.get("dst_ip"),
+            packet.get("src_mac"),
+            packet.get("dst_mac"),
+            packet.get("src_port"),
+            packet.get("dst_port"),
+        ):
+            s = str(value or "").strip()
+            if s:
+                state.term_counts[s] += 1
+        for term in _pc_query_terms(packet.get("raw_ascii_preview") or "", top_k=12):
+            if len(term) >= 3:
+                state.term_counts[term] += 1
+
+    def _get_or_create_host(self, state: "_TrackerState", *, ip: str, mac: str = "", ts: float = 0.0) -> "PacketTrackerBlock.HostRecord":
+        key = self._host_key(ip, mac)
+        rec = state.hosts.get(key)
+        if rec is None:
+            rec = self.HostRecord(
+                host_id=key,
+                ip=str(ip or ""),
+                first_seen=float(ts or time.time()),
+                last_seen=float(ts or time.time()),
+                zone=self._zone_for_ip(str(ip or "")),
+            )
+            if mac:
+                rec.macs.append(str(mac).lower())
+            state.hosts[key] = rec
+        return rec
+
+    def _touch_host(self, rec: "PacketTrackerBlock.HostRecord", *, iface: str, topic: str, peer: str, raw_len: int, direction: str, dns_name: str = "", dns_answers: Optional[List[str]] = None) -> None:
+        rec.packet_count += 1
+        rec.byte_count += int(raw_len or 0)
+        rec.last_seen = float(time.time()) if rec.last_seen <= 0 else rec.last_seen
+        self._bounded_add(rec.ifaces, iface, max_items=16)
+        self._bounded_add(rec.topics, topic, max_items=16)
+        self._bounded_add(rec.peers, peer, max_items=48)
+        if direction == "inbound":
+            rec.inbound_count += 1
+        elif direction == "outbound":
+            rec.outbound_count += 1
+        if dns_name:
+            self._bounded_add(rec.dns_queries, dns_name, max_items=64)
+        for answer in dns_answers or []:
+            self._bounded_add(rec.dns_answers, answer, max_items=64)
+        if topic and topic not in {"unknown", "arp"}:
+            self._bounded_add(rec.services, topic, max_items=24)
+        rec.importance += 0.15 + (0.2 if topic in {"dns", "http", "https", "p2pool", "monero", "stratum"} else 0.0)
+
+    def _update_hosts(self, state: "_TrackerState", packet: Dict[str, Any], dns_obs: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        ts = _pc_float(packet.get("timestamp"), time.time())
+        src_ip = str(packet.get("src_ip") or "")
+        dst_ip = str(packet.get("dst_ip") or "")
+        src_mac = str(packet.get("src_mac") or "")
+        dst_mac = str(packet.get("dst_mac") or "")
+        iface = str(packet.get("iface") or "")
+        topic = str(packet.get("topic") or "unknown")
+        raw_len = _pc_int(packet.get("raw_len"), 0)
+        src_id = None
+        dst_id = None
+
+        if src_ip or src_mac:
+            src = self._get_or_create_host(state, ip=src_ip, mac=src_mac, ts=ts)
+            src.last_seen = ts
+            self._touch_host(
+                src,
+                iface=iface,
+                topic=topic,
+                peer=dst_ip or dst_mac,
+                raw_len=raw_len,
+                direction="outbound",
+                dns_name=str(dns_obs.get("qname") or "") if str(packet.get("topic") or "").lower() == "dns" and not dns_obs.get("is_response") else "",
+                dns_answers=list(dns_obs.get("answer_ips") or []),
+            )
+            if src_mac:
+                self._bounded_add(src.macs, src_mac.lower(), max_items=8)
+            if not src.first_seen:
+                src.first_seen = ts
+            src_id = src.host_id
+
+        if dst_ip or dst_mac:
+            dst = self._get_or_create_host(state, ip=dst_ip, mac=dst_mac, ts=ts)
+            dst.last_seen = ts
+            self._touch_host(
+                dst,
+                iface=iface,
+                topic=topic,
+                peer=src_ip or src_mac,
+                raw_len=raw_len,
+                direction="inbound",
+                dns_name="",
+                dns_answers=list(dns_obs.get("answer_ips") or []) if dns_obs.get("is_response") else [],
+            )
+            if dst_mac:
+                self._bounded_add(dst.macs, dst_mac.lower(), max_items=8)
+            if not dst.first_seen:
+                dst.first_seen = ts
+            dst_id = dst.host_id
+
+        return src_id, dst_id
+
+    def _update_flow(self, state: "_TrackerState", packet: Dict[str, Any], *, query_hits: List[str], dns_obs: Dict[str, Any]) -> str:
+        ts = _pc_float(packet.get("timestamp"), time.time())
+        key = self._flow_key(packet)
+        flow = state.flows.get(key)
+        if flow is None:
+            flow = self.FlowRecord(
+                flow_id=key,
+                src_ip=str(packet.get("src_ip") or ""),
+                dst_ip=str(packet.get("dst_ip") or ""),
+                src_port=packet.get("src_port"),
+                dst_port=packet.get("dst_port"),
+                topic=str(packet.get("topic") or "unknown"),
+                l3=str(packet.get("l3") or ""),
+                l4=str(packet.get("l4") or ""),
+                first_seen=ts,
+                last_seen=ts,
+                zone_pair=f"{self._zone_for_ip(str(packet.get('src_ip') or ''))}->{self._zone_for_ip(str(packet.get('dst_ip') or ''))}",
+            )
+            state.flows[key] = flow
+        flow.packet_count += 1
+        flow.byte_count += _pc_int(packet.get("raw_len"), 0)
+        flow.last_seen = ts
+        self._bounded_add(flow.ifaces, str(packet.get("iface") or ""), max_items=16)
+        for hit in query_hits:
+            self._bounded_add(flow.query_hits, hit, max_items=16)
+        if dns_obs.get("qname"):
+            self._bounded_add(flow.dns_names, dns_obs.get("qname"), max_items=16)
+        flags = str(packet.get("tcp_flags") or "")
+        if "S" in flags and "A" not in flags:
+            flow.tcp_syn += 1
+        if "A" in flags:
+            flow.tcp_ack += 1
+        if "F" in flags:
+            flow.tcp_fin += 1
+        if "R" in flags:
+            flow.tcp_rst += 1
+        if flow.tcp_syn and flow.tcp_ack:
+            flow.state = "established_like"
+        elif flow.tcp_rst:
+            flow.state = "reset"
+        elif flow.tcp_fin:
+            flow.state = "closing"
+        else:
+            flow.state = "seen"
+        flow.score += self._packet_score(packet, query=" ".join(query_hits))
+        return key
+
+    def _update_dns(self, state: "_TrackerState", packet: Dict[str, Any], dns_obs: Dict[str, Any]) -> Optional[str]:
+        qname = str(dns_obs.get("qname") or "").strip().lower()
+        if not qname:
+            return None
+        qtype = str(dns_obs.get("qtype") or "")
+        dns_id = f"{qname}|{qtype}"
+        ts = _pc_float(packet.get("timestamp"), time.time())
+        rec = state.dns.get(dns_id)
+        if rec is None:
+            rec = self.DNSRecord(
+                dns_id=dns_id,
+                qname=qname,
+                qtype=qtype,
+                first_seen=ts,
+                last_seen=ts,
+            )
+            state.dns[dns_id] = rec
+            self._log(f"🌐 DNS discovered qname={qname} qtype={qtype or '?'}")
+        rec.last_seen = ts
+        if dns_obs.get("is_response"):
+            rec.response_count += 1
+        else:
+            rec.query_count += 1
+        if _pc_int(dns_obs.get("rcode"), 0) == 3:
+            rec.nx_count += 1
+        self._bounded_add(rec.clients, str(packet.get("src_ip") or ""), max_items=32)
+        self._bounded_add(rec.servers, str(packet.get("dst_ip") or ""), max_items=16)
+        for answer_ip in dns_obs.get("answer_ips") or []:
+            self._bounded_add(rec.answer_ips, answer_ip, max_items=32)
+        rec.score += 0.25 + (0.5 if dns_obs.get("answer_ips") else 0.0)
+        return dns_id
+
+    def _update_arp(self, state: "_TrackerState", packet: Dict[str, Any], arp_obs: Dict[str, Any]) -> Optional[str]:
+        if not arp_obs:
+            return None
+        sender_ip = str(arp_obs.get("sender_ip") or "")
+        sender_mac = str(arp_obs.get("sender_mac") or "")
+        target_ip = str(arp_obs.get("target_ip") or "")
+        operation = str(arp_obs.get("operation") or "")
+        iface = str(packet.get("iface") or "")
+        arp_id = f"{sender_ip}|{sender_mac}|{target_ip}|{operation}"
+        ts = _pc_float(packet.get("timestamp"), time.time())
+        rec = state.arp.get(arp_id)
+        if rec is None:
+            rec = self.ARPRecord(
+                arp_id=arp_id,
+                sender_ip=sender_ip,
+                sender_mac=sender_mac,
+                target_ip=target_ip,
+                target_mac=str(arp_obs.get("target_mac") or ""),
+                operation=operation,
+                iface=iface,
+                first_seen=ts,
+                last_seen=ts,
+            )
+            state.arp[arp_id] = rec
+            self._log(f"🧭 ARP {operation} {sender_ip}({sender_mac}) -> {target_ip}")
+        rec.count += 1
+        rec.last_seen = ts
+        if operation == "reply":
+            self._bounded_add(rec.notes, "binding_observed", max_items=8)
+        if sender_ip and sender_mac:
+            host = self._get_or_create_host(state, ip=sender_ip, mac=sender_mac, ts=ts)
+            self._bounded_add(host.notes, f"arp:{operation}:{target_ip}", max_items=24)
+        return arp_id
+
+    def _classify_nat(self, packet: Dict[str, Any]) -> Dict[str, Any]:
+        src_ip = str(packet.get("src_ip") or "")
+        dst_ip = str(packet.get("dst_ip") or "")
+        src_zone = self._zone_for_ip(src_ip)
+        dst_zone = self._zone_for_ip(dst_ip)
+        src_port = packet.get("src_port")
+        dst_port = packet.get("dst_port")
+        topic = str(packet.get("topic") or "unknown")
+        if not src_ip or not dst_ip:
+            return {}
+        if src_zone in {"private", "link_local", "carrier_nat"} and dst_zone == "public":
+            return {
+                "direction": "outbound",
+                "private_ip": src_ip,
+                "public_ip": dst_ip,
+                "remote_ip": dst_ip,
+                "private_port": src_port,
+                "public_port": dst_port,
+                "remote_port": dst_port,
+                "topic": topic,
+                "evidence": [f"{src_zone}->{dst_zone}"],
+            }
+        if src_zone == "public" and dst_zone in {"private", "link_local", "carrier_nat"}:
+            return {
+                "direction": "inbound",
+                "private_ip": dst_ip,
+                "public_ip": src_ip,
+                "remote_ip": src_ip,
+                "private_port": dst_port,
+                "public_port": src_port,
+                "remote_port": src_port,
+                "topic": topic,
+                "evidence": [f"{src_zone}->{dst_zone}"],
+            }
+        if src_zone in {"private", "link_local", "carrier_nat"} and dst_zone in {"private", "link_local", "carrier_nat"} and src_ip != dst_ip:
+            return {
+                "direction": "inside",
+                "private_ip": src_ip,
+                "public_ip": "",
+                "remote_ip": dst_ip,
+                "private_port": src_port,
+                "public_port": None,
+                "remote_port": dst_port,
+                "topic": topic,
+                "evidence": [f"{src_zone}->{dst_zone}"],
+            }
+        return {}
+
+    def _update_nat(self, state: "_TrackerState", packet: Dict[str, Any], flow_id: str) -> Optional[str]:
+        nat_obs = self._classify_nat(packet)
+        if not nat_obs:
+            return None
+        nat_id = "|".join([
+            str(nat_obs.get("direction") or ""),
+            str(nat_obs.get("private_ip") or ""),
+            str(nat_obs.get("remote_ip") or ""),
+            str(nat_obs.get("private_port") if nat_obs.get("private_port") is not None else ""),
+            str(nat_obs.get("remote_port") if nat_obs.get("remote_port") is not None else ""),
+            str(nat_obs.get("topic") or ""),
+        ])
+        ts = _pc_float(packet.get("timestamp"), time.time())
+        rec = state.nat.get(nat_id)
+        if rec is None:
+            rec = self.NATRecord(
+                nat_id=nat_id,
+                private_ip=str(nat_obs.get("private_ip") or ""),
+                public_ip=str(nat_obs.get("public_ip") or ""),
+                remote_ip=str(nat_obs.get("remote_ip") or ""),
+                private_port=nat_obs.get("private_port"),
+                public_port=nat_obs.get("public_port"),
+                remote_port=nat_obs.get("remote_port"),
+                direction=str(nat_obs.get("direction") or "unknown"),
+                topic=str(nat_obs.get("topic") or "unknown"),
+                first_seen=ts,
+                last_seen=ts,
+            )
+            state.nat[nat_id] = rec
+            self._log(
+                f"🧩 NAT candidate direction={rec.direction} private={rec.private_ip}:{rec.private_port} "
+                f"remote={rec.remote_ip}:{rec.remote_port} topic={rec.topic}"
+            )
+        rec.count += 1
+        rec.last_seen = ts
+        self._bounded_add(rec.ifaces, str(packet.get("iface") or ""), max_items=16)
+        for ev in nat_obs.get("evidence") or []:
+            self._bounded_add(rec.evidence, ev, max_items=16)
+        rec.score += 0.2 + (0.35 if rec.direction in {"outbound", "inbound"} else 0.05)
+        flow = state.flows.get(flow_id)
+        if flow is not None:
+            flow.nat_hits += 1
+        return nat_id
+
+    def _emit_alert(self, state: "_TrackerState", *, category: str, severity: str, message: str, packet_ref: str, host_ids: Optional[List[str]] = None, flow_ids: Optional[List[str]] = None) -> str:
+        alert_id = hashlib.sha1(f"{category}|{message}".encode("utf-8", errors="ignore")).hexdigest()[:20]
+        ts = time.time()
+        rec = state.alerts.get(alert_id)
+        if rec is None:
+            rec = self.AlertRecord(
+                alert_id=alert_id,
+                category=category,
+                severity=severity,
+                message=message,
+                first_seen=ts,
+                last_seen=ts,
+            )
+            state.alerts[alert_id] = rec
+            self._log(f"🚨 {severity.upper()} {category}: {message}")
+        rec.count += 1
+        rec.last_seen = ts
+        self._bounded_add(rec.packet_refs, packet_ref, max_items=32)
+        for host_id in host_ids or []:
+            self._bounded_add(rec.hosts, host_id, max_items=16)
+        for flow_id in flow_ids or []:
+            self._bounded_add(rec.flows, flow_id, max_items=16)
+        return alert_id
+
+    def _heuristic_alerts(self, state: "_TrackerState", packet: Dict[str, Any], *, flow_id: str, src_host_id: Optional[str], dst_host_id: Optional[str], dns_obs: Dict[str, Any], arp_obs: Dict[str, Any], nat_id: Optional[str]) -> None:
+        packet_ref = self._packet_ref(packet)
+        topic = str(packet.get("topic") or "").lower()
+        flags = str(packet.get("tcp_flags") or "")
+        host_ids = [x for x in (src_host_id, dst_host_id) if x]
+        flow_ids = [flow_id] if flow_id else []
+        if topic == "arp" and arp_obs.get("operation") == "reply" and str(arp_obs.get("sender_ip") or "") and str(arp_obs.get("sender_mac") or ""):
+            self._emit_alert(
+                state,
+                category="arp_binding",
+                severity="info",
+                message=f"ARP reply observed for {arp_obs.get('sender_ip')} -> {arp_obs.get('sender_mac')}",
+                packet_ref=packet_ref,
+                host_ids=host_ids,
+                flow_ids=flow_ids,
+            )
+        if topic == "dns" and _pc_int(dns_obs.get("rcode"), 0) == 3 and str(dns_obs.get("qname") or ""):
+            self._emit_alert(
+                state,
+                category="dns_nxdomain",
+                severity="low",
+                message=f"DNS NXDOMAIN for {dns_obs.get('qname')}",
+                packet_ref=packet_ref,
+                host_ids=host_ids,
+                flow_ids=flow_ids,
+            )
+        if "R" in flags and str(packet.get("l4") or "").lower() == "tcp":
+            self._emit_alert(
+                state,
+                category="tcp_reset",
+                severity="low",
+                message=f"TCP reset on flow {flow_id}",
+                packet_ref=packet_ref,
+                host_ids=host_ids,
+                flow_ids=flow_ids,
+            )
+        if nat_id and topic in {"p2pool", "monero", "stratum"}:
+            self._emit_alert(
+                state,
+                category="miner_nat_activity",
+                severity="info",
+                message=f"Mining-related NAT flow observed ({topic})",
+                packet_ref=packet_ref,
+                host_ids=host_ids,
+                flow_ids=flow_ids,
+            )
+        if bool(packet.get("is_broadcast")) and topic in {"nbns", "mdns", "ssdp", "dhcp"}:
+            self._emit_alert(
+                state,
+                category="broadcast_noise",
+                severity="low",
+                message=f"Broadcast discovery traffic observed ({topic})",
+                packet_ref=packet_ref,
+                host_ids=host_ids,
+                flow_ids=flow_ids,
+            )
+
+    def _state_lists(self, state: "_TrackerState") -> Dict[str, List[Dict[str, Any]]]:
+        hosts = sorted((x.to_dict() for x in state.hosts.values()), key=lambda r: (-float(r.get("importance", 0.0)), -int(r.get("packet_count", 0)), str(r.get("host_id") or "")))
+        flows = sorted((x.to_dict() for x in state.flows.values()), key=lambda r: (-int(r.get("packet_count", 0)), -float(r.get("score", 0.0)), str(r.get("flow_id") or "")))
+        dns = sorted((x.to_dict() for x in state.dns.values()), key=lambda r: (-int(r.get("query_count", 0) + r.get("response_count", 0)), str(r.get("dns_id") or "")))
+        arp = sorted((x.to_dict() for x in state.arp.values()), key=lambda r: (-int(r.get("count", 0)), str(r.get("arp_id") or "")))
+        nat = sorted((x.to_dict() for x in state.nat.values()), key=lambda r: (-int(r.get("count", 0)), -float(r.get("score", 0.0)), str(r.get("nat_id") or "")))
+        alerts = sorted((x.to_dict() for x in state.alerts.values()), key=lambda r: (-int(r.get("count", 0)), str(r.get("alert_id") or "")))
+        return {
+            "hosts": hosts,
+            "flows": flows,
+            "dns": dns,
+            "arp": arp,
+            "nat": nat,
+            "alerts": alerts,
+        }
+
+    def _save_tracker_memory(
+        self,
+        *,
+        packets_key: str,
+        packets: List[Dict[str, Any]],
+        state: "_TrackerState",
+        append: bool,
+        max_memory_items: int,
+        memory_prefix: str,
+    ) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        if packets_key:
+            counts["packets"] = _pc_save_memory_packets(
+                packets_key,
+                packets,
+                append=append,
+                max_items=max_memory_items,
+            )
+        mem = Memory.load()
+        lists = self._state_lists(state)
+        for suffix, items in lists.items():
+            key = f"{memory_prefix}_{suffix}"
+            mem[key] = items[-max_memory_items:] if max_memory_items > 0 else items
+            counts[suffix] = len(mem[key])
+        mem[f"{memory_prefix}_topics"] = dict(sorted(state.topic_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))))
+        mem[f"{memory_prefix}_ifaces"] = dict(sorted(state.iface_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0]))))
+        top_terms = sorted(state.term_counts.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:256]
+        mem[f"{memory_prefix}_terms"] = [{"term": k, "count": int(v)} for k, v in top_terms]
+        mem[f"{memory_prefix}_timeline"] = list(state.timeline)
+        mem[f"{memory_prefix}_summary"] = {
+            "hosts": len(lists["hosts"]),
+            "flows": len(lists["flows"]),
+            "dns": len(lists["dns"]),
+            "arp": len(lists["arp"]),
+            "nat": len(lists["nat"]),
+            "alerts": len(lists["alerts"]),
+            "topics": dict(state.topic_counts),
+            "ifaces": dict(state.iface_counts),
+            "capture_scanned": int(state.capture_scanned),
+            "capture_matched": int(state.capture_matched),
+            "capture_rejected": int(state.capture_rejected),
+            "saved_at": time.time(),
+        }
+        Memory.save(mem)
+        return counts
+
+    def _track_packets(
+        self,
+        *,
+        packets: List[Dict[str, Any]],
+        query: str,
+        tracker_state: "_TrackerState",
+        dedupe_signatures: bool,
+        log_every: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+        normalized: List[Dict[str, Any]] = []
+        matched_count = 0
+        rejected_count = 0
+        duplicate_count = 0
+
+        for idx, item in enumerate(packets):
+            norm = _pc_normalize_packet(item)
+            packet_sig = self._packet_ref(norm)
+            if dedupe_signatures and packet_sig in tracker_state.packet_signatures:
+                duplicate_count += 1
+                continue
+            tracker_state.packet_signatures.add(packet_sig)
+
+            ok, score, hits = _pc_packet_matches(norm, query, require_all=False if query else True)
+            norm["match_score"] = round(score, 4)
+            norm["query_hits"] = hits
+            norm["tracker_score"] = self._packet_score(norm, query=query)
+            if query and not ok:
+                rejected_count += 1
+                continue
+
+            matched_count += 1
+            normalized.append(norm)
+
+            tracker_state.topic_counts[str(norm.get("topic") or "unknown")] += 1
+            tracker_state.iface_counts[str(norm.get("iface") or "unknown")] += 1
+            self._merge_terms_from_packet(tracker_state, norm)
+
+            dns_obs = self._extract_dns_observation(norm)
+            arp_obs = self._extract_arp_observation(norm) if str(norm.get("topic") or "").lower() == "arp" else {}
+            src_host_id, dst_host_id = self._update_hosts(tracker_state, norm, dns_obs)
+            flow_id = self._update_flow(tracker_state, norm, query_hits=hits, dns_obs=dns_obs)
+            if dns_obs:
+                self._update_dns(tracker_state, norm, dns_obs)
+            if arp_obs:
+                self._update_arp(tracker_state, norm, arp_obs)
+            nat_id = self._update_nat(tracker_state, norm, flow_id)
+            self._heuristic_alerts(
+                tracker_state,
+                norm,
+                flow_id=flow_id,
+                src_host_id=src_host_id,
+                dst_host_id=dst_host_id,
+                dns_obs=dns_obs,
+                arp_obs=arp_obs,
+                nat_id=nat_id,
+            )
+
+            tracker_state.timeline.append({
+                "timestamp": _pc_float(norm.get("timestamp"), time.time()),
+                "iface": str(norm.get("iface") or ""),
+                "topic": str(norm.get("topic") or ""),
+                "src_ip": str(norm.get("src_ip") or ""),
+                "dst_ip": str(norm.get("dst_ip") or ""),
+                "src_port": norm.get("src_port"),
+                "dst_port": norm.get("dst_port"),
+                "tracker_score": norm.get("tracker_score"),
+                "flow_id": flow_id,
+            })
+
+            if log_every > 0 and matched_count % log_every == 0:
+                self._log(
+                    f"📈 tracked={matched_count} hosts={len(tracker_state.hosts)} flows={len(tracker_state.flows)} "
+                    f"dns={len(tracker_state.dns)} arp={len(tracker_state.arp)} nat={len(tracker_state.nat)} alerts={len(tracker_state.alerts)}"
+                )
+
+        return normalized, {
+            "matched": matched_count,
+            "rejected": rejected_count,
+            "duplicates": duplicate_count,
+        }
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
         query = str(params.get("query") or payload if isinstance(payload, str) else params.get("query") or "").strip()
         packets_key = str(params.get("packets_key") or "packets").strip()
+        memory_prefix = str(params.get("memory_prefix") or packets_key or "packets").strip()
         append = _pc_bool(params.get("append"), False)
         max_memory_items = max(32, _pc_int(params.get("max_memory_items"), 5000))
-        require_all_terms = _pc_bool(params.get("require_all_terms"), True)
         include_payload_packets = _pc_bool(params.get("include_payload_packets"), True)
         include_memory_packets = _pc_bool(params.get("include_memory_packets"), False)
         source_packets_key = str(params.get("source_packets_key") or packets_key).strip()
         include_libpcap = _pc_bool(params.get("include_libpcap"), True)
         emit = str(params.get("emit") or "summary").strip().lower()
+        dedupe_signatures = _pc_bool(params.get("dedupe_signatures"), True)
+        max_track_packets = max(1, _pc_int(params.get("max_track_packets"), 10000))
+        log_every = max(1, _pc_int(params.get("log_every"), 25))
 
         iface = str(params.get("iface") or params.get("capture_iface") or "").strip()
         pcap_path = str(params.get("pcap_path") or "").strip()
@@ -35373,13 +36914,19 @@ class PacketTrackerBlock(BaseBlock):
         queue_maxsize = max(8, _pc_int(params.get("queue_maxsize"), 512))
         worker_count = max(1, min(8, _pc_int(params.get("worker_count"), 2)))
 
+        self._log(
+            f"▶️ start query={query!r} key={packets_key!r} prefix={memory_prefix!r} "
+            f"payload={bool(include_payload_packets)} memory={bool(include_memory_packets)} libpcap={bool(include_libpcap)}"
+        )
+
         incoming: List[Dict[str, Any]] = []
         if include_payload_packets:
             incoming.extend([x for x in self._collect_from_payload(payload) if _pc_has_raw_data(x)])
         if include_memory_packets and source_packets_key:
             incoming.extend([x for x in _pc_load_memory_packets(source_packets_key) if _pc_has_raw_data(x)])
 
-        # libpcap capture path
+        tracker_state = self._TrackerState()
+
         if include_libpcap and (iface or pcap_path):
             backend = None
             try:
@@ -35391,43 +36938,49 @@ class PacketTrackerBlock(BaseBlock):
                 )
                 if pcap_path:
                     backend.open_offline(pcap_path)
+                    self._log(f"📦 sniffing offline pcap={pcap_path!r}")
                 else:
                     backend.open_live(iface)
+                    self._log(f"📡 sniffing live iface={iface!r}")
 
                 q: "queue.Queue[Any]" = queue.Queue(maxsize=queue_maxsize)
                 lock = threading.Lock()
                 matched: List[Dict[str, Any]] = []
-                scanned = 0
-                rejected = 0
 
                 def _producer() -> None:
-                    nonlocal scanned
                     deadline = time.time() + capture_budget_s
-                    while scanned < max_capture_packets and time.time() < deadline:
+                    while tracker_state.capture_scanned < max_capture_packets and time.time() < deadline:
                         pkt = backend.next_packet()
                         if pkt is None:
                             continue
-                        scanned += 1
-                        q.put(pkt)
+                        tracker_state.capture_scanned += 1
+                        try:
+                            q.put(pkt, timeout=0.25)
+                        except Exception:
+                            break
                     for _ in range(worker_count):
-                        q.put(_PACKET_SENTINEL)
+                        try:
+                            q.put(_PACKET_SENTINEL, timeout=0.25)
+                        except Exception:
+                            pass
 
                 def _consumer() -> None:
-                    nonlocal rejected
                     while True:
                         item = q.get()
                         try:
                             if item is _PACKET_SENTINEL:
                                 return
                             norm = _pc_normalize_packet(item, default_iface=iface or "pcap")
-                            ok, score, hits = _pc_packet_matches(norm, query, require_all=require_all_terms)
+                            ok, score, hits = _pc_packet_matches(norm, query, require_all=False if query else True)
                             norm["match_score"] = round(score, 4)
                             norm["query_hits"] = hits
-                            if ok:
+                            norm["tracker_score"] = self._packet_score(norm, query=query)
+                            if ok or not query:
                                 with lock:
                                     matched.append(norm)
+                                tracker_state.capture_matched += 1
                             else:
-                                rejected += 1
+                                tracker_state.capture_rejected += 1
                         finally:
                             q.task_done()
 
@@ -35442,7 +36995,10 @@ class PacketTrackerBlock(BaseBlock):
                     t.join(timeout=1.0)
 
                 incoming.extend(matched)
-                self._log(f"📡 libpcap scanned={scanned} matched={len(matched)} rejected={rejected} query={query!r}")
+                self._log(
+                    f"📡 sniff complete scanned={tracker_state.capture_scanned} matched={tracker_state.capture_matched} "
+                    f"rejected={tracker_state.capture_rejected} query={query!r}"
+                )
             finally:
                 try:
                     if backend is not None:
@@ -35450,62 +37006,97 @@ class PacketTrackerBlock(BaseBlock):
                 except Exception:
                     pass
 
-        normalized: List[Dict[str, Any]] = []
-        seen = set()
-        matched_count = 0
-        rejected_count = 0
+        if max_track_packets > 0 and len(incoming) > max_track_packets:
+            incoming = incoming[:max_track_packets]
 
-        for item in incoming:
-            norm = _pc_normalize_packet(item, default_iface=iface or "")
-            sig = f"{norm.get('raw_hex_preview')}|{norm.get('raw_len')}|{norm.get('src_ip')}|{norm.get('dst_ip')}|{norm.get('topic')}"
-            if sig in seen:
-                continue
-            seen.add(sig)
-            ok, score, hits = _pc_packet_matches(norm, query, require_all=require_all_terms)
-            norm["match_score"] = round(score, 4)
-            norm["query_hits"] = hits
-            if ok:
-                normalized.append(norm)
-                matched_count += 1
-            else:
-                rejected_count += 1
+        normalized, counts = self._track_packets(
+            packets=incoming,
+            query=query,
+            tracker_state=tracker_state,
+            dedupe_signatures=dedupe_signatures,
+            log_every=log_every,
+        )
 
-        stored_len = _pc_save_memory_packets(
-            packets_key,
-            normalized,
+        saved_counts = self._save_tracker_memory(
+            packets_key=packets_key,
+            packets=normalized,
+            state=tracker_state,
             append=append,
-            max_items=max_memory_items,
-        ) if packets_key else 0
+            max_memory_items=max_memory_items,
+            memory_prefix=memory_prefix,
+        )
 
+        lists = self._state_lists(tracker_state)
         meta = {
             "ok": True,
             "query": query,
             "packets_key": packets_key,
-            "matched": matched_count,
-            "rejected": rejected_count,
-            "stored_count": stored_len,
+            "memory_prefix": memory_prefix,
+            "matched": counts["matched"],
+            "rejected": counts["rejected"],
+            "duplicates": counts["duplicates"],
+            "stored_count": saved_counts.get("packets", len(normalized)),
+            "host_count": len(lists["hosts"]),
+            "flow_count": len(lists["flows"]),
+            "dns_count": len(lists["dns"]),
+            "arp_count": len(lists["arp"]),
+            "nat_count": len(lists["nat"]),
+            "alert_count": len(lists["alerts"]),
             "append": append,
             "include_libpcap": include_libpcap,
             "iface": iface,
             "pcap_path": pcap_path,
             "worker_count": worker_count,
             "queue_maxsize": queue_maxsize,
+            "capture_scanned": tracker_state.capture_scanned,
+            "capture_matched": tracker_state.capture_matched,
+            "capture_rejected": tracker_state.capture_rejected,
             "items": normalized[:128],
+            "hosts": lists["hosts"][:128],
+            "flows": lists["flows"][:128],
+            "dns": lists["dns"][:128],
+            "arp": lists["arp"][:128],
+            "nat": lists["nat"][:128],
+            "alerts": lists["alerts"][:128],
+            "topic_counts": dict(tracker_state.topic_counts),
+            "iface_counts": dict(tracker_state.iface_counts),
         }
+
+        self._log(
+            f"✅ finish matched={counts['matched']} stored={saved_counts.get('packets', len(normalized))} "
+            f"hosts={len(lists['hosts'])} flows={len(lists['flows'])} dns={len(lists['dns'])} "
+            f"arp={len(lists['arp'])} nat={len(lists['nat'])} alerts={len(lists['alerts'])}"
+        )
 
         if emit == "packets":
             return normalized, meta
         if emit == "bundle":
-            return {"packets": normalized, "packets_key": packets_key}, meta
-        return f"[PacketTracker] query={query!r} matched={matched_count} stored={stored_len} key={packets_key}", meta
+            return {
+                "packets": normalized,
+                "packets_key": packets_key,
+                "hosts": lists["hosts"],
+                "flows": lists["flows"],
+                "dns": lists["dns"],
+                "arp": lists["arp"],
+                "nat": lists["nat"],
+                "alerts": lists["alerts"],
+                "topics": dict(tracker_state.topic_counts),
+                "ifaces": dict(tracker_state.iface_counts),
+            }, meta
+        return (
+            f"[PacketTracker] query={query!r} matched={counts['matched']} stored={saved_counts.get('packets', len(normalized))} "
+            f"hosts={len(lists['hosts'])} flows={len(lists['flows'])} arp={len(lists['arp'])} dns={len(lists['dns'])} "
+            f"nat={len(lists['nat'])} alerts={len(lists['alerts'])} key={packets_key}",
+            meta,
+        )
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "",
             "packets_key": "packets",
+            "memory_prefix": "packets",
             "append": False,
             "max_memory_items": 5000,
-            "require_all_terms": True,
             "include_payload_packets": True,
             "include_memory_packets": False,
             "source_packets_key": "packets",
@@ -35519,9 +37110,11 @@ class PacketTrackerBlock(BaseBlock):
             "capture_budget_s": 2.0,
             "queue_maxsize": 512,
             "worker_count": 2,
+            "dedupe_signatures": True,
+            "max_track_packets": 10000,
+            "log_every": 25,
             "emit": "summary",  # summary | packets | bundle
         }
-
 
 BLOCKS.register("packet_tracker", PacketTrackerBlock)
 
@@ -35731,4 +37324,3 @@ class PacketNoiseBlock(BaseBlock):
 
 
 BLOCKS.register("packet_noise", PacketNoiseBlock)
-
