@@ -9404,6 +9404,163 @@ class VideoLinkTrackerBlock(BaseBlock):
 
         except Exception:
             return 0.0
+
+    def _guess_upload_meta(self, path: str) -> tuple[str, str]:
+        low = str(path or "").lower().strip()
+        if low.endswith((".jpg", ".jpeg")):
+            return "upload.jpg", "image/jpeg"
+        if low.endswith(".png"):
+            return "upload.png", "image/png"
+        return "upload.png", "image/png"
+
+    async def _save_frame_temp_file(
+            self,
+            image_bytes: bytes,
+            log: List[str],
+            filename: str = "frame.png",
+    ) -> Optional[str]:
+        import os
+        import tempfile
+
+        if not image_bytes:
+            msg = "[VideoLinkTracker][Upload] No frame bytes to save."
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return None
+
+        suffix = os.path.splitext(str(filename or "frame.png"))[1] or ".png"
+
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
+                tf.write(image_bytes)
+                temp_path = tf.name
+
+            msg = f"[VideoLinkTracker][Upload] Saved frame locally: {temp_path}"
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return temp_path
+        except Exception as e:
+            msg = f"[VideoLinkTracker][Upload] Failed to save temp frame: {e}"
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return None
+
+    async def _upload_frame_to_host(
+            self,
+            image_bytes: bytes,
+            log: List[str],
+            filename: str = "frame.png",
+            content_type: str = "image/png",
+    ) -> Optional[str]:
+        import asyncio
+        import aiohttp
+
+        if not image_bytes:
+            msg = "[VideoLinkTracker][Upload] No frame bytes to upload."
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return None
+
+        safe_filename = str(filename or "frame.png").strip() or "frame.png"
+        safe_content_type = str(content_type or "image/png").strip() or "image/png"
+        timeout_cfg = aiohttp.ClientTimeout(total=30)
+
+        async def _try_0x0(session: aiohttp.ClientSession) -> Optional[str]:
+            form = aiohttp.FormData()
+            form.add_field(
+                "file",
+                image_bytes,
+                filename=safe_filename,
+                content_type=safe_content_type,
+            )
+
+            async with session.post("https://0x0.st", data=form) as resp:
+                text = (await resp.text()).strip()
+
+                if resp.status == 200 and text.startswith(("http://", "https://")):
+                    msg = f"[VideoLinkTracker][Upload] Uploaded frame via 0x0.st: {text}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+                    return text
+
+                msg = f"[VideoLinkTracker][Upload] 0x0.st failed: status={resp.status} body={text[:200]}"
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+                return None
+
+        async def _try_tmpfiles(session: aiohttp.ClientSession) -> Optional[str]:
+            form = aiohttp.FormData()
+            form.add_field(
+                "file",
+                image_bytes,
+                filename=safe_filename,
+                content_type=safe_content_type,
+            )
+
+            async with session.post("https://tmpfiles.org/api/v1/upload", data=form) as resp:
+                text = (await resp.text()).strip()
+
+                if resp.status != 200:
+                    msg = f"[VideoLinkTracker][Upload] tmpfiles failed: status={resp.status} body={text[:200]}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+                    return None
+
+                try:
+                    payload = await resp.json(content_type=None)
+                except Exception:
+                    msg = f"[VideoLinkTracker][Upload] tmpfiles non-JSON response: {text[:200]}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+                    return None
+
+                url = (
+                        (payload.get("data") or {}).get("url")
+                        or payload.get("url")
+                        or ""
+                ).strip()
+
+                if not url.startswith(("http://", "https://")):
+                    msg = f"[VideoLinkTracker][Upload] tmpfiles missing url: {str(payload)[:200]}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+                    return None
+
+                msg = f"[VideoLinkTracker][Upload] Uploaded frame via tmpfiles: {url}"
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+                return url
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 VideoLinkTracker/1.0",
+            "Accept": "*/*",
+        }
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout_cfg, headers=headers) as session:
+                url = await _try_0x0(session)
+                if url:
+                    return url
+
+                url = await _try_tmpfiles(session)
+                if url:
+                    return url
+
+                msg = "[VideoLinkTracker][Upload] All upload hosts failed."
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+                return None
+
+        except asyncio.TimeoutError:
+            msg = "[VideoLinkTracker][Upload] Upload timed out."
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return None
+        except Exception as e:
+            msg = f"[VideoLinkTracker][Upload] Error: {e}"
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return None
     # ------------------------------------------------------------------ #
     # URL canonicalization + content-id dedupe
     # ------------------------------------------------------------------ #
@@ -10009,38 +10166,326 @@ class VideoLinkTrackerBlock(BaseBlock):
         log.append("[VideoLinkTracker][ffmpeg] Failed to extract frame from video (all strategies).")
         return None
 
-    async def _upload_frame_to_host(self, image_bytes: bytes, log: List[str]) -> Optional[str]:
-        """
-        Uploads bytes to a temporary host (Catbox.moe) to get a public URL
-        compatible with search engine 'imgurl' parameters.
-        """
-        import aiohttp
+    async def _fetch_reverse_image_seeds_from_file(
+            self,
+            image_path: str,
+            timeout: float,
+            log: List[str],
+            max_results: int = 15,
+    ) -> List[str]:
+        import os
 
-        # Using Catbox.moe for simplicity (no key needed)
-        upload_url = "https://catbox.moe/user/api.php"
+        if not image_path or not os.path.isfile(image_path):
+            msg = f"[VideoLinkTracker][RevImg] Missing local image file: {image_path}"
+            log.append(msg)
+            DEBUG_LOGGER.log_message(msg)
+            return []
 
-        data = aiohttp.FormData()
-        data.add_field("reqtype", "fileupload")
-        data.add_field("userhash", "")
-        data.add_field("fileToUpload", image_bytes, filename="frame.png", content_type="image/png")
+        seeds: List[str] = []
+        unique_seeds: Set[str] = set()
+        pw_p = pw_browser = pw_context = None
+
+        def _add_links(links):
+            for link in links or []:
+                link = str(link or "").strip()
+                if not link:
+                    continue
+                if link in unique_seeds:
+                    continue
+                if not link.startswith(("http://", "https://")):
+                    continue
+                unique_seeds.add(link)
+                seeds.append(link)
+                if len(seeds) >= max_results:
+                    break
+
+        async def _extract_external_links(page, blocked_domains: tuple[str, ...]) -> List[str]:
+            return await page.evaluate(
+                """(blockedDomains) => {
+                    const links = [];
+                    const seen = new Set();
+
+                    for (const a of document.querySelectorAll('a[href]')) {
+                        const h = (a.href || '').trim();
+                        if (!h.startsWith('http://') && !h.startsWith('https://')) continue;
+
+                        let blocked = false;
+                        for (const dom of blockedDomains) {
+                            if (h.includes(dom)) {
+                                blocked = true;
+                                break;
+                            }
+                        }
+                        if (blocked) continue;
+
+                        if (!seen.has(h)) {
+                            seen.add(h);
+                            links.push(h);
+                        }
+                    }
+                    return links;
+                }""",
+                list(blocked_domains),
+            )
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(upload_url, data=data, timeout=15) as resp:
-                    if resp.status != 200:
-                        log.append(f"[VideoLinkTracker][Upload] Upload failed: {resp.status}")
-                        return None
+            DEBUG_LOGGER.log_message("[VideoLinkTracker][RevImg] Initializing browser for local file reverse lookup...")
+            pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                ua=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                block_resources=True,
+                blocked_resource_types={"font", "media"},
+                block_domains=False,
+                blocked_domains=set(),
+                log=log,
+                use_camoufox=True,
+            )
 
-                    text = await resp.text()
-                    if text.startswith("http"):
-                        return text.strip()
-                    else:
-                        log.append(f"[VideoLinkTracker][Upload] Unexpected response: {text[:100]}")
-                        return None
-        except Exception as e:
-            log.append(f"[VideoLinkTracker][Upload] Error: {e}")
-            return None
+            if not pw_context:
+                msg = "[VideoLinkTracker][RevImg] Playwright failed to start."
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+                return []
 
+            page = await pw_context.new_page()
+
+            # ---------------- Yandex ----------------
+            try:
+                DEBUG_LOGGER.log_message("[VideoLinkTracker][RevImg] Uploading local frame to Yandex Images...")
+                await page.goto("https://yandex.com/images/", timeout=int(timeout * 1000))
+
+                # Light settle
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+
+                uploaded = False
+
+                async def _try_set_file_inputs() -> bool:
+                    selectors = [
+                        'input[type="file"]',
+                        'input[name="upfile"]',
+                        'input.CbirCore-FileInput',
+                        'input[accept*="image"]',
+                        'input[accept*="jpg"]',
+                        'input[accept*="jpeg"]',
+                        'input[accept*="png"]',
+                    ]
+                    for selector in selectors:
+                        try:
+                            loc = page.locator(selector)
+                            count = await loc.count()
+                            for i in range(count):
+                                try:
+                                    await loc.nth(i).set_input_files(image_path, timeout=2000)
+                                    return True
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    return False
+
+                # 1) easiest case: input already in DOM
+                uploaded = await _try_set_file_inputs()
+
+                # 2) click likely reverse-image triggers, then retry
+                if not uploaded:
+                    trigger_selectors = [
+                        '[aria-label*="Search by image" i]',
+                        '[aria-label*="Search with image" i]',
+                        '[aria-label*="Image search" i]',
+                        '[title*="Search by image" i]',
+                        '[title*="Search with image" i]',
+                        '[title*="Image search" i]',
+                        '[data-testid*="cbir" i]',
+                        '[class*="cbir" i]',
+                        'button[aria-label*="image" i]',
+                        'button[title*="image" i]',
+                        'button',
+                        'a',
+                    ]
+
+                    clicked = False
+                    for selector in trigger_selectors:
+                        try:
+                            loc = page.locator(selector)
+                            count = min(await loc.count(), 8)
+                            for i in range(count):
+                                try:
+                                    text = (await loc.nth(i).inner_text(timeout=500)).strip().lower()
+                                except Exception:
+                                    text = ""
+
+                                try:
+                                    html = (await loc.nth(i).evaluate("(el) => el.outerHTML")).lower()
+                                except Exception:
+                                    html = ""
+
+                                score_text = f"{text} {html}"
+                                if not any(tok in score_text for tok in (
+                                        "image", "photo", "picture", "search by", "search with", "cbir", "camera"
+                                )):
+                                    continue
+
+                                try:
+                                    await loc.nth(i).click(timeout=1500)
+                                    clicked = True
+                                    await page.wait_for_timeout(800)
+                                    uploaded = await _try_set_file_inputs()
+                                    if uploaded:
+                                        break
+                                except Exception:
+                                    pass
+
+                            if uploaded:
+                                break
+                        except Exception:
+                            pass
+
+                    # 3) filechooser fallback
+                    if not uploaded and clicked:
+                        try:
+                            async with page.expect_file_chooser(timeout=2500) as fc_info:
+                                for selector in [
+                                    '[aria-label*="Search by image" i]',
+                                    '[aria-label*="Search with image" i]',
+                                    '[title*="Search by image" i]',
+                                    '[title*="Search with image" i]',
+                                    '[data-testid*="cbir" i]',
+                                    '[class*="cbir" i]',
+                                ]:
+                                    loc = page.locator(selector).first
+                                    if await loc.count():
+                                        await loc.click(timeout=1200)
+                                        break
+
+                            chooser = await fc_info.value
+                            await chooser.set_files(image_path)
+                            uploaded = True
+                        except Exception:
+                            pass
+
+                if uploaded:
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector("a[href]", timeout=8000)
+                    except Exception:
+                        pass
+
+                    yandex_links = await _extract_external_links(
+                        page,
+                        blocked_domains=("yandex.", "google.", "bing.", "microsoft."),
+                    )
+                    _add_links(yandex_links)
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][RevImg] Yandex returned {len(seeds)} candidate links."
+                    )
+                else:
+                    msg = "[VideoLinkTracker][RevImg] Yandex upload UI not found after trigger attempts."
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+
+            except Exception as e:
+                msg = f"[VideoLinkTracker][RevImg] Yandex local upload failed: {e}"
+                log.append(msg)
+                DEBUG_LOGGER.log_message(msg)
+            # ---------------- Bing ----------------
+            if len(seeds) < max_results:
+                try:
+                    DEBUG_LOGGER.log_message(
+                        "[VideoLinkTracker][RevImg] Uploading local frame to Bing Visual Search...")
+                    await page.goto("https://www.bing.com/visualsearch", timeout=int(timeout * 1000))
+
+                    file_input = page.locator('input[type="file"]').first
+                    await file_input.set_input_files(image_path)
+
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector("a[href]", timeout=8000)
+                    except Exception:
+                        pass
+
+                    bing_links = await _extract_external_links(
+                        page,
+                        blocked_domains=("bing.com", "microsoft.com", "google.", "yandex."),
+                    )
+                    _add_links(bing_links)
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][RevImg] Bing returned {len(seeds)} candidate links."
+                    )
+                except Exception as e:
+                    msg = f"[VideoLinkTracker][RevImg] Bing local upload failed: {e}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+
+            # ---------------- Google ----------------
+            if len(seeds) < max_results:
+                try:
+                    DEBUG_LOGGER.log_message(
+                        "[VideoLinkTracker][RevImg] Uploading local frame to Google image search...")
+                    await page.goto("https://www.google.com/imghp?hl=en", timeout=int(timeout * 1000))
+
+                    try:
+                        for selector in [
+                            'div[role="button"][aria-label*="Search by image"]',
+                            'div[role="button"][aria-label*="Search with an image"]',
+                            'button[aria-label*="Search by image"]',
+                            'button[aria-label*="Search with an image"]',
+                        ]:
+                            loc = page.locator(selector).first
+                            if await loc.count():
+                                await loc.click(timeout=1500)
+                                break
+                    except Exception:
+                        pass
+
+                    file_input = page.locator('input[type="file"]').first
+                    await file_input.set_input_files(image_path)
+
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    try:
+                        await page.wait_for_selector("a[href]", timeout=8000)
+                    except Exception:
+                        pass
+
+                    google_links = await _extract_external_links(
+                        page,
+                        blocked_domains=("google.com", "googleusercontent.com", "gstatic.com", "yandex.", "bing."),
+                    )
+                    _add_links(google_links)
+                    DEBUG_LOGGER.log_message(
+                        f"[VideoLinkTracker][RevImg] Google returned {len(seeds)} total candidate links."
+                    )
+                except Exception as e:
+                    msg = f"[VideoLinkTracker][RevImg] Google local upload failed: {e}"
+                    log.append(msg)
+                    DEBUG_LOGGER.log_message(msg)
+
+        finally:
+            try:
+                await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+            except Exception:
+                pass
+
+            try:
+                os.remove(image_path)
+            except Exception:
+                pass
+
+        return seeds[:max_results]
     async def _fetch_reverse_image_seeds(
             self,
             image_url: str,
@@ -11700,19 +12145,19 @@ class VideoLinkTrackerBlock(BaseBlock):
             if not any(x in q_lower for x in ["video", "mp4", "m3u8"]):
                 sq = f"{sq} (video OR mp4 OR m3u8 OR stream)".strip()
             return sq
+
         # ------------------ Reverse Image/Video Lookup Logic ------------------ #
-        rev_input_url = str(params.get("reverse_image_url", None)).strip()
+        rev_input_url = str(params.get("reverse_image_url") or "").strip()
         ffmpeg_bin_path = str(params.get("ffmpeg_bin", "")).strip()
 
-        # Auto-detect from payload if it looks like a media file OR a local path
+        # Auto-detect from payload if not explicitly provided
         if not rev_input_url and isinstance(payload, str):
             pl_clean = payload.strip()
-            # Check 1: Is it an existing local file?
             if os.path.isfile(pl_clean):
                 rev_input_url = pl_clean
-            # Check 2: Is it a URL with media extension?
-            elif pl_clean.lower().startswith("http") and pl_clean.lower().endswith(
-                    tuple(self.VIDEO_EXTENSIONS) + (".jpg", ".png", ".webp", ".jpeg")):
+            elif pl_clean.lower().startswith(("http://", "https://")) and pl_clean.lower().endswith(
+                    tuple(self.VIDEO_EXTENSIONS) + (".jpg", ".jpeg", ".png", ".webp")
+            ):
                 rev_input_url = pl_clean
 
         if rev_input_url:
@@ -11721,82 +12166,169 @@ class VideoLinkTrackerBlock(BaseBlock):
             is_image = False
             img_bytes = None
 
-            # 1. Determine if input is video (Local/URL extension)
-            if rev_input_url.lower().startswith("http"):
+            low_rev = rev_input_url.lower()
+            is_remote = low_rev.startswith(("http://", "https://"))
+
+            # 1) Detect type
+            if is_remote:
                 try:
                     async with submanagers.HTTPSSubmanager(timeout=5.0) as checker:
                         status, headers = await checker.head(rev_input_url)
                         ctype = (headers.get("Content-Type", "") or "").lower()
 
-                        if any(x in ctype for x in self.VIDEO_CONTENT_PREFIXES) or "video" in ctype:
+                        if any(prefix in ctype for prefix in self.VIDEO_CONTENT_PREFIXES) or ctype.startswith("video/"):
                             is_video = True
-                        elif "image" in ctype:
+                        elif ctype.startswith("image/"):
                             is_image = True
-                        elif "text/html" in ctype:
+                        elif ctype.startswith("text/html"):
                             DEBUG_LOGGER.log_message(
-                                f"[VideoLinkTracker] Input is a web page ({rev_input_url}). Skipping visual signature.")
+                                f"[VideoLinkTracker] Input is a web page ({rev_input_url}). Skipping visual signature."
+                            )
                 except Exception as e:
                     log.append(f"[VideoLinkTracker][Verify] HEAD check failed: {e}")
+
+                # fallback to extension if HEAD was inconclusive
+                if not is_video and not is_image:
+                    if any(low_rev.endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                        is_video = True
+                    elif low_rev.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                        is_image = True
             else:
-                # Local file logic
-                if any(rev_input_url.lower().endswith(ext) for ext in self.VIDEO_EXTENSIONS):
+                if any(low_rev.endswith(ext) for ext in self.VIDEO_EXTENSIONS):
                     is_video = True
-                elif rev_input_url.lower().endswith((".jpg", ".png", ".webp", ".jpeg")):
+                elif low_rev.endswith((".jpg", ".jpeg", ".png", ".webp")):
                     is_image = True
-            # 2. If it is an image:
+
+            # 2) Handle image
+            search_seed_url = None
+            search_seed_file = None
+
             if is_image:
                 DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is image: {rev_input_url}")
-                if rev_input_url.lower().startswith("http"):
+
+                img_name = "input.png"
+                img_bytes = None
+
+                if is_remote:
+                    # remote jpg/png/webp/jpeg link
                     async with submanagers.HTTPSSubmanager(timeout=timeout) as downloader:
                         img_bytes = await downloader.get_bytes(rev_input_url)
+
+                    try:
+                        import os
+                        from urllib.parse import urlparse
+                        parsed_name = os.path.basename(urlparse(rev_input_url).path or "").strip()
+                        if parsed_name:
+                            img_name = parsed_name
+                    except Exception:
+                        pass
+
+                    # keep the remote URL too as a fallback
                     search_seed_url = rev_input_url
+
                 else:
+                    # local jpg/png/webp/jpeg file
                     with open(rev_input_url, "rb") as f:
                         img_bytes = f.read()
-                    search_seed_url = await self._upload_frame_to_host(img_bytes, log)
+
+                    try:
+                        import os
+                        img_name = os.path.basename(rev_input_url) or img_name
+                    except Exception:
+                        pass
 
                 if img_bytes:
                     seed_visual_sig = self._get_visual_signature(img_bytes)
 
-            # 3. If it is a video (Local or URL):
-            if is_video:
+                    search_seed_file = await self._save_frame_temp_file(
+                        img_bytes,
+                        log,
+                        filename=img_name,
+                    )
+
+                    if search_seed_file:
+                        DEBUG_LOGGER.log_message(
+                            f"[VideoLinkTracker] Saved local search image: {search_seed_file}"
+                        )
+                    else:
+                        DEBUG_LOGGER.log_message(
+                            "[VideoLinkTracker] Failed to save image for reverse lookup."
+                        )
+            # 3) Handle video
+            elif is_video:
                 DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Input is video. Extracting frame from: {rev_input_url}")
 
-                # FFmpeg handles local paths and URLs here
                 frame_bytes = await self._extract_frame_from_video(rev_input_url, ffmpeg_bin_path, log)
 
                 if frame_bytes:
                     seed_visual_sig = self._get_visual_signature(frame_bytes)
-                    public_img = await self._upload_frame_to_host(frame_bytes, log)
-                    if public_img:
-                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Generated search thumbnail: {public_img}")
-                        search_seed_url = public_img
+
+                    temp_frame_path = await self._save_frame_temp_file(
+                        frame_bytes,
+                        log,
+                        filename="frame.png",
+                    )
+
+                    if temp_frame_path:
+                        DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Generated local search frame: {temp_frame_path}")
+                        rev_seeds = await self._fetch_reverse_image_seeds_from_file(
+                            temp_frame_path,
+                            timeout=timeout,
+                            log=log,
+                            max_results=max_pages_total,
+                        )
+
+                        for url in rev_seeds:
+                            if not (global_mode or _allowed_by_required_sites_check(url)):
+                                continue
+
+                            path = self._clean_path(url)
+                            low = url.lower()
+
+                            if self._is_probable_video_url(url, path, low):
+                                direct_asset_urls.append(url)
+                            else:
+                                candidate_pages.append(url)
                     else:
-                        DEBUG_LOGGER.log_message("[VideoLinkTracker] Failed to upload video frame.")
+                        DEBUG_LOGGER.log_message("[VideoLinkTracker] Failed to save extracted frame locally.")
                 else:
                     DEBUG_LOGGER.log_message("[VideoLinkTracker] Failed to extract video frame.")
 
-            # 4. Perform Reverse Search
-            if search_seed_url:
-                DEBUG_LOGGER.log_message(f"[VideoLinkTracker] Triggering Visual Search for: {search_seed_url}")
+            # 4) Perform reverse search
+            rev_seeds = []
+
+            if search_seed_file:
+                DEBUG_LOGGER.log_message(
+                    f"[VideoLinkTracker] Triggering local-file Visual Search for: {search_seed_file}"
+                )
+                rev_seeds = await self._fetch_reverse_image_seeds_from_file(
+                    search_seed_file,
+                    timeout=timeout,
+                    log=log,
+                    max_results=max_pages_total,
+                )
+            elif search_seed_url:
+                DEBUG_LOGGER.log_message(
+                    f"[VideoLinkTracker] Triggering URL Visual Search for: {search_seed_url}"
+                )
                 rev_seeds = await self._fetch_reverse_image_seeds(
                     search_seed_url,
                     timeout=timeout,
                     log=log,
-                    max_results=max_pages_total
+                    max_results=max_pages_total,
                 )
-                for url in rev_seeds:
-                    if not (global_mode or _allowed_by_required_sites_check(url)):
-                        continue
 
-                    path = self._clean_path(url)
-                    low = url.lower()
+            for url in rev_seeds:
+                if not (global_mode or _allowed_by_required_sites_check(url)):
+                    continue
 
-                    if self._is_probable_video_url(url, path, low):
-                        direct_asset_urls.append(url)  # <-- critical
-                    else:
-                        candidate_pages.append(url)
+                path = self._clean_path(url)
+                low = url.lower()
 
+                if self._is_probable_video_url(url, path, low):
+                    direct_asset_urls.append(url)
+                else:
+                    candidate_pages.append(url)
         # ===================== source=database =====================
         if source == "database":
             if not self.store:
