@@ -12149,10 +12149,10 @@ class VideoLinkTrackerBlock(BaseBlock):
         # ------------------ Reverse Image/Video Lookup Logic ------------------ #
         rev_input_url = str(params.get("reverse_image_url") or "").strip()
         ffmpeg_bin_path = str(params.get("ffmpeg_bin", "")).strip()
-
         # Auto-detect from payload if not explicitly provided
         if not rev_input_url and isinstance(payload, str):
             pl_clean = payload.strip()
+            import os
             if os.path.isfile(pl_clean):
                 rev_input_url = pl_clean
             elif pl_clean.lower().startswith(("http://", "https://")) and pl_clean.lower().endswith(
