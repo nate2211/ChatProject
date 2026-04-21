@@ -3388,6 +3388,7 @@ class NetworkSniffer:
         self._log(summary, log)
 
         return html, merged_items, json_hits
+
 # ======================================================================
 # JSSniffer
 # ======================================================================
@@ -4734,7 +4735,6 @@ class JSSniffer:
             except Exception:
                 pass
             return html, merged
-
 
 
 # ======================================================================
@@ -11198,32 +11198,6 @@ class HLSSubManager:
             variant_manifest_path=str(variant_path) if variant_path else None,
             segment_paths=seg_paths,
         )
-
-# Drop-in rewrite for the HTTPS section.
-# External call signatures are preserved.
-# Focus: keep sniffers from getting stuck on the same link, the same body,
-# or the same parse shape over and over.
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
-from html import unescape
-import asyncio
-import hashlib
-import math
-import random
-import re
-import ssl
-import time
-import zlib
-
-import aiohttp
-from aiohttp import ClientTimeout
-
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
 
 
 # ======================================================================

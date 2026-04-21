@@ -7784,7 +7784,7 @@ class LinkTrackerBlock(BaseBlock):
             for d in str(params.get("blocked_domains", "")).split(",")
             if d.strip()
         }
-
+        depth_batch_limit = max(1, int(params.get("depth_batch_limit", 10)))
         default_blocked_domains = {
             "google-analytics.com", "googletagmanager.com", "doubleclick.net",
             "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
@@ -8694,36 +8694,33 @@ class LinkTrackerBlock(BaseBlock):
                 frontier = list(dict.fromkeys(frontier))[:max_pages_total]
                 current_depth = 0
                 pages_scanned = 0
-                logged_rescan_notice = False
-
+                global_mode = (not required_sites) or required_sites == ["*"]
                 while frontier and current_depth <= max_depth:
                     DEBUG_LOGGER.log_message(
                         f"[BFS] --- Starting Depth {current_depth} | "
-                        f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} | "
+                        f"Frontier Size: {len(frontier)} | "
+                        f"Visited: {len(visited_pages)} | "
                         f"Scanned: {pages_scanned}/{max_pages_total} ---"
                     )
 
-                    slots_left = max_pages_total - pages_scanned
-                    if slots_left <= 0:
-                        DEBUG_LOGGER.log_message("[BFS] Global max_pages_total reached. Stopping.")
+                    remaining_budget = max_pages_total - pages_scanned
+                    if remaining_budget <= 0:
+                        DEBUG_LOGGER.log_message("[BFS] Global scan limit reached. Stopping.")
                         break
 
+                    this_depth_cap = min(len(frontier), remaining_budget, depth_batch_limit)
+
                     batch: List[str] = []
+                    deferred_frontier: List[str] = []
+
                     for u in frontier:
-                        if len(batch) >= slots_left:
-                            break
-                        if u in visited_pages or u in inflight_pages:
+                        if u in visited_pages:
                             continue
 
-                        if use_database and self.store and self.store.page_scanned(u):
-                            if not logged_rescan_notice:
-                                DEBUG_LOGGER.log_message(
-                                    "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
-                                )
-                                logged_rescan_notice = True
-
-                        batch.append(u)
-                        inflight_pages.add(u)
+                        if len(batch) < this_depth_cap:
+                            batch.append(u)
+                        else:
+                            deferred_frontier.append(u)
 
                     if not batch:
                         DEBUG_LOGGER.log_message(
@@ -8731,7 +8728,11 @@ class LinkTrackerBlock(BaseBlock):
                         )
                         break
 
-                    DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
+                    DEBUG_LOGGER.log_message(
+                        f"[BFS] Processing batch of {len(batch)} URLs "
+                        f"(remaining budget: {remaining_budget}, depth batch cap: {depth_batch_limit})..."
+                    )
+
                     results: List[Dict[str, Any]] = []
 
                     if use_camoufox:
@@ -8741,49 +8742,67 @@ class LinkTrackerBlock(BaseBlock):
                                 results.append(res)
                                 pages_scanned += 1
                                 visited_pages.add(url)
+                                if pages_scanned >= max_pages_total:
+                                    break
                             except Exception as e:
-                                DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
-                            finally:
-                                inflight_pages.discard(url)
+                                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][Camoufox] Fatal error on {url}: {e}")
                     else:
                         tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
                         done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+
                         for (url, _t), r in zip(tasks, done):
-                            inflight_pages.discard(url)
                             pages_scanned += 1
+
                             if isinstance(r, Exception):
                                 DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
+                                if pages_scanned >= max_pages_total:
+                                    break
                                 continue
+
                             visited_pages.add(url)
                             results.append(r)
+
                             if pages_scanned >= max_pages_total:
                                 break
 
-                    next_frontier_candidates: List[str] = []
+                    # KEEP YOUR EXISTING RESULT / ASSET COLLECTION HERE
+                    next_frontier_candidates: List[str] = list(deferred_frontier)
+
                     for res in results:
+                        # do not remove these if they already exist in your function
                         found_pages.append(res.get("page"))
                         found_assets.extend(res.get("assets") or [])
-                        found_js_links.extend(res.get("js_links") or [])
-                        found_network_links.extend(res.get("network_links") or [])
-                        found_runtime_hits.extend(res.get("runtime_hits") or [])
-                        found_react_hits.extend(res.get("react_hits") or [])
-                        found_database_hits.extend(res.get("database_hits") or [])
-                        found_interaction_hits.extend(res.get("interaction_hits") or [])
                         debug_log.extend(res.get("log") or [])
+
                         next_frontier_candidates.extend(res.get("next_pages") or [])
 
-                    frontier = []
-                    for u in _dedupe(next_frontier_candidates):
-                        if u in visited_pages or u in inflight_pages:
+                    remaining_budget_after_depth = max_pages_total - pages_scanned
+                    if remaining_budget_after_depth <= 0:
+                        DEBUG_LOGGER.log_message("[BFS] Scan limit exhausted after current depth.")
+                        break
+
+                    next_frontier: List[str] = []
+                    seen_next = set()
+
+                    for u in next_frontier_candidates:
+                        if not u:
+                            continue
+                        if u in seen_next:
+                            continue
+                        if u in visited_pages:
                             continue
                         if not _allowed_by_required_sites(u):
                             continue
                         if any(_clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                             continue
-                        frontier.append(u)
-                        if len(frontier) >= max_pages_total:
+
+                        seen_next.add(u)
+                        next_frontier.append(u)
+
+                        if len(next_frontier) >= remaining_budget_after_depth:
                             break
 
+                    frontier = next_frontier
                     current_depth += 1
             finally:
                 if pw_needed and (pw_p or pw_browser or pw_context):
@@ -8883,6 +8902,7 @@ class LinkTrackerBlock(BaseBlock):
                 "--disable-features=UseDnsHttpsSvcb",
             ],
             "searxng_url": "http://127.0.0.1:8080",
+            "depth_batch_limit": 6,
         }
 
 
@@ -11972,7 +11992,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         http_verify = bool(params.get("http_verify", True))
         http_ca_bundle = params.get("http_ca_bundle") or None
 
-
+        depth_batch_limit = max(1, int(params.get("depth_batch_limit", 10)))
         # Download / caching
         download_assets = bool(params.get("download_assets", False))
         download_dir = str(params.get("download_dir", "video_cache"))
@@ -13402,103 +13422,106 @@ class VideoLinkTrackerBlock(BaseBlock):
 
             frontier = list(dict.fromkeys(frontier))[:max_pages_total]
             current_depth = 0
+            pages_scanned = 0
 
-            # (you can define this just above the while loop)
-            logged_rescan_notice = False
-
-            # --- BFS LOOP START ---
-            while frontier and current_depth <= max_depth and len(final_found_assets_by_content_id) < max_assets:
-
-
+            while frontier and current_depth <= max_depth:
                 DEBUG_LOGGER.log_message(
-                    f"[VideoLinkTracker][BFS] --- Starting Depth {current_depth} | "
-                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} ---"
+                    f"[BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | "
+                    f"Visited: {len(visited_pages)} | "
+                    f"Scanned: {pages_scanned}/{max_pages_total} ---"
                 )
 
-                batch: List[str] = []
-
-                # Strict global page cap across all depths
-                slots_left = max(0, max_pages_total - len(visited_pages))
-                if slots_left <= 0:
+                remaining_budget = max_pages_total - pages_scanned
+                if remaining_budget <= 0:
+                    DEBUG_LOGGER.log_message("[BFS] Global scan limit reached. Stopping.")
                     break
 
+                this_depth_cap = min(len(frontier), remaining_budget, depth_batch_limit)
+
+                batch: List[str] = []
+                next_frontier_seed: List[str] = []
+
                 for u in frontier:
-                    if len(batch) >= slots_left:
-                        break
+                    if len(batch) >= this_depth_cap:
+                        next_frontier_seed.append(u)
+                        continue
                     if u in visited_pages:
                         continue
-
-                    # Respect DB "page_scanned" flag
-                    if use_database and self.store and self.store.page_scanned(u):
-                        if not (db_allow_rescan and source == "database"):
-                            visited_pages.add(u)
-                            continue
-                        if not logged_rescan_notice:
-                            DEBUG_LOGGER.log_message("[VideoLinkTracker][db] Rescan enabled.")
-                            logged_rescan_notice = True
-
                     batch.append(u)
-                    visited_pages.add(u)  # mark immediately so it can't be re-queue
 
                 if not batch:
                     DEBUG_LOGGER.log_message(
-                        f"[VideoLinkTracker][BFS] No valid URLs in batch at depth {current_depth}.")
+                        f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
+                    )
                     break
 
-                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][BFS] Processing batch of {len(batch)} URLs...")
+                DEBUG_LOGGER.log_message(
+                    f"[BFS] Processing batch of {len(batch)} URLs "
+                    f"(remaining budget: {remaining_budget}, depth batch cap: {depth_batch_limit})..."
+                )
+
+                results: List[Dict[str, Any]] = []
 
                 if use_camoufox:
-                    results: List[Dict[str, Any]] = []
                     for url in batch:
                         try:
-                            res = await _process_page(url, current_depth, smart_sniff)
+                            res = await _process_page(url, current_depth, http)
                             results.append(res)
+                            pages_scanned += 1
+                            visited_pages.add(url)
+                            if pages_scanned >= max_pages_total:
+                                break
                         except Exception as e:
                             DEBUG_LOGGER.log_message(f"[VideoLinkTracker][Camoufox] Fatal error on {url}: {e}")
-                            continue
                 else:
-                    # Parallel execution for standard Playwright
-                    results = await asyncio.gather(
-                        *[_process_page(url, current_depth, smart_sniff) for url in batch]
-                    )
+                    tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
+                    done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
 
-                next_frontier_candidates: List[str] = []
+                    for (url, _t), r in zip(tasks, done):
+                        pages_scanned += 1
+
+                        if isinstance(r, Exception):
+                            DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
+                            if pages_scanned >= max_pages_total:
+                                break
+                            continue
+
+                        visited_pages.add(url)
+                        results.append(r)
+
+                        if pages_scanned >= max_pages_total:
+                            break
+
+                next_frontier_candidates: List[str] = list(next_frontier_seed)
                 for res in results:
-                    # Per-page logging handled in _process_page, but we aggregate lists here
-                    log.extend(res["log"])
-                    all_js_links.extend(res["js_links"])
-                    all_network_links.extend(res["network_links"])
-                    all_runtime_hits.extend(res.get("runtime_hits", []))
-                    all_react_hits.extend(res.get("react_hits", []))  # [PATCH]
-                    all_database_hits.extend(res.get("database_hits", []))
-                    all_interaction_hits.extend(res.get("interaction_hits", []))
-                    for asset in res["assets"]:
-                        cid = asset.get("content_id") or self._get_content_id(asset.get("url", ""))
-                        old = final_found_assets_by_content_id.get(cid)
-                        final_found_assets_by_content_id[cid] = self._pick_preferred_asset(old, asset)
+                    next_frontier_candidates.extend(res.get("next_pages") or [])
 
-                    # Only collect next pages if we haven't hit max depth
-                    if current_depth < max_depth:
-                        if res.get("next_pages"):
-                            next_frontier_candidates.extend(res["next_pages"])
+                remaining_budget_after_depth = max_pages_total - pages_scanned
+                if remaining_budget_after_depth <= 0:
+                    DEBUG_LOGGER.log_message("[BFS] Scan limit exhausted after current depth.")
+                    break
 
-                # Deduplicate and filter next frontier against visited
-                next_frontier = []
-                seen_in_next = set()
+                frontier = []
+                seen_frontier = set()
 
-                for url in next_frontier_candidates:
-                    if url not in visited_pages and url not in seen_in_next:
-                        next_frontier.append(url)
-                        seen_in_next.add(url)
+                for u in next_frontier_candidates:
+                    if not u:
+                        continue
+                    if u in seen_frontier:
+                        continue
+                    if u in visited_pages:
+                        continue
+                    if not self._allowed_by_required_sites(u, required_sites, global_mode):
+                        continue
+                    if any(self._clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                        continue
 
-                # Cap the next frontier to prevent exponential explosion
-                # (e.g., if one page returns 5000 links, we don't want to queue them all)
-                frontier = next_frontier[:max_pages_total]
+                    seen_frontier.add(u)
+                    frontier.append(u)
 
-                DEBUG_LOGGER.log_message(
-                    f"[VideoLinkTracker][BFS] Depth {current_depth} complete. "
-                    f"Found {len(frontier)} new unique pages for next depth."
-                )
+                    if len(frontier) >= remaining_budget_after_depth:
+                        break
 
                 current_depth += 1
 
@@ -13810,6 +13833,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 "--disable-http3",
                 "--disable-features=UseDnsHttpsSvcb"
             ],
+            "depth_batch_cap": 10
         }
 
 
@@ -37856,3 +37880,1770 @@ class PacketNoiseBlock(BaseBlock):
 
 
 BLOCKS.register("packet_noise", PacketNoiseBlock)
+
+
+# ======================= OnionTrackerBlock ==================================
+
+@dataclass
+class OnionTrackerBlock(BaseBlock):
+    """
+    OnionTrackerBlock
+
+    Goal
+    ----
+    A Tor-aware page tracker modeled after the same "search/crawl/similar-page"
+    spirit as PageTrackerBlock, but seeded from a specific onion service via
+    params["onion_link"] instead of a web search query.
+
+    Design notes
+    ------------
+    - Keeps a broad crawler-style parameter surface similar to PageTrackerBlock.
+    - Crawls only from a provided onion seed.
+    - Defaults to same-host-only crawling for predictability.
+    - Supports plain HTTP fetch, optional Playwright JS fetch, and optional
+      Camoufox fetch.
+    - Can persist discovered pages through PageTrackerStore when available.
+    - Can emit lexicon + links into Memory like other tracker-style blocks.
+    - Uses Tor SOCKS proxy when possible.
+    """
+
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite", "icon", "favicon", "logo", "tracking", "pixel", "blank",
+        "placeholder", "avatar", "thumb", "thumbnail", "analytics"
+    }
+
+    IGNORED_EXTENSIONS = {
+        ".css", ".js", ".json", ".xml", ".svg", ".png", ".jpg", ".jpeg",
+        ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map",
+        ".mp4", ".mkv", ".webm", ".mp3", ".flac", ".wav", ".zip",
+        ".rar", ".7z", ".tar", ".gz", ".pdf"
+    }
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+    _HREF_RE = re.compile(r"""href=["'](.*?)["']""", re.IGNORECASE)
+    _TEXT_TOKEN_RE = re.compile(r"[a-z0-9]{3,}")
+    _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+
+    def __post_init__(self):
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[PageTrackerStore] = None
+
+        # Optional sniffers; only used if available and enabled.
+        self.js_sniffer = None
+        self.runtime_sniffer = None
+        self.react_sniffer = None
+        self.database_sniffer = None
+        self.interaction_sniffer = None
+
+        try:
+            if hasattr(submanagers, "JSSniffer"):
+                self.js_sniffer = submanagers.JSSniffer(
+                    submanagers.JSSniffer.Config(
+                        enable_auto_scroll=True,
+                        max_scroll_steps=40,
+                    )
+                )
+        except Exception:
+            self.js_sniffer = None
+
+        try:
+            if hasattr(submanagers, "RuntimeSniffer"):
+                self.runtime_sniffer = submanagers.RuntimeSniffer()
+        except Exception:
+            self.runtime_sniffer = None
+
+        try:
+            if hasattr(submanagers, "ReactSniffer"):
+                self.react_sniffer = submanagers.ReactSniffer()
+        except Exception:
+            self.react_sniffer = None
+
+        try:
+            if hasattr(submanagers, "DatabaseSniffer"):
+                self.database_sniffer = submanagers.DatabaseSniffer()
+        except Exception:
+            self.database_sniffer = None
+
+        try:
+            if hasattr(submanagers, "InteractionSniffer"):
+                self.interaction_sniffer = submanagers.InteractionSniffer()
+        except Exception:
+            self.interaction_sniffer = None
+    # ------------------------------------------------------------------ #
+    # Interactive authenticated session helpers
+    # ------------------------------------------------------------------ #
+    async def _interactive_auth_session(
+        self,
+        start_url: str,
+        *,
+        proxy_url: str,
+        timeout_ms: int,
+        session_file: str,
+        close_mode: str = "close_browser",
+        wait_poll_ms: int = 750,
+    ) -> Dict[str, Any]:
+        """
+        Open a visible browser so the user can log in manually.
+        After the window is closed, persist Playwright storage state so
+        subsequent sniff/fetch steps reuse the authenticated session.
+
+        Returns:
+            {
+                "ok": bool,
+                "final_url": str,
+                "title": str,
+                "storage_state_path": str,
+                "error": Optional[str],
+            }
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "final_url": start_url,
+            "title": "",
+            "storage_state_path": session_file,
+            "error": None,
+        }
+
+        launch_proxy = None
+        if proxy_url:
+            try:
+                pu = urlparse(proxy_url)
+                if pu.scheme and pu.hostname and pu.port:
+                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
+            except Exception:
+                launch_proxy = None
+
+        browser = None
+        context = None
+        page = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=False,
+                    proxy=launch_proxy,
+                )
+                context = await browser.new_context(
+                    ignore_https_errors=True,
+                    java_script_enabled=False,
+                )
+                page = await context.new_page()
+                await page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+                close_mode = (close_mode or "close_browser").strip().lower()
+
+                if close_mode == "enter":
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(
+                        None,
+                        lambda: input(
+                            "\n[OnionTracker] Log in / interact with the site, then press ENTER here to continue...\n"
+                        ),
+                    )
+                else:
+                    # Wait until browser/page/context is closed by the user
+                    while True:
+                        try:
+                            if page.is_closed():
+                                break
+                            await asyncio.sleep(max(0.1, float(wait_poll_ms) / 1000.0))
+                        except Exception:
+                            break
+
+                # Try to save state if browser/context is still alive
+                try:
+                    if context is not None:
+                        if page is not None and not page.is_closed():
+                            try:
+                                result["final_url"] = page.url
+                            except Exception:
+                                pass
+                            try:
+                                result["title"] = await page.title()
+                            except Exception:
+                                pass
+
+                        await context.storage_state(path=session_file)
+                        result["ok"] = True
+                except Exception as e:
+                    result["error"] = f"failed_to_save_storage_state: {e}"
+                finally:
+                    try:
+                        if context is not None:
+                            await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        if browser is not None:
+                            await browser.close()
+                    except Exception:
+                        pass
+
+                return result
+
+        except Exception as e:
+            result["error"] = str(e)
+            try:
+                if context is not None:
+                    await context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None:
+                    await browser.close()
+            except Exception:
+                pass
+            return result
+    async def _fetch_playwright_with_state(
+        self,
+        url: str,
+        *,
+        timeout_ms: int,
+        proxy_url: str,
+        storage_state_path: str,
+        block_resources: bool,
+        blocked_resource_types: Set[str],
+        blocked_domains: Set[str],
+        block_domains: bool,
+        return_all_js_links: bool,
+        use_network_sniff: bool,
+        return_network_sniff_links: bool,
+        use_runtime_sniff: bool,
+        return_runtime_sniff_hits: bool,
+        use_react_sniff: bool,
+        return_react_sniff_hits: bool,
+        use_database_sniff: bool,
+        return_database_sniff_hits: bool,
+        use_interaction_sniff: bool,
+        return_interaction_sniff_hits: bool,
+        max_links_per_page: int,
+        headless: bool = True,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "engine": "playwright",
+            "html": "",
+            "final_url": url,
+            "title": "",
+            "links": [],
+            "network_links": [],
+            "runtime_hits": [],
+            "react_hits": [],
+            "database_hits": [],
+            "interaction_hits": [],
+            "error": None,
+        }
+
+        launch_proxy = None
+        if proxy_url:
+            try:
+                pu = urlparse(proxy_url)
+                if pu.scheme and pu.hostname and pu.port:
+                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
+            except Exception:
+                launch_proxy = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=headless,
+                    proxy=launch_proxy,
+                )
+
+                context_kwargs: Dict[str, Any] = {
+                    "ignore_https_errors": True,
+                    "java_script_enabled": False,
+                }
+                if storage_state_path and os.path.exists(storage_state_path):
+                    context_kwargs["storage_state"] = storage_state_path
+
+                context = await browser.new_context(**context_kwargs)
+                page = await context.new_page()
+
+                network_links: Set[str] = set()
+
+                async def _route_handler(route):
+                    try:
+                        req = route.request
+                        rtype = (req.resource_type or "").lower()
+                        host = (urlparse(req.url).hostname or "").lower()
+
+                        if block_resources and rtype in blocked_resource_types:
+                            await route.abort()
+                            return
+
+                        if block_domains and blocked_domains and host in blocked_domains:
+                            await route.abort()
+                            return
+
+                        if use_network_sniff or return_network_sniff_links:
+                            network_links.add(req.url)
+
+                        await route.continue_()
+                    except Exception:
+                        try:
+                            await route.continue_()
+                        except Exception:
+                            pass
+
+                await page.route("**/*", _route_handler)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+                except Exception:
+                    pass
+
+                html_text = await page.content()
+                result["html"] = html_text
+                result["final_url"] = page.url
+                try:
+                    result["title"] = await page.title()
+                except Exception:
+                    result["title"] = self._extract_title(html_text)
+
+                links = self._extract_links_from_html(html_text, page.url)
+                if return_all_js_links:
+                    try:
+                        hrefs = await page.eval_on_selector_all(
+                            "a[href]",
+                            "els => els.map(e => e.href).filter(Boolean)"
+                        )
+                        for u in hrefs or []:
+                            links.append(str(u))
+                    except Exception:
+                        pass
+
+                if use_runtime_sniff and self.runtime_sniffer:
+                    try:
+                        rh = self.runtime_sniffer.sniff(page)  # type: ignore
+                        if rh and return_runtime_sniff_hits:
+                            result["runtime_hits"] = rh
+                    except Exception:
+                        pass
+
+                if use_react_sniff and self.react_sniffer:
+                    try:
+                        rh = self.react_sniffer.sniff(page)  # type: ignore
+                        if rh and return_react_sniff_hits:
+                            result["react_hits"] = rh
+                    except Exception:
+                        pass
+
+                if use_database_sniff and self.database_sniffer:
+                    try:
+                        dh = self.database_sniffer.sniff(page)  # type: ignore
+                        if dh and return_database_sniff_hits:
+                            result["database_hits"] = dh
+                    except Exception:
+                        pass
+
+                if use_interaction_sniff and self.interaction_sniffer:
+                    try:
+                        ih = self.interaction_sniffer.sniff(page)  # type: ignore
+                        if ih and return_interaction_sniff_hits:
+                            result["interaction_hits"] = ih
+                    except Exception:
+                        pass
+
+                norm_links = []
+                seen = set()
+                for u in links:
+                    cu = self._canonicalize_url(u)
+                    if cu and cu not in seen:
+                        seen.add(cu)
+                        norm_links.append(cu)
+
+                result["links"] = norm_links[:max_links_per_page]
+                if return_network_sniff_links:
+                    result["network_links"] = sorted(network_links)[:max_links_per_page]
+
+                await context.close()
+                await browser.close()
+                return result
+
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+    # ------------------------------------------------------------------ #
+    # Sync wrapper
+    # ------------------------------------------------------------------ #
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    # ------------------------------------------------------------------ #
+    # DB init
+    # ------------------------------------------------------------------ #
+    def _init_db(self, db_path: str) -> None:
+        if self.db and self.store:
+            return
+
+        try:
+            cfg = submanagers.DatabaseConfig(path=str(db_path or "onion_corpus.db"))
+            self.db = submanagers.DatabaseSubmanager(cfg, logger=getattr(self, "logger", None))
+            self.db.open()
+            self.store = PageTrackerStore(db=self.db)
+            if hasattr(self.store, "ensure_schema"):
+                self.store.ensure_schema()
+        except Exception:
+            self.db = None
+            self.store = None
+
+    # ------------------------------------------------------------------ #
+    # URL helpers
+    # ------------------------------------------------------------------ #
+    def _normalize_seed(self, onion_link: str) -> str:
+        seed = (onion_link or "").strip()
+        if not seed:
+            return ""
+        if not seed.lower().startswith(("http://", "https://")):
+            seed = "http://" + seed
+        return seed
+
+    def _is_onion_host(self, host: Optional[str]) -> bool:
+        return bool(host and host.lower().endswith(".onion"))
+
+    def _is_onion_url(self, url: str) -> bool:
+        try:
+            return self._is_onion_host(urlparse(url).hostname)
+        except Exception:
+            return False
+
+    def _canonicalize_url(self, url: str, *, strip_fragment: bool = True) -> str:
+        try:
+            p = urlsplit((url or "").strip())
+            scheme = (p.scheme or "http").lower()
+            netloc = (p.netloc or "").lower()
+            path = p.path or "/"
+            query = p.query or ""
+            fragment = "" if strip_fragment else (p.fragment or "")
+            return urlunsplit((scheme, netloc, path, query, fragment))
+        except Exception:
+            return (url or "").strip()
+
+    def _same_host(self, a: str, b: str) -> bool:
+        try:
+            return (urlparse(a).hostname or "").lower() == (urlparse(b).hostname or "").lower()
+        except Exception:
+            return False
+
+    def _same_site(self, root: str, candidate: str) -> bool:
+        try:
+            ra = urlparse(root)
+            rb = urlparse(candidate)
+            if not ra.hostname or not rb.hostname:
+                return False
+            return ra.hostname.lower() == rb.hostname.lower()
+        except Exception:
+            return False
+
+    def _allowed_url(self, url: str, *, root_url: str, same_host_only: bool, allow_non_onion: bool) -> bool:
+        try:
+            p = urlparse(url)
+            if p.scheme not in {"http", "https"}:
+                return False
+            host = (p.hostname or "").lower()
+            if not host:
+                return False
+            if not allow_non_onion and not host.endswith(".onion"):
+                return False
+            if same_host_only and not self._same_site(root_url, url):
+                return False
+
+            path_l = (p.path or "").lower()
+            for ext in self.IGNORED_EXTENSIONS:
+                if path_l.endswith(ext):
+                    return False
+            for junk in self.JUNK_FILENAME_KEYWORDS:
+                if junk in path_l:
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _extract_links_from_html(self, html_text: str, base_url: str) -> List[str]:
+        out: List[str] = []
+        if not html_text:
+            return out
+
+        # Regex hrefs
+        for href in self._HREF_RE.findall(html_text):
+            href = (href or "").strip()
+            if not href:
+                continue
+            if href.startswith(("javascript:", "mailto:", "data:")):
+                continue
+            try:
+                out.append(urljoin(base_url, href))
+            except Exception:
+                continue
+
+        # Plain text URLs
+        for u in self._URL_RE.findall(html_text):
+            out.append(u)
+
+        # BeautifulSoup fallback
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            for a in soup.find_all("a", href=True):
+                try:
+                    out.append(urljoin(base_url, a.get("href", "").strip()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Deduplicate while preserving order
+        seen = set()
+        cleaned = []
+        for u in out:
+            cu = self._canonicalize_url(u)
+            if cu and cu not in seen:
+                seen.add(cu)
+                cleaned.append(cu)
+        return cleaned
+
+    def _extract_title(self, html_text: str) -> str:
+        if not html_text:
+            return ""
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            if soup.title and soup.title.string:
+                return soup.title.string.strip()
+        except Exception:
+            pass
+
+        m = self._TITLE_RE.search(html_text)
+        if m:
+            return html.unescape(re.sub(r"\s+", " ", m.group(1))).strip()
+        return ""
+
+    def _html_to_text(self, html_text: str, *, max_chars: int = 5000) -> str:
+        if not html_text:
+            return ""
+        try:
+            soup = BeautifulSoup(html_text, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                try:
+                    tag.decompose()
+                except Exception:
+                    pass
+            txt = soup.get_text(" ", strip=True)
+        except Exception:
+            txt = re.sub(r"<[^>]+>", " ", html_text)
+            txt = re.sub(r"\s+", " ", txt).strip()
+
+        if max_chars > 0 and len(txt) > max_chars:
+            txt = txt[:max_chars]
+        return txt
+
+    def _tokenize_text(self, text: str) -> List[str]:
+        if not text:
+            return []
+        return self._TEXT_TOKEN_RE.findall(text.lower())
+
+    def _term_overlap(self, haystack_text: str, terms: Iterable[str]) -> int:
+        if not haystack_text:
+            return 0
+        h = haystack_text.lower()
+        score = 0
+        for t in terms:
+            t = (t or "").strip().lower()
+            if len(t) < 3:
+                continue
+            if t in h:
+                score += 1
+        return score
+
+    def _score_url(
+        self,
+        url: str,
+        *,
+        root_url: str,
+        url_keywords: List[str],
+        title: str = "",
+        strict_keywords: bool = False,
+    ) -> float:
+        u = (url or "").lower()
+        t = (title or "").lower()
+        score = 0.0
+
+        if self._same_site(root_url, url):
+            score += 3.0
+
+        if self._is_onion_url(url):
+            score += 2.0
+
+        depth = max(0, len([p for p in (urlparse(url).path or "").split("/") if p]))
+        score += max(0.0, 2.0 - (depth * 0.15))
+
+        if url_keywords:
+            hits = sum(1 for k in url_keywords if k and (k in u or k in t))
+            if strict_keywords and hits == 0:
+                return -9999.0
+            score += hits * 1.75
+
+        # Penalize obvious junk
+        if any(j in u for j in ("logout", "signin", "signup", "register", "privacy", "terms")):
+            score -= 2.0
+
+        return score
+
+    def _score_page(
+        self,
+        url: str,
+        *,
+        root_url: str,
+        title: str,
+        text: str,
+        url_keywords: List[str],
+        root_terms: List[str],
+        strict_keywords: bool,
+        min_term_overlap: int,
+    ) -> float:
+        base = self._score_url(
+            url,
+            root_url=root_url,
+            url_keywords=url_keywords,
+            title=title,
+            strict_keywords=strict_keywords,
+        )
+        if base <= -999.0:
+            return base
+
+        overlap_title = self._term_overlap(title, root_terms)
+        overlap_text = self._term_overlap(text, root_terms)
+        overlap = overlap_title * 2 + overlap_text
+
+        if root_terms and overlap < int(min_term_overlap or 0):
+            base -= 3.0
+
+        # Slight reward for actual content length
+        tlen = len(text or "")
+        if tlen > 80:
+            base += 1.0
+        if tlen > 500:
+            base += 1.0
+        if tlen > 2000:
+            base += 0.5
+
+        return base + overlap
+
+    # ------------------------------------------------------------------ #
+    # Memory helpers
+    # ------------------------------------------------------------------ #
+    def _load_memory_list(self, key: str) -> List[str]:
+        try:
+            mem = Memory.load()
+            raw = mem.get(key, [])
+            if isinstance(raw, list):
+                return [str(x) for x in raw if str(x).strip()]
+            if isinstance(raw, str) and raw.strip():
+                return [raw.strip()]
+            return []
+        except Exception:
+            return []
+
+    def _save_memory_list(self, key: str, values: List[str], *, max_total: int = 4096) -> None:
+        try:
+            mem = Memory.load()
+            existing = mem.get(key, [])
+            if not isinstance(existing, list):
+                existing = [str(existing)] if existing else []
+            merged, _, _, _ = _merge_bounded(existing, values, max_total=max_total)
+            mem[key] = merged
+            Memory.save(mem)
+        except Exception:
+            pass
+
+    def _build_root_terms(
+        self,
+        *,
+        root_url: str,
+        title: str,
+        text: str,
+        memory_sources: List[str],
+        max_terms: int = 64,
+    ) -> List[str]:
+        parts: List[str] = []
+        parts.append(root_url)
+        if title:
+            parts.append(title)
+        if text:
+            parts.append(text[:5000])
+
+        for k in memory_sources:
+            vals = self._load_memory_list(k)
+            if vals:
+                parts.extend(vals[:128])
+
+        terms = _extract_terms(" ".join(parts), top_k=max_terms, min_len=4)
+        return [t for t in terms if t and len(t) >= 4]
+
+    # ------------------------------------------------------------------ #
+    # Tor / HTTP session helpers
+    # ------------------------------------------------------------------ #
+    def _build_headers(self, user_agent: str) -> Dict[str, str]:
+        return {
+            "User-Agent": user_agent or _UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.7",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
+
+    async def _build_aiohttp_session(
+        self,
+        *,
+        timeout: float,
+        http_retries: int,
+        http_max_conn_per_host: int,
+        proxy_url: str,
+        http_verify_tls: bool,
+        http_ca_bundle: str,
+        user_agent: str,
+    ) -> aiohttp.ClientSession:
+        ssl_ctx = None
+        if http_verify_tls:
+            try:
+                import ssl
+                ssl_ctx = ssl.create_default_context(cafile=http_ca_bundle or None)
+            except Exception:
+                ssl_ctx = None
+        else:
+            ssl_ctx = False
+
+        connector = None
+
+        # SOCKS support if available.
+        if proxy_url and proxy_url.lower().startswith("socks"):
+            try:
+                from aiohttp_socks import ProxyConnector  # type: ignore
+                connector = ProxyConnector.from_url(
+                    proxy_url,
+                    ssl=ssl_ctx,
+                    limit_per_host=max(1, int(http_max_conn_per_host or 8)),
+                )
+            except Exception:
+                connector = aiohttp.TCPConnector(
+                    ssl=ssl_ctx,
+                    limit_per_host=max(1, int(http_max_conn_per_host or 8)),
+                )
+        else:
+            connector = aiohttp.TCPConnector(
+                ssl=ssl_ctx,
+                limit_per_host=max(1, int(http_max_conn_per_host or 8)),
+            )
+
+        return aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=float(timeout or 15.0)),
+            headers=self._build_headers(user_agent),
+            trust_env=False,
+        )
+
+    async def _fetch_http(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        *,
+        timeout: float,
+        proxy_url: str,
+        http_retries: int,
+        block_resources: bool,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        last_err = None
+        meta: Dict[str, Any] = {"engine": "http", "status": None}
+
+        for attempt in range(max(1, int(http_retries or 1))):
+            try:
+                kwargs: Dict[str, Any] = {
+                    "allow_redirects": True,
+                }
+                if proxy_url and not proxy_url.lower().startswith("socks"):
+                    kwargs["proxy"] = proxy_url
+
+                async with session.get(url, **kwargs) as resp:
+                    meta["status"] = resp.status
+                    meta["final_url"] = str(resp.url)
+                    ctype = (resp.headers.get("Content-Type") or "").lower()
+                    meta["content_type"] = ctype
+
+                    if block_resources:
+                        if any(x in ctype for x in ("image/", "font/", "audio/", "video/", "application/octet-stream")):
+                            return "", str(resp.url), meta
+
+                    body = await resp.text(errors="ignore")
+                    return body, str(resp.url), meta
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(min(0.35 * (attempt + 1), 1.0))
+
+        meta["error"] = str(last_err) if last_err else "unknown"
+        return "", url, meta
+
+    # ------------------------------------------------------------------ #
+    # Optional JS fetchers
+    # ------------------------------------------------------------------ #
+    async def _fetch_playwright(
+        self,
+        url: str,
+        *,
+        timeout_ms: int,
+        proxy_url: str,
+        block_resources: bool,
+        blocked_resource_types: Set[str],
+        blocked_domains: Set[str],
+        block_domains: bool,
+        return_all_js_links: bool,
+        use_network_sniff: bool,
+        return_network_sniff_links: bool,
+        use_runtime_sniff: bool,
+        return_runtime_sniff_hits: bool,
+        use_react_sniff: bool,
+        return_react_sniff_hits: bool,
+        use_database_sniff: bool,
+        return_database_sniff_hits: bool,
+        use_interaction_sniff: bool,
+        return_interaction_sniff_hits: bool,
+        max_links_per_page: int,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "engine": "playwright",
+            "html": "",
+            "final_url": url,
+            "title": "",
+            "links": [],
+            "network_links": [],
+            "runtime_hits": [],
+            "react_hits": [],
+            "database_hits": [],
+            "interaction_hits": [],
+            "error": None,
+        }
+
+        launch_proxy = None
+        if proxy_url:
+            try:
+                pu = urlparse(proxy_url)
+                if pu.scheme and pu.hostname and pu.port:
+                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
+            except Exception:
+                launch_proxy = None
+
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(
+                    headless=True,
+                    proxy=launch_proxy,
+                )
+                context = await browser.new_context(
+                    ignore_https_errors=True,
+                    java_script_enabled=False,
+                )
+                page = await context.new_page()
+
+                network_links: Set[str] = set()
+
+                async def _route_handler(route):
+                    try:
+                        req = route.request
+                        rtype = (req.resource_type or "").lower()
+                        host = (urlparse(req.url).hostname or "").lower()
+
+                        if block_resources and rtype in blocked_resource_types:
+                            await route.abort()
+                            return
+
+                        if block_domains and blocked_domains and host in blocked_domains:
+                            await route.abort()
+                            return
+
+                        if use_network_sniff or return_network_sniff_links:
+                            network_links.add(req.url)
+
+                        await route.continue_()
+                    except Exception:
+                        try:
+                            await route.continue_()
+                        except Exception:
+                            pass
+
+                await page.route("**/*", _route_handler)
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+                except Exception:
+                    pass
+
+                html_text = await page.content()
+                result["html"] = html_text
+                result["final_url"] = page.url
+                try:
+                    result["title"] = await page.title()
+                except Exception:
+                    result["title"] = self._extract_title(html_text)
+
+                # Plain anchors from DOM
+                links = self._extract_links_from_html(html_text, page.url)
+                if return_all_js_links:
+                    try:
+                        hrefs = await page.eval_on_selector_all(
+                            "a[href]",
+                            "els => els.map(e => e.href).filter(Boolean)"
+                        )
+                        for u in hrefs or []:
+                            links.append(str(u))
+                    except Exception:
+                        pass
+
+                # Optional sniffer integrations if your project provides them
+                if use_runtime_sniff and self.runtime_sniffer:
+                    try:
+                        rh = self.runtime_sniffer.sniff(page)  # type: ignore
+                        if rh and return_runtime_sniff_hits:
+                            result["runtime_hits"] = rh
+                    except Exception:
+                        pass
+
+                if use_react_sniff and self.react_sniffer:
+                    try:
+                        rh = self.react_sniffer.sniff(page)  # type: ignore
+                        if rh and return_react_sniff_hits:
+                            result["react_hits"] = rh
+                    except Exception:
+                        pass
+
+                if use_database_sniff and self.database_sniffer:
+                    try:
+                        dh = self.database_sniffer.sniff(page)  # type: ignore
+                        if dh and return_database_sniff_hits:
+                            result["database_hits"] = dh
+                    except Exception:
+                        pass
+
+                if use_interaction_sniff and self.interaction_sniffer:
+                    try:
+                        ih = self.interaction_sniffer.sniff(page)  # type: ignore
+                        if ih and return_interaction_sniff_hits:
+                            result["interaction_hits"] = ih
+                    except Exception:
+                        pass
+
+                norm_links = []
+                seen = set()
+                for u in links:
+                    cu = self._canonicalize_url(u)
+                    if cu and cu not in seen:
+                        seen.add(cu)
+                        norm_links.append(cu)
+
+                result["links"] = norm_links[:max_links_per_page]
+                if return_network_sniff_links:
+                    result["network_links"] = sorted(network_links)[:max_links_per_page]
+
+                await context.close()
+                await browser.close()
+                return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+    async def _fetch_camoufox(
+        self,
+        url: str,
+        *,
+        timeout_ms: int,
+        proxy_url: str,
+        max_links_per_page: int,
+        options: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "engine": "camoufox",
+            "html": "",
+            "final_url": url,
+            "title": "",
+            "links": [],
+            "error": None,
+        }
+
+        try:
+            opts = dict(options or {})
+            if proxy_url and "proxy" not in opts:
+                pu = urlparse(proxy_url)
+                if pu.scheme and pu.hostname and pu.port:
+                    opts["proxy"] = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
+
+            async with AsyncCamoufox(**opts) as browser:
+                page = await browser.new_page()
+                await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 8000))
+                except Exception:
+                    pass
+                html_text = await page.content()
+                result["html"] = html_text
+                result["final_url"] = page.url
+                try:
+                    result["title"] = await page.title()
+                except Exception:
+                    result["title"] = self._extract_title(html_text)
+                result["links"] = self._extract_links_from_html(html_text, page.url)[:max_links_per_page]
+                return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+    # ------------------------------------------------------------------ #
+    # DB helpers
+    # ------------------------------------------------------------------ #
+    def _store_page(self, row: Dict[str, Any]) -> None:
+        if not self.store:
+            return
+        try:
+            if hasattr(self.store, "save"):
+                self.store.save(row)
+                return
+            if hasattr(self.store, "save_many"):
+                self.store.save_many([row])
+                return
+            if hasattr(self.store, "upsert_page"):
+                self.store.upsert_page(row)
+                return
+        except Exception:
+            pass
+
+    def _search_db_seeds(self, host: str, limit: int = 250) -> List[str]:
+        if not self.store:
+            return []
+        candidates: List[str] = []
+        try:
+            if hasattr(self.store, "search_fts"):
+                rows = self.store.search_fts(host, "oniontracker", limit)  # type: ignore
+                for r in rows or []:
+                    if isinstance(r, dict):
+                        u = r.get("url") or r.get("link")
+                        if u:
+                            candidates.append(str(u))
+            elif hasattr(self.store, "search"):
+                rows = self.store.search(host, limit=limit)  # type: ignore
+                for r in rows or []:
+                    if isinstance(r, dict):
+                        u = r.get("url") or r.get("link")
+                        if u:
+                            candidates.append(str(u))
+        except Exception:
+            pass
+
+        out = []
+        seen = set()
+        for u in candidates:
+            cu = self._canonicalize_url(u)
+            if cu and cu not in seen:
+                seen.add(cu)
+                out.append(cu)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Core crawl
+    # ------------------------------------------------------------------ #
+    async def _fetch_page(
+        self,
+        url: str,
+        *,
+        session: aiohttp.ClientSession,
+        timeout: float,
+        timeout_ms: int,
+        proxy_url: str,
+        http_retries: int,
+        use_js: bool,
+        use_camoufox: bool,
+        camoufox_options: Dict[str, Any],
+        interactive_storage_state_path: str = "",
+        interactive_headless_after_login: bool = True,
+        block_resources: bool,
+        blocked_resource_types: Set[str],
+        blocked_domains: Set[str],
+        block_domains: bool,
+        return_all_js_links: bool,
+        use_network_sniff: bool,
+        return_network_sniff_links: bool,
+        use_runtime_sniff: bool,
+        return_runtime_sniff_hits: bool,
+        use_react_sniff: bool,
+        return_react_sniff_hits: bool,
+        use_database_sniff: bool,
+        return_database_sniff_hits: bool,
+        use_interaction_sniff: bool,
+        return_interaction_sniff_hits: bool,
+        max_links_per_page: int,
+    ) -> Dict[str, Any]:
+        # JS path first if requested
+        if use_camoufox:
+            cx = await self._fetch_camoufox(
+                url,
+                timeout_ms=timeout_ms,
+                proxy_url=proxy_url,
+                max_links_per_page=max_links_per_page,
+                options=camoufox_options,
+            )
+            if cx.get("html"):
+                return {
+                    "url": self._canonicalize_url(cx.get("final_url") or url),
+                    "final_url": self._canonicalize_url(cx.get("final_url") or url),
+                    "title": cx.get("title") or "",
+                    "html": cx.get("html") or "",
+                    "text": self._html_to_text(cx.get("html") or ""),
+                    "links": cx.get("links") or [],
+                    "engine": "camoufox",
+                    "network_links": [],
+                    "runtime_hits": [],
+                    "react_hits": [],
+                    "database_hits": [],
+                    "interaction_hits": [],
+                    "error": cx.get("error"),
+                }
+
+        if use_js:
+            if interactive_storage_state_path:
+                pw = await self._fetch_playwright_with_state(
+                    url,
+                    timeout_ms=timeout_ms,
+                    proxy_url=proxy_url,
+                    storage_state_path=interactive_storage_state_path,
+                    block_resources=block_resources,
+                    blocked_resource_types=blocked_resource_types,
+                    blocked_domains=blocked_domains,
+                    block_domains=block_domains,
+                    return_all_js_links=return_all_js_links,
+                    use_network_sniff=use_network_sniff,
+                    return_network_sniff_links=return_network_sniff_links,
+                    use_runtime_sniff=use_runtime_sniff,
+                    return_runtime_sniff_hits=return_runtime_sniff_hits,
+                    use_react_sniff=use_react_sniff,
+                    return_react_sniff_hits=return_react_sniff_hits,
+                    use_database_sniff=use_database_sniff,
+                    return_database_sniff_hits=return_database_sniff_hits,
+                    use_interaction_sniff=use_interaction_sniff,
+                    return_interaction_sniff_hits=return_interaction_sniff_hits,
+                    max_links_per_page=max_links_per_page,
+                    headless=interactive_headless_after_login,
+                )
+            else:
+                pw = await self._fetch_playwright(
+                    url,
+                    timeout_ms=timeout_ms,
+                    proxy_url=proxy_url,
+                    block_resources=block_resources,
+                    blocked_resource_types=blocked_resource_types,
+                    blocked_domains=blocked_domains,
+                    block_domains=block_domains,
+                    return_all_js_links=return_all_js_links,
+                    use_network_sniff=use_network_sniff,
+                    return_network_sniff_links=return_network_sniff_links,
+                    use_runtime_sniff=use_runtime_sniff,
+                    return_runtime_sniff_hits=return_runtime_sniff_hits,
+                    use_react_sniff=use_react_sniff,
+                    return_react_sniff_hits=return_react_sniff_hits,
+                    use_database_sniff=use_database_sniff,
+                    return_database_sniff_hits=return_database_sniff_hits,
+                    use_interaction_sniff=use_interaction_sniff,
+                    return_interaction_sniff_hits=return_interaction_sniff_hits,
+                    max_links_per_page=max_links_per_page,
+                )
+            if pw.get("html"):
+                return {
+                    "url": self._canonicalize_url(pw.get("final_url") or url),
+                    "final_url": self._canonicalize_url(pw.get("final_url") or url),
+                    "title": pw.get("title") or "",
+                    "html": pw.get("html") or "",
+                    "text": self._html_to_text(pw.get("html") or ""),
+                    "links": pw.get("links") or [],
+                    "engine": "playwright",
+                    "network_links": pw.get("network_links") or [],
+                    "runtime_hits": pw.get("runtime_hits") or [],
+                    "react_hits": pw.get("react_hits") or [],
+                    "database_hits": pw.get("database_hits") or [],
+                    "interaction_hits": pw.get("interaction_hits") or [],
+                    "error": pw.get("error"),
+                }
+
+        body, final_url, http_meta = await self._fetch_http(
+            session,
+            url,
+            timeout=timeout,
+            proxy_url=proxy_url,
+            http_retries=http_retries,
+            block_resources=block_resources,
+        )
+        final_url = self._canonicalize_url(final_url or url)
+        title = self._extract_title(body)
+        text = self._html_to_text(body)
+        links = self._extract_links_from_html(body, final_url)
+
+        return {
+            "url": final_url,
+            "final_url": final_url,
+            "title": title,
+            "html": body,
+            "text": text,
+            "links": links[:max_links_per_page],
+            "engine": "http",
+            "network_links": [],
+            "runtime_hits": [],
+            "react_hits": [],
+            "database_hits": [],
+            "interaction_hits": [],
+            "http_meta": http_meta,
+            "error": http_meta.get("error"),
+        }
+
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        onion_link = self._normalize_seed(str(params.get("onion_link", "")).strip())
+        if not onion_link:
+            return "### OnionTracker\n- Error: missing `onion_link`", {"ok": False, "error": "missing_onion_link"}
+
+        if not self._is_onion_url(onion_link):
+            return (
+                "### OnionTracker\n"
+                f"- Error: `onion_link` must point to a `.onion` host\n"
+                f"- Provided: `{html.escape(onion_link)}`",
+                {"ok": False, "error": "invalid_onion_link", "onion_link": onion_link},
+            )
+
+        timeout = float(params.get("timeout", 15))
+        timeout_ms = int(timeout * 1000)
+        verify = bool(params.get("verify", False))
+        scan_limit = int(params.get("scan_limit", 32))
+        extensions = [s.strip().lower() for s in str(params.get("extensions", "")).split(",") if s.strip()]
+        url_keywords = [s.strip().lower() for s in str(params.get("url_keywords", "")).split(",") if s.strip()]
+        site_require = str(params.get("site_require", "")).strip().lower()
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))
+        strict_keywords = bool(params.get("strict_keywords", False))
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(params.get("return_database_sniff_hits", False))
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+        min_term_overlap = int(params.get("min_term_overlap", 1))
+        max_depth = int(params.get("max_depth", 0))
+        max_pages_total = int(params.get("max_pages_total", 32))
+        subpipeline = str(params.get("subpipeline", "")).strip()
+        use_database = bool(params.get("use_database", False))
+        db_path = str(params.get("db_path", "onion_corpus.db"))
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+            s.strip().lower() for s in str(params.get("blocked_resource_types", "image,stylesheet,font")).split(",") if s.strip()
+        }
+        block_domains = bool(params.get("block_domains", True))
+        blocked_domains = {
+            s.strip().lower() for s in str(params.get("blocked_domains", "")).split(",") if s.strip()
+        }
+        db_seed_limit = int(params.get("db_seed_limit", 250))
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+        memory_sources = [s.strip() for s in str(params.get("memory_sources", "")).split(",") if s.strip()]
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
+        http_verify_tls = bool(params.get("http_verify_tls", False))
+        http_ca_bundle = str(params.get("http_ca_bundle", "")).strip()
+        use_body = bool(params.get("use_body", True))
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options", {}) or {}
+        tor_proxy = str(params.get("tor_proxy", "socks5://127.0.0.1:9050")).strip()
+        same_host_only = bool(params.get("same_host_only", True))
+        allow_non_onion = bool(params.get("allow_non_onion", False))
+        user_agent = str(params.get("user_agent", "Mozilla/5.0 OnionTrackerBlock/1.0"))
+        return_format = str(params.get("mode", "pages")).strip().lower()
+
+        interactive_mode = bool(params.get("interactive_mode", True))
+        interactive_start_url = str(params.get("interactive_start_url", "")).strip()
+        interactive_close_mode = str(params.get("interactive_close_mode", "close_browser")).strip().lower()
+        interactive_session_file = str(params.get("interactive_session_file", "oniontracker_session.json")).strip()
+        interactive_wait_poll_ms = int(params.get("interactive_wait_poll_ms", 750))
+        interactive_headless_after_login = bool(params.get("interactive_headless_after_login", True))
+
+        interactive_storage_state_path = ""
+
+        if site_require:
+            root_host = (urlparse(onion_link).hostname or "").lower()
+            if site_require not in root_host:
+                return (
+                    "### OnionTracker\n"
+                    f"- Error: seed host does not satisfy `site_require`\n"
+                    f"- Host: `{html.escape(root_host)}`\n"
+                    f"- Required fragment: `{html.escape(site_require)}`",
+                    {"ok": False, "error": "site_require_failed", "onion_link": onion_link},
+                )
+
+        if use_database:
+            self._init_db(db_path)
+
+        session = await self._build_aiohttp_session(
+            timeout=timeout,
+            http_retries=http_retries,
+            http_max_conn_per_host=http_max_conn_per_host,
+            proxy_url=tor_proxy,
+            http_verify_tls=http_verify_tls,
+            http_ca_bundle=http_ca_bundle,
+            user_agent=user_agent,
+        )
+        seed = self._canonicalize_url(onion_link)
+        if interactive_mode and use_js:
+            start_url = self._canonicalize_url(interactive_start_url or onion_link)
+            auth_result = await self._interactive_auth_session(
+                start_url,
+                proxy_url=tor_proxy,
+                timeout_ms=timeout_ms,
+                session_file=interactive_session_file,
+                close_mode=interactive_close_mode,
+                wait_poll_ms=interactive_wait_poll_ms,
+            )
+
+            if not auth_result.get("ok"):
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+                return (
+                    "### OnionTracker\n"
+                    f"- Seed: `{html.escape(seed if 'seed' in locals() else onion_link)}`\n"
+                    f"- Error: interactive authentication failed\n"
+                    f"- Detail: `{html.escape(str(auth_result.get('error') or 'unknown'))}`",
+                    {
+                        "ok": False,
+                        "error": "interactive_auth_failed",
+                        "detail": auth_result.get("error"),
+                        "onion_link": onion_link,
+                    },
+                )
+
+            interactive_storage_state_path = auth_result.get("storage_state_path") or ""
+        queue_: collections.deque[Tuple[str, int]] = collections.deque()
+        seen: Set[str] = set()
+        pages: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        network_links_all: List[str] = []
+        runtime_hits_all: List[Any] = []
+        react_hits_all: List[Any] = []
+        database_hits_all: List[Any] = []
+        interaction_hits_all: List[Any] = []
+
+        queue_.append((seed, 0))
+
+        # Optional DB seeds from same host
+        if use_database and self.store:
+            host = (urlparse(seed).hostname or "").lower()
+            for u in self._search_db_seeds(host, limit=db_seed_limit):
+                if self._allowed_url(u, root_url=seed, same_host_only=same_host_only, allow_non_onion=allow_non_onion):
+                    if db_allow_rescan or u not in seen:
+                        queue_.append((u, 0))
+
+        try:
+            # Fetch the root once first to derive terms
+            root_page = await self._fetch_page(
+                seed,
+                session=session,
+                timeout=timeout,
+                timeout_ms=timeout_ms,
+                proxy_url=tor_proxy,
+                http_retries=http_retries,
+                use_js=use_js,
+                use_camoufox=use_camoufox,
+                camoufox_options=camoufox_options,
+                block_resources=block_resources,
+                blocked_resource_types=blocked_resource_types,
+                blocked_domains=blocked_domains,
+                block_domains=block_domains,
+                return_all_js_links=return_all_js_links,
+                use_network_sniff=use_network_sniff,
+                return_network_sniff_links=return_network_sniff_links,
+                use_runtime_sniff=use_runtime_sniff,
+                return_runtime_sniff_hits=return_runtime_sniff_hits,
+                use_react_sniff=use_react_sniff,
+                return_react_sniff_hits=return_react_sniff_hits,
+                use_database_sniff=use_database_sniff,
+                return_database_sniff_hits=return_database_sniff_hits,
+                use_interaction_sniff=use_interaction_sniff,
+                return_interaction_sniff_hits=return_interaction_sniff_hits,
+                max_links_per_page=max_links_per_page,
+                interactive_storage_state_path=interactive_storage_state_path,
+                interactive_headless_after_login=interactive_headless_after_login,
+            )
+            root_terms = self._build_root_terms(
+                root_url=seed,
+                title=root_page.get("title", ""),
+                text=root_page.get("text", "") if use_body else "",
+                memory_sources=memory_sources,
+                max_terms=64,
+            )
+
+            # Requeue root as first page
+            queue_.clear()
+            queue_.append((seed, 0))
+
+            while queue_ and len(pages) < max_pages_total and len(seen) < max(scan_limit, max_pages_total * 4):
+                current_url, depth = queue_.popleft()
+                current_url = self._canonicalize_url(current_url)
+                if not current_url or current_url in seen:
+                    continue
+                seen.add(current_url)
+
+                if not self._allowed_url(
+                    current_url,
+                    root_url=seed,
+                    same_host_only=same_host_only,
+                    allow_non_onion=allow_non_onion,
+                ):
+                    continue
+
+                page = await self._fetch_page(
+                    current_url,
+                    session=session,
+                    timeout=timeout,
+                    timeout_ms=timeout_ms,
+                    proxy_url=tor_proxy,
+                    http_retries=http_retries,
+                    use_js=use_js,
+                    use_camoufox=use_camoufox,
+                    camoufox_options=camoufox_options,
+                    block_resources=block_resources,
+                    blocked_resource_types=blocked_resource_types,
+                    blocked_domains=blocked_domains,
+                    block_domains=block_domains,
+                    return_all_js_links=return_all_js_links,
+                    use_network_sniff=use_network_sniff,
+                    return_network_sniff_links=return_network_sniff_links,
+                    use_runtime_sniff=use_runtime_sniff,
+                    return_runtime_sniff_hits=return_runtime_sniff_hits,
+                    use_react_sniff=use_react_sniff,
+                    return_react_sniff_hits=return_react_sniff_hits,
+                    use_database_sniff=use_database_sniff,
+                    return_database_sniff_hits=return_database_sniff_hits,
+                    use_interaction_sniff=use_interaction_sniff,
+                    return_interaction_sniff_hits=return_interaction_sniff_hits,
+                    max_links_per_page=max_links_per_page,
+                    interactive_storage_state_path=interactive_storage_state_path,
+                    interactive_headless_after_login=interactive_headless_after_login,
+                )
+
+                title = page.get("title") or ""
+                text = page.get("text") or ""
+                html_text = page.get("html") or ""
+                page_links = list(page.get("links") or [])
+
+                if subpipeline:
+                    try:
+                        piped = self.run_sub_pipeline(
+                            initial_value=text or title or current_url,
+                            pipeline_param_name="subpipeline",
+                            parent_params=params,
+                            collect=False,
+                        )
+                        if isinstance(piped, str) and piped.strip():
+                            text = piped
+                    except Exception:
+                        pass
+
+                if extensions:
+                    path_l = (urlparse(current_url).path or "").lower()
+                    if not any(path_l.endswith(ext if ext.startswith(".") else f".{ext}") for ext in extensions):
+                        # Extension filter is applied only to keep/discover ranking, not hard-fail crawl of root.
+                        if current_url != seed:
+                            continue
+
+                score = self._score_page(
+                    current_url,
+                    root_url=seed,
+                    title=title,
+                    text=text if use_body else "",
+                    url_keywords=url_keywords,
+                    root_terms=root_terms,
+                    strict_keywords=strict_keywords,
+                    min_term_overlap=min_term_overlap,
+                )
+
+                row = {
+                    "url": current_url,
+                    "link": current_url,
+                    "final_url": page.get("final_url") or current_url,
+                    "title": title,
+                    "host": (urlparse(current_url).hostname or "").lower(),
+                    "depth": depth,
+                    "score": score,
+                    "engine": page.get("engine"),
+                    "text": text if use_body else "",
+                    "snippet": (text or "")[:600],
+                    "html_len": len(html_text),
+                    "fetched_at": time.time(),
+                    "network_links": page.get("network_links") or [],
+                    "runtime_hits": page.get("runtime_hits") or [],
+                    "react_hits": page.get("react_hits") or [],
+                    "database_hits": page.get("database_hits") or [],
+                    "interaction_hits": page.get("interaction_hits") or [],
+                }
+
+                if html_text or title or text:
+                    pages.append(row)
+                    if use_database:
+                        self._store_page(row)
+                else:
+                    failed.append({
+                        "url": current_url,
+                        "depth": depth,
+                        "error": page.get("error") or "empty_page",
+                    })
+
+                if return_network_sniff_links and page.get("network_links"):
+                    network_links_all.extend([str(x) for x in page.get("network_links") or []])
+
+                if return_runtime_sniff_hits and page.get("runtime_hits"):
+                    runtime_hits_all.extend(page.get("runtime_hits") or [])
+
+                if return_react_sniff_hits and page.get("react_hits"):
+                    react_hits_all.extend(page.get("react_hits") or [])
+
+                if return_database_sniff_hits and page.get("database_hits"):
+                    database_hits_all.extend(page.get("database_hits") or [])
+
+                if return_interaction_sniff_hits and page.get("interaction_hits"):
+                    interaction_hits_all.extend(page.get("interaction_hits") or [])
+
+                if depth < max_depth:
+                    for nxt in page_links[:max_links_per_page]:
+                        nxt = self._canonicalize_url(nxt)
+                        if not nxt or nxt in seen:
+                            continue
+                        if not self._allowed_url(
+                            nxt,
+                            root_url=seed,
+                            same_host_only=same_host_only,
+                            allow_non_onion=allow_non_onion,
+                        ):
+                            continue
+                        queue_.append((nxt, depth + 1))
+
+                if len(seen) >= scan_limit:
+                    break
+
+        finally:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+        # Final ranking
+        pages.sort(key=lambda r: (float(r.get("score", 0.0)), -(int(r.get("depth", 0)))), reverse=True)
+        pages = pages[:max_pages_total]
+
+        discovered_links = [str(r.get("url") or "") for r in pages if r.get("url")]
+        lexicon = _extract_terms(
+            " ".join(
+                [
+                    " ".join([str(r.get("title") or ""), str(r.get("text") or "")[:2000]])
+                    for r in pages
+                ]
+            ),
+            top_k=64,
+            min_len=4,
+        )
+
+        links_key = str(params.get("links_key", "oniontracker_links"))
+        lexicon_key = str(params.get("lexicon_key", "oniontracker_lexicon"))
+        pages_key = str(params.get("pages_key", "oniontracker_pages"))
+
+        self._save_memory_list(links_key, discovered_links, max_total=4096)
+        self._save_memory_list(lexicon_key, lexicon, max_total=512)
+
+        try:
+            mem = Memory.load()
+            existing_pages = mem.get(pages_key, [])
+            if not isinstance(existing_pages, list):
+                existing_pages = []
+            existing_pages.extend(pages)
+            mem[pages_key] = existing_pages[-512:]
+            Memory.save(mem)
+        except Exception:
+            pass
+
+        # Render output
+        if return_format == "json":
+            out_obj = {
+                "seed": seed,
+                "count": len(pages),
+                "pages": pages,
+                "failed": failed,
+                "lexicon": lexicon,
+            }
+            out = json.dumps(out_obj, indent=2, ensure_ascii=False)
+        else:
+            lines: List[str] = []
+            lines.append("### OnionTracker")
+            lines.append(f"- Seed: `{seed}`")
+            lines.append(f"- Pages: **{len(pages)}**")
+            lines.append(f"- Failures: **{len(failed)}**")
+            lines.append(f"- Same-host only: **{same_host_only}**")
+            lines.append(f"- Engine: **{'camoufox' if use_camoufox else 'playwright' if use_js else 'http'}**")
+
+            if lexicon:
+                lines.append("\n### Lexicon")
+                for term in lexicon[:32]:
+                    lines.append(f"- {term}")
+
+            if pages:
+                lines.append("\n### Pages")
+                for row in pages:
+                    url = row.get("url") or ""
+                    title = row.get("title") or "(no title)"
+                    host = row.get("host") or ""
+                    depth = row.get("depth", 0)
+                    score = round(float(row.get("score", 0.0)), 2)
+                    engine = row.get("engine") or "http"
+                    snippet = (row.get("snippet") or "").strip()
+                    if snippet:
+                        snippet = snippet[:260].replace("\n", " ")
+                        lines.append(
+                            f"- [{html.escape(str(title))}]({url}) "
+                            f"— `{host}` | depth={depth} | score={score} | engine={engine}\n"
+                            f"  - {html.escape(snippet)}"
+                        )
+                    else:
+                        lines.append(
+                            f"- [{html.escape(str(title))}]({url}) "
+                            f"— `{host}` | depth={depth} | score={score} | engine={engine}"
+                        )
+
+            if failed:
+                lines.append("\n### Failures")
+                for row in failed[:16]:
+                    lines.append(
+                        f"- `{row.get('url')}` — {html.escape(str(row.get('error') or 'failed'))}"
+                    )
+
+            if return_network_sniff_links and network_links_all:
+                uniq = []
+                seen_n = set()
+                for u in network_links_all:
+                    cu = self._canonicalize_url(str(u))
+                    if cu and cu not in seen_n:
+                        seen_n.add(cu)
+                        uniq.append(cu)
+                if uniq:
+                    lines.append("\n### Network Links")
+                    for u in uniq[:64]:
+                        lines.append(f"- {u}")
+
+            if return_runtime_sniff_hits and runtime_hits_all:
+                lines.append("\n### Runtime Hits")
+                for x in runtime_hits_all[:32]:
+                    lines.append(f"- `{html.escape(str(x))}`")
+
+            if return_react_sniff_hits and react_hits_all:
+                lines.append("\n### React Hits")
+                for x in react_hits_all[:32]:
+                    lines.append(f"- `{html.escape(str(x))}`")
+
+            if return_database_sniff_hits and database_hits_all:
+                lines.append("\n### Database Hits")
+                for x in database_hits_all[:32]:
+                    lines.append(f"- `{html.escape(str(x))}`")
+
+            if return_interaction_sniff_hits and interaction_hits_all:
+                lines.append("\n### Interaction Hits")
+                for x in interaction_hits_all[:32]:
+                    lines.append(f"- `{html.escape(str(x))}`")
+
+            out = "\n".join(lines)
+
+        meta = {
+            "ok": True,
+            "seed": seed,
+            "count": len(pages),
+            "failed_count": len(failed),
+            "pages": pages,
+            "failed": failed,
+            "lexicon": lexicon,
+            "links_key": links_key,
+            "lexicon_key": lexicon_key,
+            "pages_key": pages_key,
+            "same_host_only": same_host_only,
+            "allow_non_onion": allow_non_onion,
+            "use_js": use_js,
+            "use_camoufox": use_camoufox,
+            "use_database": use_database,
+            "db_path": db_path if use_database else None,
+            "tor_proxy": tor_proxy,
+            "network_links": network_links_all[:256],
+            "runtime_hits": runtime_hits_all[:128],
+            "react_hits": react_hits_all[:128],
+            "database_hits": database_hits_all[:128],
+            "interaction_hits": interaction_hits_all[:128],
+        }
+        return out, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "onion_link": "http://examplehiddenserviceexample.onion/",
+            "timeout": 15,
+            "mode": "pages",  # pages | json
+            "scan_limit": 32,
+            "verify": False,  # reserved
+            "extensions": "",
+            "url_keywords": "",
+            "site_require": "",
+            "use_js": False,
+            "return_all_js_links": False,
+            "max_links_per_page": 500,
+            "strict_keywords": False,
+            "use_network_sniff": False,
+            "return_network_sniff_links": False,
+            "use_runtime_sniff": False,
+            "return_runtime_sniff_hits": False,
+            "use_react_sniff": False,
+            "return_react_sniff_hits": False,
+            "use_database_sniff": False,
+            "return_database_sniff_hits": False,
+            "use_interaction_sniff": False,
+            "return_interaction_sniff_hits": False,
+            "min_term_overlap": 1,
+            "max_depth": 0,
+            "max_pages_total": 32,
+            "subpipeline": "",
+            "use_database": False,
+            "db_path": "onion_corpus.db",
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",
+            "db_seed_limit": 250,
+            "db_seed_max_age_days": None,
+            "db_allow_rescan": False,
+            "memory_sources": "",
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_verify_tls": False,
+            "http_ca_bundle": "",
+            "use_body": True,
+            "use_camoufox": False,
+            "camoufox_options": {},
+            "tor_proxy": "socks5://127.0.0.1:9050",
+            "same_host_only": True,
+            "allow_non_onion": False,
+            "user_agent": "Mozilla/5.0 OnionTrackerBlock/1.0",
+            "links_key": "oniontracker_links",
+            "lexicon_key": "oniontracker_lexicon",
+            "pages_key": "oniontracker_pages",
+            "interactive_mode": True,
+            "interactive_start_url": "",
+            "interactive_close_mode": "close_browser",  # close_browser | enter
+            "interactive_session_file": "oniontracker_session.json",
+            "interactive_wait_poll_ms": 750,
+            "interactive_headless_after_login": True,
+        }
+
+
+BLOCKS.register("oniontracker", OnionTrackerBlock)
