@@ -11696,6 +11696,87 @@ class _RelationBudget:
             ranked = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[: self.max_referers_per_host]
             host_buckets[host] = dict(ranked)
 
+class _CDNLinkPrioritizer:
+    """
+    Small scoring helper for CDN / media-delivery links.
+
+    Goal:
+      - prioritize delivery hosts and asset URLs
+      - avoid changing external call signatures
+      - stay additive to your existing score logic
+    """
+
+    CDN_HOST_HINTS = (
+        "cdn", "cloudfront.net", "akamaized.net", "akamai.net", "fastly.net",
+        "fastlylb.net", "b-cdn.net", "cdn77", "edgekey.net", "edgesuite.net",
+        "cachefly.net", "hwcdn.net", "stackpathcdn.com", "jsdelivr.net",
+        "unpkg.com", "bootstrapcdn.com", "cloudflareinsights.com",
+    )
+
+    CDN_PATH_HINTS = (
+        "/cdn/", "/media/", "/assets/", "/static/", "/dist/", "/content/",
+        "/image/", "/images/", "/img/", "/video/", "/audio/", "/playback/",
+        "/manifest/", "/segment/", "/chunk/", "/frag/", "/thumb/", "/poster/",
+    )
+
+    ASSET_EXTS = (
+        ".m3u8", ".mpd", ".m4s", ".ts", ".mp4", ".webm", ".mkv",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+        ".js", ".mjs", ".css", ".json", ".xml",
+    )
+
+    MEDIA_CT_HINTS = (
+        "video/", "audio/", "image/",
+        "application/vnd.apple.mpegurl",
+        "application/x-mpegurl",
+        "application/dash+xml",
+        "application/javascript",
+        "text/css",
+        "application/json",
+    )
+
+    def score(
+        self,
+        *,
+        url: str,
+        content_type: str = "",
+        kind: str = "unknown",
+        source: str = "",
+    ) -> float:
+        u = str(url or "").lower()
+        ct = str(content_type or "").lower()
+        src = str(source or "").lower()
+        score = 0.0
+
+        # Host-based CDN boost
+        if any(h in u for h in self.CDN_HOST_HINTS):
+            score += 2.25
+
+        # Path-based delivery boost
+        if any(h in u for h in self.CDN_PATH_HINTS):
+            score += 1.10
+
+        # Extension-based asset boost
+        if any(u.endswith(ext) for ext in self.ASSET_EXTS):
+            score += 1.35
+
+        # Content-type boost
+        if any(h in ct for h in self.MEDIA_CT_HINTS):
+            score += 1.25
+
+        # Existing kind-based reinforcement
+        if kind in {"video", "audio", "image", "manifest", "asset", "json"}:
+            score += 0.90
+
+        # Sniffer/runtime-discovered links often matter more
+        if src in {"sniffer", "body_extract", "response_link_header"}:
+            score += 0.35
+
+        return round(score, 4)
+
+    def is_probable_cdn(self, url: str, content_type: str = "", kind: str = "unknown") -> bool:
+        return self.score(url=url, content_type=content_type, kind=kind) >= 2.0
 
 class HTTPSSubmanager:
     """
@@ -11878,7 +11959,7 @@ class HTTPSSubmanager:
         # identical in-flight request coalescing
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
-
+        self._cdn_priority = _CDNLinkPrioritizer()
     async def __aenter__(self):
         self._ssl_context = self._build_ssl_context()
         self._connector = aiohttp.TCPConnector(
@@ -11940,6 +12021,13 @@ class HTTPSSubmanager:
             score = 2.0 + self._score_url_similarity(seed, url)
             if kind in ("video", "audio", "image", "manifest", "json"):
                 score += 1.0
+
+            score += self._cdn_priority.score(
+                url=url,
+                content_type=str(item.get("content_type") or ""),
+                kind=kind,
+                source=source,
+            )
             await self._remember_candidate(
                 url=url,
                 source=source,
@@ -12935,8 +13023,21 @@ class HTTPSSubmanager:
             union = len(ts | tc)
             if union:
                 score += 2.4 * (inter / union)
-            if any(tok in tc for tok in ("manifest", "playlist", "segment", "stream", "cdn", "video", "audio", "download")):
-                score += 0.4
+                if any(tok in tc for tok in ("manifest", "playlist", "segment", "stream", "cdn", "video", "audio", "download")):
+                    score += 1.2
+
+                cand_host = pc.netloc.lower()
+                cand_path = pc.path.lower()
+
+                if any(h in cand_host for h in (
+                        "cdn", "cloudfront.net", "akamaized.net", "fastly.net", "b-cdn.net", "jsdelivr.net"
+                )):
+                    score += 1.6
+
+                if any(p in cand_path for p in (
+                        "/cdn/", "/media/", "/assets/", "/static/", "/video/", "/audio/", "/playback/", "/segment/", "/chunk/"
+                )):
+                    score += 0.8
         return round(score, 4)
 
     def _classify_url_kind(self, url: str, content_type: str) -> str:

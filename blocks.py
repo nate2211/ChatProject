@@ -7891,15 +7891,47 @@ class LinkTrackerBlock(BaseBlock):
 
         def _clean_domain(u: str) -> str:
             try:
-                return urlparse(u).netloc.lower().split(":")[0]
+                return urlparse(u).netloc.lower().split(":", 1)[0]
             except Exception:
                 return ""
+
+        allowed_cdn_hosts: set[str] = set()
+
+        CDN_HOST_HINTS = (
+            "cdn", "static", "assets", "asset", "media", "img", "image", "images",
+            "files", "downloads", "content", "objects", "storage",
+            "cloudfront.net", "akamai", "akamaized.net", "fastly.net", "fastly",
+            "cloudflare", "r2.dev", "b-cdn.net",
+            "amazonaws.com", "s3.", "storage.googleapis.com", "googleusercontent.com",
+            "digitaloceanspaces.com", "backblazeb2.com",
+        )
+
+        CDN_SIG_KEYS = {
+            "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-expires",
+            "x-amz-signedheaders", "x-amz-signature", "x-goog-algorithm",
+            "x-goog-credential", "x-goog-date", "x-goog-expires", "x-goog-signedheaders",
+            "x-goog-signature", "expires", "expiry", "signature", "sig", "token",
+            "auth", "policy", "key-pair-id",
+        }
+
+        CDN_FILENAME_KEYS = (
+            "filename", "filename*", "file", "download", "attachment", "name",
+            "key", "object", "path", "asset", "media", "source", "src",
+        )
+
+        def _looks_like_cdn_host(u: str) -> bool:
+            d = _clean_domain(u)
+            if not d:
+                return False
+            return any(tok in d for tok in CDN_HOST_HINTS)
 
         def _allowed_by_required_sites(u: str) -> bool:
             if not required_sites:
                 return True
             d = _clean_domain(u)
-            return any(req in d for req in required_sites)
+            if any(req in d for req in required_sites):
+                return True
+            return d in allowed_cdn_hosts
 
         def _term_overlap_ok(haystack: str) -> bool:
             if not keywords:
@@ -8007,6 +8039,15 @@ class LinkTrackerBlock(BaseBlock):
                     return True
             return False
 
+        def _extract_query_value(query: str, key: str) -> str:
+            m = re.search(rf"(?:^|[?&]){re.escape(key)}=([^&#]+)", query, re.IGNORECASE)
+            if not m:
+                return ""
+            try:
+                return unquote(m.group(1)).lower()
+            except Exception:
+                return m.group(1).lower()
+
         def _extract_effective_asset_name(u: str, headers: Optional[Dict[str, str]] = None) -> str:
             low = unquote(str(u or "")).lower()
             path_name = _clean_path(low).rsplit("/", 1)[-1]
@@ -8014,8 +8055,20 @@ class LinkTrackerBlock(BaseBlock):
                 return path_name
 
             query = _clean_query(low)
-            for key in ("filename", "file", "download", "attachment", "name"):
-                m = re.search(rf"(?:^|[?&]){key}=([^&#]+)", query, re.IGNORECASE)
+            for key in CDN_FILENAME_KEYS:
+                val = _extract_query_value(query, key)
+                if val:
+                    return val
+
+            rcd = _extract_query_value(query, "response-content-disposition")
+            if rcd:
+                m = re.search(r"filename\*=UTF-8''([^;]+)", rcd, re.IGNORECASE)
+                if m:
+                    try:
+                        return unquote(m.group(1)).lower()
+                    except Exception:
+                        return m.group(1).lower()
+                m = re.search(r'filename="?([^";]+)"?', rcd, re.IGNORECASE)
                 if m:
                     try:
                         return unquote(m.group(1)).lower()
@@ -8033,6 +8086,121 @@ class LinkTrackerBlock(BaseBlock):
                 return False
             return any(name.endswith(ext) for ext in targets)
 
+        def _normalize_assetish_url(u: str) -> str:
+            try:
+                pu = urlparse(str(u or "").strip())
+                kept_q = []
+                for k, v in parse_qsl(pu.query, keep_blank_values=True):
+                    if k.lower() in CDN_SIG_KEYS:
+                        continue
+                    kept_q.append((k, v))
+                return urlunparse((
+                    (pu.scheme or "").lower(),
+                    (pu.netloc or "").lower(),
+                    pu.path or "",
+                    "",
+                    urlencode(kept_q, doseq=True),
+                    "",
+                ))
+            except Exception:
+                return str(u or "").strip()
+
+        def _asset_key(u: str) -> str:
+            n = _normalize_assetish_url(u)
+            return n or str(u or "").strip()
+
+        def _branch_variants_for_url(u: str) -> list[str]:
+            out: list[str] = []
+            try:
+                pu = urlparse(_normalize_assetish_url(u))
+                exact = urlunparse((pu.scheme, pu.netloc, pu.path, "", pu.query, ""))
+                raw_no_frag = urlunparse((pu.scheme, pu.netloc, pu.path, "", pu.query, ""))
+                queryless = urlunparse((pu.scheme, pu.netloc, pu.path, "", "", ""))
+
+                if exact:
+                    out.append(exact)
+                if queryless and queryless != exact:
+                    out.append(queryless)
+
+                clean_path = pu.path or ""
+                if clean_path and "/" in clean_path.strip("/"):
+                    parent = clean_path.rsplit("/", 1)[0] + "/"
+                    out.append(urlunparse((pu.scheme, pu.netloc, parent, "", "", "")))
+
+                out.append(urlunparse((pu.scheme, pu.netloc, "/", "", "", "")))
+            except Exception:
+                if u:
+                    out.append(u)
+
+            dedup = []
+            seen = set()
+            for x in out:
+                if not x:
+                    continue
+                if x in seen:
+                    continue
+                seen.add(x)
+                dedup.append(x)
+            return dedup
+
+        def _register_cdn_from_page(parent_page_url: str, discovered_url: str) -> None:
+            try:
+                if not required_sites:
+                    return
+                if not _looks_like_cdn_host(discovered_url):
+                    return
+                if not any(req in _clean_domain(parent_page_url) for req in required_sites):
+                    return
+                d = _clean_domain(discovered_url)
+                if d:
+                    allowed_cdn_hosts.add(d)
+            except Exception:
+                pass
+
+        def _should_branch_cdn_url(
+            u: str,
+            *,
+            headers: Optional[Dict[str, str]] = None,
+            sniff_kind: str = "",
+            sniff_tag: str = "",
+            sniff_ct: str = "",
+        ) -> bool:
+            if not u or not str(u).startswith("http"):
+                return False
+            if self._is_mega_link(u):
+                return False
+            if _is_asset_link_for_mode(
+                u,
+                headers=headers,
+                sniff_kind=sniff_kind,
+                sniff_tag=sniff_tag,
+                sniff_ct=sniff_ct,
+            ):
+                return False
+
+            low = unquote(str(u or "")).lower()
+            host = _clean_domain(low)
+            path = _clean_path(low)
+
+            if any(x in host for x in (
+                "recaptcha", "google-analytics", "googletagmanager", "doubleclick",
+            )):
+                return False
+
+            if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                return False
+
+            if _looks_like_cdn_host(u):
+                return True
+
+            if any(tok in low for tok in (
+                "manifest", ".m3u8", ".mpd", "playlist", "segment", "chunk",
+                "source=", "file=", "filename=", "asset=", "media=", "download=",
+                "response-content-disposition=", "content-disposition=",
+            )):
+                return True
+
+            return False
         def _is_asset_link_for_mode(
                 u: str,
                 headers: Optional[Dict[str, str]] = None,
@@ -8168,24 +8336,26 @@ class LinkTrackerBlock(BaseBlock):
             host = _clean_domain(low)
             path = _clean_path(low)
 
-            # hard reject noisy social / lyrics / merch / playlist seeds
             if any(h in host for h in (
                     "reddit.com", "x.com", "twitter.com", "instagram.com",
                     "genius.com", "shop.", "shopify.com", "spotify.com",
             )):
                 return False
 
-            # strong accepts
             if _is_asset_link_for_mode(u):
+                return True
+
+            if _looks_like_cdn_host(u):
                 return True
 
             if any(tok in low for tok in (
                     "/download", "/stream", "/track/", "/audio/", "/file/",
                     "official-audio", "listen", "dl=", "download=",
+                    "manifest", ".m3u8", ".mpd", "playlist", "segment", "chunk",
+                    "filename=", "response-content-disposition=", "content-disposition=",
             )):
                 return True
 
-            # SoundCloud track pages are worth scanning
             if "soundcloud.com" in host and "/sets/" not in path and "/albums" not in path:
                 return True
 
@@ -8200,7 +8370,11 @@ class LinkTrackerBlock(BaseBlock):
             unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
             for u in unique_urls:
                 if not _allowed_by_required_sites(u):
-                    continue
+                    if _looks_like_cdn_host(u):
+                        allowed_cdn_hosts.add(_clean_domain(u))
+                    else:
+                        continue
+
                 path = _clean_path(u)
 
                 if _is_asset_link_for_mode(u):
@@ -8211,9 +8385,15 @@ class LinkTrackerBlock(BaseBlock):
                 if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                     continue
 
+                if _should_branch_cdn_url(u):
+                    for branch_url in _branch_variants_for_url(u):
+                        if _allowed_by_required_sites(branch_url):
+                            candidate_pages.append(branch_url)
+                    continue
+
                 candidate_pages.append(u)
 
-            candidate_pages = candidate_pages[:max_pages_total]
+            candidate_pages = _dedupe(candidate_pages)[:max_pages_total]
 
         if (not skip_search_engine) and pipeline_queries:
             for qv in pipeline_queries:
@@ -8239,6 +8419,7 @@ class LinkTrackerBlock(BaseBlock):
         found_interaction_hits: List[Dict[str, Any]] = []
 
         seen_asset_urls: set[str] = set()
+        seen_branch_urls: set[str] = set()
         visited_pages: set[str] = set()
         inflight_pages: set[str] = set()
 
@@ -8309,9 +8490,10 @@ class LinkTrackerBlock(BaseBlock):
                     if use_database and store and store.asset_exists(u):
                         debug_log.append(f"Skipping {u} (already in database)")
                         continue
-                    if u in seen_asset_urls:
+                    asset_key = _asset_key(u)
+                    if asset_key in seen_asset_urls:
                         continue
-                    seen_asset_urls.add(u)
+                    seen_asset_urls.add(asset_key)
 
                     status = "unverified"
                     size = "?"
@@ -8367,14 +8549,23 @@ class LinkTrackerBlock(BaseBlock):
             pw_p = pw_browser = pw_context = None
 
             effective_blocked_resource_types = set(blocked_resource_types)
-            if mode == "media" and block_resources:
-                removed = effective_blocked_resource_types & {"media", "video", "audio"}
-                if removed:
-                    effective_blocked_resource_types -= {"media", "video", "audio"}
-                    debug_log.append(
-                        "[LinkTracker][media] removed media/video/audio from blocked_resource_types so audio requests are not aborted before sniffing."
-                    )
+            if block_resources:
+                removed = set()
 
+                if mode == "media":
+                    removed |= effective_blocked_resource_types & {"media", "video", "audio"}
+
+                if mode == "pictures":
+                    removed |= effective_blocked_resource_types & {"image"}
+
+                if mode == "docs":
+                    removed |= effective_blocked_resource_types & {"fetch", "xhr"}
+
+                if removed:
+                    effective_blocked_resource_types -= removed
+                    debug_log.append(
+                        f"[LinkTracker] removed blocked resource types for mode={mode}: {sorted(removed)}"
+                    )
             try:
                 if pw_needed:
                     ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
@@ -8420,12 +8611,16 @@ class LinkTrackerBlock(BaseBlock):
                                 )
                                 if sniff_html:
                                     html = sniff_html
+
                                 for item in sniff_items or []:
                                     full_url = str(item.get("url") or "").strip()
                                     if not full_url:
                                         continue
+
                                     if not _allowed_by_required_sites(full_url) and mode != "media":
-                                        continue
+                                        _register_cdn_from_page(page_url, full_url)
+                                        if not _allowed_by_required_sites(full_url):
+                                            continue
 
                                     local_network_links.append({
                                         "page": page_url,
@@ -8435,22 +8630,18 @@ class LinkTrackerBlock(BaseBlock):
                                     })
 
                                     is_mega = self._is_mega_link(full_url)
-                                    lpath = _clean_path(full_url)
                                     sniff_ct = str(item.get("content_type") or item.get("mime") or "").lower()
                                     sniff_tag = str(item.get("tag") or "").lower()
                                     sniff_kind = str(item.get("kind") or "").lower()
 
                                     head_status = None
                                     head_headers: Dict[str, Any] = {}
-                                    ct = ""
                                     if verify_links and not is_mega:
                                         try:
                                             head_status, head_headers = await http_mgr.head(full_url)
-                                            ct = (head_headers.get("Content-Type") or head_headers.get("content-type") or "").lower()
                                         except Exception:
                                             head_status = None
                                             head_headers = {}
-                                            ct = ""
 
                                     if not is_mega:
                                         if not _is_asset_link_for_mode(
@@ -8460,6 +8651,20 @@ class LinkTrackerBlock(BaseBlock):
                                                 sniff_tag=sniff_tag,
                                                 sniff_ct=sniff_ct,
                                         ):
+                                            if _should_branch_cdn_url(
+                                                    full_url,
+                                                    headers=head_headers if verify_links else None,
+                                                    sniff_kind=sniff_kind,
+                                                    sniff_tag=sniff_tag,
+                                                    sniff_ct=sniff_ct,
+                                            ):
+                                                for branch_url in _branch_variants_for_url(full_url):
+                                                    if not _allowed_by_required_sites(branch_url):
+                                                        continue
+                                                    if branch_url in seen_branch_urls:
+                                                        continue
+                                                    seen_branch_urls.add(branch_url)
+                                                    next_pages.append(branch_url)
                                             continue
 
                                     status = "sniffed"
@@ -8470,7 +8675,8 @@ class LinkTrackerBlock(BaseBlock):
                                     elif verify_links:
                                         if head_status == 200:
                                             status = "200 OK"
-                                            cl = head_headers.get("Content-Length") or head_headers.get("content-length")
+                                            cl = head_headers.get("Content-Length") or head_headers.get(
+                                                "content-length")
                                             if cl:
                                                 try:
                                                     size = f"{int(cl) // 1024} KB"
@@ -8482,29 +8688,36 @@ class LinkTrackerBlock(BaseBlock):
                                             status = f"Dead ({head_status})"
 
                                     if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                                        display_text = (
-                                            item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]"
-                                        )[:100]
-                                        asset = {
-                                            "text": display_text,
-                                            "url": full_url,
-                                            "source": page_url,
-                                            "size": size,
-                                            "status": status,
-                                        }
-                                        DEBUG_LOGGER.log_message(
-                                            f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
-                                        )
-                                        local_assets.append(asset)
-                                        if use_database and store:
-                                            store.upsert_asset(asset)
+                                        asset_key = _asset_key(full_url)
+                                        if asset_key not in seen_asset_urls:
+                                            seen_asset_urls.add(asset_key)
+
+                                            display_text = (
+                                                    item.get("text")
+                                                    or _extract_effective_asset_name(full_url,
+                                                                                     headers=head_headers if verify_links else None)
+                                                    or full_url.rsplit("/", 1)[-1]
+                                                    or "[network asset]"
+                                            )[:100]
+
+                                            asset = {
+                                                "text": display_text,
+                                                "url": full_url,
+                                                "source": page_url,
+                                                "size": size,
+                                                "status": status,
+                                            }
+                                            DEBUG_LOGGER.log_message(
+                                                f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
+                                            )
+                                            local_assets.append(asset)
+                                            if use_database and store:
+                                                store.upsert_asset(asset)
 
                                         try:
-                                            parsed = urlparse(full_url)
-                                            parent_path = parsed.path.rsplit("/", 1)[0] + "/"
-                                            parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
-                                            if _allowed_by_required_sites(parent_url):
-                                                sniff_parent_pages.append(parent_url)
+                                            for parent_url in _branch_variants_for_url(full_url):
+                                                if _allowed_by_required_sites(parent_url):
+                                                    sniff_parent_pages.append(parent_url)
                                         except Exception:
                                             pass
                             except Exception as e:
@@ -8709,6 +8922,7 @@ class LinkTrackerBlock(BaseBlock):
                             raw_link = link.get("url") or ""
                             if not raw_link:
                                 continue
+
                             full_url = urljoin(page_url, raw_link)
                             if not full_url.startswith("http"):
                                 continue
@@ -8716,21 +8930,24 @@ class LinkTrackerBlock(BaseBlock):
                             if any(k in full_url.lower() for k in self.JUNK_FILENAME_KEYWORDS):
                                 continue
 
-                            if full_url in seen_asset_urls:
+                            asset_key = _asset_key(full_url)
+                            if asset_key in seen_asset_urls:
                                 continue
 
-                            lpath = _clean_path(full_url)
                             is_mega = self._is_mega_link(full_url)
                             head_status = None
                             head_headers: Dict[str, Any] = {}
-                            ct = ""
 
                             candidate_asset = _is_asset_link_for_mode(full_url)
                             if not candidate_asset:
                                 if not _allowed_by_required_sites(full_url) and mode != "media":
-                                    continue
+                                    _register_cdn_from_page(page_url, full_url)
+                                    if not _allowed_by_required_sites(full_url):
+                                        continue
+
                                 if not _term_overlap_ok((link.get("text") or "") + " " + full_url):
-                                    continue
+                                    if not _looks_like_cdn_host(full_url):
+                                        continue
 
                                 if verify_links and not is_mega:
                                     try:
@@ -8739,8 +8956,23 @@ class LinkTrackerBlock(BaseBlock):
                                         head_status = None
                                         head_headers = {}
 
-                                candidate_asset = _is_asset_link_for_mode(full_url, headers=head_headers if verify_links else None)
+                                candidate_asset = _is_asset_link_for_mode(
+                                    full_url,
+                                    headers=head_headers if verify_links else None,
+                                )
+
                                 if not candidate_asset:
+                                    if _should_branch_cdn_url(
+                                            full_url,
+                                            headers=head_headers if verify_links else None,
+                                    ):
+                                        for branch_url in _branch_variants_for_url(full_url):
+                                            if not _allowed_by_required_sites(branch_url):
+                                                continue
+                                            if branch_url in seen_branch_urls:
+                                                continue
+                                            seen_branch_urls.add(branch_url)
+                                            next_pages.append(branch_url)
                                     continue
 
                                 status = "unverified"
@@ -8762,9 +8994,15 @@ class LinkTrackerBlock(BaseBlock):
                                         status = f"Dead ({head_status})"
 
                                 if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                                    seen_asset_urls.add(full_url)
+                                    seen_asset_urls.add(asset_key)
                                     asset = {
-                                        "text": (link.get("text") or full_url.rsplit("/", 1)[-1] or "[asset]")[:100],
+                                        "text": (
+                                                link.get("text")
+                                                or _extract_effective_asset_name(full_url,
+                                                                                 headers=head_headers if verify_links else None)
+                                                or full_url.rsplit("/", 1)[-1]
+                                                or "[asset]"
+                                        )[:100],
                                         "url": full_url,
                                         "source": page_url,
                                         "size": size,
@@ -8783,24 +9021,37 @@ class LinkTrackerBlock(BaseBlock):
                                 raw_link = link.get("url") or ""
                                 if not raw_link:
                                     continue
+
                                 full_url = urljoin(page_url, raw_link)
+
                                 if not _allowed_by_required_sites(full_url):
-                                    continue
+                                    _register_cdn_from_page(page_url, full_url)
+                                    if not _allowed_by_required_sites(full_url):
+                                        continue
 
                                 lpath = urlparse(full_url).path.lower()
                                 if any(lpath.endswith(ext) for ext in targets):
                                     continue
 
+                                if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                    continue
+
                                 if keywords and not page_has_keywords:
                                     haystack = (link.get("text") or "") + " " + full_url
-                                    if not _term_overlap_ok(haystack):
+                                    if not _term_overlap_ok(haystack) and not _looks_like_cdn_host(full_url):
                                         continue
 
                                 if engine == "sites":
                                     if _is_search_url(full_url) and full_url not in explicit_site_seeds:
                                         continue
 
-                                next_pages.append(full_url)
+                                for branch_url in _branch_variants_for_url(full_url):
+                                    if not _allowed_by_required_sites(branch_url):
+                                        continue
+                                    if branch_url in seen_branch_urls:
+                                        continue
+                                    seen_branch_urls.add(branch_url)
+                                    next_pages.append(branch_url)
 
                         if depth < max_depth and sniff_parent_pages:
                             for parent_url in sniff_parent_pages:
@@ -8874,7 +9125,13 @@ class LinkTrackerBlock(BaseBlock):
                     deferred_frontier: List[str] = []
 
                     for u in frontier:
+                        if not u:
+                            continue
                         if u in visited_pages:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        if any(_clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
                             continue
 
                         if len(batch) < this_depth_cap:
