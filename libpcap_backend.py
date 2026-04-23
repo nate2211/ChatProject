@@ -6,7 +6,7 @@ from typing import Any, Optional, Dict, List
 
 
 @dataclass
-class   LibpcapCtypesBackend:
+class LibpcapCtypesBackend:
     """
     Minimal ctypes-backed libpcap wrapper for passive capture.
 

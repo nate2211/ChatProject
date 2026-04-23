@@ -6853,6 +6853,35 @@ class LinkTrackerBlock(BaseBlock):
         except Exception:
             return False
 
+    def _promote_hits_to_links(
+            self,
+            hits: list[dict[str, Any]],
+            links_on_page: list[dict[str, Any]],
+            next_pages: list[str],
+            *,
+            depth: int,
+            max_depth: int,
+            label: str,
+    ) -> None:
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+
+            u = str(hit.get("url") or "").strip()
+            if not u or not u.startswith("http"):
+                continue
+
+            text = str(hit.get("text") or hit.get("route") or f"[{label}]")[:200]
+            tag = str(hit.get("tag") or label)[:80]
+
+            links_on_page.append({
+                "url": u,
+                "text": text,
+                "tag": tag,
+            })
+
+            if depth < max_depth:
+                next_pages.append(u)
     # ------------------------------------------------------------------ #
     # Search engines
     # ------------------------------------------------------------------ #
@@ -7610,6 +7639,7 @@ class LinkTrackerBlock(BaseBlock):
                     urls.append(u)
         return urls
 
+
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -8003,14 +8033,88 @@ class LinkTrackerBlock(BaseBlock):
                 return False
             return any(name.endswith(ext) for ext in targets)
 
-        def _is_asset_link_for_mode(u: str, headers: Optional[Dict[str, str]] = None) -> bool:
+        def _is_asset_link_for_mode(
+                u: str,
+                headers: Optional[Dict[str, str]] = None,
+                *,
+                sniff_kind: str = "",
+                sniff_tag: str = "",
+                sniff_ct: str = "",
+        ) -> bool:
             if self._is_mega_link(u):
                 return True
-            return _has_target_extension(u, headers=headers)
+
+            low = unquote(str(u or "")).lower()
+            host = _clean_domain(low)
+            path = _clean_path(low)
+
+            # hard deny obvious non-asset/service/telemetry/auth/api URLs
+            if any(x in host for x in (
+                    "recaptcha", "google-analytics", "googletagmanager", "doubleclick",
+                    "secure.soundcloud.com", "api-v2.soundcloud.com",
+            )):
+                return False
+
+            if any(x in low for x in (
+                    "/web-auth", "/announcements", "/featured-profiles", "/relatedartists",
+                    "/spotlight", "/payments/", "/quotations/", "/stat_record",
+                    "/api/currency_data/", "/graphql", "/telemetry", "/metrics",
+            )):
+                return False
+
+            # strongest proof: explicit file extension / filename
+            if _has_target_extension(u, headers=headers):
+                return True
+
+            if mode == "media":
+                ct = (
+                        sniff_ct
+                        or (headers or {}).get("Content-Type")
+                        or (headers or {}).get("content-type")
+                        or ""
+                ).lower()
+
+                sk = (sniff_kind or "").lower()
+                st = (sniff_tag or "").lower()
+
+                # require stronger evidence for media mode
+                if _looks_like_audioish_ct(ct, headers=headers):
+                    if any(x in low for x in (
+                            "/download/", "/stream/", "/file/", "filename=", "filename*=",
+                            "response-content-disposition=", "content-disposition=",
+                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
+                            ".weba", ".alac", ".aiff", ".wma", ".oga",
+                    )):
+                        return True
+
+                if sk in {"audio", "video"}:
+                    if any(x in low for x in (
+                            "/download/", "/stream/", "/file/",
+                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
+                            ".weba", ".alac", ".aiff", ".wma", ".oga",
+                    )):
+                        return True
+
+                if any(tok in st for tok in ("download", "stream", "source")):
+                    if _looks_like_audioish_url(u):
+                        return True
+
+                # keep this last and strict so generic API URLs do not pass
+                if _looks_like_audioish_url(u):
+                    if any(x in low for x in (
+                            "/download/", "/stream/", "/file/",
+                            "filename=", "filename*=", "response-content-disposition=",
+                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
+                            ".weba", ".alac", ".aiff", ".wma", ".oga",
+                    )):
+                        return True
+
+            return False
 
         def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
             sq = q.strip()
             site_clauses = []
+
             for raw in required_sites or []:
                 s = (raw or "").strip().lower()
                 if not s:
@@ -8025,13 +8129,16 @@ class LinkTrackerBlock(BaseBlock):
                 sites_expr = " OR ".join(site_clauses)
                 sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
 
-            q_lower = sq.lower()
             if mode == "media":
-                if not any(x in q_lower for x in ["mp3", "wav", "flac", "m4a", "ogg", "opus", "aac", "audio"]):
-                    sq = f"{sq} (mp3 OR wav OR flac OR m4a OR ogg OR opus OR aac OR audio)".strip()
+                sq = (
+                    f'{sq} '
+                    f'("download" OR "stream" OR "audio" OR "official audio" OR "listen") '
+                    f'-site:reddit.com -site:x.com -site:twitter.com -site:instagram.com '
+                    f'-site:genius.com -site:shopify.com -site:spotify.com'
+                ).strip()
             elif mode == "docs":
-                if "filetype:pdf" not in q_lower:
-                    sq = f"{sq} filetype:pdf".strip()
+                sq = f"{sq} filetype:pdf".strip()
+
             return sq
 
         def _is_search_url(u: str) -> bool:
@@ -8056,6 +8163,33 @@ class LinkTrackerBlock(BaseBlock):
                     out.append(s)
             return out
 
+        def _seed_is_worth_scanning(u: str) -> bool:
+            low = str(u or "").lower()
+            host = _clean_domain(low)
+            path = _clean_path(low)
+
+            # hard reject noisy social / lyrics / merch / playlist seeds
+            if any(h in host for h in (
+                    "reddit.com", "x.com", "twitter.com", "instagram.com",
+                    "genius.com", "shop.", "shopify.com", "spotify.com",
+            )):
+                return False
+
+            # strong accepts
+            if _is_asset_link_for_mode(u):
+                return True
+
+            if any(tok in low for tok in (
+                    "/download", "/stream", "/track/", "/audio/", "/file/",
+                    "official-audio", "listen", "dl=", "download=",
+            )):
+                return True
+
+            # SoundCloud track pages are worth scanning
+            if "soundcloud.com" in host and "/sets/" not in path and "/albums" not in path:
+                return True
+
+            return False
         candidate_pages: List[str] = []
         direct_asset_urls: List[str] = []
         queries_to_run: List[str] = []
@@ -8160,7 +8294,7 @@ class LinkTrackerBlock(BaseBlock):
                                 per_page=search_per_page,
                             )
                         for u in seeds:
-                            if _allowed_by_required_sites(u):
+                            if _allowed_by_required_sites(u) and _seed_is_worth_scanning(u):
                                 candidate_pages.append(u)
                     except Exception as e:
                         debug_log.append(f"[search] Error for query {q!r}: {e}")
@@ -8319,7 +8453,13 @@ class LinkTrackerBlock(BaseBlock):
                                             ct = ""
 
                                     if not is_mega:
-                                        if not _is_asset_link_for_mode(full_url, headers=head_headers if verify_links else None):
+                                        if not _is_asset_link_for_mode(
+                                                full_url,
+                                                headers=head_headers if verify_links else None,
+                                                sniff_kind=sniff_kind,
+                                                sniff_tag=sniff_tag,
+                                                sniff_ct=sniff_ct,
+                                        ):
                                             continue
 
                                     status = "sniffed"
@@ -8421,13 +8561,22 @@ class LinkTrackerBlock(BaseBlock):
                                         rt_html = rt_result[0]
                                 else:
                                     rt_html = rt_result
+
                                 if rt_html and not html:
                                     html = rt_html
+
                                 if rt_hits:
                                     local_runtime_hits.extend(rt_hits)
+                                    self._promote_hits_to_links(
+                                        rt_hits,
+                                        links_on_page,
+                                        next_pages,
+                                        depth=depth,
+                                        max_depth=max_depth,
+                                        label="runtime",
+                                    )
                             except Exception as e:
                                 local_log.append(f"[LinkTracker][Runtime] Error on {page_url}: {e}")
-
                         if use_js and pw_context:
                             js_html, js_links = await self._pw_fetch_js_links(
                                 pw_context,
@@ -8462,14 +8611,17 @@ class LinkTrackerBlock(BaseBlock):
                                 )
                                 if r_html and not html:
                                     html = r_html
+
                                 if r_hits:
                                     local_react_hits.extend(r_hits)
-                                    for rh in r_hits:
-                                        r_url = rh.get("url")
-                                        if not r_url:
-                                            continue
-                                        if _allowed_by_required_sites(r_url) and depth < max_depth:
-                                            next_pages.append(r_url)
+                                    self._promote_hits_to_links(
+                                        r_hits,
+                                        links_on_page,
+                                        next_pages,
+                                        depth=depth,
+                                        max_depth=max_depth,
+                                        label="react",
+                                    )
                             except Exception as e:
                                 local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
 
@@ -8483,8 +8635,17 @@ class LinkTrackerBlock(BaseBlock):
                                 )
                                 if i_html and not html:
                                     html = i_html
+
                                 if i_hits:
                                     local_interaction_hits.extend(i_hits)
+                                    self._promote_hits_to_links(
+                                        i_hits,
+                                        links_on_page,
+                                        next_pages,
+                                        depth=depth,
+                                        max_depth=max_depth,
+                                        label="interaction",
+                                    )
                             except Exception as e:
                                 local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
 
@@ -8565,8 +8726,7 @@ class LinkTrackerBlock(BaseBlock):
                             ct = ""
 
                             candidate_asset = _is_asset_link_for_mode(full_url)
-
-                            if candidate_asset or verify_links:
+                            if not candidate_asset:
                                 if not _allowed_by_required_sites(full_url) and mode != "media":
                                     continue
                                 if not _term_overlap_ok((link.get("text") or "") + " " + full_url):
@@ -8769,10 +8929,16 @@ class LinkTrackerBlock(BaseBlock):
                     next_frontier_candidates: List[str] = list(deferred_frontier)
 
                     for res in results:
-                        # do not remove these if they already exist in your function
                         found_pages.append(res.get("page"))
                         found_assets.extend(res.get("assets") or [])
                         debug_log.extend(res.get("log") or [])
+
+                        found_js_links.extend(res.get("js_links") or [])
+                        found_network_links.extend(res.get("network_links") or [])
+                        found_runtime_hits.extend(res.get("runtime_hits") or [])
+                        found_react_hits.extend(res.get("react_hits") or [])
+                        found_database_hits.extend(res.get("database_hits") or [])
+                        found_interaction_hits.extend(res.get("interaction_hits") or [])
 
                         next_frontier_candidates.extend(res.get("next_pages") or [])
 
@@ -39647,3 +39813,879 @@ class OnionTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("oniontracker", OnionTrackerBlock)
+
+
+
+@dataclass
+class OllamaBlock(BaseBlock):
+    """
+    Standalone Ollama generation block for blocks.py.
+
+    Design goals:
+    - no prior ollama integration required
+    - directly calls local Ollama /api/chat
+    - accepts base `query` + incoming `payload`
+    - resolves context/lexicon/links from:
+        1) direct params
+        2) memory keys
+        3) parsed sections embedded in upstream payload
+    - supports block-style memory exports
+    - supports optional message history and tool schemas
+    """
+
+    default_base_url: str = field(
+        default_factory=lambda: os.getenv("GPTPROJECT_BASE_URL", "http://127.0.0.1:11434")
+    )
+    default_model: str = field(
+        default_factory=lambda: os.getenv("GPTPROJECT_MODEL", "qwen3:8b")
+    )
+    default_api_key: str = field(
+        default_factory=lambda: os.getenv("GPTPROJECT_API_KEY", "ollama")
+    )
+    default_temperature: float = field(
+        default_factory=lambda: float(os.getenv("GPTPROJECT_TEMPERATURE", "0.2"))
+    )
+    default_request_timeout_sec: int = field(
+        default_factory=lambda: int(os.getenv("GPTPROJECT_REQUEST_TIMEOUT_SEC", "180"))
+    )
+    default_max_history: int = field(
+        default_factory=lambda: int(os.getenv("GPTPROJECT_MAX_HISTORY", "24"))
+    )
+
+    _SECTION_RE = re.compile(
+        r"(?ims)^\[(lexicon|context|links|query|prompt|instructions|system)\]\s*\n(.*?)(?=^\[[a-zA-Z0-9_\-]+\]\s*\n|\Z)"
+    )
+
+    # ----------------------------
+    # HTTP helpers
+    # ----------------------------
+
+    def _build_session(self) -> requests.Session:
+        session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=8,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        session.headers.update({"Content-Type": "application/json"})
+        return session
+
+    def _normalize_base_url(self, base_url: str) -> str:
+        raw = (base_url or "").strip().rstrip("/")
+        if not raw:
+            raw = "http://127.0.0.1:11434"
+
+        if raw.endswith("/v1"):
+            raw = raw[:-3]
+        if raw.endswith("/api"):
+            raw = raw[:-4]
+
+        return raw.rstrip("/")
+
+    def _api_root(self, base_url: str) -> str:
+        return f"{self._normalize_base_url(base_url)}/api"
+
+    # ----------------------------
+    # value coercion helpers
+    # ----------------------------
+
+    def _coerce_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, tuple)):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+            return "\n".join(parts).strip()
+        if isinstance(value, dict):
+            for key in ("final", "text", "content", "prompt", "query", "body", "result"):
+                if key in value and str(value[key]).strip():
+                    return str(value[key]).strip()
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(value).strip()
+        return str(value).strip()
+
+    def _coerce_list(self, value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str):
+            s = value.strip()
+            if not s:
+                return []
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    return parsed
+            except Exception:
+                pass
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return [value]
+
+    def _coerce_messages(self, value: Any) -> List[Dict[str, str]]:
+        raw = self._coerce_list(value)
+        out: List[Dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "user")).strip() or "user"
+            content = self._coerce_text(item.get("content", ""))
+            if content:
+                out.append({"role": role, "content": content})
+        return out
+
+    def _coerce_tools(self, value: Any) -> List[Dict[str, Any]]:
+        raw = self._coerce_list(value)
+        return [x for x in raw if isinstance(x, dict)]
+
+    def _normalize_links(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            lines = [line.strip() for line in value.splitlines()]
+            out = [line for line in lines if line]
+            if not out and value.strip():
+                out = [value.strip()]
+            return out
+        if isinstance(value, (list, tuple)):
+            out: List[str] = []
+            for item in value:
+                if isinstance(item, dict):
+                    url = str(item.get("url", "")).strip()
+                    if url:
+                        out.append(url)
+                else:
+                    s = str(item).strip()
+                    if s:
+                        out.append(s)
+            return out
+        if isinstance(value, dict):
+            url = str(value.get("url", "")).strip()
+            return [url] if url else []
+        s = str(value).strip()
+        return [s] if s else []
+
+    def _normalize_lexicon(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if "\n" in raw:
+                parts = [x.strip(" -•\t") for x in raw.splitlines() if x.strip()]
+                return self._dedupe_preserve_order(parts)
+            parts = [x.strip() for x in raw.split(",") if x.strip()]
+            return self._dedupe_preserve_order(parts)
+        if isinstance(value, (list, tuple, set)):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+            return self._dedupe_preserve_order(parts)
+        return [str(value).strip()] if str(value).strip() else []
+
+    def _normalize_context(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, (list, tuple)):
+            parts = [str(x).strip() for x in value if str(x).strip()]
+            return "\n".join(parts).strip()
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(value).strip()
+        return str(value).strip()
+
+    def _dedupe_preserve_order(self, items: List[str]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for item in items:
+            s = str(item).strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
+
+    # ----------------------------
+    # Memory helpers
+    # ----------------------------
+
+    def _memory_load(self) -> Dict[str, Any]:
+        try:
+            return Memory.load()
+        except Exception:
+            return {}
+
+    def _memory_save(self, store: Dict[str, Any]) -> None:
+        try:
+            Memory.save(store)
+        except Exception:
+            pass
+
+    def _get_from_memory_keys(
+        self,
+        store: Dict[str, Any],
+        keys: Any,
+        *,
+        mode: str = "first",
+        joiner: str = "\n\n",
+        max_items: int = 0,
+    ) -> Any:
+        key_list = [str(x).strip() for x in self._coerce_list(keys) if str(x).strip()]
+        if not key_list:
+            return None
+
+        collected: List[Any] = []
+        for key in key_list:
+            if key in store:
+                collected.append(store.get(key))
+                if mode == "first":
+                    break
+
+        if not collected:
+            return None
+
+        if max_items > 0:
+            collected = collected[:max_items]
+
+        if mode == "first":
+            return collected[0]
+
+        if mode == "list":
+            return collected
+
+        # join/auto default
+        norm_parts: List[str] = []
+        for item in collected:
+            if isinstance(item, list):
+                norm_parts.append("\n".join(str(x) for x in item if str(x).strip()))
+            else:
+                norm_parts.append(self._coerce_text(item))
+        return joiner.join(x for x in norm_parts if x.strip()).strip()
+
+    # ----------------------------
+    # Payload section parsing
+    # ----------------------------
+
+    def _parse_payload_sections(self, text: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        raw = (text or "").strip()
+        if not raw:
+            return out
+
+        for name, body in self._SECTION_RE.findall(raw):
+            key = str(name or "").strip().lower()
+            val = str(body or "").strip()
+            if key and val:
+                out[key] = val
+
+        return out
+
+    def _strip_payload_sections(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        stripped = self._SECTION_RE.sub("", raw).strip()
+        stripped = re.sub(r"\n{3,}", "\n\n", stripped)
+        return stripped.strip()
+
+    # ----------------------------
+    # Composition helpers
+    # ----------------------------
+
+    def _resolve_query(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str]) -> str:
+        direct_query = self._coerce_text(params.get("query", ""))
+        section_query = self._coerce_text(sections.get("query", ""))
+        section_prompt = self._coerce_text(sections.get("prompt", ""))
+
+        for candidate in (direct_query, section_query, section_prompt):
+            if candidate:
+                return candidate
+        return ""
+
+    def _resolve_system(self, params: Dict[str, Any], sections: Dict[str, str]) -> str:
+        for candidate in (
+            params.get("system", ""),
+            params.get("system_prompt", ""),
+            sections.get("system", ""),
+            sections.get("instructions", ""),
+        ):
+            s = self._coerce_text(candidate)
+            if s:
+                return s
+        return ""
+
+    def _resolve_context(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> str:
+        # direct param wins
+        direct = self._normalize_context(params.get("context", None))
+        if direct:
+            return direct
+
+        # memory keys next
+        mem_context = self._get_from_memory_keys(
+            store,
+            params.get("mem_context_keys", params.get("context_key", None)),
+            mode=str(params.get("mem_context_mode", "join")),
+            joiner=str(params.get("mem_context_join", "\n\n")),
+            max_items=int(params.get("mem_context_max_items", 0) or 0),
+        )
+        mem_context_text = self._normalize_context(mem_context)
+        if mem_context_text:
+            return mem_context_text
+
+        # parsed section from payload
+        section_context = self._normalize_context(sections.get("context", ""))
+        if section_context:
+            return section_context
+
+        return ""
+
+    def _resolve_lexicon(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> List[str]:
+        # direct param
+        direct = self._normalize_lexicon(params.get("lexicon", None))
+        if direct:
+            return direct
+
+        # memory keys
+        mem_lex = self._get_from_memory_keys(
+            store,
+            params.get("mem_lexicon_keys", params.get("lexicon_key", None)),
+            mode=str(params.get("mem_lexicon_mode", "list")),
+            joiner=str(params.get("mem_lexicon_join", "\n")),
+            max_items=int(params.get("mem_lexicon_max_items", 0) or 0),
+        )
+        mem_lexicon = self._normalize_lexicon(mem_lex)
+        if mem_lexicon:
+            return mem_lexicon
+
+        # parsed section
+        section_lex = self._normalize_lexicon(sections.get("lexicon", ""))
+        if section_lex:
+            return section_lex
+
+        return []
+
+    def _resolve_links(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> List[str]:
+        direct = self._normalize_links(params.get("links", None))
+        if direct:
+            return self._dedupe_preserve_order(direct)
+
+        mem_links = self._get_from_memory_keys(
+            store,
+            params.get("mem_links_keys", params.get("links_key", None)),
+            mode=str(params.get("mem_links_mode", "list")),
+            joiner=str(params.get("mem_links_join", "\n")),
+            max_items=int(params.get("mem_links_max_items", 0) or 0),
+        )
+        mem_link_list = self._normalize_links(mem_links)
+        if mem_link_list:
+            return self._dedupe_preserve_order(mem_link_list)
+
+        section_links = self._normalize_links(sections.get("links", ""))
+        return self._dedupe_preserve_order(section_links)
+
+    def _resolve_extra_memory_inputs(self, params: Dict[str, Any], store: Dict[str, Any]) -> str:
+        """
+        General-purpose memory feeder like the larger block ecosystem's mem_in_keys style.
+        """
+        value = self._get_from_memory_keys(
+            store,
+            params.get("mem_in_keys", None),
+            mode=str(params.get("mem_in_mode", "join")),
+            joiner=str(params.get("mem_in_join", "\n\n")),
+            max_items=int(params.get("mem_in_max_items", 0) or 0),
+        )
+        return self._coerce_text(value)
+
+    def _merge_query_and_payload(
+        self,
+        *,
+        query: str,
+        payload_text: str,
+        merge_mode: str,
+        joiner: str,
+    ) -> str:
+        q = (query or "").strip()
+        p = (payload_text or "").strip()
+
+        if merge_mode == "query_only":
+            return q
+        if merge_mode == "payload_only":
+            return p
+        if merge_mode == "payload_then_query":
+            return joiner.join([x for x in (p, q) if x]).strip()
+
+        return joiner.join([x for x in (q, p) if x]).strip()
+
+    def _build_user_text(
+        self,
+        *,
+        merged_query_payload: str,
+        context_text: str,
+        lexicon: List[str],
+        links: List[str],
+        extra_memory_text: str,
+        prefix: str,
+        suffix: str,
+        include_context: bool,
+        include_lexicon: bool,
+        include_links: bool,
+        include_extra_memory: bool,
+        joiner: str,
+    ) -> str:
+        parts: List[str] = []
+
+        if prefix.strip():
+            parts.append(prefix.strip())
+
+        if merged_query_payload.strip():
+            parts.append(merged_query_payload.strip())
+
+        if include_lexicon and lexicon:
+            parts.append("### Key Terms\n" + ", ".join(lexicon))
+
+        if include_context and context_text.strip():
+            parts.append("### Context\n" + context_text.strip())
+
+        if include_links and links:
+            parts.append("### Links\n" + "\n".join(f"- {u}" for u in links))
+
+        if include_extra_memory and extra_memory_text.strip():
+            parts.append("### Memory Inputs\n" + extra_memory_text.strip())
+
+        if suffix.strip():
+            parts.append(suffix.strip())
+
+        return joiner.join([p for p in parts if p.strip()]).strip()
+
+    def _build_messages(
+        self,
+        *,
+        system_prompt: str,
+        history: List[Dict[str, str]],
+        prepend_messages: List[Dict[str, str]],
+        append_messages: List[Dict[str, str]],
+        user_text: str,
+    ) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+
+        if system_prompt.strip():
+            messages.append({"role": "system", "content": system_prompt.strip()})
+
+        messages.extend(prepend_messages)
+        messages.extend(history)
+
+        if user_text.strip():
+            messages.append({"role": "user", "content": user_text.strip()})
+
+        messages.extend(append_messages)
+        return messages
+
+    # ----------------------------
+    # Ollama response helpers
+    # ----------------------------
+
+    def _extract_assistant_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        msg = data.get("message", {})
+        if not isinstance(msg, dict):
+            return {"role": "assistant", "content": "", "tool_calls": []}
+
+        tool_calls = msg.get("tool_calls", [])
+        if not isinstance(tool_calls, list):
+            tool_calls = []
+
+        return {
+            "role": str(msg.get("role", "assistant") or "assistant"),
+            "content": str(msg.get("content", "") or ""),
+            "tool_calls": tool_calls,
+        }
+
+    # ----------------------------
+    # Memory output/export helpers
+    # ----------------------------
+
+    def _memory_export(
+        self,
+        *,
+        store: Dict[str, Any],
+        ok: bool,
+        assistant_text: str,
+        context_text: str,
+        lexicon: List[str],
+        links: List[str],
+        params: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Block-style optional exports back into Memory.
+        """
+        exports: List[str] = []
+
+        if not ok and bool(params.get("mem_out_on_ok", True)):
+            return exports
+
+        response_key = str(params.get("mem_out_response_key", "") or "").strip()
+        if response_key:
+            store[response_key] = assistant_text
+            exports.append(response_key)
+
+        out_key = str(params.get("mem_out_key", "") or "").strip()
+        out_prefix = str(params.get("mem_out_prefix", "") or "")
+        if out_key:
+            value = (out_prefix + assistant_text).strip() if out_prefix else assistant_text
+            if bool(params.get("mem_out_merge", False)):
+                existing = store.get(out_key)
+                if isinstance(existing, list):
+                    merged = existing + [value]
+                    max_items = int(params.get("mem_out_max_items", 0) or 0)
+                    if max_items > 0:
+                        merged = merged[-max_items:]
+                    store[out_key] = merged
+                elif isinstance(existing, str) and existing.strip():
+                    store[out_key] = existing.rstrip() + "\n\n" + value
+                else:
+                    store[out_key] = value
+            else:
+                store[out_key] = value
+            exports.append(out_key)
+
+        export_context_key = str(params.get("export_context_key", "") or "").strip()
+        if export_context_key and context_text.strip():
+            store[export_context_key] = context_text
+            exports.append(export_context_key)
+
+        export_lexicon_key = str(params.get("export_lexicon_key", "") or "").strip()
+        if export_lexicon_key and lexicon:
+            store[export_lexicon_key] = lexicon
+            exports.append(export_lexicon_key)
+
+        export_links_key = str(params.get("export_links_key", "") or "").strip()
+        if export_links_key and links:
+            store[export_links_key] = links
+            exports.append(export_links_key)
+
+        return exports
+
+    # ----------------------------
+    # public execute
+    # ----------------------------
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
+        # config-style params
+        base_url = str(params.get("base_url", self.default_base_url) or self.default_base_url).strip()
+        model = str(params.get("model", self.default_model) or self.default_model).strip()
+        api_key = str(params.get("api_key", self.default_api_key) or self.default_api_key).strip()
+        request_timeout_sec = int(params.get("request_timeout_sec", self.default_request_timeout_sec) or self.default_request_timeout_sec)
+        temperature = float(params.get("temperature", self.default_temperature))
+        max_history = int(params.get("max_history", self.default_max_history) or self.default_max_history)
+
+        # prompt-building params
+        joiner = str(params.get("joiner", "\n\n"))
+        merge_mode = str(params.get("merge_mode", "query_then_payload")).strip().lower()
+
+        prefix = self._coerce_text(params.get("prefix", ""))
+        suffix = self._coerce_text(params.get("suffix", ""))
+
+        include_context = bool(params.get("include_context", True))
+        include_lexicon = bool(params.get("include_lexicon", True))
+        include_links = bool(params.get("include_links", True))
+        include_extra_memory = bool(params.get("include_extra_memory", True))
+
+        # advanced message params
+        prepend_messages = self._coerce_messages(params.get("prepend_messages", []))
+        append_messages = self._coerce_messages(params.get("append_messages", []))
+        history = self._coerce_messages(params.get("history", []))[-max_history:]
+        tools = self._coerce_tools(params.get("tools", []))
+        stream = bool(params.get("stream", False))
+
+        # model options
+        top_p = params.get("top_p", None)
+        top_k = params.get("top_k", None)
+        num_predict = params.get("num_predict", None)
+        repeat_penalty = params.get("repeat_penalty", None)
+        seed = params.get("seed", None)
+        stop = params.get("stop", None)
+        format_value = params.get("format", None)
+        keep_alive = params.get("keep_alive", None)
+
+        store = self._memory_load()
+
+        payload_text_full = self._coerce_text(payload)
+        sections = self._parse_payload_sections(payload_text_full)
+        payload_text = self._strip_payload_sections(payload_text_full)
+
+        query = self._resolve_query(payload_text, params, sections)
+        system_prompt = self._resolve_system(params, sections)
+        context_text = self._resolve_context(payload_text, params, sections, store)
+        lexicon = self._resolve_lexicon(payload_text, params, sections, store)
+        links = self._resolve_links(payload_text, params, sections, store)
+        extra_memory_text = self._resolve_extra_memory_inputs(params, store)
+
+        merged_query_payload = self._merge_query_and_payload(
+            query=query,
+            payload_text=payload_text,
+            merge_mode=merge_mode,
+            joiner=joiner,
+        )
+
+        user_text = self._build_user_text(
+            merged_query_payload=merged_query_payload,
+            context_text=context_text,
+            lexicon=lexicon,
+            links=links,
+            extra_memory_text=extra_memory_text,
+            prefix=prefix,
+            suffix=suffix,
+            include_context=include_context,
+            include_lexicon=include_lexicon,
+            include_links=include_links,
+            include_extra_memory=include_extra_memory,
+            joiner=joiner,
+        )
+
+        messages = self._build_messages(
+            system_prompt=system_prompt,
+            history=history,
+            prepend_messages=prepend_messages,
+            append_messages=append_messages,
+            user_text=user_text,
+        )
+
+        if not messages:
+            return "", {
+                "ok": False,
+                "error": "empty_request",
+                "base_url": self._normalize_base_url(base_url),
+                "model": model,
+            }
+
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "options": {
+                "temperature": temperature,
+            },
+        }
+
+        if tools:
+            body["tools"] = tools
+        if top_p is not None:
+            body["options"]["top_p"] = float(top_p)
+        if top_k is not None:
+            body["options"]["top_k"] = int(top_k)
+        if num_predict is not None:
+            body["options"]["num_predict"] = int(num_predict)
+        if repeat_penalty is not None:
+            body["options"]["repeat_penalty"] = float(repeat_penalty)
+        if seed is not None:
+            body["options"]["seed"] = int(seed)
+        if stop is not None:
+            body["options"]["stop"] = stop
+        if format_value is not None:
+            body["format"] = format_value
+        if keep_alive is not None:
+            body["keep_alive"] = keep_alive
+
+        url = f"{self._api_root(base_url)}/chat"
+        session = self._build_session()
+
+        try:
+            response = session.post(
+                url,
+                data=json.dumps(body),
+                timeout=(2.0, float(request_timeout_sec)),
+            )
+
+            if not response.ok:
+                detail = response.text.strip()
+                if len(detail) > 2000:
+                    detail = detail[:2000] + "..."
+                return "", {
+                    "ok": False,
+                    "error": "server_rejected_request",
+                    "base_url": self._normalize_base_url(base_url),
+                    "chat_url": url,
+                    "status_code": response.status_code,
+                    "response_text": detail,
+                    "model": model,
+                    "request_message_count": len(messages),
+                    "query": query,
+                }
+
+            try:
+                data = response.json()
+            except ValueError:
+                return "", {
+                    "ok": False,
+                    "error": "invalid_json_response",
+                    "base_url": self._normalize_base_url(base_url),
+                    "chat_url": url,
+                    "model": model,
+                    "raw_text": response.text[:2000],
+                    "query": query,
+                }
+
+        except requests.RequestException as exc:
+            return "", {
+                "ok": False,
+                "error": "request_failed",
+                "base_url": self._normalize_base_url(base_url),
+                "chat_url": url,
+                "model": model,
+                "detail": str(exc),
+                "query": query,
+            }
+        finally:
+            session.close()
+
+        assistant_msg = self._extract_assistant_message(data)
+        assistant_text = str(assistant_msg.get("content", "") or "")
+        tool_calls = assistant_msg.get("tool_calls", []) or []
+
+        exports = self._memory_export(
+            store=store,
+            ok=True,
+            assistant_text=assistant_text,
+            context_text=context_text,
+            lexicon=lexicon,
+            links=links,
+            params=params,
+        )
+        if exports:
+            self._memory_save(store)
+
+        meta: Dict[str, Any] = {
+            "ok": True,
+            "base_url": self._normalize_base_url(base_url),
+            "chat_url": url,
+            "model": model,
+            "api_key": api_key,
+            "temperature": temperature,
+            "request_timeout_sec": request_timeout_sec,
+            "query": query,
+            "merge_mode": merge_mode,
+
+            "context_chars": len(context_text),
+            "lexicon_size": len(lexicon),
+            "links_count": len(links),
+            "extra_memory_chars": len(extra_memory_text),
+
+            "request_message_count": len(messages),
+            "history_count": len(history),
+            "tools_count": len(tools),
+            "tool_calls": tool_calls,
+
+            "done": data.get("done", None),
+            "done_reason": data.get("done_reason", None),
+            "prompt_eval_count": data.get("prompt_eval_count", None),
+            "eval_count": data.get("eval_count", None),
+            "total_duration": data.get("total_duration", None),
+            "load_duration": data.get("load_duration", None),
+            "prompt_eval_duration": data.get("prompt_eval_duration", None),
+            "eval_duration": data.get("eval_duration", None),
+        }
+
+        if exports:
+            meta["memory_exports"] = exports
+
+        return assistant_text, meta
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            # config/provider-style
+            "base_url": "http://127.0.0.1:11434",
+            "model": "qwen3:8b",
+            "api_key": "ollama",
+            "request_timeout_sec": 180,
+            "temperature": 0.2,
+            "max_history": 24,
+
+            # main prompt inputs
+            "query": "",
+            "merge_mode": "query_then_payload",   # query_then_payload | payload_then_query | query_only | payload_only
+            "system": "",
+            "system_prompt": "",
+            "prefix": "",
+            "suffix": "",
+            "joiner": "\n\n",
+
+            # direct injected rich inputs
+            "context": None,
+            "lexicon": None,
+            "links": None,
+
+            # parse/include controls
+            "include_context": True,
+            "include_lexicon": True,
+            "include_links": True,
+            "include_extra_memory": True,
+
+            # memory resolution
+            "mem_in_keys": None,
+            "mem_in_mode": "join",
+            "mem_in_join": "\n\n",
+            "mem_in_max_items": 0,
+
+            "context_key": "",
+            "lexicon_key": "",
+            "links_key": "",
+
+            "mem_context_keys": None,
+            "mem_context_mode": "join",
+            "mem_context_join": "\n\n",
+            "mem_context_max_items": 0,
+
+            "mem_lexicon_keys": None,
+            "mem_lexicon_mode": "list",
+            "mem_lexicon_join": "\n",
+            "mem_lexicon_max_items": 0,
+
+            "mem_links_keys": None,
+            "mem_links_mode": "list",
+            "mem_links_join": "\n",
+            "mem_links_max_items": 0,
+
+            # message-level advanced inputs
+            "history": [],
+            "prepend_messages": [],
+            "append_messages": [],
+            "tools": [],
+            "stream": False,
+
+            # model options
+            "top_p": None,
+            "top_k": None,
+            "num_predict": None,
+            "repeat_penalty": None,
+            "seed": None,
+            "stop": None,
+            "format": None,
+            "keep_alive": None,
+
+            # exports
+            "mem_out_prefix": "",
+            "mem_out_key": "",
+            "mem_out_response_key": "",
+            "mem_out_on_ok": True,
+            "mem_out_merge": False,
+            "mem_out_max_items": 0,
+
+            "export_context_key": "",
+            "export_lexicon_key": "",
+            "export_links_key": "",
+        }
+
+
+BLOCKS.register("ollama", OllamaBlock)

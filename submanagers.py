@@ -28,7 +28,7 @@ import asyncio, json, re, hashlib, time
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin
 
 from loggers import DEBUG_LOGGER
-
+import libpcap_backend
 try:
     from playwright.async_api import BrowserContext, Response, Page, Request, async_playwright
 except ImportError:  # allow import in non-PW envs
@@ -460,18 +460,77 @@ class NetworkSniffer:
             pass
 
     # ---------------------------- helpers ---------------------------- #
-    def _extract_urls_from_text(self, s: Any) -> "NetworkSniffer.List[str]":
-        s = self._to_str(s)
-        if not s:
+    def _extract_urls_from_text(self, s: Any, base_url: Any = "") -> "NetworkSniffer.List[str]":
+        """
+        Extract link-ish URLs from arbitrary text.
+
+        Backwards-compatible:
+          - Existing call sites pass only `s` (works).
+          - If `base_url` is provided, relative URLs found in HTML/CSS-ish text are url-joined.
+
+        What it extracts:
+          - absolute: http(s)://, ws(s)://
+          - schemeless: //example.com/path  -> https://example.com/path
+          - common HTML attrs: href/src/action/data-* values
+          - CSS url(...) and @import targets
+        """
+        txt = self._to_str(s)
+        if not txt:
             return []
-        rx = self.re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", self.re.IGNORECASE)
+
+        base = self._to_str(base_url).strip() or ""
+
+        abs_rx = self.re.compile(r"\b(?:https?|wss?)://[^\s\"'<>`]+", self.re.IGNORECASE)
+        schemeless_rx = self.re.compile(r"(?<!:)\b//[^\s\"'<>`]+", self.re.IGNORECASE)
+
+        # Common attribute forms
+        attr_rx = self.re.compile(
+            r"""(?is)\b(?:href|src|action|formaction|data-src|data-href|data-url|data-video|data-audio)\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))"""
+        )
+        css_url_rx = self.re.compile(r"""(?is)\burl\(\s*['"]?([^'"\)\s]+)""")
+        css_import_rx = self.re.compile(r"""(?is)@import\s+(?:url\()?\s*['"]?([^'"\)\s;]+)""")
+
         out: "NetworkSniffer.List[str]" = []
         seen: "NetworkSniffer.Set[str]" = set()
-        for u in rx.findall(s):
-            uu = self._to_str(u)
-            if uu and uu not in seen:
-                seen.add(uu)
-                out.append(uu)
+
+        def push(raw: Any) -> None:
+            u = self._to_str(raw).strip()
+            if not u:
+                return
+            low = u.lower()
+            if low.startswith(("javascript:", "mailto:", "data:", "blob:", "about:", "tel:", "#")):
+                return
+
+            if u.startswith("//"):
+                u2 = "https:" + u
+            else:
+                u2 = u
+
+            if base and not u2.lower().startswith(("http://", "https://", "ws://", "wss://")):
+                try:
+                    u2 = self._safe_urljoin(base, u2)
+                except Exception:
+                    pass
+
+            cu = self._canonicalize_url(u2)
+            if not cu or cu in seen:
+                return
+            seen.add(cu)
+            out.append(cu)
+
+        for u in abs_rx.findall(txt):
+            push(u)
+        for u in schemeless_rx.findall(txt):
+            push(u)
+
+        if base:
+            for m in attr_rx.finditer(txt):
+                push(m.group(1) or m.group(2) or m.group(3) or "")
+            for m in css_url_rx.finditer(txt):
+                push(m.group(1) or "")
+            for m in css_import_rx.finditer(txt):
+                push(m.group(1) or "")
+
         return out
 
     def _host_allowed(self, url: Any) -> bool:
