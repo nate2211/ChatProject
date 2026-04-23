@@ -8905,7 +8905,7 @@ class LinkTrackerBlock(BaseBlock):
                                 if pages_scanned >= max_pages_total:
                                     break
                             except Exception as e:
-                                DEBUG_LOGGER.log_message(f"[VideoLinkTracker][Camoufox] Fatal error on {url}: {e}")
+                                DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
                     else:
                         tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
                         done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
@@ -11264,19 +11264,17 @@ class VideoLinkTrackerBlock(BaseBlock):
         DEFAULT_CHROMIUM_ARGS = [
             "--no-first-run",
             "--no-default-browser-check",
-            "--disable-extensions",
             "--disable-default-apps",
             "--disable-component-update",
-            "--disable-sync",
-            "--disable-notifications",
-            "--disable-popup-blocking",
             "--disable-background-networking",
             "--disable-background-timer-throttling",
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
-            "--metrics-recording-only",
+            "--disable-notifications",
+            "--disable-popup-blocking",
+            "--disable-sync",
             "--mute-audio",
-            "--js-flags=--max_old_space_size=2048",
+            "--js-flags=--max_old_space_size=6048",
         ]
 
         def _merge_args(*arg_lists: list[str]) -> list[str]:
@@ -13913,13 +13911,15 @@ class VideoLinkTrackerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "query": "lil uzi vert live performance",
-            "source": "search",  # "search", "payload", "database"
+            "source": "search",
             "sites": "",
             "scan_limit": 5,
             "timeout": 8.0,
             "user_agent": "promptchat/VideoLinkTracker",
-            "engine": "duckduckgo",  # "duckduckgo", "google_cse", "sites"
-            "verify": False,
+            "engine": "duckduckgo",  # "duckduckgo", "google_cse", "sites", "searxng"
+
+            # parity with linktracker
+            "verify": True,
             "use_js": False,
             "smart_sniff": False,
             "return_all_js_links": False,
@@ -13928,6 +13928,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             "max_pages_total": 20,
             "max_links_per_page": 200,
             "max_assets": 100,
+
             "use_network_sniff": False,
             "return_network_sniff_links": False,
             "use_runtime_sniff": False,
@@ -13951,15 +13952,18 @@ class VideoLinkTrackerBlock(BaseBlock):
             "db_seed_max_age_days": 14,
             "db_include_synthetic_seeds": False,
             "db_seed_per_domain_cap": 8,
-            "memory_souces":"",
+            "memory_sources": "",  # FIXED TYPO
             "db_expand_max_per_seed": 4,
             "db_expand_ladder_depth": 2,
             "db_domain_cap": 80,
             "db_allow_rescan": False,
 
             "extract_urls_from_db_text": True,
-            "ignored_exts": [".m3u8"],
+
+            # do not suppress stream manifests by default
+            "ignored_exts": [],
             "use_body": True,
+
             # Cooldown
             "output_cooldown_hours": 48,
 
@@ -13974,32 +13978,32 @@ class VideoLinkTrackerBlock(BaseBlock):
             "search_page_limit": 1,
             "search_per_page": 50,
 
-            # HTTPSSubmanager tuning
+            # HTTPS tuning - keep parity naming with linktracker
             "http_retries": 2,
             "http_max_conn_per_host": 8,
-            "http_verify": True,
-            "http_ca_bundle": "",  # e.g. certifi bundle path inside PyInstaller exe
+            "http_verify_tls": True,
+            "http_ca_bundle": "",
 
             "use_camoufox": False,
             "camoufox_options": {},
 
             "check_search_url": True,
-            "download_assets": False,            # NEW: actually fetch media bytes
-            "download_dir": "video_cache",       # NEW: base dir to stash files
-            "max_download_bytes": 300 * 1024**2, # NEW: 300 MB per asset safety cap
-            "skip_if_no_content_length": True,   # NEW: avoid unknown-size downloads
+            "download_assets": False,
+            "download_dir": "video_cache",
+            "max_download_bytes": 300 * 1024 ** 2,
+            "skip_if_no_content_length": True,
             "searxng_url": "http://127.0.0.1:8080",
             "reverse_image_url": "",
             "ffmpeg_bin": "",
             "pw_headless": True,
-            "pw_channel": "",  # e.g. "chrome"
-            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
+            "pw_channel": "",
+            "pw_proxy": {},
             "pw_launch_args": [
                 "--disable-quic",
                 "--disable-http3",
                 "--disable-features=UseDnsHttpsSvcb"
             ],
-            "depth_batch_cap": 10
+            "depth_batch_cap": 10,
         }
 
 
