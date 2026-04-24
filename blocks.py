@@ -9733,6 +9733,123 @@ class VideoLinkTrackerBlock(BaseBlock):
             )
         )
 
+    def _fast_url_profile(self, u: str) -> dict:
+        """
+        Cheap per-URL routing profile.
+
+        Goal:
+          - direct assets: no browser sniffing
+          - weak/search pages: cheap HTTP/DOM only
+          - real candidate pages: allow network/runtime sniff
+          - only very high-value pages: allow React/DB/Interaction
+        """
+        try:
+            pu = urlparse(str(u or ""))
+            host = (pu.netloc or "").lower()
+            path = (pu.path or "").lower()
+            query = (pu.query or "").lower()
+            full = str(u or "").lower()
+        except Exception:
+            host, path, query, full = "", "", "", str(u or "").lower()
+
+        direct_asset_exts = (
+            ".jpg", ".jpeg", ".png", ".webp", ".gif", ".ico",
+            ".mp4", ".webm", ".mov", ".m4v", ".mkv",
+            ".m3u8", ".mpd", ".ts",
+        )
+
+        direct_asset = path.endswith(direct_asset_exts)
+
+        image_proxy = (
+                host.endswith("wp.com")
+                or "pbs.twimg.com" in host
+                or "twimg.com" in host
+                or "googleusercontent.com" in host
+        )
+
+        search_like = (
+                "/search" in path
+                or "/results" in path
+                or "q=" in query
+                or "query=" in query
+                or "search=" in query
+        )
+
+        likely_html_content_page = any(x in path for x in (
+            "/watch", "/video", "/videos", "/post", "/view",
+            "/gallery", "/album", "/a/", "/g/", "/details"
+        ))
+
+        likely_manifest_or_video = (
+                path.endswith((".m3u8", ".mpd", ".mp4", ".webm", ".mov", ".m4v"))
+                or "manifest" in full
+                or "playlist" in full
+                or "videoplayback" in full
+        )
+
+        # Fastest path: direct files should be recorded/evaluated, not browser-sniffed.
+        if direct_asset:
+            return {
+                "direct_asset": True,
+                "allow_js": False,
+                "allow_network": False,
+                "allow_runtime": False,
+                "allow_react": False,
+                "allow_database": False,
+                "allow_interaction": False,
+                "reason": "direct_asset",
+            }
+
+        # Image proxies rarely need React/DB/Interaction.
+        if image_proxy:
+            return {
+                "direct_asset": False,
+                "allow_js": False,
+                "allow_network": True,
+                "allow_runtime": False,
+                "allow_react": False,
+                "allow_database": False,
+                "allow_interaction": False,
+                "reason": "image_proxy",
+            }
+
+        # Search pages can explode into thousands of links; keep them cheap.
+        if search_like:
+            return {
+                "direct_asset": False,
+                "allow_js": True,
+                "allow_network": True,
+                "allow_runtime": False,
+                "allow_react": False,
+                "allow_database": False,
+                "allow_interaction": False,
+                "reason": "search_like",
+            }
+
+        # Good content pages deserve network/runtime, but not all specialized sniffers.
+        if likely_html_content_page or likely_manifest_or_video:
+            return {
+                "direct_asset": False,
+                "allow_js": True,
+                "allow_network": True,
+                "allow_runtime": True,
+                "allow_react": False,
+                "allow_database": False,
+                "allow_interaction": False,
+                "reason": "content_candidate",
+            }
+
+        # Default: cheap.
+        return {
+            "direct_asset": False,
+            "allow_js": True,
+            "allow_network": True,
+            "allow_runtime": False,
+            "allow_react": False,
+            "allow_database": False,
+            "allow_interaction": False,
+            "reason": "default_cheap",
+        }
     def _get_visual_signature(self, image_bytes: bytes) -> Optional[dict]:
         """
         Generates a content-aware visual signature:
@@ -13268,6 +13385,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                 local_interaction_hits: List[Dict[str, Any]] = []
                 next_pages: List[str] = []
                 self.network_sniffer.http = http
+
                 DEBUG_LOGGER.log_message(f"[BFS] processing page: {page_url} (depth={depth})")
                 try:
                     links_on_page: List[Dict[str, str]] = []
@@ -13276,13 +13394,33 @@ class VideoLinkTrackerBlock(BaseBlock):
                     sniff_items: List[Dict[str, str]] = []
                     sniff_json_hits: List[Dict[str, Any]] = []
                     sniff_parent_pages: List[str] = []
+                    profile = self._fast_url_profile(page_url)
+                    local_log.append(f"[FAST] url_profile={profile.get('reason')} url={page_url}")
 
+                    if profile["direct_asset"]:
+                        links_on_page.append({
+                            "url": page_url,
+                            "text": "[Direct Asset FastPath]",
+                            "tag": "direct_asset",
+                        })
+                        return {
+                            "page_url": page_url,
+                            "html": html or "",
+                            "links_on_page": links_on_page,
+                            "next_pages": next_pages,
+                            "network_links": local_network_links,
+                            "runtime_hits": local_runtime_hits,
+                            "react_hits": local_react_hits,
+                            "database_hits": local_database_hits,
+                            "interaction_hits": local_interaction_hits,
+                            "log": local_log,
+                        }
                     # ======================= SEQUENTIAL SNIFFER EXECUTION =======================
                     # We run sniffers one by one to avoid 100% CPU/Network usage (DDoS self-inflicted).
 
                     # 1. NETWORK SNIFFER (Priority #1)
                     # This is the heaviest sniffer. We give it the full timeout and run it first.
-                    if use_network_sniff and pw_context:
+                    if use_network_sniff and profile["allow_network"] and pw_context:
                         try:
                             # Run alone to prevent resource contention
                             res_net = await self._pw_fetch_with_sniff(pw_context, page_url, timeout, local_log)
@@ -13323,7 +13461,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     # 2. RUNTIME SNIFFER (Priority #2)
                     # Good for capturing DOM state if Network failed, or getting console logs.
-                    if use_runtime_sniff and pw_context:
+                    if use_runtime_sniff and profile["allow_runtime"] and pw_context:
                         try:
                             res_runtime = await self._pw_fetch_runtime_hits(pw_context, page_url, timeout / 2,
                                                                             local_log)
@@ -13361,7 +13499,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     # 3. SPECIALIZED SNIFFERS (Sequential Fallbacks)
                     # Run these only if enabled. They reuse the context but won't fight for bandwidth.
 
-                    if use_react_sniff and pw_context:
+                    if use_react_sniff and profile["allow_react"] and pw_context:
                         try:
                             res_react = await self._pw_fetch_react_hits(pw_context, page_url, timeout / 2, local_log)
                             if isinstance(res_react, tuple):
@@ -13375,7 +13513,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         except:
                             pass
 
-                    if use_database_sniff and pw_context:
+                    if use_database_sniff and profile["allow_database"] and pw_context:
                         try:
                             res_db = await self._pw_fetch_database_hits(pw_context, page_url, timeout / 2, local_log)
                             if isinstance(res_db, tuple):
@@ -13390,7 +13528,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         except:
                             pass
 
-                    if use_interaction_sniff and pw_context:
+                    if use_interaction_sniff and profile["allow_interaction"] and pw_context:
                         try:
                             res_interaction = await self._pw_fetch_interaction_hits(pw_context, page_url, timeout / 2,
                                                                                     local_log)
