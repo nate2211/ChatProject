@@ -8209,73 +8209,299 @@ class LinkTrackerBlock(BaseBlock):
                 sniff_tag: str = "",
                 sniff_ct: str = "",
         ) -> bool:
+            """
+            CDN-safe asset gate.
+
+            Drop-in replacement for the existing _is_asset_link_for_mode().
+
+            Main fix:
+              - CDN URLs are often extensionless.
+              - CDN URLs are often signed.
+              - CDN HEAD responses can be weak/missing.
+              - Playwright/network sniffed CDN requests should not be thrown away
+                just because the path does not end in .mp3/.wav/.mp4/etc.
+
+            This function is intentionally more permissive for CDN hosts, but still
+            blocks obvious tracking/auth/API junk.
+            """
+            if not u or not str(u).startswith("http"):
+                return False
+
             if self._is_mega_link(u):
                 return True
 
-            low = unquote(str(u or "")).lower()
+            raw = str(u or "")
+            low = unquote(raw).lower()
             host = _clean_domain(low)
             path = _clean_path(low)
+            query = _clean_query(low)
 
-            # hard deny obvious non-asset/service/telemetry/auth/api URLs
+            h = headers or {}
+            ct = (
+                    sniff_ct
+                    or h.get("Content-Type")
+                    or h.get("content-type")
+                    or ""
+            ).lower()
+
+            sk = (sniff_kind or "").lower()
+            st = (sniff_tag or "").lower()
+
+            # ------------------------------------------------------------
+            # Hard deny: obvious non-assets / telemetry / auth / service APIs
+            # ------------------------------------------------------------
             if any(x in host for x in (
-                    "recaptcha", "google-analytics", "googletagmanager", "doubleclick",
-                    "secure.soundcloud.com", "api-v2.soundcloud.com",
+                    "recaptcha",
+                    "google-analytics",
+                    "googletagmanager",
+                    "doubleclick",
+                    "stats.g.doubleclick",
+                    "facebook.net",
+                    "hotjar",
+                    "segment.io",
+                    "mixpanel",
+                    "scorecardresearch",
+                    "secure.soundcloud.com",
+                    "api-v2.soundcloud.com",
             )):
                 return False
 
             if any(x in low for x in (
-                    "/web-auth", "/announcements", "/featured-profiles", "/relatedartists",
-                    "/spotlight", "/payments/", "/quotations/", "/stat_record",
-                    "/api/currency_data/", "/graphql", "/telemetry", "/metrics",
+                    "/web-auth",
+                    "/login",
+                    "/oauth",
+                    "/authorize",
+                    "/announcements",
+                    "/featured-profiles",
+                    "/relatedartists",
+                    "/spotlight",
+                    "/payments/",
+                    "/quotations/",
+                    "/stat_record",
+                    "/api/currency_data/",
+                    "/graphql",
+                    "/telemetry",
+                    "/metrics",
+                    "/analytics",
+                    "/collect?",
+                    "/beacon",
             )):
                 return False
 
-            # strongest proof: explicit file extension / filename
-            if _has_target_extension(u, headers=headers):
+            # ------------------------------------------------------------
+            # Strong proof: explicit target extension or filename/header name
+            # ------------------------------------------------------------
+            if _has_target_extension(u, headers=h):
                 return True
 
+            # ------------------------------------------------------------
+            # Header proof: Content-Type says it is an asset.
+            # This matters because CDN paths are often extensionless.
+            # ------------------------------------------------------------
+            if ct:
+                if mode == "media":
+                    if ct.startswith(("audio/", "video/")):
+                        return True
+
+                    if any(x in ct for x in (
+                            "audio/mpeg",
+                            "audio/mp3",
+                            "audio/wav",
+                            "audio/x-wav",
+                            "audio/wave",
+                            "audio/vnd.wave",
+                            "audio/flac",
+                            "audio/x-flac",
+                            "audio/aac",
+                            "audio/mp4",
+                            "video/mp4",
+                            "video/webm",
+                            "video/quicktime",
+                            "application/ogg",
+                            "audio/ogg",
+                            "audio/opus",
+                            "application/vnd.apple.mpegurl",
+                            "application/x-mpegurl",
+                            "mpegurl",
+                            "dash+xml",
+                    )):
+                        return True
+
+                    # CDN downloads often come back as octet-stream.
+                    if "octet-stream" in ct:
+                        fname = _content_disposition_filename(h)
+                        if _looks_like_audioish_text(fname):
+                            return True
+
+                        # If the URL itself is CDN-ish and the request was sniffed
+                        # as media/fetch/source, keep it as an asset candidate.
+                        if _looks_like_cdn_host(u) and (
+                                sk in {"audio", "video", "media", "source", "download", "fetch", "xhr", "other"}
+                                or any(x in st for x in ("media", "audio", "video", "source", "stream", "download"))
+                        ):
+                            return True
+
+                elif mode == "pictures":
+                    if ct.startswith("image/"):
+                        return True
+
+                elif mode == "docs":
+                    if any(x in ct for x in (
+                            "application/pdf",
+                            "application/epub",
+                            "application/msword",
+                            "officedocument",
+                            "application/vnd",
+                    )):
+                        return True
+
+                elif mode == "archives":
+                    if any(x in ct for x in (
+                            "zip",
+                            "rar",
+                            "7z",
+                            "gzip",
+                            "x-tar",
+                            "x-gtar",
+                            "octet-stream",
+                    )):
+                        return True
+
+            # ------------------------------------------------------------
+            # URL proof: normal direct asset/path/query markers.
+            # ------------------------------------------------------------
             if mode == "media":
-                ct = (
-                        sniff_ct
-                        or (headers or {}).get("Content-Type")
-                        or (headers or {}).get("content-type")
-                        or ""
-                ).lower()
-
-                sk = (sniff_kind or "").lower()
-                st = (sniff_tag or "").lower()
-
-                # require stronger evidence for media mode
-                if _looks_like_audioish_ct(ct, headers=headers):
-                    if any(x in low for x in (
-                            "/download/", "/stream/", "/file/", "filename=", "filename*=",
-                            "response-content-disposition=", "content-disposition=",
-                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
-                            ".weba", ".alac", ".aiff", ".wma", ".oga",
-                    )):
-                        return True
-
-                if sk in {"audio", "video"}:
-                    if any(x in low for x in (
-                            "/download/", "/stream/", "/file/",
-                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
-                            ".weba", ".alac", ".aiff", ".wma", ".oga",
-                    )):
-                        return True
-
-                if any(tok in st for tok in ("download", "stream", "source")):
-                    if _looks_like_audioish_url(u):
-                        return True
-
-                # keep this last and strict so generic API URLs do not pass
                 if _looks_like_audioish_url(u):
-                    if any(x in low for x in (
-                            "/download/", "/stream/", "/file/",
-                            "filename=", "filename*=", "response-content-disposition=",
-                            ".mp3", ".wav", ".flac", ".m4a", ".ogg", ".opus", ".aac",
-                            ".weba", ".alac", ".aiff", ".wma", ".oga",
-                    )):
-                        return True
+                    return True
+
+                if any(x in low for x in (
+                        ".mp3", ".wav", ".wave", ".flac", ".m4a", ".aac", ".ogg",
+                        ".opus", ".weba", ".alac", ".aiff", ".wma", ".oga",
+                        ".mp4", ".webm", ".mov", ".m3u8", ".mpd",
+                        "/audio/", "/video/", "/media/", "/stream/", "/download/",
+                        "/file/", "/track/", "/songs/", "/source/",
+                        "audio=", "audio_url=", "video=", "video_url=",
+                        "media=", "media_url=", "source=", "src=",
+                        "format=mp3", "format=wav", "format=flac", "format=m4a",
+                        "mime=audio", "mime=video",
+                        "content_type=audio", "content_type=video",
+                        "response-content-type=audio%2f",
+                        "response-content-type=video%2f",
+                        "response-content-disposition=",
+                        "content-disposition=",
+                        "filename=", "filename*=",
+                        "download=1", "dl=1",
+                        "playlist", "manifest", "segment", "chunk",
+                )):
+                    return True
+
+            elif mode == "pictures":
+                if any(x in low for x in (
+                        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+                        ".tiff", ".tif", ".heic", ".heif", ".avif", ".svg",
+                        "/image/", "/images/", "/img/", "/picture/", "/pictures/",
+                        "image=", "image_url=", "img=", "src=",
+                        "response-content-type=image%2f",
+                        "filename=", "filename*=",
+                )):
+                    return True
+
+            elif mode == "docs":
+                if any(x in low for x in (
+                        ".pdf", ".epub", ".mobi", ".doc", ".docx",
+                        "/docs/", "/documents/", "/download/", "/file/",
+                        "filename=", "filename*=",
+                        "response-content-disposition=",
+                )):
+                    return True
+
+            elif mode == "archives":
+                if any(x in low for x in (
+                        ".zip", ".rar", ".7z", ".tar", ".gz",
+                        "/archive/", "/archives/", "/download/", "/file/",
+                        "filename=", "filename*=",
+                        "response-content-disposition=",
+                )):
+                    return True
+
+            # ------------------------------------------------------------
+            # CDN-specific fix:
+            # Keep CDN-ish network/runtime candidates alive even if extensionless.
+            # This is the part that fixes "no assets from CDN domains".
+            # ------------------------------------------------------------
+            cdnish = _looks_like_cdn_host(u)
+
+            if cdnish:
+                # Never count obvious static page support files as target assets.
+                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                    return False
+
+                # If Playwright/network saw it as media/fetch/source/download,
+                # treat it as a real candidate instead of dropping it.
+                if sk in {
+                        "audio", "video", "media", "source", "download",
+                        "fetch", "xhr", "other", "request", "response",
+                }:
+                    return True
+
+                if any(x in st for x in (
+                        "audio", "video", "media", "source", "stream",
+                        "download", "asset", "cdn", "network",
+                )):
+                    return True
+
+                # Signed object-storage URLs usually hide the real filename/type.
+                if any(k in query for k in (
+                        "x-amz-signature",
+                        "x-amz-credential",
+                        "x-amz-expires",
+                        "x-goog-signature",
+                        "x-goog-credential",
+                        "x-goog-expires",
+                        "signature=",
+                        "sig=",
+                        "token=",
+                        "policy=",
+                        "key-pair-id=",
+                        "expires=",
+                        "response-content-disposition=",
+                        "response-content-type=",
+                )):
+                    return True
+
+                # Common CDN asset path hints.
+                if any(x in low for x in (
+                        "/media/",
+                        "/asset/",
+                        "/assets/",
+                        "/content/",
+                        "/objects/",
+                        "/storage/",
+                        "/files/",
+                        "/downloads/",
+                        "/stream/",
+                        "/source/",
+                        "/video/",
+                        "/audio/",
+                        "asset=",
+                        "media=",
+                        "source=",
+                        "src=",
+                        "file=",
+                        "path=",
+                        "key=",
+                        "object=",
+                        "download=",
+                        "filename=",
+                        "filename*=",
+                )):
+                    return True
+
+                # Last-resort CDN survival rule:
+                # If it is a CDN URL and not obvious junk, keep it as a candidate.
+                # Verification/status handling later can decide if it is dead.
+                if mode in {"media", "pictures", "docs", "archives"}:
+                    return True
 
             return False
 
@@ -8643,35 +8869,110 @@ class LinkTrackerBlock(BaseBlock):
                                             head_status = None
                                             head_headers = {}
 
-                                    if not is_mega:
-                                        if not _is_asset_link_for_mode(
+                                    # ------------------------------------------------------------------
+                                    # Runtime asset survival patch:
+                                    # This is the best place to fix asset discovery because NetworkSniffer
+                                    # sees real runtime CDN/media requests before static page crawling does.
+                                    # It keeps true sniffer/CDN assets alive even when HEAD is blocked,
+                                    # missing, redirected, range-only, or extensionless.
+                                    # ------------------------------------------------------------------
+
+                                    def _runtime_asset_evidence() -> bool:
+                                        low_url = unquote(str(full_url or "")).lower()
+                                        sk = str(sniff_kind or "").lower()
+                                        st = str(sniff_tag or "").lower()
+                                        sc = str(sniff_ct or "").lower()
+
+                                        # Strong sniffer evidence.
+                                        if sk in {
+                                            "audio", "video", "media", "source", "download",
+                                            "fetch", "xhr", "other", "request", "response"
+                                        }:
+                                            return True
+
+                                        if any(x in st for x in (
+                                                "audio", "video", "media", "source", "stream",
+                                                "download", "asset", "cdn", "network", "mse",
+                                                "manifest", "playlist", "segment", "chunk"
+                                        )):
+                                            return True
+
+                                        # Header/content-type evidence from the sniffer or HEAD.
+                                        if _looks_like_audioish_ct(sc, head_headers if verify_links else None):
+                                            return True
+
+                                        # URL evidence.
+                                        if _looks_like_audioish_url(full_url):
+                                            return True
+
+                                        if _has_target_extension(full_url,
+                                                                 headers=head_headers if verify_links else None):
+                                            return True
+
+                                        # CDN evidence. Runtime CDN requests are often extensionless and signed.
+                                        if _looks_like_cdn_host(full_url):
+                                            if any(x in low_url for x in (
+                                                    "/media/", "/audio/", "/video/", "/stream/", "/source/",
+                                                    "/asset/", "/assets/", "/content/", "/objects/", "/storage/",
+                                                    "/files/", "/downloads/",
+                                                    "audio=", "audio_url=", "video=", "video_url=",
+                                                    "media=", "media_url=", "source=", "src=",
+                                                    "file=", "path=", "key=", "object=",
+                                                    "download=", "filename=", "filename*=",
+                                                    "response-content-disposition=",
+                                                    "response-content-type=audio%2f",
+                                                    "response-content-type=video%2f",
+                                                    "x-amz-signature", "x-goog-signature",
+                                                    "signature=", "sig=", "token=", "expires="
+                                            )):
+                                                return True
+
+                                            # Last runtime fallback:
+                                            # If the browser actually requested it from a CDN and it is not
+                                            # an ignored static extension, keep it so FOUND ASSET can fire.
+                                            path = _clean_path(full_url)
+                                            if mode == "media" and not any(
+                                                    path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                                return True
+
+                                        return False
+
+                                    runtime_asset_ok = is_mega or _is_asset_link_for_mode(
+                                        full_url,
+                                        headers=head_headers if verify_links else None,
+                                        sniff_kind=sniff_kind,
+                                        sniff_tag=sniff_tag,
+                                        sniff_ct=sniff_ct,
+                                    )
+
+                                    if not runtime_asset_ok and mode == "media" and _runtime_asset_evidence():
+                                        runtime_asset_ok = True
+                                        local_log.append(
+                                            f"[LinkTracker][RuntimeAssetPatch] promoted runtime asset: {full_url}")
+
+                                    if not runtime_asset_ok:
+                                        if _should_branch_cdn_url(
                                                 full_url,
                                                 headers=head_headers if verify_links else None,
                                                 sniff_kind=sniff_kind,
                                                 sniff_tag=sniff_tag,
                                                 sniff_ct=sniff_ct,
                                         ):
-                                            if _should_branch_cdn_url(
-                                                    full_url,
-                                                    headers=head_headers if verify_links else None,
-                                                    sniff_kind=sniff_kind,
-                                                    sniff_tag=sniff_tag,
-                                                    sniff_ct=sniff_ct,
-                                            ):
-                                                for branch_url in _branch_variants_for_url(full_url):
-                                                    if not _allowed_by_required_sites(branch_url):
-                                                        continue
-                                                    if branch_url in seen_branch_urls:
-                                                        continue
-                                                    seen_branch_urls.add(branch_url)
-                                                    next_pages.append(branch_url)
-                                            continue
+                                            for branch_url in _branch_variants_for_url(full_url):
+                                                if not _allowed_by_required_sites(branch_url):
+                                                    continue
+                                                if branch_url in seen_branch_urls:
+                                                    continue
+                                                seen_branch_urls.add(branch_url)
+                                                next_pages.append(branch_url)
+                                        continue
 
                                     status = "sniffed"
                                     size = item.get("size") or "?"
 
                                     if is_mega:
                                         status = "MEGA link"
+
                                     elif verify_links:
                                         if head_status == 200:
                                             status = "200 OK"
@@ -8680,14 +8981,31 @@ class LinkTrackerBlock(BaseBlock):
                                             if cl:
                                                 try:
                                                     size = f"{int(cl) // 1024} KB"
-                                                except ValueError:
+                                                except Exception:
                                                     size = "?"
-                                        elif head_status is None:
-                                            status = "Timeout/Error"
-                                        else:
-                                            status = f"Dead ({head_status})"
 
-                                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                                        elif head_status in (206, 301, 302, 303, 307, 308):
+                                            # CDN media often redirects or responds as range content.
+                                            status = f"sniffed-runtime ({head_status})"
+
+                                        elif head_status in (401, 403, 405, 416, 429) or head_status is None:
+                                            # Do not kill runtime-discovered CDN/media assets because HEAD failed.
+                                            if mode == "media" and _runtime_asset_evidence():
+                                                status = f"sniffed-runtime-head-blocked ({head_status})"
+                                            else:
+                                                status = "Timeout/Error" if head_status is None else f"Dead ({head_status})"
+
+                                        else:
+                                            if mode == "media" and _runtime_asset_evidence():
+                                                status = f"sniffed-runtime-weak-head ({head_status})"
+                                            else:
+                                                status = f"Dead ({head_status})"
+
+                                    if (
+                                            not verify_links
+                                            or status in ("200 OK", "MEGA link", "sniffed", "unverified")
+                                            or str(status).startswith("sniffed-runtime")
+                                    ):
                                         asset_key = _asset_key(full_url)
                                         if asset_key not in seen_asset_urls:
                                             seen_asset_urls.add(asset_key)
@@ -9330,7 +9648,6 @@ class LinkTrackerBlock(BaseBlock):
 
 
 BLOCKS.register("linktracker", LinkTrackerBlock)
-
 
 
 
