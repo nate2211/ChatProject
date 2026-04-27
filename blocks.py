@@ -6749,8 +6749,6 @@ class LinkTrackerBlock(BaseBlock):
       • All sqlite access goes through DatabaseSubmanager + LinkTrackerStore.
       • No direct sqlite3 usage in this block.
       • Schema + queries are store-owned.
-      • media mode no longer accidentally blocks audio/media requests before sniffers see them.
-      • DB content-link reinjection is filtered in media mode so mp3/wav hunts stay focused.
     """
 
     JUNK_FILENAME_KEYWORDS = {
@@ -6762,31 +6760,21 @@ class LinkTrackerBlock(BaseBlock):
         ".gif", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"
     }
 
-    _URL_RE = re.compile(r'https?://[^\s\"\'<>\\)]+', re.IGNORECASE)
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
 
     MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
     MEGA_PATH_MARKERS = ("/file/", "/folder/", "/embed/", "/#F!", "/#!")
-    MEGA_QUERY_MARKERS = ("mega.nz",)
+    MEGA_QUERY_MARKERS = ("mega.nz",)  # fallback
+
 
     def __post_init__(self):
+        # Store/submanager are initialized per-run when use_database=True
         self.db: Optional[submanagers.DatabaseSubmanager] = None
         self.store: Optional[LinkTrackerStore] = None
-
-        self.js_sniffer = submanagers.JSSniffer(
-            submanagers.JSSniffer.Config(
-                enable_auto_scroll=True,
-                max_scroll_steps=40,
-                scroll_step_delay_ms=500,
-            )
-        )
-        self.network_sniffer = submanagers.NetworkSniffer(
-            submanagers.NetworkSniffer.Config(
-                enable_auto_scroll=True,
-                max_scroll_steps=40,
-                scroll_step_delay_ms=500,
-            )
-        )
+        self.js_sniffer = submanagers.JSSniffer(submanagers.JSSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
+        self.network_sniffer = submanagers.NetworkSniffer(submanagers.NetworkSniffer.Config(enable_auto_scroll=True,max_scroll_steps=40,scroll_step_delay_ms=500))
         self.runtime_sniffer = submanagers.RuntimeSniffer(submanagers.RuntimeSniffer.Config())
+
         self.react_sniffer = submanagers.ReactSniffer(
             submanagers.ReactSniffer.Config(
                 hook_history_api=True,
@@ -6796,20 +6784,19 @@ class LinkTrackerBlock(BaseBlock):
         )
         self.database_sniffer = submanagers.DatabaseSniffer(
             submanagers.DatabaseSniffer.Config(
-                enable_indexeddb_dump=True,
-                enable_backend_fingerprint=True,
-                enable_html_link_scan=True,
-                enable_backend_link_scan=True,
+                enable_indexeddb_dump=True,  # Get Metadata
+                enable_backend_fingerprint=True,  # Get Tech Stack
+                enable_html_link_scan=True,  # Scan HTML for raw links
+                enable_backend_link_scan=True  # Scan JS Globals for links
             )
         )
         self.interaction_sniffer = submanagers.InteractionSniffer(
             submanagers.InteractionSniffer.Config(
                 enable_cdp_listeners=True,
                 enable_overlay_detection=True,
-                enable_form_extraction=True,
+                enable_form_extraction=True
             )
         )
-
     # ------------------------------------------------------------------ #
     # Database lifecycle (Submanager + Store)
     # ------------------------------------------------------------------ #
@@ -6845,7 +6832,6 @@ class LinkTrackerBlock(BaseBlock):
                 if frag.startswith("f!") or frag.startswith("!") or "file/" in frag or "folder/" in frag:
                     return True
                 return True
-
             if "mega.nz/#" in full_low or "mega.co.nz/#" in full_low:
                 return True
 
@@ -6853,54 +6839,39 @@ class LinkTrackerBlock(BaseBlock):
         except Exception:
             return False
 
-    def _promote_hits_to_links(
-            self,
-            hits: list[dict[str, Any]],
-            links_on_page: list[dict[str, Any]],
-            next_pages: list[str],
-            *,
-            depth: int,
-            max_depth: int,
-            label: str,
-    ) -> None:
-        for hit in hits or []:
-            if not isinstance(hit, dict):
-                continue
-
-            u = str(hit.get("url") or "").strip()
-            if not u or not u.startswith("http"):
-                continue
-
-            text = str(hit.get("text") or hit.get("route") or f"[{label}]")[:200]
-            tag = str(hit.get("tag") or label)[:80]
-
-            links_on_page.append({
-                "url": u,
-                "text": text,
-                "tag": tag,
-            })
-
-            if depth < max_depth:
-                next_pages.append(u)
     # ------------------------------------------------------------------ #
-    # Search engines
+    # Search engines (unchanged)
     # ------------------------------------------------------------------ #
+
     async def _search_searxng(
-        self,
-        q: str,
-        max_results: int,
-        timeout: float,
-        base_url: Optional[str] = None,
-        page_limit: int = 1,
+            self,
+            q: str,
+            max_results: int,
+            timeout: float,
+            base_url: Optional[str] = None,
+            page_limit: int = 1,
     ) -> List[str]:
-        import os
-        import json
+        """
+        Query a SearXNG instance and return a list of result URLs.
 
-        base_url = (base_url or os.environ.get("SEARXNG_URL") or "http://127.0.0.1:8080").rstrip("/")
+        - Uses ?format=json
+        - Respects max_results and page_limit
+        - base_url can be passed via params['searxng_url'] or SEARXNG_URL env var.
+        """
+        import os, json
+
+        # Where is SearXNG?
+        base_url = (
+                base_url
+                or os.environ.get("SEARXNG_URL")
+                or "http://127.0.0.1:8080"
+        ).rstrip("/")
+
         search_url = base_url + "/search"
 
         max_results = max(1, min(int(max_results), 256))
         page_limit = max(1, min(int(page_limit), 5))
+
         out: List[str] = []
         did_dump_debug = False
 
@@ -6910,17 +6881,35 @@ class LinkTrackerBlock(BaseBlock):
                     if len(out) >= max_results:
                         break
 
-                    params = {"q": q, "format": "json", "pageno": str(page_idx + 1)}
+                    # SearXNG pagination: 'pageno' is 1-based
+                    params = {
+                        "q": q,
+                        "format": "json",
+                        "pageno": str(page_idx + 1),
+                    }
+
                     text = ""
+                    status = None
 
                     try:
                         async with session.get(
-                            search_url,
-                            params=params,
-                            timeout=aiohttp.ClientTimeout(total=timeout),
+                                search_url,
+                                params=params,
+                                timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            text = await resp.text()
                             status = resp.status
+                            text = await resp.text()
+
+                            # Classic misconfig case: JSON disabled -> 403 HTML
+                            if status == 403:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][SearXNG][debug] HTTP 403 "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
 
                             if status != 200:
                                 if not did_dump_debug:
@@ -6932,9 +6921,21 @@ class LinkTrackerBlock(BaseBlock):
                                     did_dump_debug = True
                                 break
 
-                            data = json.loads(text)
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                print(f"[LinkTracker][SearXNG] JSON decode error: {e}")
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][SearXNG][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
                             results = data.get("results") or []
                             if not results:
+                                # No more pages.
                                 break
 
                             for item in results:
@@ -6943,17 +6944,21 @@ class LinkTrackerBlock(BaseBlock):
                                     out.append(u)
                                     if len(out) >= max_results:
                                         break
+
                     except aiohttp.ClientError as e:
                         print(f"[LinkTracker][SearXNG] AIOHTTP error: {e}")
+                        if not did_dump_debug and text:
+                            preview = text[:1500].replace("\n", " ")
+                            print(
+                                f"[LinkTracker][SearXNG][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
                         break
-                    except json.JSONDecodeError as e:
-                        print(f"[LinkTracker][SearXNG] JSON decode error: {e}")
-                        break
+
         except Exception as e:
             print(f"[LinkTracker][SearXNG] General error: {e}")
 
         return out[:max_results]
-
     async def _search_duckduckgo(
         self,
         q: str,
@@ -6967,6 +6972,7 @@ class LinkTrackerBlock(BaseBlock):
 
         pages: List[str] = []
         seen_urls: set[str] = set()
+        did_dump_debug = False
 
         real_ua = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -6999,28 +7005,51 @@ class LinkTrackerBlock(BaseBlock):
                         break
 
                     if page_idx > 0:
-                        await asyncio.sleep(random.uniform(2.0, 5.0))
+                        st = random.uniform(2.0, 5.0)
+                        print(f"[LinkTracker] Sleeping {st:.2f}s between search pages...")
+                        await asyncio.sleep(st)
 
                     offset = page_idx * 30
-                    data = {"q": q, "s": str(offset), "dc": str(offset)}
+                    text = ""
+                    status = None
+                    final_url = base_url
 
                     try:
+                        data = {'q': q, 's': str(offset), 'dc': str(offset)}
                         async with session.post(
                             base_url,
                             data=data,
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
-                            if resp.status == 403:
+                            status = resp.status
+                            final_url = str(resp.url)
+
+                            if status == 403:
                                 print(f"[LinkTracker] 403 Forbidden on page {page_idx}.")
-                                break
+                                if not pages and not did_dump_debug:
+                                    text = await resp.text()
+                                    preview = text[:2000].replace("\n", " ")
+                                    print(f"[LinkTracker][DDG][debug] 403 body preview: {preview}")
+                                    did_dump_debug = True
+                                return pages
+
                             resp.raise_for_status()
                             text = await resp.text()
+
                     except Exception as e:
                         print(f"[LinkTracker] DuckDuckGo request failed (page {page_idx}): {e}")
+                        if not pages and text and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            print(f"[LinkTracker][DDG][debug] Failed page HTML preview: {preview}")
+                            did_dump_debug = True
                         break
 
                     if "Unfortunately, bots use DuckDuckGo too." in text:
                         print("[LinkTracker] Bot detected by DDG.")
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            print(f"[LinkTracker][DDG][debug] Bot wall preview: {preview}")
+                            did_dump_debug = True
                         break
 
                     soup = BeautifulSoup(text, "html.parser")
@@ -7043,8 +7072,17 @@ class LinkTrackerBlock(BaseBlock):
                             pages.append(href)
                             found_new = True
 
+                    if not found_new and not pages and not did_dump_debug:
+                        preview = text[:2000].replace("\n", " ")
+                        print(
+                            f"[LinkTracker][DDG][debug] No results on page {page_idx} for query={q!r} "
+                            f"(status={status}, url={final_url}). HTML preview: {preview}"
+                        )
+                        did_dump_debug = True
+
                     if not found_new:
                         break
+
         except Exception as e:
             print(f"[LinkTracker] DDG outer error: {e}")
 
@@ -7057,8 +7095,7 @@ class LinkTrackerBlock(BaseBlock):
         timeout: float,
         page_limit: int = 1,
     ) -> List[str]:
-        import os
-        import json
+        import os, json
 
         cx = os.environ.get("GOOGLE_CSE_ID")
         key = os.environ.get("GOOGLE_API_KEY")
@@ -7072,6 +7109,7 @@ class LinkTrackerBlock(BaseBlock):
         pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
 
         out: List[str] = []
+        did_dump_debug = False
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -7082,6 +7120,9 @@ class LinkTrackerBlock(BaseBlock):
                     start = 1 + page_idx * per_page
                     if start > 100:
                         break
+
+                    text = ""
+                    status = None
 
                     try:
                         async with session.get(
@@ -7095,17 +7136,56 @@ class LinkTrackerBlock(BaseBlock):
                             },
                             timeout=aiohttp.ClientTimeout(total=timeout),
                         ) as resp:
+                            status = resp.status
                             text = await resp.text()
-                            if resp.status != 200:
-                                print(
-                                    f"[LinkTracker][GoogleCSE][debug] HTTP {resp.status} "
-                                    f"query={q!r} start={start}."
-                                )
+
+                            if status != 200:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(
+                                        f"[LinkTracker][GoogleCSE][debug] HTTP {status} "
+                                        f"query={q!r} start={start}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
                                 break
 
-                            data = json.loads(text)
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                print(f"[LinkTracker][GoogleCSE] JSON decode error: {e}")
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Bad JSON preview: {preview}")
+                                    did_dump_debug = True
+                                break
+
+                            err_obj = data.get("error")
+                            if err_obj:
+                                msg = err_obj.get("message") or "Unknown CSE error"
+                                reason = ""
+                                errors = err_obj.get("errors") or []
+                                if errors and isinstance(errors, list):
+                                    reason = errors[0].get("reason") or ""
+                                print(
+                                    f"[LinkTracker][GoogleCSE] API error for query={q!r}, "
+                                    f"start={start}: {msg} ({reason})"
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Error JSON preview: {preview}")
+                                    did_dump_debug = True
+                                break
+
                             items = data.get("items") or []
                             if not items:
+                                print(
+                                    f"[LinkTracker][GoogleCSE] No items for query={q!r}, "
+                                    f"start={start}. Stopping pagination."
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    print(f"[LinkTracker][GoogleCSE][debug] Empty items JSON preview: {preview}")
+                                    did_dump_debug = True
                                 break
 
                             for item in items:
@@ -7114,9 +7194,15 @@ class LinkTrackerBlock(BaseBlock):
                                     out.append(u)
                                     if len(out) >= max_total:
                                         break
-                    except Exception as e:
-                        print(f"[LinkTracker][GoogleCSE] Error: {e}")
+
+                    except aiohttp.ClientError as e:
+                        print(f"[LinkTracker][GoogleCSE] AIOHTTP error: {e}")
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            print(f"[LinkTracker][GoogleCSE][debug] ClientError body preview: {preview}")
+                            did_dump_debug = True
                         break
+
         except Exception as e:
             print(f"[LinkTracker][GoogleCSE] General error: {e}")
 
@@ -7154,8 +7240,8 @@ class LinkTrackerBlock(BaseBlock):
         if root.tag.startswith("{"):
             ns = root.tag.split("}", 1)[0] + "}"
 
-        sitemap_urls: list[str] = []
-        page_urls: list[str] = []
+        sitemap_urls = []
+        page_urls = []
 
         if root.tag.endswith("sitemapindex"):
             for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
@@ -7205,6 +7291,7 @@ class LinkTrackerBlock(BaseBlock):
 
         low = u.lower().replace("%20", " ")
         score += sum(2 for k in keywords if k and k in low)
+
         return score
 
     def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
@@ -7217,7 +7304,9 @@ class LinkTrackerBlock(BaseBlock):
 
     def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
         out = []
-        containers = soup.select("article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]")
+        containers = soup.select(
+            "article a[href], .result a[href], .search-result a[href], .item a[href], li a[href]"
+        )
         for a in containers:
             href = a.get("href")
             if not href:
@@ -7275,24 +7364,36 @@ class LinkTrackerBlock(BaseBlock):
         return collected[:per_site_cap]
 
     # ------------------------------------------------------------------ #
-    # Playwright shared context manager
+    # Playwright shared context manager (unchanged)
     # ------------------------------------------------------------------ #
     async def _open_playwright_context(
-        self,
-        ua: str,
-        block_resources: bool,
-        blocked_resource_types: set[str],
-        block_domains: bool,
-        blocked_domains: set[str],
-        log: List[str],
-        *,
-        use_camoufox: bool = False,
-        camoufox_options: Optional[Dict[str, Any]] = None,
-        pw_launch_args: Optional[List[str]] = None,
-        pw_headless: bool = True,
-        pw_channel: Optional[str] = None,
-        pw_proxy: Optional[Dict[str, Any]] = None,
+            self,
+            ua: str,
+            block_resources: bool,
+            blocked_resource_types: set[str],
+            block_domains: bool,
+            blocked_domains: set[str],
+            log: List[str],
+            *,
+            use_camoufox: bool = False,
+            camoufox_options: Optional[Dict[str, Any]] = None,
+
+            # NEW:
+            pw_launch_args: Optional[List[str]] = None,
+            pw_headless: bool = True,
+            pw_channel: Optional[str] = None,
+            pw_proxy: Optional[Dict[str, Any]] = None,
     ):
+        """
+        Open a shared Playwright/Camoufox browser context.
+
+        Returns (p_handle, browser, context) where:
+          - For plain Playwright:
+              p_handle = async_playwright() instance
+          - For Camoufox:
+              p_handle = AsyncCamoufox instance (so we can __aexit__ it later)
+        """
+        # ---- small helper for blocked domains ----
         def _host_matches_blocked(host: str) -> bool:
             host = host.split(":", 1)[0].lower()
             for bd in blocked_domains:
@@ -7303,11 +7404,13 @@ class LinkTrackerBlock(BaseBlock):
                     return True
             return False
 
+        # ---- Camoufox path ----
         if use_camoufox:
             if AsyncCamoufox is None:
                 log.append("[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium.")
             else:
                 try:
+                    # Default Camoufox launch opts; you can tweak these
                     options = {
                         "headless": True,
                         "block_images": block_resources,
@@ -7318,10 +7421,12 @@ class LinkTrackerBlock(BaseBlock):
                     if camoufox_options:
                         options.update(camoufox_options)
 
+                    # Async context manager: we keep the CM instance as p_handle
                     cf_cm = AsyncCamoufox(**options)
-                    browser = await cf_cm.__aenter__()
+                    browser = await cf_cm.__aenter__()  # returns a Playwright-like Browser
                     context = await browser.new_context(user_agent=ua)
 
+                    # Route blocking is exactly like Playwright Firefox
                     if block_resources or block_domains:
                         async def route_blocker(route, request):
                             rtype = (request.resource_type or "").lower()
@@ -7344,9 +7449,11 @@ class LinkTrackerBlock(BaseBlock):
 
                     log.append("[PlaywrightCtx] Camoufox context ready.")
                     return cf_cm, browser, context
+
                 except Exception as e:
                     log.append(f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium.")
 
+        # ---- Standard Playwright (Chromium) path ----
         try:
             from playwright.async_api import async_playwright
         except ImportError:
@@ -7355,37 +7462,9 @@ class LinkTrackerBlock(BaseBlock):
 
         p = await async_playwright().start()
 
-        DEFAULT_CHROMIUM_ARGS = [
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-extensions",
-            "--disable-default-apps",
-            "--disable-component-update",
-            "--disable-sync",
-            "--disable-notifications",
-            "--disable-popup-blocking",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--metrics-recording-only",
-            "--mute-audio",
-            "--js-flags=--max_old_space_size=2048",
-        ]
-
-        def _merge_args(*arg_lists: list[str]) -> list[str]:
-            seen = set()
-            out: list[str] = []
-            for lst in arg_lists:
-                for a in lst:
-                    if a and a not in seen:
-                        seen.add(a)
-                        out.append(a)
-            return out
-
         launch_opts = {
             "headless": pw_headless,
-            "args": _merge_args(DEFAULT_CHROMIUM_ARGS, list(pw_launch_args or [])),
+            "args": list(pw_launch_args or []),
         }
         if pw_channel:
             launch_opts["channel"] = pw_channel
@@ -7419,6 +7498,7 @@ class LinkTrackerBlock(BaseBlock):
         return p, browser, context
 
     async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        # Close page context
         try:
             if context:
                 close_ctx = getattr(context, "close", None)
@@ -7430,6 +7510,7 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox context: {e}")
 
+        # Close browser
         try:
             if browser:
                 close_browser = getattr(browser, "close", None)
@@ -7441,106 +7522,1767 @@ class LinkTrackerBlock(BaseBlock):
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox browser: {e}")
 
+        # Close handle:
+        #   - Playwright: p.stop()
+        #   - Camoufox: await p.__aexit__(...)
         try:
             if p:
                 stop = getattr(p, "stop", None)
+
+                # async_playwright handle
                 if stop:
                     if asyncio.iscoroutinefunction(stop):
                         await stop()
                     else:
                         stop()
+
                 else:
+                    # AsyncCamoufox (or any other async CM)
                     aexit = getattr(p, "__aexit__", None)
                     if aexit:
                         if asyncio.iscoroutinefunction(aexit):
                             await aexit(None, None, None)
                         else:
                             aexit(None, None, None)
+
             log.append("Playwright/Camoufox shared context closed.")
         except Exception as e:
             log.append(f"Error closing Playwright/Camoufox handle: {e}")
-
     async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
-        return await asyncio.wait_for(
-            self.network_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-                extensions=extensions,
-            ),
+        return await asyncio.wait_for(self.network_sniffer.sniff(
+            context, page_url,
             timeout=timeout,
-        )
+            log=log,
+            extensions=extensions,
+        ),timeout=25)
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
-        return await asyncio.wait_for(
-            self.js_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-                extensions=extensions,
-            ),
+        return await asyncio.wait_for(self.js_sniffer.sniff(
+            context,
+            page_url,
             timeout=timeout,
-        )
-
+            log=log,
+            extensions=extensions,
+        ),timeout=25)
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(
-            self.runtime_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-            ),
+        return await asyncio.wait_for(self.runtime_sniffer.sniff(
+            context,
+            page_url,
             timeout=timeout,
-        )
+            log=log,
+        ),timeout=25)
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(
-            self.react_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-            ),
+        return await asyncio.wait_for(self.react_sniffer.sniff(
+            context,
+            page_url,
             timeout=timeout,
-        )
+            log=log,
+        ),timeout=25)
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(
-            self.database_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-            ),
+        return await asyncio.wait_for(self.database_sniffer.sniff(
+            context,
+            page_url,
             timeout=timeout,
-        )
+            log=log,
+        ),timeout=25)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
-        return await asyncio.wait_for(
-            self.interaction_sniffer.sniff(
-                context,
-                page_url,
-                timeout=timeout,
-                log=log,
-            ),
+        return await asyncio.wait_for(self.interaction_sniffer.sniff(
+            context,
+            page_url,
             timeout=timeout,
+            log=log
+        ),timeout=25)
+    # ------------------------------------------------------------------ #
+    # Main execution (Async)
+    # ------------------------------------------------------------------ #
+    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        # --------- Natural ChatBlock-style parsing of context / lexicon ---------
+        text = str(payload or "")
+
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        # Last [context] block
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        # Last [lexicon] block (up to the next [tag)
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        # Core text = everything before the blocks
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        subpipeline = params.get("subpipeline", None)
+
+        # --------- Extract URL seeds from context + lexicon (if present) ---------
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]   # sanity cap
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            # If it looks like a URL, treat it as URL seed; otherwise as a keyword term
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
+
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
+        # ------------------- DB setup ------------------- #
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "link_corpus.db")
+        if use_database:
+            self._initialize_database(db_path, logger=getattr(self, "logger", None))
+
+        store = self.store  # local alias (may be None)
+
+        # ----------------- Subpipeline ------------------ #
+        pipeline_result: Any = query_raw
+        pipeline_queries: List[str] = []
+        pipeline_urls: List[str] = []
+
+        if subpipeline:
+            subpipe_out: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+                collect=True,
+            )
+
+            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
+                pipeline_result = subpipe_out.get("final")
+                pipeline_queries = list(subpipe_out.get("queries") or [])
+                pipeline_urls = list(subpipe_out.get("urls") or [])
+            else:
+                pipeline_result = subpipe_out
+        # Naturally merge URL seeds from [context] and [lexicon] into pipeline URLs
+        extra_seed_urls: List[str] = []
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
+
+        if extra_seed_urls:
+            if not pipeline_urls:
+                pipeline_urls = []
+            pipeline_urls.extend(extra_seed_urls)
+
+        # =========================================================================
+        # <--- NEW: Memory Sources Ingestion (SocketPipe Bridge)
+        # =========================================================================
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                # Split "socketpipe_links, socketpipe_domains" into keys
+                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
+
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+
+                    # Handle lists (standard SocketPipe output) or single items
+                    items = data if isinstance(data, list) else [data]
+
+                    for item in items:
+                        candidate = None
+
+                        # 1. Extract string from Dict or raw String
+                        if isinstance(item, dict):
+                            # Try standard SocketPipe keys
+                            candidate = item.get("url") or item.get("domain") or item.get("text")
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        # 2. CLASSIFY: URL vs Keyword
+
+                        # A) It's definitely a URL (http/https)
+                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
+                            pipeline_urls.append(cand_str)
+
+                        # B) It looks like a domain (has dot, no spaces) -> Treat as Seed URL
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
+                            # Prepend protocol to make it actionable
+                            pipeline_urls.append(f"https://{cand_str}")
+
+                        # C) It's just text -> Treat as Lexicon Keyword
+                        else:
+                            # Adds to list used for relevancy scoring
+                            non_url_lex_terms.append(cand_str)
+
+            except Exception as e:
+                # Log but don't crash
+                msg = f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}"
+                print(msg)
+        # ------------------- Config --------------------- #
+        mode = str(params.get("mode", "docs")).lower()
+        scan_limit = int(params.get("scan_limit", 5))
+        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
+
+        timeout = float(params.get("timeout", 5.0))
+        verify_links = bool(params.get("verify", True))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
+        use_body = bool(params.get("use_body", False))
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))
+        search_results_cap = int(params.get("search_results_cap", 256))
+
+        search_page_limit = int(params.get("search_page_limit", 1))
+        search_per_page = int(params.get("search_per_page", 50))
+
+        use_network_sniff = bool(params.get("use_network_sniff", False))
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+
+        # NEW: runtime sniffer toggles
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(
+            params.get("return_database_sniff_hits", False)
         )
 
+        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
+        min_term_overlap = max(1, min_term_overlap_raw)
+
+        custom_ext = str(params.get("extensions", "")).split(",")
+        keywords_in_url = str(params.get("url_keywords", "")).split(",")
+        site_require_raw = str(params.get("site_require", "")).split(",")
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        max_depth = max(0, int(params.get("max_depth", 0)))
+
+        # HTTP/TLS config for HTTPSSubmanager
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
+        http_verify_tls = bool(params.get("http_verify_tls", True))
+        http_ca_bundle = params.get("http_ca_bundle", None)
+
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+
+        # PW blocking params
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+            t.strip().lower()
+            for t in str(params.get("blocked_resource_types", "")).split(",")
+            if t.strip()
+        } or {"image", "stylesheet", "font"}
+
+        block_domains = bool(params.get("block_domains", True))
+        user_blocked_domains = {
+            d.strip().lower()
+            for d in str(params.get("blocked_domains", "")).split(",")
+            if d.strip()
+        }
+
+        default_blocked_domains = {
+            "google-analytics.com", "googletagmanager.com", "doubleclick.net",
+            "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
+            "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
+            "cloudflareinsights.com", "stats.g.doubleclick.net",
+            "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
+        }
+
+        blocked_domains: set[str] = set()
+        if block_domains:
+            blocked_domains = default_blocked_domains.union(user_blocked_domains)
+
+        pw_launch_args = params.get("pw_launch_args") or []
+        if isinstance(pw_launch_args, str):
+            # allow comma-separated string
+            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
+        if not isinstance(pw_launch_args, list):
+            pw_launch_args = []
+
+        pw_headless = bool(params.get("pw_headless", True))
+        pw_channel = params.get("pw_channel", None)  # e.g. "chrome"
+        pw_proxy = params.get("pw_proxy", None)  # e.g. {"server":"http://127.0.0.1:8080"}
+
+        # ------------------- Targets -------------------- #
+        targets: set[str] = set()
+        if mode == "media":
+            targets.update([".mp3", ".wav", ".flac", ".m4a", ".ogg"])
+        elif mode == "pictures":
+            targets.update([
+                ".jpg", ".jpeg", ".png", ".gif", ".webp",
+                ".bmp", ".tiff", ".tif",
+                ".heic", ".heif",
+                ".avif", ".svg"
+            ])
+        elif mode == "docs":
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
+        elif mode == "archives":
+            targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
+
+        for e in custom_ext:
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
+
+        if not targets:
+            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
+
+        # ------------------- Keywords ------------------- #
+        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
+        strict_keywords = bool(params.get("strict_keywords", False))
+
+        if query_raw:
+            if strict_keywords:
+                whole = query_raw.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
+                    if qt not in keywords:
+                        keywords.append(qt)
+        # Add non-URL lexicon terms as natural keyword seasoning
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
+        # -------------------- Helpers ------------------- #
+        def _clean_domain(u: str) -> str:
+            try:
+                return urlparse(u).netloc.lower().split(":")[0]
+            except Exception:
+                return ""
+
+        def _allowed_by_required_sites(u: str) -> bool:
+            if not required_sites:
+                return True
+            d = _clean_domain(u)
+            return any(req in d for req in required_sites)
+
+        def _term_overlap_ok(haystack: str) -> bool:
+            if not keywords:
+                return True
+            h = haystack.lower()
+            hits = 0
+            for k in keywords:
+                if k and k in h:
+                    hits += 1
+                    if hits >= min_term_overlap:
+                        return True
+            return False
+
+        def _clean_path(u: str) -> str:
+            try:
+                return urlparse(u).path.lower()
+            except Exception:
+                return ""
+
+        def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
+            sq = q.strip()
+            site_clauses = []
+            for raw in required_sites or []:
+                s = (raw or "").strip().lower()
+                if not s:
+                    continue
+                if "://" in s:
+                    s = s.split("://", 1)[1]
+                s = s.split("/", 1)[0].lstrip(".")
+                if s:
+                    site_clauses.append(f"site:{s}")
+
+            if site_clauses:
+                sites_expr = " OR ".join(site_clauses)
+                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+            q_lower = sq.lower()
+            if mode == "media":
+                if not any(x in q_lower for x in ["mp3", "flac", "m4a", "ogg"]):
+                    sq = f"{sq} (mp3 OR flac OR m4a OR ogg)".strip()
+            elif mode == "docs":
+                if "filetype:pdf" not in q_lower:
+                    sq = f"{sq} filetype:pdf".strip()
+            return sq
+
+        def _is_search_url(u: str) -> bool:
+            try:
+                pu = urlparse(u)
+                path = (pu.path or "").lower()
+                q = (pu.query or "").lower()
+                if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
+                    return True
+                if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        def _dedupe(seq: List[str]) -> List[str]:
+            seen = set()
+            out = []
+            for s in seq:
+                if s not in seen:
+                    seen.add(s)
+                    out.append(s)
+            return out
+
+        # -------------------- Triage -------------------- #
+        candidate_pages: List[str] = []
+        direct_asset_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine = False
+
+        if pipeline_urls:
+            skip_search_engine = False
+            unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
+
+            for u in unique_urls:
+                if not _allowed_by_required_sites(u):
+                    continue
+                path = _clean_path(u)
+
+                if self._is_mega_link(u):
+                    direct_asset_urls.append(u)
+                    continue
+
+                if any(path.endswith(ext) for ext in targets):
+                    if _term_overlap_ok(u):
+                        direct_asset_urls.append(u)
+                    continue
+
+                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                    continue
+
+                candidate_pages.append(u)
+
+            candidate_pages = candidate_pages[:max_pages_total]
+
+        if (not skip_search_engine) and pipeline_queries:
+            for qv in pipeline_queries:
+                qv_s = str(qv).strip()
+                if qv_s:
+                    queries_to_run.append(qv_s)
+
+        if not pipeline_urls and not pipeline_queries:
+            if isinstance(pipeline_result, list) and pipeline_result:
+                for qv in pipeline_result:
+                    qv_s = str(qv).strip()
+                    if qv_s:
+                        queries_to_run.append(qv_s)
+            else:
+                base_q: Optional[str] = None
+                if isinstance(pipeline_result, str) and pipeline_result.strip():
+                    base_q = pipeline_result.strip()
+                elif query_raw:
+                    base_q = query_raw
+                if base_q:
+                    queries_to_run.append(base_q)
+
+        if not queries_to_run and query_raw and not skip_search_engine:
+            queries_to_run = [query_raw]
+
+        queries_to_run = _dedupe(queries_to_run)
+        query = queries_to_run[0] if queries_to_run else query_raw
+
+        # ---------------- Search discovery --------------- #
+        explicit_site_seeds: set[str] = set()
+        synthetic_search_seeds: set[str] = set()
+
+        if not skip_search_engine and queries_to_run:
+            ua_search = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+            seen_search_urls: set[str] = set()
+
+            # -------- Engine: database (Store-backed) -------- #
+            if engine == "database":
+                if not use_database or not store:
+                    print("[LinkTracker][db] engine=database requires use_database=True.")
+                else:
+                    print("[LinkTracker] Running Advanced Database Intelligence...")
+
+                    db_seed_limit = int(params.get("db_seed_limit", 250))
+                    db_seed_max_age_days = params.get("db_seed_max_age_days", None)
+
+                    db_assets = store.fetch_db_seed_assets(
+                        limit=db_seed_limit * 2,
+                        require_keywords=keywords,
+                        required_sites=required_sites,
+                        max_age_days=db_seed_max_age_days,
+                    )
+
+                    proven_urls = [row["url"] for row in db_assets if row.get("url")]
+                    predicted_urls = self._predict_next_in_sequence(proven_urls)
+                    if predicted_urls:
+                        filtered_predicted: list[str] = []
+                        for pu in predicted_urls:
+                            ppath = _clean_path(pu)
+
+                            # allow MEGA always
+                            if self._is_mega_link(pu):
+                                filtered_predicted.append(pu)
+                                continue
+
+                            # hard-block known junk
+                            if any(ppath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue
+
+                            # only keep if it matches your target extensions
+                            if any(ppath.endswith(ext) for ext in targets):
+                                filtered_predicted.append(pu)
+
+                        if filtered_predicted:
+                            print(f"[db] Generated {len(filtered_predicted)} predictive sequence URLs (filtered).")
+                            direct_asset_urls.extend(filtered_predicted)
+
+                    proven_hubs = store.fetch_proven_hubs(required_sites, min_hits=1)
+                    if proven_hubs:
+                        print(f"[db] identified {len(proven_hubs)} high-yield hubs for re-crawling.")
+                        candidate_pages.extend(proven_hubs)
+
+                    cand_from_db, direct_from_db = store.seed_pages_from_database(
+                        db_assets=db_assets,
+                        targets=targets,
+                        max_pages_total=max_pages_total,
+                        required_sites=required_sites,
+                        keywords=keywords,
+                        min_term_overlap=min_term_overlap,
+                    )
+
+                    candidate_pages.extend(cand_from_db)
+                    direct_asset_urls.extend(direct_from_db)
+
+                    candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+                    direct_asset_urls = list(dict.fromkeys(direct_asset_urls))
+
+                    print(f"[db] Execution Plan: Checking {len(direct_asset_urls)} assets "
+                          f"({len(predicted_urls)} predicted) & Crawling {len(candidate_pages)} hubs.")
+
+            # -------- Engine: sites -------- #
+            if engine == "sites" and required_sites:
+                seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
+                    required_sites=required_sites,
+                    queries=queries_to_run,
+                    probe_cap_per_site=max(8, len(queries_to_run) * 3),
+                    sitemap_cap_per_site=12,
+                    hub_cap_per_site=10,
+                )
+                synthetic_search_seeds = syn_seeds
+                explicit_site_seeds = exp_seeds
+
+                per_site_cap = max(5, max_pages_total // max(1, len(required_sites)))
+                global_seen = set()
+
+                # Use a dedicated HTTPSSubmanager just for the “sites” engine
+                ua_http_sites = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                async with submanagers.HTTPSSubmanager(
+                    user_agent=ua_http_sites,
+                    timeout=timeout,
+                    retries=http_retries,
+                    max_conn_per_host=http_max_conn_per_host,
+                    verify=http_verify_tls,
+                    ca_bundle=http_ca_bundle,
+                ) as http_sites:
+
+                    for site in required_sites:
+                        root = f"https://{site.strip().lstrip('.')}".rstrip("/") + "/"
+                        host = urlparse(root).netloc.lower()
+
+                        # --- robots.txt -> sitemap URLs ---
+                        robots_url = root + "robots.txt"
+                        try:
+                            robots_txt = await http_sites.get_text(robots_url)
+                        except Exception:
+                            robots_txt = ""
+                        sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
+
+                        if not sm_urls:
+                            sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:8]
+
+                        # --- Crawl sitemaps for good candidate pages ---
+                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
+                            http=http_sites,
+                            root=root,
+                            sm_urls=sm_urls,
+                            keywords=keywords,
+                            targets=targets,
+                            per_site_cap=per_site_cap,
+                            global_seen=global_seen,
+                        )
+
+                        # --- Expand from internal “search/hub” pages ---
+                        hub_like = [u for u in seed_pages if site in u and _is_search_url(u)]
+                        expanded_from_hubs: list[str] = []
+
+                        for hub in hub_like[:3]:
+                            try:
+                                html_hub = await http_sites.get_text(hub)
+                                soup = BeautifulSoup(html_hub or "", "html.parser")
+
+                                expanded_from_hubs.extend(
+                                    self._extract_internal_result_links(soup, hub, host)
+                                )
+
+                                for nxt in self._extract_next_page_links(soup, hub):
+                                    html_nxt = await http_sites.get_text(nxt)
+                                    soup_nxt = BeautifulSoup(html_nxt or "", "html.parser")
+                                    expanded_from_hubs.extend(
+                                        self._extract_internal_result_links(soup_nxt, nxt, host)
+                                    )
+                            except Exception:
+                                # ignore hub failures; they’re just bonuses
+                                pass
+
+                        expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
+                        expanded_from_hubs.sort(
+                            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
+                        )
+                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
+
+                        merged = list(
+                            dict.fromkeys(
+                                [root]
+                                + best_from_sitemaps
+                                + expanded_from_hubs
+                                + [u for u in seed_pages if site in u]
+                            )
+                        )
+                        merged.sort(
+                            key=lambda u: self._score_site_url(u, keywords, targets), reverse=True
+                        )
+
+                        for u in merged:
+                            if len(candidate_pages) >= max_pages_total:
+                                break
+                            if _allowed_by_required_sites(u) and (not keywords or _term_overlap_ok(u)):
+                                candidate_pages.append(u)
+
+                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+
+            # -------- Engine: duckduckgo -------- #
+            elif engine == "duckduckgo":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_duckduckgo(
+                            sq,
+                            max_results=search_results_cap,
+                            ua=ua_search,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                            per_page=search_per_page,
+                        )
+                    except Exception as e:
+                        print(f"[search][ddg] error for {sq!r}: {e}")
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+
+            # -------- Engine: google_cse -------- #
+            elif engine == "google_cse":
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_google_cse(
+                            sq,
+                            n=search_results_cap,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        print(f"[search][cse] error for {sq!r}: {e}")
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+            # -------- Engine: searxng -------- #
+            elif engine == "searxng":
+                searxng_url = params.get("searxng_url") or None
+                for qv in queries_to_run:
+                    sq = _augment_search_query(qv, mode, required_sites)
+                    try:
+                        urls = await self._search_searxng(
+                            sq,
+                            max_results=search_results_cap,
+                            timeout=timeout,
+                            base_url=searxng_url,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        print(f"[search][searxng] error for {sq!r}: {e}")
+                        urls = []
+
+                    for u in urls:
+                        if len(candidate_pages) >= max_pages_total:
+                            break
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not _allowed_by_required_sites(u):
+                            continue
+                        candidate_pages.append(u)
+                        seen_search_urls.add(u)
+        # ---------------- Crawl state ------------------ #
+        found_assets: List[Dict[str, Any]] = []
+        seen_asset_urls: set[str] = set()
+        visited_pages: set[str] = set()
+        inflight_pages: set[str] = set()
+
+        log: List[str] = []
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
+        all_runtime_hits: List[Dict[str, Any]] = []
+        all_react_hits: List[Dict[str, Any]] = []  # [PATCH] New list
+        all_database_hits: List[Dict[str, Any]] = []
+        all_interaction_hits: List[Dict[str, Any]] = []
+        # choose UA for HTTP engine
+        ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+
+        # HTTPSSubmanager handles all HTTP(S) GET/HEAD for this run
+        async with submanagers.HTTPSSubmanager(
+            user_agent=ua_http,
+            timeout=timeout,
+            retries=http_retries,
+            max_conn_per_host=http_max_conn_per_host,
+            verify=http_verify_tls,
+            ca_bundle=http_ca_bundle,
+        ) as http:
+
+            # ---------------- Direct assets ---------------- #
+            if direct_asset_urls:
+                for u in direct_asset_urls:
+                    upath = _clean_path(u)
+
+                    # [PATCH] never treat ignored extensions as assets
+                    if not self._is_mega_link(u):
+                        if any(upath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                            continue
+                        # [PATCH] never treat non-target extensions as assets
+                        if targets and not any(upath.endswith(ext) for ext in targets):
+                            continue
+
+                    if use_database and store and store.asset_exists(u):
+                        log.append(f"Skipping {u} (already in database)")
+                        continue
+                    if u in seen_asset_urls:
+                        continue
+                    seen_asset_urls.add(u)
+
+                    status = "unverified"
+                    size = "?"
+                    if verify_links:
+                        try:
+                            h_status, headers = await http.head(u)
+                            if h_status == 200:
+                                status = "200 OK"
+                                cl = headers.get("Content-Length")
+                                if cl:
+                                    try:
+                                        size = f"{int(cl) // 1024} KB"
+                                    except ValueError:
+                                        size = "?"
+                            else:
+                                status = f"Dead ({h_status})"
+                        except Exception:
+                            status = "Timeout/Error"
+
+                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                        filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
+                        asset = {
+                            "text": filename[:100],
+                            "url": u,
+                            "source": "<urls>",
+                            "size": size,
+                            "status": status,
+                        }
+                        found_assets.append(asset)
+                        if use_database and store:
+                            store.upsert_asset(asset)
+
+            def _should_persist_page(u: str) -> bool:
+                if engine != "sites":
+                    return True
+                if u in explicit_site_seeds or u in synthetic_search_seeds:
+                    return False
+                if _is_search_url(u):
+                    return False
+                return True
+
+            # --- Shared Playwright context, if needed --- #
+            pw_needed = (
+                    use_js or
+                    use_network_sniff or
+                    use_runtime_sniff or
+                    use_react_sniff or
+                    use_database_sniff or
+                    use_interaction_sniff
+            )
+            pw_p = pw_browser = pw_context = None
+            try:
+                if pw_needed:
+                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                        pw_launch_args=pw_launch_args,  # NEW
+                        pw_headless=pw_headless,  # NEW
+                        pw_channel=pw_channel,  # NEW
+                        pw_proxy=pw_proxy,  # NEW
+                    )
+            except:
+                # ALWAYS close Camoufox/Playwright if we opened it
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+            async def _process_page(
+                page_url: str,
+                depth: int,
+                http: submanagers.HTTPSSubmanager,
+            ) -> Dict[str, Any]:
+                local_log: List[str] = []
+                local_js_links: List[Dict[str, str]] = []
+                local_network_links: List[Dict[str, str]] = []
+                local_runtime_hits: List[Dict[str, Any]] = []  # NEW
+                local_assets: List[Dict[str, Any]] = []
+                local_react_hits: List[Dict[str, Any]] = []
+                local_database_hits: List[Dict[str, Any]] = []
+                local_interaction_hits: List[Dict[str, Any]] = []
+                next_pages: List[str] = []
+                self.network_sniffer.http = http
+                try:
+                    links_on_page: List[Dict[str, str]] = []
+                    html = ""
+
+                    sniff_items: List[Dict[str, str]] = []
+                    for si in sniff_items:
+                        url_hit = si.get("url", "")
+                        if not url_hit:
+                            continue
+                        links_on_page.append({
+                            "url": url_hit,
+                            "text": si.get("text", ""),
+                            "tag": si.get("tag", "network_sniff"),
+                        })
+                    sniff_parent_pages: List[str] = []
+
+                    # 1) Network sniff (shared PW)
+                    if use_network_sniff and pw_context:
+                        sniff_html = ""
+                        sniff_items = []
+                        sniff_json = None
+
+                        sniff_result = await self._pw_fetch_with_sniff(
+                            pw_context, page_url, timeout, local_log, targets
+                        )
+
+                        # Backwards-compatible: accept (html, items) or (html, items, json_hits)
+                        if isinstance(sniff_result, tuple):
+                            if len(sniff_result) == 3:
+                                sniff_html, sniff_items, sniff_json = sniff_result
+                            elif len(sniff_result) == 2:
+                                sniff_html, sniff_items = sniff_result
+                            elif len(sniff_result) == 1:
+                                sniff_html = sniff_result[0]
+                        else:
+                            # e.g. if you ever change sniff() to return a dict
+                            sniff_html = sniff_result
+
+                        html = sniff_html or html
+
+                        # Archive metadata special-casing
+                        if "archive.org/metadata/" in page_url:
+                            try:
+                                meta = json.loads(html) if html.strip().startswith("{") else {}
+                                files = meta.get("files") or []
+                                identifier = (meta.get("metadata") or {}).get("identifier", "")
+                                for f in files:
+                                    name = f.get("name", "")
+                                    if not name:
+                                        continue
+                                    low = name.lower()
+                                    if any(low.endswith(ext) for ext in targets):
+                                        dl = f"https://archive.org/download/{identifier}/{name}"
+                                        links_on_page.append({
+                                            "url": dl,
+                                            "text": name,
+                                            "tag": "archive_file",
+                                        })
+                            except Exception:
+                                # best-effort only
+                                pass
+
+                        # Pull identifiers from sniffed JSON
+                        try:
+                            if sniff_json:
+                                for hit in sniff_json:
+                                    data = hit.get("json") or {}
+                                    docs = (((data.get("response") or {}).get("docs")) or [])
+                                    for d in docs:
+                                        ident = d.get("identifier")
+                                        if ident:
+                                            for u2 in self._archive_ident_to_downloads(ident):
+                                                if _allowed_by_required_sites(u2):
+                                                    links_on_page.append({
+                                                        "url": u2,
+                                                        "text": "[Archive identifier]",
+                                                        "tag": "archive_ident",
+                                                    })
+                        except Exception as e:
+                            local_log.append(f"JSON sniff parse error on {page_url}: {e}")
+
+                        for si in sniff_items:
+                            url_hit = si.get("url", "")
+                            if not url_hit:
+                                continue
+                            local_network_links.append({
+                                "page": page_url,
+                                "url": url_hit,
+                                "text": si.get("text", ""),
+                                "tag": si.get("tag", "network_sniff"),
+                                "size": si.get("size", "?"),
+                            })
+
+                            try:
+                                parsed = urlparse(url_hit)
+                                path = parsed.path or ""
+                                if "/" in path:
+                                    parent_path = path.rsplit("/", 1)[0] + "/"
+                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+                                    if _allowed_by_required_sites(parent_url):
+                                        sniff_parent_pages.append(parent_url)
+                            except Exception:
+                                pass
+                    if use_database_sniff and pw_context:
+                        try:
+                            db_html, db_hits = await self._pw_fetch_database_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                            # Use this HTML if previous sniffers failed to get it
+                            if db_html and not html:
+                                html = db_html
+
+                            if db_hits:
+                                local_database_hits.extend(db_hits)
+
+                                # Feed content links back into the processing loop
+                                for hit in db_hits:
+                                    if hit.get("kind") == "content_link":
+                                        u = hit.get("url")
+                                        if u:
+                                            # Add to links_on_page.
+                                            # The subsequent loop will check if 'u' ends with a target extension (.pdf, .zip).
+                                            links_on_page.append({
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"
+                                            })
+
+                                            # Also add to debug links list for visibility
+                                            local_js_links.append({
+                                                "page": page_url,
+                                                "url": u,
+                                                "text": "[DB Content]",
+                                                "tag": "db_link"
+                                            })
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][DB] Error on {page_url}: {e}")
+                    # 1b) Runtime sniff (WebSockets, perf, storage, media events, etc.)
+                    if use_runtime_sniff and pw_context:
+                        rt_html = ""
+                        rt_hits: list[dict[str, Any]] = []
+
+                        rt_result = await self._pw_fetch_runtime_hits(
+                            pw_context, page_url, timeout, local_log
+                        )
+
+                        # Accept (html, items, hits) or (html, hits)
+                        if isinstance(rt_result, tuple):
+                            if len(rt_result) == 3:
+                                rt_html, _rt_items, rt_hits = rt_result
+                            elif len(rt_result) == 2:
+                                rt_html, rt_hits = rt_result
+                            elif len(rt_result) == 1:
+                                rt_html = rt_result[0]
+                        else:
+                            rt_html = rt_result
+
+                        if rt_html and not html:
+                            html = rt_html
+                        if rt_hits:
+                            local_runtime_hits.extend(rt_hits)
+
+                    # 2) JS render/gather (shared PW)
+                    if use_js and pw_context:
+                        js_html, js_links = await self._pw_fetch_js_links(
+                            pw_context, page_url, timeout, local_log, extensions=targets
+                        )
+                        if js_html:
+                            html = js_html
+                        links_on_page.extend(js_links)
+
+                        if not js_links:
+                            preview = (html or "")[:2000].replace("\n", " ")
+                            local_log.append(f"[debug] JS DOM preview (first 2000 chars): {preview}")
+
+                        for jl in js_links:
+                            local_js_links.append({
+                                "page": page_url,
+                                "url": jl.get("url", ""),
+                                "text": jl.get("text", ""),
+                                "tag": jl.get("tag", ""),
+                            })
+                    if use_react_sniff and pw_context:
+                        try:
+                            r_html, r_hits = await self._pw_fetch_react_hits(
+                                pw_context, page_url, timeout, local_log
+                            )
+                            # Use React-rendered HTML if we don't have one yet
+                            if r_html and not html:
+                                html = r_html
+
+                            if r_hits:
+                                local_react_hits.extend(r_hits)
+
+                                # Treat found React routes as potential next pages for BFS
+                                for rh in r_hits:
+                                    r_url = rh.get("url")
+                                    if not r_url:
+                                        continue
+
+                                    # Verify site scope before adding to frontier
+                                    if _allowed_by_required_sites(r_url):
+                                        if depth < max_depth:
+                                            next_pages.append(r_url)
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
+
+                    if use_interaction_sniff and pw_context:
+                        try:
+                            i_html, i_hits = await self._pw_fetch_interaction_hits(
+                                pw_context, page_url, timeout, local_log
+                            )
+                            # Use interaction HTML if we don't have a snapshot yet
+                            if i_html and not html:
+                                html = i_html
+
+                            if i_hits:
+                                local_interaction_hits.extend(i_hits)
+                        except Exception as e:
+                            local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
+                    # 3) Plain HTML if PW didn't fill html
+                    if not html:
+                        try:
+                            html = await http.get_text(page_url)
+                            if not html:
+                                raise RuntimeError("Empty HTML")
+                        except Exception as e:
+                            local_log.append(f"Error fetching {page_url}: {e}")
+                            if use_database and self.store and _should_persist_page(page_url):
+                                self.store.mark_scan_complete(page_url)
+                            return {
+                                "page": page_url,
+                                "assets": local_assets,
+                                "next_pages": next_pages,
+                                "js_links": local_js_links,
+                                "network_links": local_network_links,
+                                "runtime_hits": local_runtime_hits,
+                                "react_hits": local_react_hits,
+                                "database_hits": local_database_hits,  # [PATCH] Return hits
+                                "interaction_hits": local_interaction_hits,
+                                "log": local_log,
+                            }
+
+                    soup = BeautifulSoup(html or "", "html.parser")
+
+                    page_title = ""
+                    try:
+                        if soup.title and soup.title.string:
+                            page_title = soup.title.string
+                    except Exception:
+                        page_title = ""
+                    if use_body:
+                        body_text = ""
+                        try:
+                            body_text = soup.get_text(strip=True)[:4000]
+                        except Exception:
+                            pass
+
+                        page_haystack = f"{page_title} {page_url} {body_text}"
+                    else:
+                        page_haystack = f"{page_title} {page_url}"
+                    page_has_keywords = _term_overlap_ok(page_haystack)
+
+                    # Plain <a> links
+                    link_count = 0
+                    for a in soup.find_all("a", href=True):
+                        links_on_page.append({
+                            "url": a["href"],
+                            "text": a.get_text(strip=True),
+                            "tag": "a",
+                        })
+                        link_count += 1
+                        if link_count >= max_links_per_page:
+                            break
+
+                    # Scan links for assets
+                    for link in links_on_page:
+                        raw_link = link["url"]
+                        full_url = urljoin(page_url, raw_link)
+                        path = urlparse(full_url).path.lower()
+
+                        is_mega = self._is_mega_link(full_url)
+
+                        if not is_mega and not any(path.endswith(ext) for ext in targets):
+                            continue
+                        if use_database and store and store.asset_exists(full_url):
+                            local_log.append(f"Skipping asset {full_url} (already in database)")
+                            continue
+
+                        clean_url_for_matching = unquote(full_url).lower()
+                        if keywords and not page_has_keywords:
+                            haystack = f"{page_title} {link.get('text', '')} {clean_url_for_matching}".lower()
+                            if not _term_overlap_ok(haystack):
+                                continue
+
+                        if not _allowed_by_required_sites(full_url):
+                            continue
+
+                        status = "unverified"
+                        size = "?"
+                        if verify_links and not is_mega:
+                            try:
+                                h_status, headers = await http.head(full_url)
+                                if h_status == 200:
+                                    status = "200 OK"
+                                    cl = headers.get("Content-Length")
+                                    if cl:
+                                        try:
+                                            size = f"{int(cl) // 1024} KB"
+                                        except ValueError:
+                                            size = "?"
+                                elif h_status is None:
+                                    status = "Timeout/Error"
+                                else:
+                                    status = f"Dead ({h_status})"
+                            except Exception:
+                                status = "Timeout/Error"
+                        elif is_mega:
+                            status = "MEGA link"
+
+                        if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                            display_text = (link.get("text", "") or path.split("/")[-1])[:100]
+                            tag = "mega" if is_mega else "a"
+                            asset = {
+                                "text": display_text or ("[mega link]" if is_mega else "[asset]"),
+                                "url": full_url,
+                                "source": page_url,
+                                "size": size,
+                                "status": status,
+                                "tag": tag,
+                            }
+                            DEBUG_LOGGER.log_message(
+                                f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})")
+
+                            local_assets.append(asset)
+                            if use_database and store:
+                                store.upsert_asset(asset)
+
+                    # Network-sniffed assets (STRICT)
+                    if sniff_items:
+                        for item in sniff_items:
+                            full_url = item.get("url")
+                            if not full_url:
+                                continue
+                            if not _allowed_by_required_sites(full_url):
+                                continue
+                            if use_database and store and store.asset_exists(full_url):
+                                local_log.append(f"Skipping sniffed asset {full_url} (already in database)")
+                                continue
+
+                            is_mega = self._is_mega_link(full_url)
+                            lpath = urlparse(full_url).path.lower()
+
+                            # [PATCH] hard-block obvious junk always
+                            if not is_mega and any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue
+
+                            head_status = None
+                            head_headers: dict[str, str] = {}
+                            ct = ""
+
+                            # One HEAD only (and reuse it for filtering + status/size)
+                            if verify_links and not is_mega:
+                                try:
+                                    head_status, head_headers = await http.head(full_url)
+                                    ct = (head_headers.get("Content-Type") or head_headers.get(
+                                        "content-type") or "").lower()
+                                except Exception:
+                                    head_status, head_headers, ct = None, {}, ""
+
+                            # [PATCH] accept rules:
+                            # - If URL ends with a target ext: accept
+                            # - Else: ONLY accept if HEAD content-type matches the mode (prevents JS/non-audio)
+                            if not is_mega:
+                                has_target_ext = any(lpath.endswith(ext) for ext in targets)
+
+                                if not has_target_ext:
+                                    # If we can't verify, we do NOT accept extensionless sniffed "assets"
+                                    if not verify_links:
+                                        continue
+
+                                    if mode == "media":
+                                        if not ct.startswith("audio/"):
+                                            continue
+                                    elif mode == "pictures":
+                                        if not ct.startswith("image/"):
+                                            continue
+                                    elif mode == "docs":
+                                        if ("pdf" not in ct) and ("epub" not in ct) and ("msword" not in ct) and (
+                                                "officedocument" not in ct):
+                                            continue
+                                    elif mode == "archives":
+                                        if not any(x in ct for x in ["zip", "rar", "7z", "tar", "gzip"]):
+                                            continue
+                                    else:
+                                        continue
+
+                            # Status/size (reuse HEAD results)
+                            status = "sniffed"
+                            size = item.get("size") or "?"
+
+                            if is_mega:
+                                status = "MEGA link"
+                            elif verify_links:
+                                if head_status == 200:
+                                    status = "200 OK"
+                                    cl = head_headers.get("Content-Length") or head_headers.get("content-length")
+                                    if cl:
+                                        try:
+                                            size = f"{int(cl) // 1024} KB"
+                                        except ValueError:
+                                            size = "?"
+                                elif head_status is None:
+                                    status = "Timeout/Error"
+                                else:
+                                    status = f"Dead ({head_status})"
+
+                            if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
+                                display_text = (item.get("text") or full_url.rsplit("/", 1)[-1] or "[network asset]")[
+                                    :100]
+                                asset = {
+                                    "text": display_text,
+                                    "url": full_url,
+                                    "source": page_url,
+                                    "size": size,
+                                    "status": status,
+                                }
+
+                                DEBUG_LOGGER.log_message(
+                                    f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
+                                )
+
+                                local_assets.append(asset)
+                                if use_database and store:
+                                    store.upsert_asset(asset)
+
+                    # Next-level pages
+                    if depth < max_depth:
+                        for link in links_on_page:
+                            raw_link = link.get("url") or ""
+                            if not raw_link:
+                                continue
+                            full_url = urljoin(page_url, raw_link)
+                            if not _allowed_by_required_sites(full_url):
+                                continue
+
+                            lpath = urlparse(full_url).path.lower()
+                            if any(lpath.endswith(ext) for ext in targets):
+                                continue
+
+                            if keywords and not page_has_keywords:
+                                haystack = (link.get("text") or "") + " " + full_url
+                                if not _term_overlap_ok(haystack):
+                                    continue
+
+                            if engine == "sites":
+                                if _is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                    continue
+
+                            next_pages.append(full_url)
+
+                    if depth < max_depth and sniff_parent_pages:
+                        for parent_url in sniff_parent_pages:
+                            if _allowed_by_required_sites(parent_url):
+                                next_pages.append(parent_url)
+
+                    if use_database and store and _should_persist_page(page_url):
+                        store.mark_page_scanned(page_url)
+
+                except Exception as e:
+                    local_log.append(f"Error scanning {page_url}: {e}")
+                    if use_database and store and _should_persist_page(page_url):
+                        try:
+                            store.mark_page_scanned(page_url)
+                        except Exception as ee:
+                            local_log.append(f"Error marking page scanned {page_url}: {ee}")
+
+                return {
+                    "page": page_url,
+                    "assets": local_assets,
+                    "next_pages": next_pages,
+                    "js_links": local_js_links,
+                    "network_links": local_network_links,
+                    "runtime_hits": local_runtime_hits,  # NEW
+                    "react_hits": local_react_hits,
+                    "database_hits": local_database_hits,
+                    "interaction_hits": local_interaction_hits,
+                    "log": local_log,
+                }
+
+            # ---------------- BFS frontier ----------------- #
+            frontier: List[str] = []
+            site_buckets = {s: [] for s in required_sites} if required_sites else {}
+
+            for u in candidate_pages:
+                if not _allowed_by_required_sites(u):
+                    continue
+                if required_sites:
+                    d = _clean_domain(u)
+                    for s in required_sites:
+                        if s in d:
+                            site_buckets[s].append(u)
+                            break
+                else:
+                    frontier.append(u)
+
+            if required_sites:
+                per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
+                for s, bucket in site_buckets.items():
+                    frontier.extend(bucket[:per_site_cap])
+
+            # Initial frontier: only unique URLs
+            frontier = list(dict.fromkeys(frontier))
+
+            current_depth = 0
+            pages_scanned = 0  # metric only
+
+            DEBUG_LOGGER.log_message(
+                f"[LinkTracker][BFS] Starting BFS with max_depth={max_depth}, "
+                f"max_pages_total={max_pages_total}, initial_frontier={len(frontier)}"
+            )
+
+            # New: only log the rescan notice once (for information only)
+            logged_rescan_notice = False
+
+            # BFS over depths
+            # NOTE: we no longer gate on pages_scanned < max_pages_total,
+            # and we no longer **skip** pages based on page_scanned().
+            # Ensure frontier is unique and respects the limit initially
+            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+            current_depth = 0
+            logged_rescan_notice = False
+
+            # --- BFS LOOP START ---
+            # We check pages_scanned against max_pages_total to ensure global termination
+            # --- BFS LOOP START ---
+            while frontier and current_depth <= max_depth:
+
+                DEBUG_LOGGER.log_message(
+                    f"[BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)} | "
+                    f"Scanned: {pages_scanned}/{max_pages_total} ---"
+                )
+
+                # [PATCH] global termination
+                slots_left = max_pages_total - pages_scanned
+                if slots_left <= 0:
+                    DEBUG_LOGGER.log_message("[BFS] Global max_pages_total reached. Stopping.")
+                    break
+
+                batch: List[str] = []
+
+                for u in frontier:
+                    if len(batch) >= min(scan_limit, slots_left):
+                        break
+                    if u in visited_pages or u in inflight_pages:
+                        continue
+
+                    if use_database and self.store and self.store.page_scanned(u):
+                        if not logged_rescan_notice:
+                            DEBUG_LOGGER.log_message(
+                                "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
+                            )
+                            logged_rescan_notice = True
+
+                    batch.append(u)
+                    inflight_pages.add(u)
+
+                if not batch:
+                    DEBUG_LOGGER.log_message(
+                        f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
+                    )
+                    break
+
+                DEBUG_LOGGER.log_message(f"[BFS] Processing batch of {len(batch)} URLs...")
+
+                results: List[Dict[str, Any]] = []
+
+                if use_camoufox:
+                    for url in batch:
+                        try:
+                            res = await _process_page(url, current_depth, http)
+                            results.append(res)
+                        except Exception as e:
+                            DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
+                        finally:
+                            # allow retry later if it failed
+                            inflight_pages.discard(url)
+                else:
+                    tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
+                    done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+
+                    for (url, _t), r in zip(tasks, done):
+                        inflight_pages.discard(url)
+
+                        # count attempts toward global cap (prevents infinite loops)
+                        pages_scanned += 1
+
+                        if isinstance(r, Exception):
+                            DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
+                            # do NOT mark visited -> it can be retried if it shows up again
+                            continue
+
+                        visited_pages.add(url)
+                        results.append(r)
+
+                        if pages_scanned >= max_pages_total:
+                            break
+
+                next_frontier_candidates: List[str] = []
+
+                for res in results:
+                    # Aggregate Logs & Links
+                    all_js_links.extend(res.get("js_links", []))
+                    all_network_links.extend(res.get("network_links", []))
+                    all_runtime_hits.extend(res.get("runtime_hits", []))
+                    all_react_hits.extend(res.get("react_hits", []))
+                    all_database_hits.extend(res.get("database_hits", []))
+                    all_interaction_hits.extend(res.get("interaction_hits", []))
+
+                    # Collect Assets
+                    for asset in res.get("assets", []):
+                        a_url = asset.get("url")
+                        if a_url and a_url not in seen_asset_urls:
+                            seen_asset_urls.add(a_url)
+                            found_assets.append(asset)
+
+                    # Collect Next Pages
+                    if current_depth < max_depth:
+                        next_pages = res.get("next_pages", [])
+                        if next_pages:
+                            next_frontier_candidates.extend(next_pages)
+
+                next_frontier = []
+                seen_in_next = set()
+
+                for url in next_frontier_candidates:
+                    if url in visited_pages or url in inflight_pages or url in seen_in_next:
+                        continue
+                    next_frontier.append(url)
+                    seen_in_next.add(url)
+
+                # [PATCH] don’t exceed remaining global capacity
+                remaining = max_pages_total - pages_scanned
+                frontier = next_frontier[:max(0, remaining)]
+
+                DEBUG_LOGGER.log_message(
+                    f"[BFS] Depth {current_depth} complete. "
+                    f"Discovered {len(frontier)} new unique pages for next depth."
+                )
+
+                current_depth += 1
+
+            # Close shared PW
+            if pw_needed:
+                await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # ---------------- Output formatting ------------- #
+        from urllib.parse import urlparse as _urlparse
+
+        if not found_assets:
+            base_text = (
+                "### LinkTracker: No specific assets found.\n"
+                f"Scanned {len(candidate_pages)} pages for extensions: {sorted(list(targets))}.\n"
+                f"Required keywords: {keywords}\n"
+                f"Required sites: {required_sites or '[none]'}\n"
+                f"min_term_overlap: {min_term_overlap}\n"
+                f"Engine: {engine}\n"
+            )
+            lines = [base_text]
+
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                    url = jl["url"]
+                    text = jl["text"] or "(no text)"
+                    tag = jl["tag"] or "a"
+                    lines.append(f"- **[{text}]({url})**")
+                    lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
+
+            if return_network_sniff_links and all_network_links:
+                lines.append("\n### All Network-Sniffed Assets (debug)\n")
+                for nl in all_network_links:
+                    host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                    url = nl["url"]
+                    text = nl["text"] or "(no text)"
+                    tag = nl.get("tag", "network_sniff")
+                    size = nl.get("size", "?")
+                    lines.append(f"- **[{text}]({url})**")
+                    lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+            if return_database_sniff_hits and all_database_hits:
+                lines.append("\n### Database / Content Sniff Hits (debug)\n")
+                for dbh in all_database_hits[:100]:
+                    kind = dbh.get("kind")
+                    url = dbh.get("url")
+                    meta = dbh.get("meta") or {}
+
+                    if kind == "content_link":
+                        src = meta.get("source", "?")
+                        lines.append(f"- `db_link` ({src}) **{url}**")
+                    elif kind == "indexeddb_dump":
+                        db_name = meta.get("name", "?")
+                        stores = meta.get("stores", [])
+                        store_str = ", ".join([f"{s['name']}(~{s.get('approx_count')})" for s in stores])
+                        lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
+                    elif kind == "db_config_detected":
+                        name = meta.get("name")
+                        lines.append(f"- `backend_config` **{name}** detected")
+            return "\n".join(lines), {
+                "count": 0,
+                "keywords_used": keywords,
+                "min_term_overlap": min_term_overlap,
+                "engine": engine,
+                "required_sites": required_sites,
+                "js_links": all_js_links,
+                "network_sniff_links": all_network_links,
+                "runtime_hits": all_runtime_hits,
+                "react_hits": all_react_hits,
+                "database_hits": all_database_hits,
+                "interaction_hits": all_interaction_hits,
+                "log": log,
+                "queries_run": queries_to_run,
+            }
+
+        lines = [f"### LinkTracker Found {len(found_assets)} Assets"]
+        lines.append(
+            f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
+            f"Required Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
+            f"Required Sites: {required_sites or '[none]'}_"
+        )
+        lines.append("")
+
+        for asset in found_assets:
+            lines.append(f"- **[{asset['text']}]({asset['url']})**")
+            lines.append(
+                f"  - *Size: {asset.get('size','?')} | Status: {asset.get('status','?')} | "
+                f"Source: {_urlparse(asset.get('source','')).netloc if asset.get('source') else '(unknown)'}*"
+            )
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                url = jl["url"]
+                text = jl["text"] or "(no text)"
+                tag = jl["tag"] or "a"
+                lines.append(f"- **[{text}]({url})**")
+                lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
+
+        if return_network_sniff_links and all_network_links:
+            lines.append("\n### All Network-Sniffed Assets (debug)\n")
+            for nl in all_network_links:
+                host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                url = nl["url"]
+                text = nl["text"] or "(no text)"
+                tag = nl.get("tag", "network_sniff")
+                size = nl.get("size", "?")
+                lines.append(f"- **[{text}]({url})**")
+                lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+        if return_react_sniff_hits and all_react_hits:
+            lines.append("\n### React / SPA Hits (debug)\n")
+            for rh in all_react_hits[:100]:
+                url = rh.get("url") or "(no url)"
+                route = rh.get("route") or ""
+                kind = rh.get("kind") or "react_nav"
+                lines.append(f"- `{kind}` **{route}** → {url}")
+        if return_runtime_sniff_hits and all_runtime_hits:
+            lines.append("\n### Runtime Sniff Hits (debug)\n")
+            # Cap output to prevent massive message overflow (e.g. 100 items)
+            for hit in all_runtime_hits[:100]:
+                url = hit.get("url") or "(no url)"
+                payload = hit.get("json") or {}
+
+                # Format a readable description based on the hit type
+                desc_parts = []
+                if "console" in payload:
+                    desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
+                elif "ws_frame" in payload:
+                    desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
+                elif "request_body" in payload:
+                    desc_parts.append("Request Body (JSON)")
+                elif "media_events" in payload:
+                    evts = payload["media_events"]
+                    desc_parts.append(f"Media Events: {len(evts)}")
+                elif "storage" in payload:
+                    desc_parts.append(f"Storage Items: {len(payload['storage'])}")
+                elif "perf_entries" in payload:
+                    desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
+                else:
+                    # Generic fallback for unknown payloads
+                    import json as _json
+                    try:
+                        dump = _json.dumps(payload)
+                        desc_parts.append(f"Data: {dump[:100]}...")
+                    except:
+                        desc_parts.append("Data: (complex object)")
+
+                desc = " | ".join(desc_parts)
+                lines.append(f"- `{desc}` found on **{url}**")
+        if return_interaction_sniff_hits and all_interaction_hits:
+            lines.append("\n### Interaction / CDP Hits (debug)\n")
+            for ih in all_interaction_hits[:100]:
+                kind = ih.get("kind")
+                meta = ih.get("meta") or {}
+                url = ih.get("url")
+
+                if kind == "event_listener":
+                    node = meta.get("nodeName", "UNK")
+                    types = meta.get("types", [])
+                    lines.append(f"- `listener` **{node}** {types} on {url}")
+                elif kind == "form_definition":
+                    ins = meta.get("input_count", 0)
+                    method = meta.get("method", "get")
+                    lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
+                elif kind == "overlay_detected":
+                    cov = meta.get("coverage", "?")
+                    z = meta.get("zIndex", "?")
+                    lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
+                elif kind == "summary":
+                    lc = meta.get("listener_count", 0)
+                    fc = meta.get("form_count", 0)
+                    lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
+        return "\n".join(lines), {
+            "found": len(found_assets),
+            "scanned_pages": len(visited_pages),
+            "assets": found_assets,
+            "keywords_used": keywords,
+            "min_term_overlap": min_term_overlap,
+            "engine": engine,
+            "required_sites": required_sites,
+            "js_links": all_js_links,
+            "network_sniff_links": all_network_links,
+            "runtime_hits": all_runtime_hits,
+            "react_hits": all_react_hits,
+            "database_hits": all_database_hits,
+            "interaction_hits": all_interaction_hits,
+            "log": log,
+            "queries_run": queries_to_run,
+        }
+
     # ------------------------------------------------------------------ #
-    # Required-site seeding helpers
+    # Predictive sequencing (unchanged)
     # ------------------------------------------------------------------ #
-    def _build_required_site_seeds(
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+
+        for u in urls:
+            match = re_seq.search(u)
+            if match:
+                original_num_str = match.group(1)
+                try:
+                    width = len(original_num_str)
+                    val = int(original_num_str)
+                    for i in range(1, 4):
+                        next_val = val + i
+                        next_str = f"{next_val:0{width}d}"
+                        new_url = u[:match.start(1)] + next_str + u[match.end(1):]
+                        generated.add(new_url)
+                except ValueError:
+                    pass
+
+        return list(generated)
+
+    # ------------------------------------------------------------------ #
+    # Sites seeding helpers (unchanged)
+    # ------------------------------------------------------------------ #
+    def _seed_pages_from_required_sites(
         self,
-        required_sites: List[str],
-        queries: List[str],
-        *,
-        sitemap_cap_per_site: int = 6,
-        hub_cap_per_site: int = 12,
-        probe_cap_per_site: int = 12,
-    ) -> tuple[list[str], set[str], set[str]]:
-        out: list[str] = []
+        required_sites,
+        queries,
+        probe_cap_per_site=5,
+        sitemap_cap_per_site=8,
+        hub_cap_per_site=6,
+    ):
+        out: List[str] = []
         synthetic_search_seeds: set[str] = set()
         explicit_site_seeds: set[str] = set()
 
@@ -7562,20 +9304,18 @@ class LinkTrackerBlock(BaseBlock):
         ]
         for s in norm_sites:
             u = s + "/robots.txt"
-            out.append(u)
-            explicit_site_seeds.add(u)
+            out.append(u); explicit_site_seeds.add(u)
             added = 0
             for sm in common_sitemaps:
                 if added >= sitemap_cap_per_site:
                     break
                 u = s + sm
-                out.append(u)
-                explicit_site_seeds.add(u)
+                out.append(u); explicit_site_seeds.add(u)
                 added += 1
 
         hub_paths = [
             "/tag/", "/tags/", "/category/", "/categories/", "/archive/", "/archives/",
-            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search", "/search/",
+            "/browse/", "/collections/", "/series/", "/authors/", "/topics/", "/search",
         ]
         for s in norm_sites:
             added = 0
@@ -7583,8 +9323,7 @@ class LinkTrackerBlock(BaseBlock):
                 if added >= hub_cap_per_site:
                     break
                 u = s + hp
-                out.append(u)
-                explicit_site_seeds.add(u)
+                out.append(u); explicit_site_seeds.add(u)
                 added += 1
 
         def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
@@ -7593,10 +9332,8 @@ class LinkTrackerBlock(BaseBlock):
                 return [
                     base + f"/search.php?query={enc_query}",
                     base + f"/advancedsearch.php?q={enc_query}",
-                    base + (
-                        f"/advancedsearch.php?q={enc_query}"
-                        f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"
-                    ),
+                    base + (f"/advancedsearch.php?q={enc_query}"
+                            f"&fl[]=identifier&fl[]=title&rows=50&page=1&output=json"),
                     base + f"/details/{enc_query}",
                     base + f"/browse.php?field=subject&query={enc_query}",
                 ]
@@ -7639,1944 +9376,6 @@ class LinkTrackerBlock(BaseBlock):
                     urls.append(u)
         return urls
 
-
-    # ------------------------------------------------------------------ #
-    # Main execution (Async)
-    # ------------------------------------------------------------------ #
-    async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
-        text = str(payload or "")
-
-        inline_ctx: str = ""
-        inline_lex: List[str] = []
-
-        try:
-            inline_ctx = text.rsplit("[context]\n", 1)[1]
-        except Exception:
-            inline_ctx = ""
-
-        try:
-            lex_part = text.rsplit("[lexicon]\n", 1)[1]
-            lex_part = lex_part.split("\n[", 1)[0]
-            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
-        except Exception:
-            inline_lex = []
-
-        core = text
-        if inline_ctx:
-            core = core.rsplit("[context]\n", 1)[0]
-        if inline_lex:
-            core = core.rsplit("[lexicon]\n", 1)[0]
-        core = core.strip()
-
-        query_raw = str(params.get("query", "") or str(payload or "")).strip()
-        subpipeline = params.get("subpipeline", None)
-
-        context_urls: List[str] = []
-        if inline_ctx:
-            ctx_slice = inline_ctx[:20000]
-            for m in self._URL_RE.finditer(ctx_slice):
-                context_urls.append(m.group(0))
-
-        lexicon_url_seeds: List[str] = []
-        non_url_lex_terms: List[str] = []
-        for term in inline_lex:
-            t = term.strip()
-            if not t:
-                continue
-            if self._URL_RE.match(t):
-                lexicon_url_seeds.append(t)
-            else:
-                non_url_lex_terms.append(t)
-
-        use_camoufox = bool(params.get("use_camoufox", False))
-        camoufox_options = params.get("camoufox_options") or {}
-        if not isinstance(camoufox_options, dict):
-            camoufox_options = {}
-        camoufox_options.update({"i_know_what_im_doing": True})
-
-        use_database = bool(params.get("use_database", False))
-        db_path = params.get("db_path", "link_corpus.db")
-        if use_database:
-            self._initialize_database(db_path, logger=getattr(self, "logger", None))
-        store = self.store
-
-        pipeline_result: Any = query_raw
-        pipeline_queries: List[str] = []
-        pipeline_urls: List[str] = []
-
-        if subpipeline:
-            subpipe_out: Any = self.run_sub_pipeline(
-                initial_value=query_raw,
-                pipeline_param_name="subpipeline",
-                parent_params=params,
-                collect=True,
-            )
-            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
-                pipeline_result = subpipe_out.get("final")
-                pipeline_queries = list(subpipe_out.get("queries") or [])
-                pipeline_urls = list(subpipe_out.get("urls") or [])
-            else:
-                pipeline_result = subpipe_out
-
-        extra_seed_urls: List[str] = []
-        if context_urls:
-            extra_seed_urls.extend(context_urls)
-        if lexicon_url_seeds:
-            extra_seed_urls.extend(lexicon_url_seeds)
-        if extra_seed_urls:
-            pipeline_urls.extend(extra_seed_urls)
-
-        memory_sources_raw = str(params.get("memory_sources", "")).strip()
-        if memory_sources_raw:
-            try:
-                mem_data = Memory.load()
-                keys_to_read = [k.strip() for k in memory_sources_raw.split(",") if k.strip()]
-                for key in keys_to_read:
-                    data = mem_data.get(key)
-                    if not data:
-                        continue
-                    items = data if isinstance(data, list) else [data]
-                    for item in items:
-                        candidate = None
-                        if isinstance(item, dict):
-                            candidate = item.get("url") or item.get("domain") or item.get("text")
-                        elif isinstance(item, (str, int, float)):
-                            candidate = str(item)
-                        if not candidate:
-                            continue
-
-                        cand_str = str(candidate).strip()
-                        if not cand_str:
-                            continue
-
-                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
-                            pipeline_urls.append(cand_str)
-                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
-                            pipeline_urls.append(f"https://{cand_str}")
-                        else:
-                            non_url_lex_terms.append(cand_str)
-            except Exception as e:
-                print(f"[LinkTracker] Error reading memory sources '{memory_sources_raw}': {e}")
-
-        mode = str(params.get("mode", "docs")).lower()
-        scan_limit = int(params.get("scan_limit", 5))
-        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
-        timeout = float(params.get("timeout", 5.0))
-        verify_links = bool(params.get("verify", True))
-        engine = str(params.get("engine", "duckduckgo")).lower()
-
-        use_body = bool(params.get("use_body", False))
-        use_js = bool(params.get("use_js", False))
-        return_all_js_links = bool(params.get("return_all_js_links", False))
-        max_links_per_page = int(params.get("max_links_per_page", 500))
-        search_results_cap = int(params.get("search_results_cap", 256))
-        search_page_limit = int(params.get("search_page_limit", 1))
-        search_per_page = int(params.get("search_per_page", 50))
-
-        use_network_sniff = bool(params.get("use_network_sniff", False))
-        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
-        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
-        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
-        use_react_sniff = bool(params.get("use_react_sniff", False))
-        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
-        use_database_sniff = bool(params.get("use_database_sniff", False))
-        return_database_sniff_hits = bool(params.get("return_database_sniff_hits", False))
-        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
-        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
-
-        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
-        min_term_overlap = max(1, min(min_term_overlap_raw, 999))
-
-        custom_ext = str(params.get("extensions", "")).split(",")
-        keywords_in_url = str(params.get("url_keywords", "")).split(",")
-        site_require_raw = str(params.get("site_require", "")).split(",")
-        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
-        max_depth = max(0, int(params.get("max_depth", 0)))
-
-        http_retries = int(params.get("http_retries", 2))
-        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
-        http_verify_tls = bool(params.get("http_verify_tls", True))
-        http_ca_bundle = params.get("http_ca_bundle", None)
-
-        db_allow_rescan = bool(params.get("db_allow_rescan", False))
-        _ = db_allow_rescan  # kept for signature parity / future use
-
-        block_resources = bool(params.get("block_resources", False))
-        blocked_resource_types = {
-            t.strip().lower()
-            for t in str(params.get("blocked_resource_types", "")).split(",")
-            if t.strip()
-        } or {"image", "stylesheet", "font"}
-
-        block_domains = bool(params.get("block_domains", True))
-        user_blocked_domains = {
-            d.strip().lower()
-            for d in str(params.get("blocked_domains", "")).split(",")
-            if d.strip()
-        }
-        depth_batch_limit = max(1, int(params.get("depth_batch_limit", 10)))
-        default_blocked_domains = {
-            "google-analytics.com", "googletagmanager.com", "doubleclick.net",
-            "facebook.com", "facebook.net", "twitter.com", "scorecardresearch.com",
-            "quantserve.com", "hotjar.com", "segment.io", "mixpanel.com",
-            "cloudflareinsights.com", "stats.g.doubleclick.net",
-            "adservice.google.com", "ads.yahoo.com", "adsafeprotected.com",
-        }
-        blocked_domains: set[str] = set()
-        if block_domains:
-            blocked_domains = default_blocked_domains.union(user_blocked_domains)
-
-        pw_launch_args = params.get("pw_launch_args") or []
-        if isinstance(pw_launch_args, str):
-            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
-        if not isinstance(pw_launch_args, list):
-            pw_launch_args = []
-
-        pw_headless = bool(params.get("pw_headless", True))
-        pw_channel = params.get("pw_channel", None)
-        pw_proxy = params.get("pw_proxy", None)
-
-        targets: set[str] = set()
-        if mode == "media":
-            targets.update([
-                ".mp3", ".wav", ".wave", ".flac", ".m4a", ".ogg", ".opus", ".aac",
-                ".weba", ".alac", ".aiff", ".wma", ".oga",
-            ])
-        elif mode == "pictures":
-            targets.update([
-                ".jpg", ".jpeg", ".png", ".gif", ".webp",
-                ".bmp", ".tiff", ".tif", ".heic", ".heif", ".avif", ".svg",
-            ])
-        elif mode == "docs":
-            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
-        elif mode == "archives":
-            targets.update([".zip", ".rar", ".7z", ".tar", ".gz"])
-
-        for e in custom_ext:
-            e = e.strip()
-            if not e:
-                continue
-            if not e.startswith("."):
-                e = "." + e
-            targets.add(e.lower())
-
-        if not targets:
-            targets.update([".pdf", ".epub", ".mobi", ".doc", ".docx"])
-
-        keywords: List[str] = [k.strip().lower() for k in keywords_in_url if k.strip()]
-        strict_keywords = bool(params.get("strict_keywords", False))
-        allow_audioish_octet_stream = bool(params.get("allow_audioish_octet_stream", True))
-        trust_sniffed_audio_kind = bool(params.get("trust_sniffed_audio_kind", True))
-
-        audio_hint_terms = [
-            "mp3", "wav", "wave", "flac", "m4a", "aac", "ogg", "opus", "weba",
-            "alac", "aiff", "wma", "oga", "audio", "track", "song", "stem",
-            "instrumental", "acapella", "download", "lossless", "320kbps", "1411kbps",
-        ]
-
-        if query_raw:
-            if strict_keywords:
-                whole = query_raw.lower().strip()
-                if whole and whole not in keywords:
-                    keywords.append(whole)
-            else:
-                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
-                    if qt not in keywords:
-                        keywords.append(qt)
-
-        for term in non_url_lex_terms:
-            lt = term.lower()
-            if lt and lt not in keywords:
-                keywords.append(lt)
-
-        def _clean_domain(u: str) -> str:
-            try:
-                return urlparse(u).netloc.lower().split(":", 1)[0]
-            except Exception:
-                return ""
-
-        allowed_cdn_hosts: set[str] = set()
-
-        CDN_HOST_HINTS = (
-            "cdn", "static", "assets", "asset", "media", "img", "image", "images",
-            "files", "downloads", "content", "objects", "storage",
-            "cloudfront.net", "akamai", "akamaized.net", "fastly.net", "fastly",
-            "cloudflare", "r2.dev", "b-cdn.net",
-            "amazonaws.com", "s3.", "storage.googleapis.com", "googleusercontent.com",
-            "digitaloceanspaces.com", "backblazeb2.com",
-        )
-
-        CDN_SIG_KEYS = {
-            "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-expires",
-            "x-amz-signedheaders", "x-amz-signature", "x-goog-algorithm",
-            "x-goog-credential", "x-goog-date", "x-goog-expires", "x-goog-signedheaders",
-            "x-goog-signature", "expires", "expiry", "signature", "sig", "token",
-            "auth", "policy", "key-pair-id",
-        }
-
-        CDN_FILENAME_KEYS = (
-            "filename", "filename*", "file", "download", "attachment", "name",
-            "key", "object", "path", "asset", "media", "source", "src",
-        )
-
-        def _looks_like_cdn_host(u: str) -> bool:
-            d = _clean_domain(u)
-            if not d:
-                return False
-            return any(tok in d for tok in CDN_HOST_HINTS)
-
-        def _allowed_by_required_sites(u: str) -> bool:
-            if not required_sites:
-                return True
-            d = _clean_domain(u)
-            if any(req in d for req in required_sites):
-                return True
-            return d in allowed_cdn_hosts
-
-        def _term_overlap_ok(haystack: str) -> bool:
-            if not keywords:
-                return True
-            h = haystack.lower()
-            hits = 0
-            for k in keywords:
-                if k and k in h:
-                    hits += 1
-                    if hits >= min_term_overlap:
-                        return True
-            return False
-
-        def _clean_path(u: str) -> str:
-            try:
-                return urlparse(u).path.lower()
-            except Exception:
-                return ""
-
-        def _clean_query(u: str) -> str:
-            try:
-                return urlparse(u).query.lower()
-            except Exception:
-                return ""
-
-        def _content_disposition_filename(headers: Optional[Dict[str, str]]) -> str:
-            if not headers:
-                return ""
-            try:
-                cd = (headers.get("Content-Disposition") or headers.get("content-disposition") or "")
-            except Exception:
-                cd = ""
-            if not cd:
-                return ""
-
-            m = re.search(r"filename\*=UTF-8''([^;]+)", cd, re.IGNORECASE)
-            if m:
-                return unquote(m.group(1)).lower()
-
-            m = re.search(r'filename="?([^";]+)"?', cd, re.IGNORECASE)
-            if m:
-                return unquote(m.group(1)).lower()
-
-            return unquote(cd).lower()
-
-        def _looks_like_audioish_text(s: str) -> bool:
-            low = unquote(str(s or "")).lower()
-            if not low:
-                return False
-            return any(tok in low for tok in audio_hint_terms)
-
-        def _looks_like_audioish_url(u: str) -> bool:
-            raw = str(u or "")
-            low = unquote(raw).lower()
-            if not low:
-                return False
-
-            path = _clean_path(low)
-            query = _clean_query(low)
-            audio_exts = (
-                ".mp3", ".wav", ".wave", ".flac", ".m4a", ".aac", ".ogg", ".opus",
-                ".weba", ".alac", ".aiff", ".wma", ".oga",
-            )
-
-            if any(path.endswith(ext) for ext in targets):
-                return True
-            if any(path.endswith(ext) for ext in audio_exts):
-                return True
-            if any(tok in low for tok in (
-                "/audio/", "/download/", "/stream/", "/file/",
-                "audio=", "audio_url=", "source=audio",
-                "format=mp3", "format=wav", "format=flac",
-                "mime=audio", "content_type=audio",
-                "response-content-type=audio%2f",
-                "response-content-disposition=", "content-disposition=",
-                "filename=", "filename*=", "attachment", "download=1", "dl=1",
-            )):
-                return True
-            if "filename=" in query or "filename*=" in query:
-                if any(ext in query for ext in audio_exts):
-                    return True
-            if "response-content-disposition=" in query or "content-disposition=" in query:
-                if any(ext in query for ext in audio_exts):
-                    return True
-            return _looks_like_audioish_text(low)
-
-        def _looks_like_audioish_ct(ct: str, headers: Optional[Dict[str, str]] = None) -> bool:
-            c = (ct or "").lower()
-            if not c:
-                return False
-            if c.startswith("audio/"):
-                return True
-            if any(x in c for x in (
-                "audio/mpeg", "audio/mp3",
-                "audio/wav", "audio/x-wav", "audio/wave", "audio/vnd.wave",
-                "audio/flac", "audio/x-flac",
-                "audio/aac", "audio/mp4",
-                "audio/ogg", "audio/opus", "application/ogg",
-                "audio/webm", "audio/x-m4a",
-            )):
-                return True
-            if allow_audioish_octet_stream and "octet-stream" in c:
-                fname = _content_disposition_filename(headers)
-                if _looks_like_audioish_text(fname):
-                    return True
-            return False
-
-        def _extract_query_value(query: str, key: str) -> str:
-            m = re.search(rf"(?:^|[?&]){re.escape(key)}=([^&#]+)", query, re.IGNORECASE)
-            if not m:
-                return ""
-            try:
-                return unquote(m.group(1)).lower()
-            except Exception:
-                return m.group(1).lower()
-
-        def _extract_effective_asset_name(u: str, headers: Optional[Dict[str, str]] = None) -> str:
-            low = unquote(str(u or "")).lower()
-            path_name = _clean_path(low).rsplit("/", 1)[-1]
-            if path_name:
-                return path_name
-
-            query = _clean_query(low)
-            for key in CDN_FILENAME_KEYS:
-                val = _extract_query_value(query, key)
-                if val:
-                    return val
-
-            rcd = _extract_query_value(query, "response-content-disposition")
-            if rcd:
-                m = re.search(r"filename\*=UTF-8''([^;]+)", rcd, re.IGNORECASE)
-                if m:
-                    try:
-                        return unquote(m.group(1)).lower()
-                    except Exception:
-                        return m.group(1).lower()
-                m = re.search(r'filename="?([^";]+)"?', rcd, re.IGNORECASE)
-                if m:
-                    try:
-                        return unquote(m.group(1)).lower()
-                    except Exception:
-                        return m.group(1).lower()
-
-            cd_name = _content_disposition_filename(headers)
-            if cd_name:
-                return cd_name
-            return ""
-
-        def _has_target_extension(u: str, headers: Optional[Dict[str, str]] = None) -> bool:
-            name = _extract_effective_asset_name(u, headers=headers)
-            if not name:
-                return False
-            return any(name.endswith(ext) for ext in targets)
-
-        def _normalize_assetish_url(u: str) -> str:
-            try:
-                pu = urlparse(str(u or "").strip())
-                kept_q = []
-                for k, v in parse_qsl(pu.query, keep_blank_values=True):
-                    if k.lower() in CDN_SIG_KEYS:
-                        continue
-                    kept_q.append((k, v))
-                return urlunparse((
-                    (pu.scheme or "").lower(),
-                    (pu.netloc or "").lower(),
-                    pu.path or "",
-                    "",
-                    urlencode(kept_q, doseq=True),
-                    "",
-                ))
-            except Exception:
-                return str(u or "").strip()
-
-        def _asset_key(u: str) -> str:
-            n = _normalize_assetish_url(u)
-            return n or str(u or "").strip()
-
-        def _branch_variants_for_url(u: str) -> list[str]:
-            out: list[str] = []
-            try:
-                pu = urlparse(_normalize_assetish_url(u))
-                exact = urlunparse((pu.scheme, pu.netloc, pu.path, "", pu.query, ""))
-                raw_no_frag = urlunparse((pu.scheme, pu.netloc, pu.path, "", pu.query, ""))
-                queryless = urlunparse((pu.scheme, pu.netloc, pu.path, "", "", ""))
-
-                if exact:
-                    out.append(exact)
-                if queryless and queryless != exact:
-                    out.append(queryless)
-
-                clean_path = pu.path or ""
-                if clean_path and "/" in clean_path.strip("/"):
-                    parent = clean_path.rsplit("/", 1)[0] + "/"
-                    out.append(urlunparse((pu.scheme, pu.netloc, parent, "", "", "")))
-
-                out.append(urlunparse((pu.scheme, pu.netloc, "/", "", "", "")))
-            except Exception:
-                if u:
-                    out.append(u)
-
-            dedup = []
-            seen = set()
-            for x in out:
-                if not x:
-                    continue
-                if x in seen:
-                    continue
-                seen.add(x)
-                dedup.append(x)
-            return dedup
-
-        def _register_cdn_from_page(parent_page_url: str, discovered_url: str) -> None:
-            try:
-                if not required_sites:
-                    return
-                if not _looks_like_cdn_host(discovered_url):
-                    return
-                if not any(req in _clean_domain(parent_page_url) for req in required_sites):
-                    return
-                d = _clean_domain(discovered_url)
-                if d:
-                    allowed_cdn_hosts.add(d)
-            except Exception:
-                pass
-
-        def _should_branch_cdn_url(
-            u: str,
-            *,
-            headers: Optional[Dict[str, str]] = None,
-            sniff_kind: str = "",
-            sniff_tag: str = "",
-            sniff_ct: str = "",
-        ) -> bool:
-            if not u or not str(u).startswith("http"):
-                return False
-            if self._is_mega_link(u):
-                return False
-            if _is_asset_link_for_mode(
-                u,
-                headers=headers,
-                sniff_kind=sniff_kind,
-                sniff_tag=sniff_tag,
-                sniff_ct=sniff_ct,
-            ):
-                return False
-
-            low = unquote(str(u or "")).lower()
-            host = _clean_domain(low)
-            path = _clean_path(low)
-
-            if any(x in host for x in (
-                "recaptcha", "google-analytics", "googletagmanager", "doubleclick",
-            )):
-                return False
-
-            if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                return False
-
-            if _looks_like_cdn_host(u):
-                return True
-
-            if any(tok in low for tok in (
-                "manifest", ".m3u8", ".mpd", "playlist", "segment", "chunk",
-                "source=", "file=", "filename=", "asset=", "media=", "download=",
-                "response-content-disposition=", "content-disposition=",
-            )):
-                return True
-
-            return False
-        def _is_asset_link_for_mode(
-                u: str,
-                headers: Optional[Dict[str, str]] = None,
-                *,
-                sniff_kind: str = "",
-                sniff_tag: str = "",
-                sniff_ct: str = "",
-        ) -> bool:
-            """
-            CDN-safe asset gate.
-
-            Drop-in replacement for the existing _is_asset_link_for_mode().
-
-            Main fix:
-              - CDN URLs are often extensionless.
-              - CDN URLs are often signed.
-              - CDN HEAD responses can be weak/missing.
-              - Playwright/network sniffed CDN requests should not be thrown away
-                just because the path does not end in .mp3/.wav/.mp4/etc.
-
-            This function is intentionally more permissive for CDN hosts, but still
-            blocks obvious tracking/auth/API junk.
-            """
-            if not u or not str(u).startswith("http"):
-                return False
-
-            if self._is_mega_link(u):
-                return True
-
-            raw = str(u or "")
-            low = unquote(raw).lower()
-            host = _clean_domain(low)
-            path = _clean_path(low)
-            query = _clean_query(low)
-
-            h = headers or {}
-            ct = (
-                    sniff_ct
-                    or h.get("Content-Type")
-                    or h.get("content-type")
-                    or ""
-            ).lower()
-
-            sk = (sniff_kind or "").lower()
-            st = (sniff_tag or "").lower()
-
-            # ------------------------------------------------------------
-            # Hard deny: obvious non-assets / telemetry / auth / service APIs
-            # ------------------------------------------------------------
-            if any(x in host for x in (
-                    "recaptcha",
-                    "google-analytics",
-                    "googletagmanager",
-                    "doubleclick",
-                    "stats.g.doubleclick",
-                    "facebook.net",
-                    "hotjar",
-                    "segment.io",
-                    "mixpanel",
-                    "scorecardresearch",
-                    "secure.soundcloud.com",
-                    "api-v2.soundcloud.com",
-            )):
-                return False
-
-            if any(x in low for x in (
-                    "/web-auth",
-                    "/login",
-                    "/oauth",
-                    "/authorize",
-                    "/announcements",
-                    "/featured-profiles",
-                    "/relatedartists",
-                    "/spotlight",
-                    "/payments/",
-                    "/quotations/",
-                    "/stat_record",
-                    "/api/currency_data/",
-                    "/graphql",
-                    "/telemetry",
-                    "/metrics",
-                    "/analytics",
-                    "/collect?",
-                    "/beacon",
-            )):
-                return False
-
-            # ------------------------------------------------------------
-            # Strong proof: explicit target extension or filename/header name
-            # ------------------------------------------------------------
-            if _has_target_extension(u, headers=h):
-                return True
-
-            # ------------------------------------------------------------
-            # Header proof: Content-Type says it is an asset.
-            # This matters because CDN paths are often extensionless.
-            # ------------------------------------------------------------
-            if ct:
-                if mode == "media":
-                    if ct.startswith(("audio/", "video/")):
-                        return True
-
-                    if any(x in ct for x in (
-                            "audio/mpeg",
-                            "audio/mp3",
-                            "audio/wav",
-                            "audio/x-wav",
-                            "audio/wave",
-                            "audio/vnd.wave",
-                            "audio/flac",
-                            "audio/x-flac",
-                            "audio/aac",
-                            "audio/mp4",
-                            "video/mp4",
-                            "video/webm",
-                            "video/quicktime",
-                            "application/ogg",
-                            "audio/ogg",
-                            "audio/opus",
-                            "application/vnd.apple.mpegurl",
-                            "application/x-mpegurl",
-                            "mpegurl",
-                            "dash+xml",
-                    )):
-                        return True
-
-                    # CDN downloads often come back as octet-stream.
-                    if "octet-stream" in ct:
-                        fname = _content_disposition_filename(h)
-                        if _looks_like_audioish_text(fname):
-                            return True
-
-                        # If the URL itself is CDN-ish and the request was sniffed
-                        # as media/fetch/source, keep it as an asset candidate.
-                        if _looks_like_cdn_host(u) and (
-                                sk in {"audio", "video", "media", "source", "download", "fetch", "xhr", "other"}
-                                or any(x in st for x in ("media", "audio", "video", "source", "stream", "download"))
-                        ):
-                            return True
-
-                elif mode == "pictures":
-                    if ct.startswith("image/"):
-                        return True
-
-                elif mode == "docs":
-                    if any(x in ct for x in (
-                            "application/pdf",
-                            "application/epub",
-                            "application/msword",
-                            "officedocument",
-                            "application/vnd",
-                    )):
-                        return True
-
-                elif mode == "archives":
-                    if any(x in ct for x in (
-                            "zip",
-                            "rar",
-                            "7z",
-                            "gzip",
-                            "x-tar",
-                            "x-gtar",
-                            "octet-stream",
-                    )):
-                        return True
-
-            # ------------------------------------------------------------
-            # URL proof: normal direct asset/path/query markers.
-            # ------------------------------------------------------------
-            if mode == "media":
-                if _looks_like_audioish_url(u):
-                    return True
-
-                if any(x in low for x in (
-                        ".mp3", ".wav", ".wave", ".flac", ".m4a", ".aac", ".ogg",
-                        ".opus", ".weba", ".alac", ".aiff", ".wma", ".oga",
-                        ".mp4", ".webm", ".mov", ".m3u8", ".mpd",
-                        "/audio/", "/video/", "/media/", "/stream/", "/download/",
-                        "/file/", "/track/", "/songs/", "/source/",
-                        "audio=", "audio_url=", "video=", "video_url=",
-                        "media=", "media_url=", "source=", "src=",
-                        "format=mp3", "format=wav", "format=flac", "format=m4a",
-                        "mime=audio", "mime=video",
-                        "content_type=audio", "content_type=video",
-                        "response-content-type=audio%2f",
-                        "response-content-type=video%2f",
-                        "response-content-disposition=",
-                        "content-disposition=",
-                        "filename=", "filename*=",
-                        "download=1", "dl=1",
-                        "playlist", "manifest", "segment", "chunk",
-                )):
-                    return True
-
-            elif mode == "pictures":
-                if any(x in low for x in (
-                        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
-                        ".tiff", ".tif", ".heic", ".heif", ".avif", ".svg",
-                        "/image/", "/images/", "/img/", "/picture/", "/pictures/",
-                        "image=", "image_url=", "img=", "src=",
-                        "response-content-type=image%2f",
-                        "filename=", "filename*=",
-                )):
-                    return True
-
-            elif mode == "docs":
-                if any(x in low for x in (
-                        ".pdf", ".epub", ".mobi", ".doc", ".docx",
-                        "/docs/", "/documents/", "/download/", "/file/",
-                        "filename=", "filename*=",
-                        "response-content-disposition=",
-                )):
-                    return True
-
-            elif mode == "archives":
-                if any(x in low for x in (
-                        ".zip", ".rar", ".7z", ".tar", ".gz",
-                        "/archive/", "/archives/", "/download/", "/file/",
-                        "filename=", "filename*=",
-                        "response-content-disposition=",
-                )):
-                    return True
-
-            # ------------------------------------------------------------
-            # CDN-specific fix:
-            # Keep CDN-ish network/runtime candidates alive even if extensionless.
-            # This is the part that fixes "no assets from CDN domains".
-            # ------------------------------------------------------------
-            cdnish = _looks_like_cdn_host(u)
-
-            if cdnish:
-                # Never count obvious static page support files as target assets.
-                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                    return False
-
-                # If Playwright/network saw it as media/fetch/source/download,
-                # treat it as a real candidate instead of dropping it.
-                if sk in {
-                        "audio", "video", "media", "source", "download",
-                        "fetch", "xhr", "other", "request", "response",
-                }:
-                    return True
-
-                if any(x in st for x in (
-                        "audio", "video", "media", "source", "stream",
-                        "download", "asset", "cdn", "network",
-                )):
-                    return True
-
-                # Signed object-storage URLs usually hide the real filename/type.
-                if any(k in query for k in (
-                        "x-amz-signature",
-                        "x-amz-credential",
-                        "x-amz-expires",
-                        "x-goog-signature",
-                        "x-goog-credential",
-                        "x-goog-expires",
-                        "signature=",
-                        "sig=",
-                        "token=",
-                        "policy=",
-                        "key-pair-id=",
-                        "expires=",
-                        "response-content-disposition=",
-                        "response-content-type=",
-                )):
-                    return True
-
-                # Common CDN asset path hints.
-                if any(x in low for x in (
-                        "/media/",
-                        "/asset/",
-                        "/assets/",
-                        "/content/",
-                        "/objects/",
-                        "/storage/",
-                        "/files/",
-                        "/downloads/",
-                        "/stream/",
-                        "/source/",
-                        "/video/",
-                        "/audio/",
-                        "asset=",
-                        "media=",
-                        "source=",
-                        "src=",
-                        "file=",
-                        "path=",
-                        "key=",
-                        "object=",
-                        "download=",
-                        "filename=",
-                        "filename*=",
-                )):
-                    return True
-
-                # Last-resort CDN survival rule:
-                # If it is a CDN URL and not obvious junk, keep it as a candidate.
-                # Verification/status handling later can decide if it is dead.
-                if mode in {"media", "pictures", "docs", "archives"}:
-                    return True
-
-            return False
-
-        def _augment_search_query(q: str, mode: str, required_sites: List[str]) -> str:
-            sq = q.strip()
-            site_clauses = []
-
-            for raw in required_sites or []:
-                s = (raw or "").strip().lower()
-                if not s:
-                    continue
-                if "://" in s:
-                    s = s.split("://", 1)[1]
-                s = s.split("/", 1)[0].lstrip(".")
-                if s:
-                    site_clauses.append(f"site:{s}")
-
-            if site_clauses:
-                sites_expr = " OR ".join(site_clauses)
-                sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
-
-            if mode == "media":
-                sq = (
-                    f'{sq} '
-                    f'("download" OR "stream" OR "audio" OR "official audio" OR "listen") '
-                    f'-site:reddit.com -site:x.com -site:twitter.com -site:instagram.com '
-                    f'-site:genius.com -site:shopify.com -site:spotify.com'
-                ).strip()
-            elif mode == "docs":
-                sq = f"{sq} filetype:pdf".strip()
-
-            return sq
-
-        def _is_search_url(u: str) -> bool:
-            try:
-                pu = urlparse(u)
-                path = (pu.path or "").lower()
-                q = (pu.query or "").lower()
-                if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
-                    return True
-                if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
-                    return True
-                return False
-            except Exception:
-                return False
-
-        def _dedupe(seq: List[str]) -> List[str]:
-            seen = set()
-            out = []
-            for s in seq:
-                if s not in seen:
-                    seen.add(s)
-                    out.append(s)
-            return out
-
-        def _seed_is_worth_scanning(u: str) -> bool:
-            low = str(u or "").lower()
-            host = _clean_domain(low)
-            path = _clean_path(low)
-
-            if any(h in host for h in (
-                    "reddit.com", "x.com", "twitter.com", "instagram.com",
-                    "genius.com", "shop.", "shopify.com", "spotify.com",
-            )):
-                return False
-
-            if _is_asset_link_for_mode(u):
-                return True
-
-            if _looks_like_cdn_host(u):
-                return True
-
-            if any(tok in low for tok in (
-                    "/download", "/stream", "/track/", "/audio/", "/file/",
-                    "official-audio", "listen", "dl=", "download=",
-                    "manifest", ".m3u8", ".mpd", "playlist", "segment", "chunk",
-                    "filename=", "response-content-disposition=", "content-disposition=",
-            )):
-                return True
-
-            if "soundcloud.com" in host and "/sets/" not in path and "/albums" not in path:
-                return True
-
-            return False
-        candidate_pages: List[str] = []
-        direct_asset_urls: List[str] = []
-        queries_to_run: List[str] = []
-        skip_search_engine = False
-
-        if pipeline_urls:
-            skip_search_engine = False
-            unique_urls = _dedupe([str(u).strip() for u in pipeline_urls if str(u).strip()])
-            for u in unique_urls:
-                if not _allowed_by_required_sites(u):
-                    if _looks_like_cdn_host(u):
-                        allowed_cdn_hosts.add(_clean_domain(u))
-                    else:
-                        continue
-
-                path = _clean_path(u)
-
-                if _is_asset_link_for_mode(u):
-                    if _term_overlap_ok(u):
-                        direct_asset_urls.append(u)
-                    continue
-
-                if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                    continue
-
-                if _should_branch_cdn_url(u):
-                    for branch_url in _branch_variants_for_url(u):
-                        if _allowed_by_required_sites(branch_url):
-                            candidate_pages.append(branch_url)
-                    continue
-
-                candidate_pages.append(u)
-
-            candidate_pages = _dedupe(candidate_pages)[:max_pages_total]
-
-        if (not skip_search_engine) and pipeline_queries:
-            for qv in pipeline_queries:
-                qv_s = str(qv).strip()
-                if qv_s:
-                    queries_to_run.append(qv_s)
-
-        if not queries_to_run and query_raw:
-            queries_to_run.append(query_raw)
-        if not queries_to_run and core:
-            queries_to_run.append(core)
-
-        queries_to_run = [_augment_search_query(q, mode, required_sites) for q in _dedupe(queries_to_run) if q.strip()]
-
-        found_assets: List[Dict[str, Any]] = []
-        found_pages: List[str] = []
-        debug_log: List[str] = []
-        found_js_links: List[Dict[str, Any]] = []
-        found_network_links: List[Dict[str, Any]] = []
-        found_runtime_hits: List[Dict[str, Any]] = []
-        found_react_hits: List[Dict[str, Any]] = []
-        found_database_hits: List[Dict[str, Any]] = []
-        found_interaction_hits: List[Dict[str, Any]] = []
-
-        seen_asset_urls: set[str] = set()
-        seen_branch_urls: set[str] = set()
-        visited_pages: set[str] = set()
-        inflight_pages: set[str] = set()
-
-        ua_http = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-
-        async with submanagers.HTTPSSubmanager(
-            user_agent=ua_http,
-            timeout=timeout,
-            retries=http_retries,
-            max_conn_per_host=http_max_conn_per_host,
-            verify=http_verify_tls,
-            ca_bundle=http_ca_bundle,
-        ) as http:
-            if required_sites:
-                site_seed_urls, synthetic_search_seeds, explicit_site_seeds = self._build_required_site_seeds(
-                    required_sites,
-                    queries_to_run,
-                )
-                for u in site_seed_urls:
-                    if u not in candidate_pages:
-                        candidate_pages.append(u)
-            else:
-                synthetic_search_seeds = set()
-                explicit_site_seeds = set()
-
-            if not candidate_pages and queries_to_run:
-                for q in queries_to_run:
-                    try:
-                        if engine == "google_cse":
-                            seeds = await self._search_google_cse(
-                                q,
-                                search_results_cap,
-                                timeout,
-                                page_limit=search_page_limit,
-                            )
-                        elif engine == "searxng":
-                            seeds = await self._search_searxng(
-                                q,
-                                search_results_cap,
-                                timeout,
-                                base_url=params.get("searxng_url"),
-                                page_limit=search_page_limit,
-                            )
-                        elif engine == "sites":
-                            seeds = []
-                        else:
-                            seeds = await self._search_duckduckgo(
-                                q,
-                                search_results_cap,
-                                ua_http,
-                                timeout,
-                                page_limit=search_page_limit,
-                                per_page=search_per_page,
-                            )
-                        for u in seeds:
-                            if _allowed_by_required_sites(u) and _seed_is_worth_scanning(u):
-                                candidate_pages.append(u)
-                    except Exception as e:
-                        debug_log.append(f"[search] Error for query {q!r}: {e}")
-
-            if direct_asset_urls:
-                for u in direct_asset_urls:
-                    upath = _clean_path(u)
-                    if not self._is_mega_link(u):
-                        if any(upath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                            continue
-
-                    if use_database and store and store.asset_exists(u):
-                        debug_log.append(f"Skipping {u} (already in database)")
-                        continue
-                    asset_key = _asset_key(u)
-                    if asset_key in seen_asset_urls:
-                        continue
-                    seen_asset_urls.add(asset_key)
-
-                    status = "unverified"
-                    size = "?"
-                    if verify_links:
-                        try:
-                            h_status, headers = await http.head(u)
-                            if not self._is_mega_link(u):
-                                if not _is_asset_link_for_mode(u, headers=headers):
-                                    continue
-                            if h_status == 200:
-                                status = "200 OK"
-                                cl = headers.get("Content-Length") or headers.get("content-length")
-                                if cl:
-                                    try:
-                                        size = f"{int(cl) // 1024} KB"
-                                    except ValueError:
-                                        size = "?"
-                            else:
-                                status = f"Dead ({h_status})"
-                        except Exception:
-                            status = "Timeout/Error"
-
-                    if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                        filename = _clean_path(u).rsplit("/", 1)[-1] or "[asset]"
-                        asset = {
-                            "text": filename[:100],
-                            "url": u,
-                            "source": "<urls>",
-                            "size": size,
-                            "status": status,
-                        }
-                        found_assets.append(asset)
-                        if use_database and store:
-                            store.upsert_asset(asset)
-
-            def _should_persist_page(u: str) -> bool:
-                if engine != "sites":
-                    return True
-                if u in explicit_site_seeds or u in synthetic_search_seeds:
-                    return False
-                if _is_search_url(u):
-                    return False
-                return True
-
-            pw_needed = (
-                use_js or
-                use_network_sniff or
-                use_runtime_sniff or
-                use_react_sniff or
-                use_database_sniff or
-                use_interaction_sniff
-            )
-            pw_p = pw_browser = pw_context = None
-
-            effective_blocked_resource_types = set(blocked_resource_types)
-            if block_resources:
-                removed = set()
-
-                if mode == "media":
-                    removed |= effective_blocked_resource_types & {"media", "video", "audio"}
-
-                if mode == "pictures":
-                    removed |= effective_blocked_resource_types & {"image"}
-
-                if mode == "docs":
-                    removed |= effective_blocked_resource_types & {"fetch", "xhr"}
-
-                if removed:
-                    effective_blocked_resource_types -= removed
-                    debug_log.append(
-                        f"[LinkTracker] removed blocked resource types for mode={mode}: {sorted(removed)}"
-                    )
-            try:
-                if pw_needed:
-                    ua_pw = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/LinkTracker"
-                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
-                        ua=ua_pw,
-                        block_resources=block_resources,
-                        blocked_resource_types=effective_blocked_resource_types,
-                        block_domains=block_domains,
-                        blocked_domains=blocked_domains,
-                        log=debug_log,
-                        use_camoufox=use_camoufox,
-                        camoufox_options=camoufox_options,
-                        pw_launch_args=pw_launch_args,
-                        pw_headless=pw_headless,
-                        pw_channel=pw_channel,
-                        pw_proxy=pw_proxy,
-                    )
-
-                async def _process_page(page_url: str, depth: int, http_mgr) -> Dict[str, Any]:
-                    local_assets: List[Dict[str, Any]] = []
-                    next_pages: List[str] = []
-                    local_js_links: List[Dict[str, Any]] = []
-                    local_network_links: List[Dict[str, Any]] = []
-                    local_runtime_hits: List[Dict[str, Any]] = []
-                    local_react_hits: List[Dict[str, Any]] = []
-                    local_database_hits: List[Dict[str, Any]] = []
-                    local_interaction_hits: List[Dict[str, Any]] = []
-                    local_log: List[str] = []
-                    sniff_parent_pages: List[str] = []
-                    html = ""
-
-                    try:
-                        links_on_page: List[Dict[str, Any]] = []
-
-                        if use_network_sniff and pw_context:
-                            try:
-                                sniff_html, sniff_items = await self._pw_fetch_with_sniff(
-                                    pw_context,
-                                    page_url,
-                                    timeout,
-                                    local_log,
-                                    extensions=targets,
-                                )
-                                if sniff_html:
-                                    html = sniff_html
-
-                                for item in sniff_items or []:
-                                    full_url = str(item.get("url") or "").strip()
-                                    if not full_url:
-                                        continue
-
-                                    if not _allowed_by_required_sites(full_url) and mode != "media":
-                                        _register_cdn_from_page(page_url, full_url)
-                                        if not _allowed_by_required_sites(full_url):
-                                            continue
-
-                                    local_network_links.append({
-                                        "page": page_url,
-                                        "url": full_url,
-                                        "text": item.get("text", ""),
-                                        "tag": item.get("tag", ""),
-                                    })
-
-                                    is_mega = self._is_mega_link(full_url)
-                                    sniff_ct = str(item.get("content_type") or item.get("mime") or "").lower()
-                                    sniff_tag = str(item.get("tag") or "").lower()
-                                    sniff_kind = str(item.get("kind") or "").lower()
-
-                                    head_status = None
-                                    head_headers: Dict[str, Any] = {}
-                                    if verify_links and not is_mega:
-                                        try:
-                                            head_status, head_headers = await http_mgr.head(full_url)
-                                        except Exception:
-                                            head_status = None
-                                            head_headers = {}
-
-                                    # ------------------------------------------------------------------
-                                    # Runtime asset survival patch:
-                                    # This is the best place to fix asset discovery because NetworkSniffer
-                                    # sees real runtime CDN/media requests before static page crawling does.
-                                    # It keeps true sniffer/CDN assets alive even when HEAD is blocked,
-                                    # missing, redirected, range-only, or extensionless.
-                                    # ------------------------------------------------------------------
-
-                                    def _runtime_asset_evidence() -> bool:
-                                        low_url = unquote(str(full_url or "")).lower()
-                                        sk = str(sniff_kind or "").lower()
-                                        st = str(sniff_tag or "").lower()
-                                        sc = str(sniff_ct or "").lower()
-
-                                        # Strong sniffer evidence.
-                                        if sk in {
-                                            "audio", "video", "media", "source", "download",
-                                            "fetch", "xhr", "other", "request", "response"
-                                        }:
-                                            return True
-
-                                        if any(x in st for x in (
-                                                "audio", "video", "media", "source", "stream",
-                                                "download", "asset", "cdn", "network", "mse",
-                                                "manifest", "playlist", "segment", "chunk"
-                                        )):
-                                            return True
-
-                                        # Header/content-type evidence from the sniffer or HEAD.
-                                        if _looks_like_audioish_ct(sc, head_headers if verify_links else None):
-                                            return True
-
-                                        # URL evidence.
-                                        if _looks_like_audioish_url(full_url):
-                                            return True
-
-                                        if _has_target_extension(full_url,
-                                                                 headers=head_headers if verify_links else None):
-                                            return True
-
-                                        # CDN evidence. Runtime CDN requests are often extensionless and signed.
-                                        if _looks_like_cdn_host(full_url):
-                                            if any(x in low_url for x in (
-                                                    "/media/", "/audio/", "/video/", "/stream/", "/source/",
-                                                    "/asset/", "/assets/", "/content/", "/objects/", "/storage/",
-                                                    "/files/", "/downloads/",
-                                                    "audio=", "audio_url=", "video=", "video_url=",
-                                                    "media=", "media_url=", "source=", "src=",
-                                                    "file=", "path=", "key=", "object=",
-                                                    "download=", "filename=", "filename*=",
-                                                    "response-content-disposition=",
-                                                    "response-content-type=audio%2f",
-                                                    "response-content-type=video%2f",
-                                                    "x-amz-signature", "x-goog-signature",
-                                                    "signature=", "sig=", "token=", "expires="
-                                            )):
-                                                return True
-
-                                            # Last runtime fallback:
-                                            # If the browser actually requested it from a CDN and it is not
-                                            # an ignored static extension, keep it so FOUND ASSET can fire.
-                                            path = _clean_path(full_url)
-                                            if mode == "media" and not any(
-                                                    path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                                                return True
-
-                                        return False
-
-                                    runtime_asset_ok = is_mega or _is_asset_link_for_mode(
-                                        full_url,
-                                        headers=head_headers if verify_links else None,
-                                        sniff_kind=sniff_kind,
-                                        sniff_tag=sniff_tag,
-                                        sniff_ct=sniff_ct,
-                                    )
-
-                                    if not runtime_asset_ok and mode == "media" and _runtime_asset_evidence():
-                                        runtime_asset_ok = True
-                                        local_log.append(
-                                            f"[LinkTracker][RuntimeAssetPatch] promoted runtime asset: {full_url}")
-
-                                    if not runtime_asset_ok:
-                                        if _should_branch_cdn_url(
-                                                full_url,
-                                                headers=head_headers if verify_links else None,
-                                                sniff_kind=sniff_kind,
-                                                sniff_tag=sniff_tag,
-                                                sniff_ct=sniff_ct,
-                                        ):
-                                            for branch_url in _branch_variants_for_url(full_url):
-                                                if not _allowed_by_required_sites(branch_url):
-                                                    continue
-                                                if branch_url in seen_branch_urls:
-                                                    continue
-                                                seen_branch_urls.add(branch_url)
-                                                next_pages.append(branch_url)
-                                        continue
-
-                                    status = "sniffed"
-                                    size = item.get("size") or "?"
-
-                                    if is_mega:
-                                        status = "MEGA link"
-
-                                    elif verify_links:
-                                        if head_status == 200:
-                                            status = "200 OK"
-                                            cl = head_headers.get("Content-Length") or head_headers.get(
-                                                "content-length")
-                                            if cl:
-                                                try:
-                                                    size = f"{int(cl) // 1024} KB"
-                                                except Exception:
-                                                    size = "?"
-
-                                        elif head_status in (206, 301, 302, 303, 307, 308):
-                                            # CDN media often redirects or responds as range content.
-                                            status = f"sniffed-runtime ({head_status})"
-
-                                        elif head_status in (401, 403, 405, 416, 429) or head_status is None:
-                                            # Do not kill runtime-discovered CDN/media assets because HEAD failed.
-                                            if mode == "media" and _runtime_asset_evidence():
-                                                status = f"sniffed-runtime-head-blocked ({head_status})"
-                                            else:
-                                                status = "Timeout/Error" if head_status is None else f"Dead ({head_status})"
-
-                                        else:
-                                            if mode == "media" and _runtime_asset_evidence():
-                                                status = f"sniffed-runtime-weak-head ({head_status})"
-                                            else:
-                                                status = f"Dead ({head_status})"
-
-                                    if (
-                                            not verify_links
-                                            or status in ("200 OK", "MEGA link", "sniffed", "unverified")
-                                            or str(status).startswith("sniffed-runtime")
-                                    ):
-                                        asset_key = _asset_key(full_url)
-                                        if asset_key not in seen_asset_urls:
-                                            seen_asset_urls.add(asset_key)
-
-                                            display_text = (
-                                                    item.get("text")
-                                                    or _extract_effective_asset_name(full_url,
-                                                                                     headers=head_headers if verify_links else None)
-                                                    or full_url.rsplit("/", 1)[-1]
-                                                    or "[network asset]"
-                                            )[:100]
-
-                                            asset = {
-                                                "text": display_text,
-                                                "url": full_url,
-                                                "source": page_url,
-                                                "size": size,
-                                                "status": status,
-                                            }
-                                            DEBUG_LOGGER.log_message(
-                                                f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
-                                            )
-                                            local_assets.append(asset)
-                                            if use_database and store:
-                                                store.upsert_asset(asset)
-
-                                        try:
-                                            for parent_url in _branch_variants_for_url(full_url):
-                                                if _allowed_by_required_sites(parent_url):
-                                                    sniff_parent_pages.append(parent_url)
-                                        except Exception:
-                                            pass
-                            except Exception as e:
-                                local_log.append(f"[LinkTracker][Network] Error on {page_url}: {e}")
-
-                        if use_database_sniff and pw_context:
-                            try:
-                                db_html, db_hits = await self._pw_fetch_database_hits(
-                                    pw_context,
-                                    page_url,
-                                    timeout,
-                                    local_log,
-                                )
-                                if db_html and not html:
-                                    html = db_html
-
-                                if db_hits:
-                                    local_database_hits.extend(db_hits)
-                                    for hit in db_hits:
-                                        if hit.get("kind") != "content_link":
-                                            continue
-                                        u = hit.get("url")
-                                        if not u:
-                                            continue
-
-                                        if not _is_asset_link_for_mode(u):
-                                            continue
-
-                                        links_on_page.append({
-                                            "url": u,
-                                            "text": "[DB Content]",
-                                            "tag": "db_link",
-                                        })
-                                        local_js_links.append({
-                                            "page": page_url,
-                                            "url": u,
-                                            "text": "[DB Content]",
-                                            "tag": "db_link",
-                                        })
-                            except Exception as e:
-                                local_log.append(f"[LinkTracker][DB] Error on {page_url}: {e}")
-
-                        if use_runtime_sniff and pw_context:
-                            try:
-                                rt_html = ""
-                                rt_hits: list[dict[str, Any]] = []
-                                rt_result = await self._pw_fetch_runtime_hits(pw_context, page_url, timeout, local_log)
-                                if isinstance(rt_result, tuple):
-                                    if len(rt_result) == 3:
-                                        rt_html, _rt_items, rt_hits = rt_result
-                                    elif len(rt_result) == 2:
-                                        rt_html, rt_hits = rt_result
-                                    elif len(rt_result) == 1:
-                                        rt_html = rt_result[0]
-                                else:
-                                    rt_html = rt_result
-
-                                if rt_html and not html:
-                                    html = rt_html
-
-                                if rt_hits:
-                                    local_runtime_hits.extend(rt_hits)
-                                    self._promote_hits_to_links(
-                                        rt_hits,
-                                        links_on_page,
-                                        next_pages,
-                                        depth=depth,
-                                        max_depth=max_depth,
-                                        label="runtime",
-                                    )
-                            except Exception as e:
-                                local_log.append(f"[LinkTracker][Runtime] Error on {page_url}: {e}")
-                        if use_js and pw_context:
-                            js_html, js_links = await self._pw_fetch_js_links(
-                                pw_context,
-                                page_url,
-                                timeout,
-                                local_log,
-                                extensions=targets,
-                            )
-                            if js_html:
-                                html = js_html
-                            links_on_page.extend(js_links)
-
-                            if not js_links:
-                                preview = (html or "")[:2000].replace("\n", " ")
-                                local_log.append(f"[debug] JS DOM preview (first 2000 chars): {preview}")
-
-                            for jl in js_links:
-                                local_js_links.append({
-                                    "page": page_url,
-                                    "url": jl.get("url", ""),
-                                    "text": jl.get("text", ""),
-                                    "tag": jl.get("tag", ""),
-                                })
-
-                        if use_react_sniff and pw_context:
-                            try:
-                                r_html, r_hits = await self._pw_fetch_react_hits(
-                                    pw_context,
-                                    page_url,
-                                    timeout,
-                                    local_log,
-                                )
-                                if r_html and not html:
-                                    html = r_html
-
-                                if r_hits:
-                                    local_react_hits.extend(r_hits)
-                                    self._promote_hits_to_links(
-                                        r_hits,
-                                        links_on_page,
-                                        next_pages,
-                                        depth=depth,
-                                        max_depth=max_depth,
-                                        label="react",
-                                    )
-                            except Exception as e:
-                                local_log.append(f"[LinkTracker][React] Error on {page_url}: {e}")
-
-                        if use_interaction_sniff and pw_context:
-                            try:
-                                i_html, i_hits = await self._pw_fetch_interaction_hits(
-                                    pw_context,
-                                    page_url,
-                                    timeout,
-                                    local_log,
-                                )
-                                if i_html and not html:
-                                    html = i_html
-
-                                if i_hits:
-                                    local_interaction_hits.extend(i_hits)
-                                    self._promote_hits_to_links(
-                                        i_hits,
-                                        links_on_page,
-                                        next_pages,
-                                        depth=depth,
-                                        max_depth=max_depth,
-                                        label="interaction",
-                                    )
-                            except Exception as e:
-                                local_log.append(f"[LinkTracker][Interaction] Error on {page_url}: {e}")
-
-                        if not html:
-                            try:
-                                html = await http_mgr.get_text(page_url)
-                                if not html:
-                                    raise RuntimeError("Empty HTML")
-                            except Exception as e:
-                                local_log.append(f"Error fetching {page_url}: {e}")
-                                if use_database and self.store and _should_persist_page(page_url):
-                                    self.store.mark_scan_complete(page_url)
-                                return {
-                                    "page": page_url,
-                                    "assets": local_assets,
-                                    "next_pages": next_pages,
-                                    "js_links": local_js_links,
-                                    "network_links": local_network_links,
-                                    "runtime_hits": local_runtime_hits,
-                                    "react_hits": local_react_hits,
-                                    "database_hits": local_database_hits,
-                                    "interaction_hits": local_interaction_hits,
-                                    "log": local_log,
-                                }
-
-                        page_has_keywords = _term_overlap_ok((html or "") + " " + page_url) if keywords else True
-                        soup = BeautifulSoup(html, "html.parser")
-
-                        if use_body:
-                            for a in soup.select("a[href]")[:max_links_per_page]:
-                                href = a.get("href")
-                                if not href:
-                                    continue
-                                links_on_page.append({
-                                    "url": urljoin(page_url, href),
-                                    "text": a.get_text(" ", strip=True)[:200],
-                                    "tag": "html_a",
-                                })
-
-                            for source_tag in soup.select("audio[src], source[src], video[src], track[src], a[href], link[href]")[:max_links_per_page]:
-                                attr = source_tag.get("src") or source_tag.get("href")
-                                if not attr:
-                                    continue
-                                links_on_page.append({
-                                    "url": urljoin(page_url, attr),
-                                    "text": source_tag.get_text(" ", strip=True)[:200],
-                                    "tag": source_tag.name,
-                                })
-
-                        dedup_links = []
-                        seen_link_urls = set()
-                        for link in links_on_page:
-                            lu = str(link.get("url") or "").strip()
-                            if not lu or lu in seen_link_urls:
-                                continue
-                            seen_link_urls.add(lu)
-                            dedup_links.append(link)
-                        links_on_page = dedup_links[:max_links_per_page]
-
-                        for link in links_on_page:
-                            raw_link = link.get("url") or ""
-                            if not raw_link:
-                                continue
-
-                            full_url = urljoin(page_url, raw_link)
-                            if not full_url.startswith("http"):
-                                continue
-
-                            if any(k in full_url.lower() for k in self.JUNK_FILENAME_KEYWORDS):
-                                continue
-
-                            asset_key = _asset_key(full_url)
-                            if asset_key in seen_asset_urls:
-                                continue
-
-                            is_mega = self._is_mega_link(full_url)
-                            head_status = None
-                            head_headers: Dict[str, Any] = {}
-
-                            candidate_asset = _is_asset_link_for_mode(full_url)
-                            if not candidate_asset:
-                                if not _allowed_by_required_sites(full_url) and mode != "media":
-                                    _register_cdn_from_page(page_url, full_url)
-                                    if not _allowed_by_required_sites(full_url):
-                                        continue
-
-                                if not _term_overlap_ok((link.get("text") or "") + " " + full_url):
-                                    if not _looks_like_cdn_host(full_url):
-                                        continue
-
-                                if verify_links and not is_mega:
-                                    try:
-                                        head_status, head_headers = await http_mgr.head(full_url)
-                                    except Exception:
-                                        head_status = None
-                                        head_headers = {}
-
-                                candidate_asset = _is_asset_link_for_mode(
-                                    full_url,
-                                    headers=head_headers if verify_links else None,
-                                )
-
-                                if not candidate_asset:
-                                    if _should_branch_cdn_url(
-                                            full_url,
-                                            headers=head_headers if verify_links else None,
-                                    ):
-                                        for branch_url in _branch_variants_for_url(full_url):
-                                            if not _allowed_by_required_sites(branch_url):
-                                                continue
-                                            if branch_url in seen_branch_urls:
-                                                continue
-                                            seen_branch_urls.add(branch_url)
-                                            next_pages.append(branch_url)
-                                    continue
-
-                                status = "unverified"
-                                size = "?"
-                                if is_mega:
-                                    status = "MEGA link"
-                                elif verify_links:
-                                    if head_status == 200:
-                                        status = "200 OK"
-                                        cl = head_headers.get("Content-Length") or head_headers.get("content-length")
-                                        if cl:
-                                            try:
-                                                size = f"{int(cl) // 1024} KB"
-                                            except ValueError:
-                                                size = "?"
-                                    elif head_status is None:
-                                        status = "Timeout/Error"
-                                    else:
-                                        status = f"Dead ({head_status})"
-
-                                if not verify_links or status in ("200 OK", "MEGA link", "sniffed", "unverified"):
-                                    seen_asset_urls.add(asset_key)
-                                    asset = {
-                                        "text": (
-                                                link.get("text")
-                                                or _extract_effective_asset_name(full_url,
-                                                                                 headers=head_headers if verify_links else None)
-                                                or full_url.rsplit("/", 1)[-1]
-                                                or "[asset]"
-                                        )[:100],
-                                        "url": full_url,
-                                        "source": page_url,
-                                        "size": size,
-                                        "status": status,
-                                    }
-                                    DEBUG_LOGGER.log_message(
-                                        f"[BFS] FOUND ASSET on {page_url}: Text: {asset['text']} URL: ({asset['url']})"
-                                    )
-                                    local_assets.append(asset)
-                                    if use_database and store:
-                                        store.upsert_asset(asset)
-                                continue
-
-                        if depth < max_depth:
-                            for link in links_on_page:
-                                raw_link = link.get("url") or ""
-                                if not raw_link:
-                                    continue
-
-                                full_url = urljoin(page_url, raw_link)
-
-                                if not _allowed_by_required_sites(full_url):
-                                    _register_cdn_from_page(page_url, full_url)
-                                    if not _allowed_by_required_sites(full_url):
-                                        continue
-
-                                lpath = urlparse(full_url).path.lower()
-                                if any(lpath.endswith(ext) for ext in targets):
-                                    continue
-
-                                if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                                    continue
-
-                                if keywords and not page_has_keywords:
-                                    haystack = (link.get("text") or "") + " " + full_url
-                                    if not _term_overlap_ok(haystack) and not _looks_like_cdn_host(full_url):
-                                        continue
-
-                                if engine == "sites":
-                                    if _is_search_url(full_url) and full_url not in explicit_site_seeds:
-                                        continue
-
-                                for branch_url in _branch_variants_for_url(full_url):
-                                    if not _allowed_by_required_sites(branch_url):
-                                        continue
-                                    if branch_url in seen_branch_urls:
-                                        continue
-                                    seen_branch_urls.add(branch_url)
-                                    next_pages.append(branch_url)
-
-                        if depth < max_depth and sniff_parent_pages:
-                            for parent_url in sniff_parent_pages:
-                                if _allowed_by_required_sites(parent_url):
-                                    next_pages.append(parent_url)
-
-                        if use_database and store and _should_persist_page(page_url):
-                            store.mark_page_scanned(page_url)
-
-                    except Exception as e:
-                        local_log.append(f"Error scanning {page_url}: {e}")
-                        if use_database and store and _should_persist_page(page_url):
-                            try:
-                                store.mark_page_scanned(page_url)
-                            except Exception as ee:
-                                local_log.append(f"Error marking page scanned {page_url}: {ee}")
-
-                    return {
-                        "page": page_url,
-                        "assets": local_assets,
-                        "next_pages": next_pages,
-                        "js_links": local_js_links,
-                        "network_links": local_network_links,
-                        "runtime_hits": local_runtime_hits,
-                        "react_hits": local_react_hits,
-                        "database_hits": local_database_hits,
-                        "interaction_hits": local_interaction_hits,
-                        "log": local_log,
-                    }
-
-                frontier: List[str] = []
-                site_buckets = {s: [] for s in required_sites} if required_sites else {}
-
-                for u in candidate_pages:
-                    if not _allowed_by_required_sites(u):
-                        continue
-                    if required_sites:
-                        d = _clean_domain(u)
-                        for s in required_sites:
-                            if s in d:
-                                site_buckets[s].append(u)
-                                break
-                    else:
-                        frontier.append(u)
-
-                if required_sites:
-                    per_site_cap = max(3, max_pages_total // max(1, len(required_sites)))
-                    for _s, bucket in site_buckets.items():
-                        frontier.extend(bucket[:per_site_cap])
-
-                frontier = list(dict.fromkeys(frontier))[:max_pages_total]
-                current_depth = 0
-                pages_scanned = 0
-                global_mode = (not required_sites) or required_sites == ["*"]
-                while frontier and current_depth <= max_depth:
-                    DEBUG_LOGGER.log_message(
-                        f"[BFS] --- Starting Depth {current_depth} | "
-                        f"Frontier Size: {len(frontier)} | "
-                        f"Visited: {len(visited_pages)} | "
-                        f"Scanned: {pages_scanned}/{max_pages_total} ---"
-                    )
-
-                    remaining_budget = max_pages_total - pages_scanned
-                    if remaining_budget <= 0:
-                        DEBUG_LOGGER.log_message("[BFS] Global scan limit reached. Stopping.")
-                        break
-
-                    this_depth_cap = min(len(frontier), remaining_budget, depth_batch_limit)
-
-                    batch: List[str] = []
-                    deferred_frontier: List[str] = []
-
-                    for u in frontier:
-                        if not u:
-                            continue
-                        if u in visited_pages:
-                            continue
-                        if not _allowed_by_required_sites(u):
-                            continue
-                        if any(_clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                            continue
-
-                        if len(batch) < this_depth_cap:
-                            batch.append(u)
-                        else:
-                            deferred_frontier.append(u)
-
-                    if not batch:
-                        DEBUG_LOGGER.log_message(
-                            f"[BFS] Depth {current_depth} – no valid pages to process in this batch. Stopping."
-                        )
-                        break
-
-                    DEBUG_LOGGER.log_message(
-                        f"[BFS] Processing batch of {len(batch)} URLs "
-                        f"(remaining budget: {remaining_budget}, depth batch cap: {depth_batch_limit})..."
-                    )
-
-                    results: List[Dict[str, Any]] = []
-
-                    if use_camoufox:
-                        for url in batch:
-                            try:
-                                res = await _process_page(url, current_depth, http)
-                                results.append(res)
-                                pages_scanned += 1
-                                visited_pages.add(url)
-                                if pages_scanned >= max_pages_total:
-                                    break
-                            except Exception as e:
-                                DEBUG_LOGGER.log_message(f"[LinkTracker][Camoufox] Fatal error on {url}: {e}")
-                    else:
-                        tasks = [(url, asyncio.create_task(_process_page(url, current_depth, http))) for url in batch]
-                        done = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
-
-                        for (url, _t), r in zip(tasks, done):
-                            pages_scanned += 1
-
-                            if isinstance(r, Exception):
-                                DEBUG_LOGGER.log_message(f"[BFS] Error scanning {url}: {r}")
-                                if pages_scanned >= max_pages_total:
-                                    break
-                                continue
-
-                            visited_pages.add(url)
-                            results.append(r)
-
-                            if pages_scanned >= max_pages_total:
-                                break
-
-                    # KEEP YOUR EXISTING RESULT / ASSET COLLECTION HERE
-                    next_frontier_candidates: List[str] = list(deferred_frontier)
-
-                    for res in results:
-                        found_pages.append(res.get("page"))
-                        found_assets.extend(res.get("assets") or [])
-                        debug_log.extend(res.get("log") or [])
-
-                        found_js_links.extend(res.get("js_links") or [])
-                        found_network_links.extend(res.get("network_links") or [])
-                        found_runtime_hits.extend(res.get("runtime_hits") or [])
-                        found_react_hits.extend(res.get("react_hits") or [])
-                        found_database_hits.extend(res.get("database_hits") or [])
-                        found_interaction_hits.extend(res.get("interaction_hits") or [])
-
-                        next_frontier_candidates.extend(res.get("next_pages") or [])
-
-                    remaining_budget_after_depth = max_pages_total - pages_scanned
-                    if remaining_budget_after_depth <= 0:
-                        DEBUG_LOGGER.log_message("[BFS] Scan limit exhausted after current depth.")
-                        break
-
-                    next_frontier: List[str] = []
-                    seen_next = set()
-
-                    for u in next_frontier_candidates:
-                        if not u:
-                            continue
-                        if u in seen_next:
-                            continue
-                        if u in visited_pages:
-                            continue
-                        if not _allowed_by_required_sites(u):
-                            continue
-                        if any(_clean_path(u).endswith(ext) for ext in self.IGNORED_EXTENSIONS):
-                            continue
-
-                        seen_next.add(u)
-                        next_frontier.append(u)
-
-                        if len(next_frontier) >= remaining_budget_after_depth:
-                            break
-
-                    frontier = next_frontier
-                    current_depth += 1
-            finally:
-                if pw_needed and (pw_p or pw_browser or pw_context):
-                    await self._close_playwright_context(pw_p, pw_browser, pw_context, debug_log)
-
-        text_lines = []
-        for asset in found_assets:
-            text_lines.append(f"[{asset.get('status', '?')}] {asset.get('text', '[asset]')} -> {asset.get('url', '')}")
-        final_text = "\n".join(text_lines[:1000])
-
-        out: Dict[str, Any] = {
-            "query": query_raw,
-            "pipeline_result": pipeline_result,
-            "mode": mode,
-            "assets": found_assets,
-            "pages": _dedupe(found_pages),
-            "log": debug_log,
-        }
-        if return_all_js_links:
-            out["js_links"] = found_js_links
-        if return_network_sniff_links:
-            out["network_links"] = found_network_links
-        if return_runtime_sniff_hits:
-            out["runtime_hits"] = found_runtime_hits
-        if return_react_sniff_hits:
-            out["react_hits"] = found_react_hits
-        if return_database_sniff_hits:
-            out["database_hits"] = found_database_hits
-        if return_interaction_sniff_hits:
-            out["interaction_hits"] = found_interaction_hits
-
-        return final_text, out
-
     # ------------------------------------------------------------------ #
     # Sync wrapper
     # ------------------------------------------------------------------ #
@@ -9593,7 +9392,7 @@ class LinkTrackerBlock(BaseBlock):
             "search_page_limit": 1,
             "search_per_page": 50,
             "verify": True,
-            "extensions": ".pdf,txt",
+            "extensions": ".pdf,.txt",
             "url_keywords": "archive,download",
             "engine": "duckduckgo",
             "site_require": "",
@@ -9601,8 +9400,6 @@ class LinkTrackerBlock(BaseBlock):
             "return_all_js_links": False,
             "max_links_per_page": 500,
             "strict_keywords": False,
-            "allow_audioish_octet_stream": True,
-            "trust_sniffed_audio_kind": True,
             "use_network_sniff": False,
             "return_network_sniff_links": False,
             "use_runtime_sniff": False,
@@ -9630,20 +9427,19 @@ class LinkTrackerBlock(BaseBlock):
             "http_retries": 2,
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
-            "http_ca_bundle": "",
+            "http_ca_bundle": "",   # path to bundled cacert.pem if needed
             "use_body": True,
             "use_camoufox": False,
             "camoufox_options": {},
             "pw_headless": True,
-            "pw_channel": "",
-            "pw_proxy": {},
+            "pw_channel": "",  # e.g. "chrome"
+            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
             "pw_launch_args": [
                 "--disable-quic",
                 "--disable-http3",
-                "--disable-features=UseDnsHttpsSvcb",
+                "--disable-features=UseDnsHttpsSvcb"
             ],
-            "searxng_url": "http://127.0.0.1:8080",
-            "depth_batch_limit": 6,
+            "searxng_url": "http://127.0.0.1:8080"
         }
 
 
@@ -12847,7 +12643,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         http_verify = bool(params.get("http_verify", True))
         http_ca_bundle = params.get("http_ca_bundle") or None
 
-        depth_batch_limit = max(1, int(params.get("depth_batch_limit", 10)))
+        depth_batch_limit = max(1, int(params.get("depth_batch_limit", scan_limit)))
         # Download / caching
         download_assets = bool(params.get("download_assets", False))
         download_dir = str(params.get("download_dir", "video_cache"))
@@ -14313,7 +14109,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     DEBUG_LOGGER.log_message("[BFS] Global scan limit reached. Stopping.")
                     break
 
-                this_depth_cap = min(len(frontier), remaining_budget, depth_batch_limit)
+                this_depth_cap = min(len(frontier), remaining_budget, scan_limit)
 
                 batch: List[str] = []
                 next_frontier_seed: List[str] = []
