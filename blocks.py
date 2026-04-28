@@ -7554,7 +7554,7 @@ class LinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
             extensions=extensions,
-        ),timeout=25)
+        ),timeout=timeout)
 
     async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
         return await asyncio.wait_for(self.js_sniffer.sniff(
@@ -7563,14 +7563,14 @@ class LinkTrackerBlock(BaseBlock):
             timeout=timeout,
             log=log,
             extensions=extensions,
-        ),timeout=25)
+        ),timeout=timeout)
     async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.runtime_sniffer.sniff(
             context,
             page_url,
             timeout=timeout,
             log=log,
-        ),timeout=25)
+        ),timeout=timeout)
 
     async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.react_sniffer.sniff(
@@ -7578,7 +7578,7 @@ class LinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ),timeout=25)
+        ),timeout=timeout)
 
     async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.database_sniffer.sniff(
@@ -7586,7 +7586,7 @@ class LinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log,
-        ),timeout=25)
+        ),timeout=timeout)
 
     async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
         return await asyncio.wait_for(self.interaction_sniffer.sniff(
@@ -7594,7 +7594,7 @@ class LinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log
-        ),timeout=25)
+        ),timeout=timeout)
     # ------------------------------------------------------------------ #
     # Main execution (Async)
     # ------------------------------------------------------------------ #
@@ -11912,7 +11912,7 @@ class VideoLinkTrackerBlock(BaseBlock):
             page_url,
             timeout=timeout,
             log=log
-        ), timeout=25)
+        ), timeout=timeout)
 
     # ------------------------------------------------------------------ #
     # Search engines (DuckDuckGo + Google CSE)
