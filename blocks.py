@@ -8041,7 +8041,7 @@ class LinkTrackerBlock(BaseBlock):
 
                     db_assets = store.fetch_db_seed_assets(
                         limit=db_seed_limit * 2,
-                        require_keywords=keywords,
+                        extra_keywords=keywords,
                         required_sites=required_sites,
                         max_age_days=db_seed_max_age_days,
                     )
