@@ -12476,6 +12476,7 @@ class VideoLinkTrackerBlock(BaseBlock):
         return self._term_overlap_ok_check(hay, keywords, min_overlap)
 
     async def _execute_async(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        from urllib.parse import urlparse
         # --- NEW: runtime skip extensions (CLI) ---
         # Canonical: skip_extensions
         # Aliases: ignored_extensions, ignored_exts, skip_exts
@@ -12887,7 +12888,6 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     try:
                         import os
-                        from urllib.parse import urlparse
                         parsed_name = os.path.basename(urlparse(rev_input_url).path or "").strip()
                         if parsed_name:
                             img_name = parsed_name
