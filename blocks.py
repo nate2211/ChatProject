@@ -7383,6 +7383,9 @@ class LinkTrackerBlock(BaseBlock):
             pw_headless: bool = True,
             pw_channel: Optional[str] = None,
             pw_proxy: Optional[Dict[str, Any]] = None,
+                        pw_user_data_dir: Optional[str] = None,
+            pw_interactive_login: bool = False,
+            pw_login_url: Optional[str] = None,
     ):
         """
         Open a shared Playwright/Camoufox browser context.
@@ -7403,7 +7406,9 @@ class LinkTrackerBlock(BaseBlock):
                 if host == bd or host.endswith("." + bd):
                     return True
             return False
-
+        if use_camoufox and pw_interactive_login:
+            log.append("[PlaywrightAuth] interactive login requested; using Chromium persistent context instead of Camoufox.")
+            use_camoufox = False
         # ---- Camoufox path ----
         if use_camoufox:
             if AsyncCamoufox is None:
@@ -7462,19 +7467,10 @@ class LinkTrackerBlock(BaseBlock):
 
         p = await async_playwright().start()
 
-        launch_opts = {
-            "headless": pw_headless,
-            "args": list(pw_launch_args or []),
-        }
-        if pw_channel:
-            launch_opts["channel"] = pw_channel
-        if pw_proxy:
-            launch_opts["proxy"] = pw_proxy
+        async def _attach_route_blocking(ctx):
+            if not (block_resources or block_domains):
+                return
 
-        browser = await p.chromium.launch(**launch_opts)
-        context = await browser.new_context(user_agent=ua)
-
-        if block_resources or block_domains:
             async def route_blocker(route, request):
                 rtype = (request.resource_type or "").lower()
                 try:
@@ -7492,7 +7488,121 @@ class LinkTrackerBlock(BaseBlock):
 
                 await route.continue_()
 
-            await context.route("**/*", route_blocker)
+            await ctx.route("**/*", route_blocker)
+
+        launch_args = list(pw_launch_args or [])
+
+        # ------------------------------------------------------------------
+        # Persistent authenticated profile mode
+        # ------------------------------------------------------------------
+        # If pw_user_data_dir is set, cookies/localStorage/session data persist.
+        # If pw_interactive_login is true, open visible browser first, let user log in,
+        # wait until the user closes the tab/window, then reopen same profile for scraping.
+        if pw_interactive_login or pw_user_data_dir:
+            import os
+            import asyncio
+
+            profile_dir = str(
+                pw_user_data_dir
+                or os.path.abspath(".linktracker_auth_profile")
+            )
+            os.makedirs(profile_dir, exist_ok=True)
+
+            def _persistent_opts(headless_value: bool) -> Dict[str, Any]:
+                opts: Dict[str, Any] = {
+                    "headless": headless_value,
+                    "args": launch_args,
+                    "user_agent": ua,
+                }
+                if pw_channel:
+                    opts["channel"] = pw_channel
+                if pw_proxy:
+                    opts["proxy"] = pw_proxy
+                return opts
+
+            if pw_interactive_login:
+                login_start_url = pw_login_url or "about:blank"
+
+                log.append(
+                    f"[PlaywrightAuth] Opening login browser with profile={profile_dir!r}. "
+                    "Log in normally, then CLOSE the browser tab/window to continue."
+                )
+
+                login_ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
+                    **_persistent_opts(False),  # always visible for login
+                )
+
+                login_page = login_ctx.pages[0] if login_ctx.pages else await login_ctx.new_page()
+
+                try:
+                    if login_start_url and login_start_url != "about:blank":
+                        await login_page.goto(
+                            login_start_url,
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                    try:
+                        await login_page.bring_to_front()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    log.append(f"[PlaywrightAuth] Login start page navigation failed: {e}")
+
+                # Wait until user closes either the tab or the whole context.
+                waiters = []
+                try:
+                    waiters.append(asyncio.create_task(login_ctx.wait_for_event("close")))
+                except Exception:
+                    pass
+                try:
+                    waiters.append(asyncio.create_task(login_page.wait_for_event("close")))
+                except Exception:
+                    pass
+
+                if waiters:
+                    done, pending = await asyncio.wait(
+                        waiters,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+
+                # Ensure profile is unlocked before reopening for crawl.
+                try:
+                    await login_ctx.close()
+                except Exception:
+                    pass
+
+                await asyncio.sleep(0.75)
+                log.append("[PlaywrightAuth] Login browser closed. Reopening same profile for scraping.")
+
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                **_persistent_opts(pw_headless),
+            )
+
+            await _attach_route_blocking(context)
+
+            log.append(f"Playwright persistent authenticated context ready: {profile_dir}")
+            return p, None, context
+
+        # ------------------------------------------------------------------
+        # Original non-persistent mode
+        # ------------------------------------------------------------------
+        launch_opts = {
+            "headless": pw_headless,
+            "args": launch_args,
+        }
+        if pw_channel:
+            launch_opts["channel"] = pw_channel
+        if pw_proxy:
+            launch_opts["proxy"] = pw_proxy
+
+        browser = await p.chromium.launch(**launch_opts)
+        context = await browser.new_context(user_agent=ua)
+
+        await _attach_route_blocking(context)
 
         log.append("Playwright shared context ready.")
         return p, browser, context
@@ -7648,6 +7758,14 @@ class LinkTrackerBlock(BaseBlock):
                 lexicon_url_seeds.append(t)
             else:
                 non_url_lex_terms.append(t)
+        pw_launch_args = params.get("pw_launch_args") or []
+        if isinstance(pw_launch_args, str):
+            # allow comma-separated string
+            pw_launch_args = [a.strip() for a in pw_launch_args.split(",") if a.strip()]
+        if not isinstance(pw_launch_args, list):
+            pw_launch_args = []
+
+
 
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options") or {}
@@ -7838,7 +7956,37 @@ class LinkTrackerBlock(BaseBlock):
         pw_headless = bool(params.get("pw_headless", True))
         pw_channel = params.get("pw_channel", None)  # e.g. "chrome"
         pw_proxy = params.get("pw_proxy", None)  # e.g. {"server":"http://127.0.0.1:8080"}
+        # Auth/session reuse params
+        pw_interactive_login = bool(
+            params.get("pw_interactive_login", params.get("interactive_login", False))
+        )
 
+        # Persistent profile folder. Keep this stable per site/account.
+        pw_user_data_dir = (
+            params.get("pw_user_data_dir")
+            or params.get("auth_profile_dir")
+            or None
+        )
+
+        # Page to open for manual login. If omitted, we use first candidate page later.
+        pw_login_url = (
+            params.get("pw_login_url")
+            or params.get("auth_start_url")
+            or None
+        )
+
+        # If user asks for interactive login but forgot to enable a Playwright-backed scanner,
+        # force JS mode so the authenticated Playwright context is actually used.
+        if pw_interactive_login and not (
+            use_js
+            or use_network_sniff
+            or use_runtime_sniff
+            or use_react_sniff
+            or use_database_sniff
+            or use_interaction_sniff
+        ):
+            use_js = True
+            return_all_js_links = True
         # ------------------- Targets -------------------- #
         targets: set[str] = set()
         if mode == "media":
@@ -8364,7 +8512,8 @@ class LinkTrackerBlock(BaseBlock):
                     use_runtime_sniff or
                     use_react_sniff or
                     use_database_sniff or
-                    use_interaction_sniff
+                    use_interaction_sniff or
+                    pw_interactive_login
             )
             pw_p = pw_browser = pw_context = None
             try:
@@ -8379,10 +8528,16 @@ class LinkTrackerBlock(BaseBlock):
                         log=log,
                         use_camoufox=use_camoufox,
                         camoufox_options=camoufox_options,
-                        pw_launch_args=pw_launch_args,  # NEW
-                        pw_headless=pw_headless,  # NEW
-                        pw_channel=pw_channel,  # NEW
-                        pw_proxy=pw_proxy,  # NEW
+                        pw_launch_args=pw_launch_args,
+                        pw_headless=pw_headless,
+                        pw_channel=pw_channel,
+                        pw_proxy=pw_proxy,
+                        pw_user_data_dir=pw_user_data_dir,
+                        pw_interactive_login=pw_interactive_login,
+                        pw_login_url=(
+                            pw_login_url
+                            or (candidate_pages[0] if candidate_pages else None)
+                        ),
                     )
             except:
                 # ALWAYS close Camoufox/Playwright if we opened it
@@ -9392,7 +9547,7 @@ class LinkTrackerBlock(BaseBlock):
             "search_page_limit": 1,
             "search_per_page": 50,
             "verify": True,
-            "extensions": ".pdf,.txt",
+            "extensions": ".pdf,txt",
             "url_keywords": "archive,download",
             "engine": "duckduckgo",
             "site_require": "",
@@ -9427,18 +9582,35 @@ class LinkTrackerBlock(BaseBlock):
             "http_retries": 2,
             "http_max_conn_per_host": 8,
             "http_verify_tls": True,
-            "http_ca_bundle": "",   # path to bundled cacert.pem if needed
+            "http_ca_bundle": "",
             "use_body": True,
+
+            # Browser / Playwright
             "use_camoufox": False,
             "camoufox_options": {},
             "pw_headless": True,
             "pw_channel": "",  # e.g. "chrome"
-            "pw_proxy": {},  # e.g. {"server":"http://127.0.0.1:8080"}
+            "pw_proxy": {},    # e.g. {"server": "http://127.0.0.1:8080"}
             "pw_launch_args": [
                 "--disable-quic",
                 "--disable-http3",
                 "--disable-features=UseDnsHttpsSvcb"
             ],
+
+            # Authenticated interactive login/session reuse
+            "pw_interactive_login": False,
+            "interactive_login": False,  # alias accepted by _execute_async patch
+
+            # Persistent browser profile folder.
+            # Keep this stable per site/account so cookies/localStorage are reused.
+            "pw_user_data_dir": ".linktracker_profiles/default",
+            "auth_profile_dir": ".linktracker_profiles/default",  # alias accepted by patch
+
+            # Page opened for manual login.
+            # If empty, the patch can fall back to the first candidate page.
+            "pw_login_url": "",
+            "auth_start_url": "",  # alias accepted by patch
+
             "searxng_url": "http://127.0.0.1:8080"
         }
 
