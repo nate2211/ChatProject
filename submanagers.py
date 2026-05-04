@@ -10680,6 +10680,29 @@ class InteractionSniffer:
         max_link_hits: int = 72
         max_html_regex_link_hits: int = 180
 
+        # libpcap packet link sniffing
+        enable_libpcap_link_sniff: bool = True
+        libpcap_iface: Optional[str] = None
+        libpcap_auto_wifi_names: Tuple[str, ...] = (
+            "Wi-Fi", "Wi-Fi 2", "WI-FI", "WI-FI 2", "wifi", "wifi 2"
+        )
+        libpcap_auto_discover: bool = True
+        libpcap_timeout_ms: int = 120
+        libpcap_snaplen: int = 65535
+        libpcap_promisc: bool = True
+        libpcap_max_packets: int = 192
+        libpcap_packet_budget_s: float = 1.15
+        libpcap_min_budget_s: float = 0.70
+        libpcap_max_link_hits: int = 80
+        libpcap_scan_text_chars: int = 262_144
+        libpcap_emit_host_hints: bool = True
+        libpcap_host_hint_limit: int = 24
+        libpcap_command_timeout_s: float = 1.25
+        libpcap_emit_summary_hit: bool = True
+        # Windows/Npcap: friendly names like Wi-Fi are only discovery hints, not open_live names.
+        # Turn this on only for libpcap builds that genuinely accept display names.
+        libpcap_open_display_names: bool = False
+        libpcap_failed_iface_cooldown_s: float = 120.0
 
         # AX / accessibility
         enable_ax_tree_scan: bool = True
@@ -10708,6 +10731,8 @@ class InteractionSniffer:
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
         self._reset_memory()
+        self._pcap_iface_cache: Optional[str] = None
+        self._pcap_bad_iface_until: Dict[str, float] = {}
         self._log("InteractionSniffer Initialized", None)
 
     # ------------------------------------------------------------------ #
@@ -11021,6 +11046,542 @@ class InteractionSniffer:
         if added:
             self._log(f"[{phase}] DOM links: +{added}", log)
     # ------------------------------------------------------------------ #
+    # libpcap packet link sniffing
+    # ------------------------------------------------------------------ #
+
+    def _start_libpcap_task(
+        self,
+        page_url: str,
+        log: Optional[List[str]],
+        *,
+        deadline: float,
+    ) -> Optional["asyncio.Task[List[Dict[str, Any]]]" ]:
+        if not bool(getattr(self.cfg, "enable_libpcap_link_sniff", True)):
+            return None
+        if self._remaining_budget(deadline) < float(getattr(self.cfg, "libpcap_min_budget_s", 0.70)):
+            return None
+        try:
+            return asyncio.create_task(self._collect_libpcap_link_hits(page_url, log, deadline=deadline))
+        except Exception as e:
+            self._log(f"libpcap task start failed: {e}", log)
+            return None
+
+    async def _drain_libpcap_task(
+        self,
+        task: Optional["asyncio.Task[List[Dict[str, Any]]]"],
+        page_url: str,
+        log: Optional[List[str]],
+        *,
+        deadline: float,
+    ) -> None:
+        if task is None:
+            return
+        try:
+            wait_s = min(1.4, max(0.05, self._remaining_budget(deadline) + 0.15))
+            await asyncio.wait_for(task, timeout=wait_s)
+        except asyncio.TimeoutError:
+            self._log("libpcap link sniff timed out; returning collected browser-side hits.", log)
+        except Exception as e:
+            self._log(f"libpcap link sniff failed: {e}", log)
+
+    async def _collect_libpcap_link_hits(
+        self,
+        page_url: str,
+        log: Optional[List[str]],
+        *,
+        deadline: float,
+    ) -> List[Dict[str, Any]]:
+        budget_s = min(
+            float(getattr(self.cfg, "libpcap_packet_budget_s", 1.15)),
+            max(0.05, self._remaining_budget(deadline)),
+        )
+        if budget_s <= 0.05:
+            return []
+
+        candidates = self._libpcap_interface_candidates(log)
+        if not candidates:
+            self._log("libpcap disabled: no Wi-Fi interface candidates found.", log)
+            return []
+
+        loop = asyncio.get_running_loop()
+        try:
+            result = await loop.run_in_executor(
+                None,
+                self._libpcap_collect_sync,
+                candidates,
+                int(getattr(self.cfg, "libpcap_max_packets", 192)),
+                float(budget_s),
+            )
+        except Exception as e:
+            self._log(f"libpcap collection executor failed: {e}", log)
+            return []
+
+        if not isinstance(result, dict):
+            return []
+
+        iface = str(result.get("iface") or "")
+        packets = result.get("packets") or []
+        error = str(result.get("error") or "")
+        if error and not packets:
+            self._log(f"libpcap capture unavailable: {error}", log)
+            return []
+
+        urls = self._extract_libpcap_urls_from_packets(packets, page_url=page_url)
+        emitted: List[Dict[str, Any]] = []
+        max_hits = int(getattr(self.cfg, "libpcap_max_link_hits", 80))
+
+        for item in urls[:max_hits]:
+            u = str(item.get("url") or "").strip()
+            if not u:
+                continue
+            meta = {
+                "phase": "libpcap",
+                "source": str(item.get("source") or "libpcap_packet"),
+                "selector_hint": "",
+                "text_preview": str(item.get("text_preview") or "")[:160],
+                "evidence": str(item.get("evidence") or "packet_payload_link"),
+                "iface": iface,
+                "packet_count": len(packets),
+                "datalink": item.get("datalink"),
+                "timestamp": item.get("timestamp"),
+            }
+            self._emit_hit(page_url, "derived_link", meta, url=u)
+            emitted.append({"url": u, "meta": meta})
+
+        if bool(getattr(self.cfg, "libpcap_emit_summary_hit", True)):
+            self._emit_hit(
+                page_url,
+                "libpcap_summary",
+                {
+                    "phase": "libpcap",
+                    "iface": iface,
+                    "packet_count": len(packets),
+                    "link_hits": len(emitted),
+                    "candidate_count": len(candidates),
+                    "error": error[:200],
+                },
+            )
+
+        if emitted:
+            self._log(f"[libpcap] iface={iface!r} packets={len(packets)} links=+{len(emitted)}", log)
+        else:
+            self._log(f"[libpcap] iface={iface!r} packets={len(packets)} links=0", log)
+        return emitted
+
+    def _load_libpcap_module(self):
+        mod = globals().get("libpcap_backend")
+        if mod is not None:
+            return mod
+        try:
+            import libpcap_backend as mod  # requested import name
+            globals()["libpcap_backend"] = mod
+            return mod
+        except Exception as e:
+            raise RuntimeError(f"import libpcap_backend failed: {e}")
+
+    def _libpcap_collect_sync(self, candidates: List[str], max_packets: int, budget_s: float) -> Dict[str, Any]:
+        """
+        Open one real libpcap/Npcap device and collect packets.
+
+        Important Windows/Npcap rule:
+          - pcap_open_live() wants the capture device name, usually:
+                \\Device\\NPF_{GUID}
+          - it usually does NOT accept adapter display names like "Wi-Fi 2".
+
+        This method creates the ctypes backend once, normalizes candidates, skips
+        recently failed candidates, and avoids re-loading wpcap.dll for every miss.
+        """
+        last_err = ""
+        mod = self._load_libpcap_module()
+        backend_cls = getattr(mod, "LibpcapCtypesBackend", None)
+        if backend_cls is None:
+            raise RuntimeError("libpcap_backend.LibpcapCtypesBackend is missing")
+
+        # Normalize + de-dupe here too because this runs in the executor thread.
+        cleaned: List[str] = []
+        seen: Set[str] = set()
+        now = time.time()
+        for raw in candidates or []:
+            iface = self._normalize_pcap_iface(raw)
+            if not iface or iface in seen:
+                continue
+            if self._pcap_bad_iface_until.get(iface, 0.0) > now:
+                continue
+            seen.add(iface)
+            cleaned.append(iface)
+
+        if not cleaned:
+            return {"iface": "", "packets": [], "error": "no usable pcap interface candidates"}
+
+        backend = None
+        try:
+            backend = backend_cls(
+                timeout_ms=int(getattr(self.cfg, "libpcap_timeout_ms", 120)),
+                snaplen=int(getattr(self.cfg, "libpcap_snaplen", 65535)),
+                promisc=bool(getattr(self.cfg, "libpcap_promisc", True)),
+                logger=self.logger,
+            )
+
+            for iface in cleaned:
+                try:
+                    backend.open_live(iface)
+                    packets = backend.collect(max_packets=int(max_packets), budget_s=float(budget_s))
+                    self._pcap_iface_cache = str(iface)
+                    self._pcap_bad_iface_until.pop(iface, None)
+                    return {"iface": str(iface), "packets": packets, "error": ""}
+                except Exception as e:
+                    last_err = f"{iface}: {e}"
+                    # Error 123 is the classic sign of an invalid Windows path/display name.
+                    cooldown = float(getattr(self.cfg, "libpcap_failed_iface_cooldown_s", 120.0))
+                    self._pcap_bad_iface_until[iface] = time.time() + max(5.0, cooldown)
+                    try:
+                        backend.close()
+                    except Exception:
+                        pass
+
+            return {"iface": "", "packets": [], "error": last_err or "no interface opened"}
+        finally:
+            try:
+                if backend is not None:
+                    backend.close()
+            except Exception:
+                pass
+
+    def _libpcap_interface_candidates(self, log: Optional[List[str]]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        is_windows = self._is_windows_platform()
+
+        def push(x: Any, *, allow_display_name: bool = False) -> None:
+            s = self._normalize_pcap_iface(x)
+            if not s:
+                return
+
+            # On Windows/Npcap, display names such as WIFI 2 / Wi-Fi 2 usually
+            # throw WinError 123 in pcap_open_live(). Use them only as discovery
+            # hints, not as open_live targets.
+            if is_windows and not self._looks_like_windows_pcap_device(s):
+                if not allow_display_name and not bool(getattr(self.cfg, "libpcap_open_display_names", False)):
+                    return
+
+            if self._pcap_bad_iface_until.get(s, 0.0) > time.time():
+                return
+            if s in seen:
+                return
+            seen.add(s)
+            out.append(s)
+
+        # Explicit interface override gets first priority. If the caller really
+        # passes an NPF name, we use it. If they pass "Wi-Fi 2", auto-discovery
+        # below will still map it to the NPF GUID.
+        push(getattr(self.cfg, "libpcap_iface", None), allow_display_name=True)
+        push(getattr(self, "_pcap_iface_cache", None))
+
+        env_iface = ""
+        try:
+            import os as _os
+            env_iface = _os.environ.get("INTERACTION_SNIFFER_PCAP_IFACE", "")
+        except Exception:
+            env_iface = ""
+        push(env_iface, allow_display_name=True)
+
+        # Auto-discovered NPF devices should come before friendly-name fallbacks.
+        if bool(getattr(self.cfg, "libpcap_auto_discover", True)):
+            for dev in self._discover_libpcap_wifi_devices(log):
+                push(dev)
+
+        # Last-resort display names only when explicitly enabled, or for non-Windows
+        # libpcap environments where interface names like wlan0 are valid.
+        if (not is_windows) or bool(getattr(self.cfg, "libpcap_open_display_names", False)):
+            wifi_names = tuple(getattr(self.cfg, "libpcap_auto_wifi_names", ()) or ())
+            for name in wifi_names:
+                push(name, allow_display_name=True)
+                push(str(name).upper(), allow_display_name=True)
+                push(str(name).lower(), allow_display_name=True)
+
+        return out
+
+    def _is_windows_platform(self) -> bool:
+        try:
+            import os as _os
+            return _os.name == "nt"
+        except Exception:
+            return False
+
+    def _normalize_pcap_iface(self, x: Any) -> str:
+        """Normalize common escaped Npcap interface forms."""
+        s = str(x or "").strip().strip('"').strip("'")
+        if not s:
+            return ""
+
+        # Some discovery paths accidentally return a doubly escaped runtime
+        # string: "\\Device\\NPF_{GUID}". pcap_open_live wants
+        # "\Device\NPF_{GUID}".
+        while s.startswith("\\\\Device"):
+            s = s[1:]
+        s = s.replace("\\\\NPF_", "\\NPF_")
+        s = s.replace("//Device//NPF_", "\\Device\\NPF_")
+        s = s.replace("/Device/NPF_", "\\Device\\NPF_")
+
+        if s.lower().startswith("device\\npf_"):
+            s = "\\" + s
+
+        # Normalize accidental double prefix from copy/paste.
+        s = re.sub(r"(?i)^\\+Device\\+NPF_", r"\\Device\\NPF_", s)
+        return s
+
+    def _looks_like_windows_pcap_device(self, s: str) -> bool:
+        ss = self._normalize_pcap_iface(s)
+        low = ss.lower()
+        return (
+            low.startswith("\\device\\npf_")
+            or low.startswith("rpcap://")
+            or low.startswith("npf_")
+        )
+
+    def _norm_iface_name(self, s: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+    def _is_target_wifi_name(self, s: str) -> bool:
+        target = {self._norm_iface_name(x) for x in getattr(self.cfg, "libpcap_auto_wifi_names", ()) or ()}
+        ns = self._norm_iface_name(s)
+        return bool(ns and ns in target)
+
+    def _discover_libpcap_wifi_devices(self, log: Optional[List[str]]) -> List[str]:
+        devices: List[str] = []
+        seen: Set[str] = set()
+
+        def push_device(x: Any) -> None:
+            s = self._normalize_pcap_iface(x)
+            if not s or s in seen:
+                return
+            # Discovery should only return actual pcap device names on Windows.
+            if self._is_windows_platform() and not self._looks_like_windows_pcap_device(s):
+                return
+            seen.add(s)
+            devices.append(s)
+
+        # Best Windows/Npcap path: tshark/dumpcap -D gives lines like:
+        #   1. \Device\NPF_{GUID} (Wi-Fi)
+        # Do not push the parenthesized display name into pcap_open_live().
+        for exe in ("tshark", "dumpcap"):
+            try:
+                import subprocess as _subprocess
+                proc = _subprocess.run(
+                    [exe, "-D"],
+                    capture_output=True,
+                    text=True,
+                    timeout=float(getattr(self.cfg, "libpcap_command_timeout_s", 1.25)),
+                    errors="ignore",
+                )
+                data = (proc.stdout or "") + "\n" + (proc.stderr or "")
+                for line in data.splitlines():
+                    m = re.match(r"\s*\d+\.\s+(.+?)(?:\s+\((.*?)\))?\s*$", line)
+                    if not m:
+                        continue
+                    dev = (m.group(1) or "").strip()
+                    desc = (m.group(2) or "").strip()
+                    if self._is_target_wifi_name(desc) or self._is_target_wifi_name(dev):
+                        push_device(dev)
+            except Exception:
+                continue
+
+        # PowerShell fallback: map Wi-Fi friendly names to their InterfaceGuid,
+        # then build the Npcap path with SINGLE runtime backslashes.
+        try:
+            import subprocess as _subprocess
+            ps = (
+                "Get-NetAdapter | Where-Object { $_.Name -match '^(Wi-Fi|WI-FI)( 2)?$' } | "
+                "ForEach-Object { $_.Name + '|' + $_.InterfaceGuid }"
+            )
+            proc = _subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                capture_output=True,
+                text=True,
+                timeout=float(getattr(self.cfg, "libpcap_command_timeout_s", 1.25)),
+                errors="ignore",
+            )
+            for line in (proc.stdout or "").splitlines():
+                if "|" not in line:
+                    continue
+                name, guid = [p.strip() for p in line.split("|", 1)]
+                if not self._is_target_wifi_name(name) or not guid:
+                    continue
+                guid = guid.strip("{}")
+                push_device(f"\\Device\\NPF_{{{guid}}}")
+        except Exception as e:
+            self._log(f"PowerShell Wi-Fi interface discovery skipped: {e}", log)
+
+        if devices:
+            try:
+                self._log(f"libpcap Wi-Fi candidates: {devices[:4]}", log)
+            except Exception:
+                pass
+        return devices
+
+    def _extract_libpcap_urls_from_packets(self, packets: List[Dict[str, Any]], *, page_url: str) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        page_host = ""
+        try:
+            page_host = (urlparse(page_url).netloc or "").lower().split(":")[0]
+        except Exception:
+            page_host = ""
+
+        def push(url: str, *, source: str, evidence: str, pkt: Dict[str, Any], text_preview: str = "") -> None:
+            clean = self._clean_packet_url(url)
+            if not clean:
+                return
+            key = clean.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append({
+                "url": clean,
+                "source": source,
+                "evidence": evidence,
+                "datalink": pkt.get("datalink"),
+                "timestamp": pkt.get("timestamp"),
+                "text_preview": text_preview[:160],
+            })
+
+        for pkt in packets or []:
+            if not isinstance(pkt, dict):
+                continue
+            raw = pkt.get("raw_bytes") or b""
+            if not raw:
+                continue
+            if isinstance(raw, memoryview):
+                raw = raw.tobytes()
+            elif isinstance(raw, bytearray):
+                raw = bytes(raw)
+            elif not isinstance(raw, bytes):
+                try:
+                    raw = bytes(raw)
+                except Exception:
+                    continue
+
+            text = self._packet_bytes_to_text(raw)
+            if not text:
+                continue
+            cap = int(getattr(self.cfg, "libpcap_scan_text_chars", 262_144))
+            if cap > 0:
+                text = text[:cap]
+
+            # Absolute URL leakage from HTTP, headers, manifests, JSON, websocket URLs, etc.
+            for u in self._extract_urls_from_text(text):
+                push(u, source="libpcap_url", evidence="absolute_url_in_packet", pkt=pkt, text_preview=u)
+
+            # Plain HTTP request reconstruction: GET /path HTTP/1.1 + Host: example.com
+            for u, preview in self._extract_http_request_urls(text):
+                push(u, source="libpcap_http_request", evidence="http_request_line_host", pkt=pkt, text_preview=preview)
+
+            # Header mining: Location/Referer can expose URLs. Relative Location can be joined against Host.
+            for u, preview in self._extract_http_header_urls(text):
+                push(u, source="libpcap_http_header", evidence="http_header_url", pkt=pkt, text_preview=preview)
+
+            # HTTPS encrypts paths, but TLS ClientHello often leaks SNI hostnames. Emit conservative host roots.
+            if bool(getattr(self.cfg, "libpcap_emit_host_hints", True)):
+                for host in self._extract_host_hints(text, page_host=page_host)[: int(getattr(self.cfg, "libpcap_host_hint_limit", 24))]:
+                    push(f"https://{host}/", source="libpcap_host_hint", evidence="probable_sni_or_host_string", pkt=pkt, text_preview=host)
+
+        return out[: int(getattr(self.cfg, "libpcap_max_link_hits", 80))]
+
+    def _packet_bytes_to_text(self, raw: bytes) -> str:
+        try:
+            return raw.decode("utf-8", "ignore")
+        except Exception:
+            try:
+                return raw.decode("latin-1", "ignore")
+            except Exception:
+                return ""
+
+    def _clean_packet_url(self, url: str) -> str:
+        u = str(url or "").strip()
+        if not u:
+            return ""
+        # Trim common delimiters that regex sees at the end of quoted JSON/HTML/header strings.
+        u = u.rstrip("\x00\r\n\t .,;')]}><\\\"")
+        u = u.replace("&amp;", "&")
+        low = u.lower()
+        if not low.startswith(("http://", "https://", "ws://", "wss://")):
+            return ""
+        try:
+            p = urlparse(u)
+            if not p.scheme or not p.netloc:
+                return ""
+        except Exception:
+            return ""
+        return u
+
+    def _extract_http_request_urls(self, text: str) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        if not text:
+            return out
+        rx = re.compile(r"(?im)^(GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH)\s+([^\s]+)\s+HTTP/[0-9.]+\s*\r?\n((?:[^\r\n]*\r?\n){0,80})")
+        for m in rx.finditer(text):
+            method = (m.group(1) or "GET").upper()
+            target = (m.group(2) or "").strip()
+            headers = m.group(3) or ""
+            host_m = re.search(r"(?im)^Host:\s*([^\r\n]+)", headers)
+            host = (host_m.group(1).strip() if host_m else "")
+            if not target:
+                continue
+            if target.lower().startswith(("http://", "https://")):
+                out.append((target, f"{method} {target}"))
+                continue
+            if host and target.startswith("/"):
+                scheme = "https" if host.endswith(":443") else "http"
+                out.append((f"{scheme}://{host}{target}", f"{method} {target} Host:{host}"))
+        return out
+
+    def _extract_http_header_urls(self, text: str) -> List[Tuple[str, str]]:
+        out: List[Tuple[str, str]] = []
+        if not text:
+            return out
+        host = ""
+        hm = re.search(r"(?im)^Host:\s*([^\r\n]+)", text)
+        if hm:
+            host = hm.group(1).strip()
+        for m in re.finditer(r"(?im)^(Location|Referer|Referrer|Origin|Content-Location):\s*([^\r\n]+)", text):
+            key = (m.group(1) or "").strip()
+            val = (m.group(2) or "").strip()
+            if not val:
+                continue
+            if val.lower().startswith(("http://", "https://", "ws://", "wss://")):
+                out.append((val, f"{key}: {val}"))
+            elif host and val.startswith("/"):
+                out.append((f"http://{host}{val}", f"{key}: {val} Host:{host}"))
+        return out
+
+    def _extract_host_hints(self, text: str, *, page_host: str = "") -> List[str]:
+        hosts: List[str] = []
+        seen: Set[str] = set()
+        if not text:
+            return hosts
+
+        bad_suffixes = (".local", ".lan", ".home", ".arpa")
+        host_rx = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|co|tv|me|dev|app|cloud|cdn|media|video|audio|jp|kr|cn|uk|de|fr|ru|to|is|gg|xyz)\b", re.I)
+        for m in host_rx.finditer(text):
+            h = (m.group(0) or "").strip(". ").lower()
+            if not h or h in seen or h.endswith(bad_suffixes):
+                continue
+            if len(h) > 253:
+                continue
+
+            # Be conservative to avoid emitting random certificate/name noise.
+            if page_host and (h == page_host or h.endswith("." + page_host) or page_host.endswith("." + h)):
+                pass
+            elif any(x in h for x in ("cdn", "media", "video", "audio", "stream", "hls", "dash", "cloudfront", "akamai", "fastly")):
+                pass
+            else:
+                continue
+
+            seen.add(h)
+            hosts.append(h)
+        return hosts
+
+    # ------------------------------------------------------------------ #
     # public API
     # ------------------------------------------------------------------ #
 
@@ -11070,6 +11631,8 @@ class InteractionSniffer:
             self._log(f"Fast-skip asset-like page: {page_url}", log)
             return "", self._hits[: self.cfg.max_hits]
 
+        libpcap_task = self._start_libpcap_task(page_url, log, deadline=deadline)
+
         page = None
         try:
             page = await context.new_page()
@@ -11111,9 +11674,11 @@ class InteractionSniffer:
                     {"content_type": ctype, "status": getattr(response, "status", None)},
                 )
                 self._log(f"Skipping non-HTML response for {page_url}: {ctype}", log)
+                await self._drain_libpcap_task(libpcap_task, page_url, log, deadline=deadline)
                 return "", self._hits[: self.cfg.max_hits]
 
             if self._remaining_budget(deadline) <= 0.15:
+                await self._drain_libpcap_task(libpcap_task, page_url, log, deadline=deadline)
                 return "", self._hits[: self.cfg.max_hits]
 
             await page.wait_for_timeout(
@@ -11134,6 +11699,7 @@ class InteractionSniffer:
 
             if not probe.get("ok", False):
                 self._log("DOM probe failed; returning partial hits.", log)
+                await self._drain_libpcap_task(libpcap_task, page_url, log, deadline=deadline)
                 return "", self._hits[: self.cfg.max_hits]
 
             degraded = bool(
@@ -11213,6 +11779,8 @@ class InteractionSniffer:
                     await asyncio.wait_for(page.close(), timeout=2.0)
                 except Exception as e:
                     self._log(f"Error closing page for {page_url}: {e}", log)
+
+        await self._drain_libpcap_task(libpcap_task, page_url, log, deadline=deadline)
 
         hits = self._hits[: self.cfg.max_hits]
         self._log(f"Finished interaction sniff for {page_url}: hits={len(hits)}", log)
