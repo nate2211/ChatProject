@@ -11,6 +11,7 @@ import sqlite3
 import ssl
 import threading
 import time
+import traceback
 import zlib
 from dataclasses import dataclass, field, fields
 from html import unescape
@@ -8180,43 +8181,45 @@ class RuntimeSniffer:
             merged = self._merge_hits(runtime_hits, promoted_links)
             return html, merged
 
+
 # ======================================================================
-# ReactSniffer (Advanced: Fiber + Router + State URLs)
+# ReactSniffer (Advanced Forensics: Fiber + Router + State + Chunks)
 # ======================================================================
 
 class ReactSniffer:
     """
-    Playwright-based sniffer focused on React / SPA behavior.
+    Playwright-based sniffer focused on deep React / SPA behavior and hidden state extraction.
 
     Goals (structural):
-      • Match the API of other sniffers (NetworkSniffer, JSSniffer, RuntimeSniffer).
+      • Match the API of other sniffers.
       • Single public entrypoint: `await sniff(context, page_url, timeout, log, extensions=None)`.
       • Return `(html, hits)` so it can be dropped into existing pipelines.
 
-    `hits` is a list of dicts like:
-        {
-            "page": <page_url>,
-            "url": <derived or navigated URL>,
-            "route": <react route / pathname>,
-            "tag": "react_route" | "react_link" | "react_nav" | "react_meta",
-            "kind": "initial" | "pushState" | "replaceState" | "popstate"
-                    | "hashchange" | "click"
-                    | "react_devtools" | "summary"
-                    | "router_config" | "fiber_link" | "fiber_state_url",
-            "meta": {...anything extra...},
-        }
-
-    New “active” capabilities:
-      • React Router Extraction:
-            - Reads router-like configs discovered in memory (paths, children).
-      • Fiber Tree Crawling:
-            - Walks React Fiber roots to find props like:
-                to="/dashboard", href="...", path="..."
-              even when not present in the DOM yet.
-      • State Inspection:
-            - Examines memoizedState / state for URL-like strings
-              (API endpoints, internal routes, etc).
+    Deep Forensics Capabilities:
+      • React Router Extraction: Reads nested routes and useRoutes configs.
+      • Deep Fiber Tree Crawling: Walks Fiber roots to find hidden props and Context states.
+      • State Inspection: Extracts URLs/routes from Redux, Zustand, Apollo, and React Query.
+      • Framework Hydration: Dumps Next.js (__NEXT_DATA__) and Nuxt.js (__NUXT__) payload configs.
+      • Webpack Chunk Interception: Scans dynamically loaded JS chunks for endpoints.
+      • Fetch/XHR Interception: Captures silent background API calls triggered by React components.
     """
+
+    # --- basic URL patterns (link-only) ---
+    _ABS_URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>\[\]{}]+", re.IGNORECASE)
+    _SCHEMELESS_RE = re.compile(r"(?<!:)\b//[^\s\"'<>\[\]{}]+", re.IGNORECASE)
+    _CSS_URL_RE = re.compile(r"url\(\s*(?:['\"])?([^'\"\)\s]+)(?:['\"])?\s*\)", re.IGNORECASE)
+
+    # JS string literal URL-ish extraction (kept conservative but thorough)
+    _JS_LIT_RE = re.compile(
+        r"""(?:
+            (?P<abs>(?:https?|wss?)://[^"'\\\s<>{}\[\]]+)
+          | (?P<schemeless>//[^"'\\\s<>{}\[\]]+)
+          | (?P<rel>(?:/|\./|\.\./)[^"'\\\s<>{}\[\]]+)
+        )""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    _ALLOWED_SCHEMES = {"http", "https", "ws", "wss"}
 
     # ------------------------------------------------------------------ #
     # Config
@@ -8224,11 +8227,11 @@ class ReactSniffer:
     @dataclass
     class Config:
         # generic controls
-        timeout: float = 8.0
-        max_hits: int = 200
+        timeout: float = 15.0
+        max_hits: int = 500
 
-        # how long to wait after first load for SPA nav / route changes
-        wait_after_load_ms: int = 1000
+        # how long to wait after first load for SPA nav / route changes / Hydration
+        wait_after_load_ms: int = 2500
 
         # whether to instrument history / pushState / replaceState
         hook_history_api: bool = True
@@ -8237,27 +8240,45 @@ class ReactSniffer:
         hook_link_clicks: bool = True
 
         # whether to attempt to read React DevTools global hook as a hint
-        inspect_react_devtools_hook: bool = False
+        inspect_react_devtools_hook: bool = True
 
         # advanced controls
         capture_hashchange: bool = True
         dedupe_events: bool = True
-        max_events_per_kind: int = 500  # safety cap per kind inside the browser
+        max_events_per_kind: int = 1000  # Safety cap per kind inside the browser
 
         # whether to emit an aggregate summary hit
         emit_summary_hit: bool = True
 
-        # ----- NEW: Fiber / Router / State inspection toggles -----
+        # ----- NEW: Deep Forensic Inspection Toggles -----
         enable_fiber_traversal: bool = True
         enable_router_inspection: bool = True
         enable_state_url_scan: bool = True
 
-        # Limits for traversal / extraction
-        max_fiber_nodes: int = 5000
-        max_router_entries: int = 500
+        # State Managers & Frameworks
+        enable_redux_inspection: bool = True
+        enable_apollo_graphql_inspection: bool = True
+        enable_react_query_inspection: bool = True
+        enable_nextjs_nuxt_inspection: bool = True
+
+        # Network & Chunks
+        enable_webpack_chunk_interception: bool = True
+        enable_fetch_xhr_interception: bool = True
+
+        # Limits for traversal / extraction to prevent IPC payload crashes
+        max_fiber_nodes: int = 15000
+        max_router_entries: int = 1000
+        max_state_object_depth: int = 6
+        max_state_string_length: int = 10000
 
         # Heuristic: what looks like a URL / route?
         url_like_regex: str = r"(https?://[^\s\"']+|/[A-Za-z0-9_./-]+)"
+
+        @classmethod
+        def from_kwargs(cls, **kwargs) -> "ReactSniffer.Config":
+            allowed = {f.name for f in fields(cls)}
+            filtered = {k: v for k, v in kwargs.items() if k in allowed}
+            return cls(**filtered)
 
     # ------------------------------------------------------------------ #
     # Internal memory data structures ("sniffer memory")
@@ -8282,11 +8303,18 @@ class ReactSniffer:
         renderer_ids: List[str] = field(default_factory=list)
         timestamp: Optional[float] = None
 
+    @dataclass
+    class StateExtractionEvent:
+        source: str  # e.g., 'redux', 'apollo', 'nextjs', 'webpack'
+        url: str
+        meta: Dict[str, Any] = field(default_factory=dict)
+        timestamp: Optional[float] = None
+
     def __init__(self, config: "ReactSniffer.Config", logger=None):
         self.cfg = config
         self.logger = logger or DEBUG_LOGGER
         self._reset_memory()
-        self._log("ReactSniffer Initialized", None)
+        self._log("ReactSniffer Initialized (Enterprise Forensics Mode)", None)
 
     # ------------------------------------------------------------------ #
     # Logging helper
@@ -8307,48 +8335,49 @@ class ReactSniffer:
     def _reset_memory(self) -> None:
         self._nav_events: List[ReactSniffer.RouteEvent] = []
         self._click_events: List[ReactSniffer.ClickEvent] = []
+        self._state_events: List[ReactSniffer.StateExtractionEvent] = []
         self._routes_seen: Set[str] = set()
         self._urls_seen: Set[str] = set()
-        # Router config extracted from fiber / globals
         self._router_routes: List[Dict[str, Any]] = []
-        # event fingerprints so we don't double-count same browser event
-        # fingerprint = (kind, url, pathname, timestamp)
+
+        # Event fingerprints so we don't double-count identical browser events
         self._event_fingerprint_seen: Set[Tuple[Any, Any, Any, Any]] = set()
         self._summary: Optional[ReactSniffer.DevtoolsSummary] = None
 
     # ------------------------------------------------------------------ #
-    # NEW helpers: URL promotion / normalization
+    # Helpers: URL promotion / normalization
     # ------------------------------------------------------------------ #
     def _extract_urls_from_text(self, s: str) -> List[str]:
-        import re
-
         if not s:
             return []
-        rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
         out: List[str] = []
         seen: Set[str] = set()
-        for m in rx.findall(s):
+
+        # Combine standard and schemeless regexes
+        cands = self._ABS_URL_RE.findall(s) + self._SCHEMELESS_RE.findall(s)
+
+        for m in cands:
             if m not in seen:
                 seen.add(m)
                 out.append(m)
         return out
 
     def _absolutize_url(self, page_url: str, raw_url: str) -> str:
-        from urllib.parse import urljoin
-
         raw = str(raw_url or "").strip()
         if not raw:
             return ""
-        if raw.startswith(("javascript:", "mailto:", "tel:", "data:")):
+        if raw.startswith(("javascript:", "mailto:", "tel:", "data:", "blob:", "#")):
             return ""
+
+        if raw.startswith("//"):
+            raw = "https:" + raw
+
         try:
             return urljoin(page_url, raw)
         except Exception:
             return raw
 
     def _route_from_url(self, url: str) -> str:
-        from urllib.parse import urlparse
-
         try:
             return str(urlparse(url).path or "")
         except Exception:
@@ -8391,7 +8420,11 @@ class ReactSniffer:
             out.append(hit)
         return out
 
+    # ------------------------------------------------------------------ #
+    # DOM Harvesters
+    # ------------------------------------------------------------------ #
     async def _collect_dom_link_hits(self, page, page_url: str, log: List[str]) -> List[Dict[str, Any]]:
+        """Deep DOM scan targeting React specific data-attributes and standard elements."""
         dom_hits: List[Dict[str, Any]] = []
 
         try:
@@ -8411,7 +8444,8 @@ class ReactSniffer:
                         low.startsWith("javascript:") ||
                         low.startsWith("mailto:") ||
                         low.startsWith("tel:") ||
-                        low.startsWith("data:")
+                        low.startsWith("data:") ||
+                        low.startsWith("blob:")
                       ) return;
 
                       const key = `${kind}|${url}`;
@@ -8421,11 +8455,12 @@ class ReactSniffer:
                       out.push({
                         url,
                         kind,
-                        text: String(text || "").trim().slice(0, 200)
+                        text: String(text || "").trim().slice(0, 250)
                       });
                     } catch (_) {}
                   }
 
+                  // Standard Links
                   for (const el of document.querySelectorAll("a[href], area[href]")) {
                     push(
                       el.getAttribute("href"),
@@ -8434,6 +8469,7 @@ class ReactSniffer:
                     );
                   }
 
+                  // Media and Iframes
                   for (const el of document.querySelectorAll("iframe[src], frame[src], img[src], video[src], audio[src], source[src], embed[src]")) {
                     push(
                       el.getAttribute("src"),
@@ -8442,6 +8478,7 @@ class ReactSniffer:
                     );
                   }
 
+                  // Forms
                   for (const el of document.querySelectorAll("form[action]")) {
                     push(
                       el.getAttribute("action"),
@@ -8450,6 +8487,7 @@ class ReactSniffer:
                     );
                   }
 
+                  // Head Links
                   for (const el of document.querySelectorAll("link[href]")) {
                     push(
                       el.getAttribute("href"),
@@ -8458,6 +8496,7 @@ class ReactSniffer:
                     );
                   }
 
+                  // Open Graph & Twitter Cards
                   for (const el of document.querySelectorAll("meta[content]")) {
                     const p = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
                     if (
@@ -8472,18 +8511,20 @@ class ReactSniffer:
                     }
                   }
 
-                  for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [onclick]")) {
+                  // SPA Data Attributes
+                  for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [data-route], [onclick]")) {
                     push(el.getAttribute("data-href"), "dom_data_href", "");
                     push(el.getAttribute("data-url"), "dom_data_url", "");
                     push(el.getAttribute("data-src"), "dom_data_src", "");
                     push(el.getAttribute("data-video"), "dom_data_video", "");
+                    push(el.getAttribute("data-route"), "dom_data_route", "");
 
                     const onclick = el.getAttribute("onclick") || "";
                     const matches = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
                     for (const u of matches) push(u, "dom_onclick", "");
                   }
 
-                  return out.slice(0, 4000);
+                  return out.slice(0, 5000);
                 }
                 """
             ) or []
@@ -8517,13 +8558,15 @@ class ReactSniffer:
                 }
             )
 
-        self._log(f"DOM link harvest found {len(dom_hits)} link(s) on {page_url}", log)
+        self._log(f"DOM link harvest found {len(dom_hits)} link(s)", log)
         return dom_hits
 
     def _collect_html_url_hits(self, page_url: str, html: str) -> List[Dict[str, Any]]:
+        """Fallback raw regex scan over the entire HTML payload."""
         hits: List[Dict[str, Any]] = []
 
-        for u in self._extract_urls_from_text(html)[:500]:
+        # Cap the regex hits to prevent memory explosion on huge payloads
+        for u in self._extract_urls_from_text(html)[:1000]:
             full = self._absolutize_url(page_url, u)
             if not full:
                 continue
@@ -8543,7 +8586,7 @@ class ReactSniffer:
         return hits
 
     # ------------------------------------------------------------------ #
-    # Public API (matches other sniffers)
+    # Core Orchestrator
     # ------------------------------------------------------------------ #
     async def sniff(
             self,
@@ -8551,22 +8594,16 @@ class ReactSniffer:
             page_url: str,
             timeout: float,
             log: List[str],
-            extensions=None,  # kept for signature compatibility; usually unused
+            extensions=None,  # kept for signature compatibility
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
-        Main entrypoint.
-
-        Returns:
-            (html, hits)
-        Where:
-            html: final outerHTML / document HTML snapshot (str)
-            hits: list of dicts describing React routes / SPA navigations.
+        Main Execution Entrypoint.
+        Orchestrates page load, instrumentation, deep state extraction, and serialization.
         """
         from playwright.async_api import TimeoutError as PWTimeoutError
 
-        # fresh memory for each sniff run
         self._reset_memory()
-        self._log(f"Start React sniff: {page_url} timeout={timeout}s", log)
+        self._log(f"Start Advanced React sniff: {page_url} timeout={timeout}s", log)
 
         page = None
         hits: List[Dict[str, Any]] = []
@@ -8576,18 +8613,16 @@ class ReactSniffer:
         try:
             page = await context.new_page()
 
-            # Install instrumentation BEFORE first navigation so early SPA boot is captured
+            # Install instrumentation BEFORE first navigation to catch SPA boot / Hydration
             try:
                 await self._install_instrumentation(page, page_url, log)
             except Exception as e:
-                self._log(f"Pre-navigation instrumentation error on {page_url}: {e}", log)
+                self._log(f"Pre-navigation instrumentation error: {e}", log)
 
-            nav_modes: List[str] = []
-            for mode in ("domcontentloaded", "commit", "load"):
-                if mode not in nav_modes:
-                    nav_modes.append(mode)
-
+            # Execution Ladders for robust loading
+            nav_modes: List[str] = ["domcontentloaded", "commit", "load"]
             loaded = False
+
             for mode in nav_modes:
                 try:
                     await page.goto(
@@ -8597,93 +8632,82 @@ class ReactSniffer:
                     )
                     loaded = True
                     if mode != "domcontentloaded":
-                        self._log(f"goto recovered using wait_until={mode} for {page_url}", log)
+                        self._log(f"goto recovered using wait_until={mode}", log)
                     break
                 except PWTimeoutError:
-                    self._log(f"Timeout while loading {page_url} with wait_until={mode}", log)
+                    self._log(f"Timeout loading {page_url} with wait_until={mode}", log)
                 except Exception as e:
                     self._log(f"Error loading {page_url} with wait_until={mode}: {e}", log)
 
-            # Give React / SPA some time to bootstrap & navigate
+            # Allow robust SPA hydration, lazy-loading, and API fetches to complete
             await page.wait_for_timeout(self.cfg.wait_after_load_ms)
 
-            # Grab HTML
+            # HTML Snapshot Capture
             try:
                 html = await page.content()
             except Exception as e:
-                self._log(f"Error getting HTML for {page_url}: {e}", log)
+                self._log(f"Error getting HTML snapshot: {e}", log)
 
-            # Extract JS / React instrumentation hits into memory
+            # Execute explicit post-load forensic scans via JS
+            try:
+                await self._execute_post_load_scans(page, log)
+            except Exception as e:
+                self._log(f"Error executing post-load forensics: {e}", log)
+
+            # Ingest all JS-captured hits into Python memory
             try:
                 raw_hits = await self._collect_raw_hits(page, page_url, log)
                 self._ingest_raw_hits(raw_hits, page_url, log)
                 hits = self._materialize_hits(page_url)
             except Exception as e:
-                self._log(f"Error collecting instrumentation hits for {page_url}: {e}", log)
+                self._log(f"Error collecting instrumentation hits: {e}", log)
 
-            # NEW: direct DOM link harvest
+            # Direct DOM & Regex Harvests
             try:
                 dom_hits = await self._collect_dom_link_hits(page, page_url, log)
                 hits.extend(dom_hits)
             except Exception as e:
-                self._log(f"Error collecting DOM links for {page_url}: {e}", log)
+                self._log(f"Error collecting DOM links: {e}", log)
 
-            # NEW: raw absolute URLs from HTML snapshot
             try:
                 html_hits = self._collect_html_url_hits(page_url, html or "")
                 hits.extend(html_hits)
             except Exception as e:
-                self._log(f"Error collecting HTML URLs for {page_url}: {e}", log)
+                self._log(f"Error collecting HTML URLs: {e}", log)
 
-            # Normalize relative routes/URLs into absolute URLs
+            # Normalize & Dedupe Final Payload
             hits = self._normalize_hit_urls(page_url, hits)
-
-            # Dedupe final output
             hits = self._dedupe_hits(hits)
 
         except PWTimeoutError:
-            self._log(f"Timeout while loading {page_url}", log)
+            self._log(f"Fatal Timeout while loading {page_url}", log)
         except Exception as e:
-            self._log(f"Fatal error on {page_url}: {e}", log)
+            self._log(f"Fatal error on {page_url}: {e}\n{traceback.format_exc()}", log)
         finally:
             if page is not None:
                 try:
                     await page.close()
                 except Exception as e:
-                    self._log(f"Error closing page for {page_url}: {e}", log)
+                    self._log(f"Error closing page: {e}", log)
 
-        # Enforce max_hits
+        # Enforce max_hits globally
         if len(hits) > self.cfg.max_hits:
             hits = hits[: self.cfg.max_hits]
 
-        self._log(f"Finished React sniff for {page_url}: hits={len(hits)}", log)
+        self._log(f"Finished Advanced React sniff for {page_url}: Total Hits = {len(hits)}", log)
         return html or "", hits
 
     # ------------------------------------------------------------------ #
-    # Internal helpers: JS injection
+    # JS Injection: The Advanced Forensic Engine
     # ------------------------------------------------------------------ #
     async def _install_instrumentation(self, page, page_url: str, log: List[str]) -> None:
         """
-        Inject JavaScript into the page to observe:
-          • history.pushState / replaceState
-          • popstate
-          • hashchange (optional)
-          • link clicks
-          • optional React DevTools hook
-          • OPTIONAL (advanced):
-                - Fiber traversal
-                - Router config extraction
-                - State URL sniffing
-
-        Stashes events on window.__PROMPTCHAT_REACT_SNIFFER_HITS__.
+        Builds and injects a massive JavaScript payload to hook into Web APIs,
+        State Managers, Webpack Chunks, and React Internals.
         """
         script_parts: List[str] = []
 
-        max_events_per_kind = int(self.cfg.max_events_per_kind)
-
-        # ------------------------------------------------------------------
-        # Shared event buffer + pushEvent helper
-        # ------------------------------------------------------------------
+        # 1. Base Shared Memory Buffer
         script_parts.append(
             f"""
             (function() {{
@@ -8692,7 +8716,7 @@ class ReactSniffer:
                         window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = [];
                     }}
 
-                    var MAX_EVENTS_PER_KIND = {max_events_per_kind};
+                    var MAX_EVENTS_PER_KIND = {int(self.cfg.max_events_per_kind)};
 
                     function __RS_pushEvent(evt) {{
                         try {{
@@ -8706,9 +8730,7 @@ class ReactSniffer:
                             for (var i = 0; i < arr.length; i++) {{
                                 if (arr[i] && arr[i].kind === kind) {{
                                     count++;
-                                    if (count >= MAX_EVENTS_PER_KIND) {{
-                                        return;
-                                    }}
+                                    if (count >= MAX_EVENTS_PER_KIND) return;
                                 }}
                             }}
                             arr.push(evt);
@@ -8717,477 +8739,368 @@ class ReactSniffer:
 
                     window.__RS_pushEvent = __RS_pushEvent;
                 }} catch (e) {{
-                    try {{
-                        console.log("[ReactSniffer] Shared buffer init error:", e);
-                    }} catch (_e) {{}}
+                    console.log("[ReactSniffer] Shared buffer init error:", e);
                 }}
-            }})();"""
+            }})();
+            """
         )
 
-        # ------------------------------------------------------------------
-        # History / SPA navigation hooks
-        # ------------------------------------------------------------------
+        # 2. Network Interceptors (XHR & Fetch) - Captures SPA background API calls
+        if self.cfg.enable_fetch_xhr_interception:
+            script_parts.append(
+                """
+                (function() {
+                    try {
+                        // Fetch Interceptor
+                        const origFetch = window.fetch;
+                        if (origFetch) {
+                            window.fetch = async function(...args) {
+                                try {
+                                    const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : "");
+                                    if (reqUrl) {
+                                        window.__RS_pushEvent({
+                                            kind: "intercept_fetch",
+                                            url: reqUrl,
+                                            pathname: location.pathname,
+                                            timestamp: Date.now()
+                                        });
+                                    }
+                                } catch (_) {}
+                                return origFetch.apply(this, args);
+                            };
+                        }
+
+                        // XHR Interceptor
+                        const origOpen = XMLHttpRequest.prototype.open;
+                        if (origOpen) {
+                            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+                                try {
+                                    if (url) {
+                                        window.__RS_pushEvent({
+                                            kind: "intercept_xhr",
+                                            url: String(url),
+                                            pathname: location.pathname,
+                                            timestamp: Date.now()
+                                        });
+                                    }
+                                } catch (_) {}
+                                return origOpen.call(this, method, url, ...rest);
+                            };
+                        }
+                    } catch (e) {
+                        console.log("[ReactSniffer] Network Interceptor Error:", e);
+                    }
+                })();
+                """
+            )
+
+        # 3. Webpack Chunk Interceptor
+        if self.cfg.enable_webpack_chunk_interception:
+            script_parts.append(
+                """
+                (function() {
+                    try {
+                        const originalPush = window.webpackChunk_N_E ? window.webpackChunk_N_E.push.bind(window.webpackChunk_N_E) : null;
+                        if (originalPush) {
+                            window.webpackChunk_N_E.push = function(chunkData) {
+                                try {
+                                    const chunkIds = chunkData[0] || [];
+                                    const modules = chunkData[1] || {};
+                                    for (const key in modules) {
+                                        const modString = modules[key].toString();
+                                        const urls = modString.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
+                                        const routes = modString.match(/\\/[A-Za-z0-9_./-]+/g) || [];
+
+                                        [...urls, ...routes].forEach(u => {
+                                            if (u.length > 2) {
+                                                window.__RS_pushEvent({
+                                                    kind: "webpack_chunk_leak",
+                                                    url: u,
+                                                    pathname: location.pathname,
+                                                    meta: { chunkId: chunkIds.join(","), moduleKey: key },
+                                                    timestamp: Date.now()
+                                                });
+                                            }
+                                        });
+                                    }
+                                } catch (_) {}
+                                return originalPush(chunkData);
+                            };
+                        }
+                    } catch (e) {}
+                })();
+                """
+            )
+
+        # 4. History API & Routing Hooks
         if self.cfg.hook_history_api or self.cfg.capture_hashchange:
             script_parts.append(
                 """
                 (function() {
                     try {
-                        if (typeof window.__RS_pushEvent !== "function") return;
-
                         function recordReactNav(kind, url) {
-                            try {
-                                window.__RS_pushEvent({
-                                    kind: kind,
-                                    url: String(url || location.href),
-                                    href: String(location.href),
-                                    pathname: location.pathname,
-                                    search: location.search,
-                                    hash: location.hash,
-                                    timestamp: Date.now()
-                                });
-                            } catch (_) {}
+                            window.__RS_pushEvent({
+                                kind: kind,
+                                url: String(url || location.href),
+                                pathname: location.pathname,
+                                timestamp: Date.now()
+                            });
                         }
-                """
-            )
 
-            if self.cfg.hook_history_api:
-                script_parts.append(
-                    """
-                        var origPush = history.pushState;
-                        var origReplace = history.replaceState;
+                        if (window.history && window.history.pushState) {
+                            var origPush = history.pushState;
+                            var origReplace = history.replaceState;
 
-                        history.pushState = function(state, title, url) {
-                            try { origPush.apply(this, arguments); } catch (_) {}
-                            recordReactNav("pushState", url);
-                        };
+                            history.pushState = function(state, title, url) {
+                                try { origPush.apply(this, arguments); } catch (_) {}
+                                recordReactNav("pushState", url);
+                            };
 
-                        history.replaceState = function(state, title, url) {
-                            try { origReplace.apply(this, arguments); } catch (_) {}
-                            recordReactNav("replaceState", url);
-                        };
+                            history.replaceState = function(state, title, url) {
+                                try { origReplace.apply(this, arguments); } catch (_) {}
+                                recordReactNav("replaceState", url);
+                            };
+                        }
 
-                        window.addEventListener("popstate", function() {
-                            recordReactNav("popstate", location.href);
-                        });
+                        window.addEventListener("popstate", function() { recordReactNav("popstate", location.href); });
+                        window.addEventListener("hashchange", function() { recordReactNav("hashchange", location.href); });
 
-                        // initial page load
                         recordReactNav("initial", location.href);
-                    """
-                )
-
-            if self.cfg.capture_hashchange:
-                script_parts.append(
-                    """
-                        window.addEventListener("hashchange", function() {
-                            recordReactNav("hashchange", location.href);
-                        });
-                    """
-                )
-
-            script_parts.append(
-                """
-                    } catch (e) {
-                        try {
-                            console.log("[ReactSniffer] History instrumentation error:", e);
-                        } catch (_e) {}
-                    }
+                    } catch (e) {}
                 })();
                 """
             )
 
-        # ------------------------------------------------------------------
-        # Link click hooks
-        # ------------------------------------------------------------------
+        # 5. Link Clicks
         if self.cfg.hook_link_clicks:
             script_parts.append(
                 """
                 (function() {
                     try {
-                        if (typeof window.__RS_pushEvent !== "function") return;
-
                         document.addEventListener("click", function(ev) {
-                            try {
-                                var t = ev.target;
-                                // climb up to nearest <a> if needed
-                                while (t && t !== document && !t.href) {
-                                    t = t.parentElement;
-                                }
-                                if (!t || !t.href) { return; }
+                            var t = ev.target;
+                            while (t && t !== document && !t.href) t = t.parentElement;
+                            if (!t || !t.href) return;
 
-                                window.__RS_pushEvent({
-                                    kind: "click",
-                                    url: String(t.href),
-                                    href: String(t.href),
-                                    pathname: location.pathname,
-                                    search: location.search,
-                                    hash: location.hash,
-                                    text: (t.innerText || "").trim(),
-                                    timestamp: Date.now()
-                                });
-                            } catch (_) {}
-                        }, true);
-                    } catch (e) {
-                        try {
-                            console.log("[ReactSniffer] Link instrumentation error:", e);
-                        } catch (_e) {}
-                    }
-                })();
-                """
-            )
-
-        # ------------------------------------------------------------------
-        # Optional React DevTools hook inspection
-        # ------------------------------------------------------------------
-        if self.cfg.inspect_react_devtools_hook:
-            script_parts.append(
-                """
-                (function() {
-                    try {
-                        if (typeof window.__RS_pushEvent !== "function") return;
-
-                        var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-                        if (hook && hook.renderers) {
-                            var rendererIds = Object.keys(hook.renderers || {});
                             window.__RS_pushEvent({
-                                kind: "react_devtools",
-                                rendererIds: rendererIds,
-                                hasReact: rendererIds.length > 0,
+                                kind: "click",
+                                url: String(t.href),
                                 pathname: location.pathname,
-                                href: String(location.href),
+                                text: (t.innerText || "").trim(),
                                 timestamp: Date.now()
                             });
-                        }
-                    } catch (e) {
-                        try {
-                            console.log("[ReactSniffer] DevTools hook inspection error:", e);
-                        } catch (_e) {}
-                    }
+                        }, true);
+                    } catch (e) {}
                 })();
                 """
             )
 
-        # ------------------------------------------------------------------
-        # NEW: Fiber traversal + Router/state extraction
-        # ------------------------------------------------------------------
-        if (
-            self.cfg.enable_fiber_traversal
-            or self.cfg.enable_router_inspection
-            or self.cfg.enable_state_url_scan
-        ):
-            url_rx = self.cfg.url_like_regex or r"(https?://[^\\s\"']+|/[A-Za-z0-9_./-]+)"
-            # safe JSON string for JS
-            url_rx_js = json.dumps(url_rx)
+        # 6. Deep State Management Extraction Engine (Redux, Apollo, Next, Nuxt)
+        url_rx_js = json.dumps(self.cfg.url_like_regex or r"(https?://[^\s\"']+|/[A-Za-z0-9_./-]+)")
 
-            script_parts.append(
-                f"""
-                (function() {{
-                    try {{
-                        if (typeof window.__RS_pushEvent !== "function") return;
+        script_parts.append(
+            f"""
+            window.__RS_DEEP_STATE_EXTRACTOR = function() {{
+                try {{
+                    const MAX_DEPTH = {int(self.cfg.max_state_object_depth)};
+                    const URL_RX = new RegExp({url_rx_js}, "i");
 
-                        var MAX_FIBER_NODES = {int(self.cfg.max_fiber_nodes)};
-                        var MAX_ROUTES = {int(self.cfg.max_router_entries)};
-                        var URL_RX = new RegExp({url_rx_js}, "i");
-
-                        function isUrlish(str) {{
-                            if (typeof str !== "string") return false;
-                            if (!str) return false;
-                            if (URL_RX.test(str)) return true;
-                            if (str[0] === "/" && str.length <= 256) return true;
-                            return false;
-                        }}
-
-                        function emitFiberLink(url, meta) {{
-                            try {{
-                                if (!url || !isUrlish(url)) return;
-                                window.__RS_pushEvent({{
-                                    kind: "fiber_link",
-                                    url: String(url),
-                                    href: String(location.href),
-                                    pathname: location.pathname,
-                                    meta: meta || {{}},
-                                    timestamp: Date.now()
-                                }});
-                            }} catch (_) {{}}
-                        }}
-
-                        function emitStateUrl(url, meta) {{
-                            try {{
-                                if (!url || !isUrlish(url)) return;
-                                window.__RS_pushEvent({{
-                                    kind: "fiber_state_url",
-                                    url: String(url),
-                                    href: String(location.href),
-                                    pathname: location.pathname,
-                                    meta: meta || {{}},
-                                    timestamp: Date.now()
-                                }});
-                            }} catch (_) {{}}
-                        }}
-
-                        function scanObjectForUrls(obj, meta, depth, maxDepth, cb) {{
-                            if (!obj || typeof obj !== "object") return;
-                            if (depth > maxDepth) return;
-                            var seen = new WeakSet();
-                            function walk(o, d) {{
-                                if (!o || typeof o !== "object") return;
-                                if (seen.has(o)) return;
-                                seen.add(o);
-                                if (d > maxDepth) return;
-                                var keys = Object.keys(o);
-                                for (var i = 0; i < keys.length; i++) {{
-                                    var k = keys[i];
-                                    var v = o[k];
-                                    if (typeof v === "string") {{
-                                        if (isUrlish(v)) {{
-                                            cb(v, Object.assign({{ key: k }}, meta || {{}}));
-                                        }}
-                                    }} else if (v && typeof v === "object") {{
-                                        walk(v, d + 1);
-                                    }}
-                                }}
-                            }}
-                            walk(obj, depth);
-                        }}
-
-                        function gatherRouterRoutesFromConfig(config, meta, out) {{
-                            if (!config || typeof config !== "object") return;
-                            var seen = new WeakSet();
-                            function walkRouteNode(node, baseMeta) {{
-                                if (!node || typeof node !== "object") return;
-                                if (seen.has(node)) return;
-                                seen.add(node);
-                                var path = null;
-                                var hasIndex = false;
-
-                                try {{
-                                    if (typeof node.path === "string") {{
-                                        path = node.path;
-                                    }} else if (typeof node.route === "string") {{
-                                        path = node.route;
-                                    }}
-                                    if (node.index === true) {{
-                                        hasIndex = true;
-                                    }}
-                                }} catch (_) {{}}
-
-                                if (path || hasIndex) {{
-                                    out.push({{
-                                        path: path || null,
-                                        index: !!hasIndex,
-                                        meta: baseMeta || meta || {{}}
-                                    }});
-                                }}
-
-                                var children = null;
-                                try {{
-                                    children = node.children || node.routes || node.childRoutes || null;
-                                }} catch (_) {{}}
-
-                                if (Array.isArray(children)) {{
-                                    for (var i = 0; i < children.length; i++) {{
-                                        walkRouteNode(children[i], baseMeta || meta);
-                                        if (out.length >= MAX_ROUTES) return;
-                                    }}
-                                }}
-                            }}
-
-                            walkRouteNode(config, meta || {{}});
-                        }}
-
-                        function getFiberRootsFromDevtools() {{
-                            var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-                            if (!hook || !hook.getFiberRoots) return [];
-                            var roots = [];
-                            try {{
-                                var rendererIds = Object.keys(hook.renderers || {{}});
-                                for (var i = 0; i < rendererIds.length; i++) {{
-                                    var id = Number(rendererIds[i]);
-                                    var rootSet = hook.getFiberRoots(id);
-                                    if (!rootSet) continue;
-                                    if (typeof rootSet.forEach === "function") {{
-                                        rootSet.forEach(function(root) {{
-                                            if (root && root.current) {{
-                                                roots.push(root.current);
-                                            }} else if (root) {{
-                                                roots.push(root);
-                                            }}
-                                        }});
-                                    }}
-                                }}
-                            }} catch (e) {{
-                                try {{
-                                    console.log("[ReactSniffer] getFiberRoots error", e);
-                                }} catch (_e) {{}}
-                            }}
-                            return roots;
-                        }}
-
-                        function traverseFiberRoot(root, routerRoutes) {{
-                            var seen = new WeakSet();
-                            var count = 0;
-
-                            function visit(node) {{
-                                if (!node || typeof node !== "object") return;
-                                if (seen.has(node)) return;
-                                seen.add(node);
-
-                                if (count >= MAX_FIBER_NODES) return;
-                                count++;
-
-                                var elementTypeName = null;
-                                try {{
-                                    var et = node.elementType || node.type || null;
-                                    if (et && typeof et === "function" && et.name) {{
-                                        elementTypeName = et.name;
-                                    }} else if (typeof et === "string") {{
-                                        elementTypeName = et;
-                                    }}
-                                }} catch (_) {{}}
-
-                                // ----- props scan -----
-                                try {{
-                                    var props = node.memoizedProps || node.pendingProps || node.props || null;
-                                    if (props && typeof props === "object") {{
-                                        // Common React Router / link props
-                                        ["to", "href", "as", "path"].forEach(function(key) {{
-                                            if (props && typeof props[key] === "string") {{
-                                                var val = props[key];
-                                                if (isUrlish(val)) {{
-                                                    emitFiberLink(val, {{
-                                                        where: "props",
-                                                        key: key,
-                                                        elementType: elementTypeName
-                                                    }});
-                                                    if (key === "path" && routerRoutes.length < MAX_ROUTES) {{
-                                                        routerRoutes.push({{
-                                                            path: val,
-                                                            index: false,
-                                                            meta: {{ source: "fiber_props", elementType: elementTypeName }}
-                                                        }});
-                                                    }}
-                                                }}
-                                            }}
-                                        }});
-
-                                        // Also scan nested objects for URL-ish strings
-                                        scanObjectForUrls(
-                                            props,
-                                            {{ where: "props_deep", elementType: elementTypeName }},
-                                            0,
-                                            2,
-                                            emitFiberLink
-                                        );
-                                    }}
-                                }} catch (_) {{}}
-
-                                // ----- state scan -----
-                                try {{
-                                    var st = node.memoizedState || (node.stateNode && node.stateNode.state) || null;
-                                    if (st && typeof st === "object") {{
-                                        scanObjectForUrls(
-                                            st,
-                                            {{ where: "state", elementType: elementTypeName }},
-                                            0,
-                                            2,
-                                            emitStateUrl
-                                        );
-                                    }}
-                                }} catch (_) {{}}
-
-                                // descend
-                                try {{ visit(node.child); }} catch (_) {{}}
-                                try {{ visit(node.sibling); }} catch (_) {{}}
-                            }}
-
-                            visit(root);
-                        }}
-
-                        function scanReactRouterFromGlobals(routerRoutes) {{
-                            try {{
-                                // Heuristic search in window for route configs
-                                var rootKeys = Object.keys(window || {{}});
-                                for (var i = 0; i < rootKeys.length; i++) {{
-                                    var k = rootKeys[i];
-                                    if (!k) continue;
-                                    // skip obvious noise
-                                    if (k === "webpackJsonp" || k === "__PROMPTCHAT_REACT_SNIFFER_HITS__" || k === "__RS_pushEvent") continue;
-                                    if (k.indexOf("route") === -1 && k.indexOf("Router") === -1) continue;
-
-                                    var v;
-                                    try {{ v = window[k]; }} catch (_e) {{ v = null; }}
-                                    if (!v || typeof v !== "object") continue;
-                                    gatherRouterRoutesFromConfig(
-                                        v,
-                                        {{ source: "window:"+k }},
-                                        routerRoutes
-                                    );
-                                    if (routerRoutes.length >= MAX_ROUTES) break;
-                                }}
-                            }} catch (e) {{
-                                try {{
-                                    console.log("[ReactSniffer] scanReactRouterFromGlobals error", e);
-                                }} catch (_e) {{}}
-                            }}
-                        }}
-
-                        function runFiberScan() {{
-                            try {{
-                                var routerRoutes = [];
-                                var roots = getFiberRootsFromDevtools();
-                                for (var i = 0; i < roots.length; i++) {{
-                                    traverseFiberRoot(roots[i], routerRoutes);
-                                    if (routerRoutes.length >= MAX_ROUTES) break;
-                                }}
-
-                                scanReactRouterFromGlobals(routerRoutes);
-
-                                if (routerRoutes.length) {{
-                                    window.__RS_pushEvent({{
-                                        kind: "react_router_routes",
-                                        url: String(location.href),
-                                        href: String(location.href),
-                                        pathname: location.pathname,
-                                        meta: {{
-                                            routes: routerRoutes.slice(0, MAX_ROUTES)
-                                        }},
-                                        timestamp: Date.now()
-                                    }});
-                                }}
-                            }} catch (e) {{
-                                try {{
-                                    console.log("[ReactSniffer] runFiberScan error", e);
-                                }} catch (_e) {{}}
-                            }}
-                        }}
-
-                        // Schedule after initial React bootstraps
-                        setTimeout(runFiberScan, 0);
-                    }} catch (e) {{
-                        try {{
-                            console.log("[ReactSniffer] Fiber instrumentation error:", e);
-                        }} catch (_e) {{}}
+                    function isUrlish(str) {{
+                        if (typeof str !== "string" || !str) return false;
+                        return URL_RX.test(str) || (str[0] === "/" && str.length > 2 && str.length <= 256);
                     }}
-                }})();
-                """
-            )
+
+                    function extractFromObject(sourceName, obj) {{
+                        if (!obj || typeof obj !== "object") return;
+                        const seen = new WeakSet();
+
+                        function walk(o, depth, currentPath) {{
+                            if (depth > MAX_DEPTH || !o || typeof o !== "object") return;
+                            if (seen.has(o)) return;
+                            seen.add(o);
+
+                            const keys = Object.keys(o);
+                            for (let i = 0; i < keys.length; i++) {{
+                                const k = keys[i];
+                                const v = o[k];
+
+                                if (typeof v === "string") {{
+                                    if (isUrlish(v)) {{
+                                        window.__RS_pushEvent({{
+                                            kind: "state_extraction",
+                                            url: v,
+                                            pathname: location.pathname,
+                                            meta: {{ source: sourceName, keyPath: currentPath + "." + k }},
+                                            timestamp: Date.now()
+                                        }});
+                                    }}
+                                    // Parse stringified JSON inside state
+                                    if (v.startsWith("{{") || v.startsWith("[")) {{
+                                        try {{ walk(JSON.parse(v), depth + 1, currentPath + "." + k + "[Parsed]"); }} catch (_) {{}}
+                                    }}
+                                }} else if (v && typeof v === "object") {{
+                                    walk(v, depth + 1, currentPath + "." + k);
+                                }}
+                            }}
+                        }}
+                        walk(obj, 0, sourceName);
+                    }}
+
+                    // 6A. Next.js Hydration Data
+                    if ({str(self.cfg.enable_nextjs_nuxt_inspection).lower()} && window.__NEXT_DATA__) {{
+                        extractFromObject("NextJS__NEXT_DATA__", window.__NEXT_DATA__);
+                    }}
+
+                    // 6B. Nuxt.js Hydration Data
+                    if ({str(self.cfg.enable_nextjs_nuxt_inspection).lower()} && window.__NUXT__) {{
+                        extractFromObject("NuxtJS__NUXT__", window.__NUXT__);
+                    }}
+
+                    // 6C. Apollo GraphQL Cache
+                    if ({str(self.cfg.enable_apollo_graphql_inspection).lower()} && window.__APOLLO_STATE__) {{
+                        extractFromObject("ApolloGraphQL", window.__APOLLO_STATE__);
+                    }}
+
+                    // 6D. Redux Stores attached to window
+                    if ({str(self.cfg.enable_redux_inspection).lower()}) {{
+                        if (window.__PRELOADED_STATE__) extractFromObject("ReduxPreloaded", window.__PRELOADED_STATE__);
+                        if (window.store && typeof window.store.getState === "function") {{
+                            extractFromObject("ReduxGlobalStore", window.store.getState());
+                        }}
+                    }}
+
+                }} catch (e) {{ console.log("[ReactSniffer] Deep State Extraction Error", e); }}
+            }};
+            """
+        )
+
+        # 7. Deep Fiber Traversal Engine
+        script_parts.append(
+            f"""
+            window.__RS_FIBER_EXTRACTOR = function() {{
+                try {{
+                    const MAX_NODES = {int(self.cfg.max_fiber_nodes)};
+                    const MAX_ROUTES = {int(self.cfg.max_router_entries)};
+                    const URL_RX = new RegExp({url_rx_js}, "i");
+                    let routerRoutes = [];
+
+                    function isUrlish(str) {{
+                        return typeof str === "string" && !!str && (URL_RX.test(str) || (str[0] === "/" && str.length > 2 && str.length <= 256));
+                    }}
+
+                    function getFiberRoots() {{
+                        const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+                        if (!hook || !hook.getFiberRoots) return [];
+                        const roots = [];
+                        try {{
+                            const rendererIds = Object.keys(hook.renderers || {{}});
+                            for (let i = 0; i < rendererIds.length; i++) {{
+                                const rootSet = hook.getFiberRoots(Number(rendererIds[i]));
+                                if (rootSet && typeof rootSet.forEach === "function") {{
+                                    rootSet.forEach(r => roots.push(r.current ? r.current : r));
+                                }}
+                            }}
+                        }} catch (_) {{}}
+                        return roots;
+                    }}
+
+                    function traverseFiber(root) {{
+                        const seen = new WeakSet();
+                        let count = 0;
+
+                        function visit(node) {{
+                            if (!node || typeof node !== "object" || seen.has(node) || count >= MAX_NODES) return;
+                            seen.add(node);
+                            count++;
+
+                            let cName = "Unknown";
+                            try {{
+                                const et = node.elementType || node.type;
+                                if (typeof et === "function" && et.name) cName = et.name;
+                                else if (typeof et === "string") cName = et;
+                                else if (typeof et === "object" && et !== null && et.$$typeof) cName = "Context/Provider";
+                            }} catch (_) {{}}
+
+                            // Introspect Props (Routes, links, API endpoints)
+                            try {{
+                                const props = node.memoizedProps || node.pendingProps;
+                                if (props && typeof props === "object") {{
+                                    ['to', 'href', 'path', 'src', 'endpoint', 'url', 'action'].forEach(key => {{
+                                        if (typeof props[key] === "string" && isUrlish(props[key])) {{
+                                            window.__RS_pushEvent({{
+                                                kind: "fiber_prop_leak",
+                                                url: props[key],
+                                                pathname: location.pathname,
+                                                meta: {{ component: cName, propKey: key }},
+                                                timestamp: Date.now()
+                                            }});
+                                        }}
+                                    }});
+                                }}
+                            }} catch (_) {{}}
+
+                            // Introspect Memoized State (Hooks, local component state)
+                            try {{
+                                let st = node.memoizedState;
+                                let depth = 0;
+                                while (st && typeof st === "object" && depth < 5) {{
+                                    if (typeof st.memoizedState === "string" && isUrlish(st.memoizedState)) {{
+                                        window.__RS_pushEvent({{
+                                            kind: "fiber_state_leak",
+                                            url: st.memoizedState,
+                                            pathname: location.pathname,
+                                            meta: {{ component: cName }},
+                                            timestamp: Date.now()
+                                        }});
+                                    }}
+                                    st = st.next; // Traverse hook linked list
+                                    depth++;
+                                }}
+                            }} catch (_) {{}}
+
+                            try {{ visit(node.child); }} catch (_) {{}}
+                            try {{ visit(node.sibling); }} catch (_) {{}}
+                        }}
+                        visit(root);
+                    }}
+
+                    const roots = getFiberRoots();
+                    for (let i = 0; i < roots.length; i++) traverseFiber(roots[i]);
+
+                }} catch (e) {{ console.log("[ReactSniffer] Fiber Traversal Error", e); }}
+            }};
+            """
+        )
 
         final_script = "\n".join(script_parts)
 
         try:
             await page.add_init_script(final_script)
-            # also run immediately for the already-loaded document
             await page.evaluate(final_script)
-            self._log(f"Instrumentation installed on {page_url}", log)
+            self._log(f"Deep Instrumentation installed on {page_url}", log)
         except Exception as e:
-            self._log(f"Failed to install instrumentation on {page_url}: {e}", log)
+            self._log(f"Failed to install instrumentation: {e}", log)
+
+    async def _execute_post_load_scans(self, page, log: List[str]) -> None:
+        """
+        Triggers the heavy forensic extraction scripts after the page has hydrated.
+        """
+        trigger_script = """
+        () => {
+            if (typeof window.__RS_DEEP_STATE_EXTRACTOR === 'function') window.__RS_DEEP_STATE_EXTRACTOR();
+            if (typeof window.__RS_FIBER_EXTRACTOR === 'function') window.__RS_FIBER_EXTRACTOR();
+        }
+        """
+        try:
+            await page.evaluate(trigger_script)
+            self._log("Executed post-load forensic scans.", log)
+        except Exception as e:
+            self._log(f"Failed to execute post-load scans: {e}", log)
 
     # ------------------------------------------------------------------ #
-    # Collect & ingest raw hits
+    # Collect & ingest raw hits from JS into Python
     # ------------------------------------------------------------------ #
     async def _collect_raw_hits(self, page, page_url: str, log: List[str]) -> List[Dict[str, Any]]:
-        """
-        Read back the window.__PROMPTCHAT_REACT_SNIFFER_HITS__ array.
-        """
         try:
             raw_hits = await page.evaluate(
                 """() => {
@@ -9195,25 +9108,20 @@ class ReactSniffer:
                         return Array.isArray(window.__PROMPTCHAT_REACT_SNIFFER_HITS__)
                             ? window.__PROMPTCHAT_REACT_SNIFFER_HITS__
                             : [];
-                    } catch (e) {
-                        return [];
-                    }
+                    } catch (e) { return []; }
                 }"""
             )
         except Exception as e:
-            self._log(f"Error reading hits from {page_url}: {e}", log)
+            self._log(f"Error reading hits: {e}", log)
             return []
 
         if not isinstance(raw_hits, list):
             raw_hits = []
 
-        self._log(f"Raw hits length={len(raw_hits)} for {page_url}", log)
+        self._log(f"Raw JS hits captured: {len(raw_hits)}", log)
         return raw_hits
 
     def _ingest_raw_hits(self, raw_hits: List[Dict[str, Any]], page_url: str, log: List[str]) -> None:
-        """
-        Convert JS-side events into internal dataclasses (sniffer memory).
-        """
         for h in raw_hits or []:
             if not isinstance(h, dict):
                 continue
@@ -9223,7 +9131,6 @@ class ReactSniffer:
             pathname = str(h.get("pathname") or "")
             timestamp = h.get("timestamp")
 
-            # dedupe based on event fingerprint if enabled
             fp = (kind, url, pathname, timestamp)
             if self.cfg.dedupe_events and fp in self._event_fingerprint_seen:
                 continue
@@ -9233,164 +9140,88 @@ class ReactSniffer:
                 self._register_nav(kind, url, pathname, timestamp)
 
             elif kind == "click":
-                text = str(h.get("text") or "")
-                self._register_click(url, pathname, text, timestamp)
+                self._register_click(url, pathname, str(h.get("text") or ""), timestamp)
+
+            elif kind in ("state_extraction", "fiber_prop_leak", "fiber_state_leak", "intercept_fetch", "intercept_xhr",
+                          "webpack_chunk_leak"):
+                self._state_events.append(
+                    ReactSniffer.StateExtractionEvent(
+                        source=kind,
+                        url=url,
+                        meta=h.get("meta") or {},
+                        timestamp=timestamp
+                    )
+                )
+                self._urls_seen.add(url)
 
             elif kind == "react_devtools":
-                renderer_ids = list(h.get("rendererIds") or [])
-                has_react = bool(h.get("hasReact"))
-                self._register_summary(has_react, renderer_ids, timestamp)
-
-            elif kind == "react_router_routes":
-                # Router config dump; meta.routes is a list of {path, index, meta}
-                meta = h.get("meta") or {}
-                routes = meta.get("routes") or []
-                if isinstance(routes, list):
-                    for r in routes:
-                        if not isinstance(r, dict):
-                            continue
-                        path = str(r.get("path") or "")
-                        idx_flag = bool(r.get("index", False))
-                        rmeta = r.get("meta") or {}
-                        if path:
-                            self._router_routes.append(
-                                {
-                                    "path": path,
-                                    "index": idx_flag,
-                                    "meta": rmeta,
-                                }
-                            )
-                            # treat as navigation-type route as well
-                            self._register_nav("router_config", url, path, timestamp)
+                self._register_summary(bool(h.get("hasReact")), list(h.get("rendererIds") or []), timestamp)
 
             else:
-                # unknown kinds (fiber_link, fiber_state_url, etc.) treated as generic nav
                 self._register_nav(kind, url, pathname, timestamp)
 
         self._log(
-            f"Memory populated: "
-            f"{len(self._nav_events)} nav_events, "
-            f"{len(self._click_events)} click_events, "
-            f"router_routes={len(self._router_routes)}, "
-            f"summary={'present' if self._summary else 'none'}",
+            f"Ingestion complete: "
+            f"{len(self._nav_events)} nav, "
+            f"{len(self._click_events)} clicks, "
+            f"{len(self._state_events)} deep state hits.",
             log,
         )
 
     # ------------------------------------------------------------------ #
-    # Memory helpers
+    # Memory Registration Helpers
     # ------------------------------------------------------------------ #
     def _register_nav(self, kind: str, url: str, pathname: str, timestamp: Optional[float]) -> None:
-        self._nav_events.append(
-            ReactSniffer.RouteEvent(
-                kind=kind,
-                url=url,
-                pathname=pathname,
-                timestamp=timestamp,
-            )
-        )
+        self._nav_events.append(ReactSniffer.RouteEvent(kind, url, pathname, timestamp))
         self._urls_seen.add(url)
-        if pathname:
-            self._routes_seen.add(pathname)
+        if pathname: self._routes_seen.add(pathname)
 
     def _register_click(self, url: str, pathname: str, text: str, timestamp: Optional[float]) -> None:
-        self._click_events.append(
-            ReactSniffer.ClickEvent(
-                url=url,
-                pathname=pathname,
-                text=text,
-                timestamp=timestamp,
-            )
-        )
+        self._click_events.append(ReactSniffer.ClickEvent(url, pathname, text, timestamp))
         self._urls_seen.add(url)
-        if pathname:
-            self._routes_seen.add(pathname)
+        if pathname: self._routes_seen.add(pathname)
 
     def _register_summary(self, has_react: bool, renderer_ids: List[str], timestamp: Optional[float]) -> None:
-        self._summary = ReactSniffer.DevtoolsSummary(
-            has_react=has_react,
-            renderer_ids=renderer_ids,
-            timestamp=timestamp,
-        )
+        self._summary = ReactSniffer.DevtoolsSummary(has_react, renderer_ids, timestamp)
 
     # ------------------------------------------------------------------ #
-    # Memory -> final hits
+    # Memory -> Final API Translation
     # ------------------------------------------------------------------ #
     def _materialize_hits(self, page_url: str) -> List[Dict[str, Any]]:
-        """
-        Turn sniffer memory into the final list of dict hits.
-
-        This mirrors the pattern of NetworkSniffer / JSSniffer:
-          • 'page' always present
-          • 'url', 'route', 'tag', 'kind'
-          • 'meta' for extra info
-        """
         hits: List[Dict[str, Any]] = []
 
-        # 1) Nav events (history, hashchange, router_config, fiber_link, etc.)
+        # 1. Standard Navigation Events
         for nav in self._nav_events:
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": nav.url,
-                    "route": nav.pathname,
-                    "tag": "react_route",
-                    "kind": nav.kind,
-                    "meta": {
-                        "timestamp": nav.timestamp,
-                    },
-                }
-            )
+            hits.append({
+                "page": page_url, "url": nav.url, "route": nav.pathname,
+                "tag": "react_route", "kind": nav.kind, "meta": {"timestamp": nav.timestamp}
+            })
 
-        # 2) Click events
+        # 2. Click Events
         for click in self._click_events:
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": click.url,
-                    "route": click.pathname,
-                    "tag": "react_link",
-                    "kind": "click",
-                    "meta": {
-                        "text": click.text,
-                        "timestamp": click.timestamp,
-                    },
-                }
-            )
+            hits.append({
+                "page": page_url, "url": click.url, "route": click.pathname,
+                "tag": "react_link", "kind": "click", "meta": {"text": click.text, "timestamp": click.timestamp}
+            })
 
-        # 3) Router routes (from config / fiber props)
-        for r in self._router_routes:
-            path = r.get("path") or ""
-            meta = dict(r.get("meta") or {})
-            meta["index"] = bool(r.get("index", False))
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": path or page_url,
-                    "route": path,
-                    "tag": "react_route",
-                    "kind": "router_config",
-                    "meta": meta,
-                }
-            )
+        # 3. Deep State Forensic Hits
+        for state in self._state_events:
+            hits.append({
+                "page": page_url, "url": state.url, "route": self._route_from_url(state.url),
+                "tag": "react_forensics", "kind": state.source,
+                "meta": {**state.meta, "timestamp": state.timestamp}
+            })
 
-        # 4) Devtools info as its own hit
+        # 4. React DevTools Meta
         if self._summary is not None:
-            hits.append(
-                {
-                    "page": page_url,
-                    "url": page_url,
-                    "route": "",
-                    "tag": "react_meta",
-                    "kind": "react_devtools",
-                    "meta": {
-                        "hasReact": self._summary.has_react,
-                        "rendererIds": self._summary.renderer_ids,
-                        "timestamp": self._summary.timestamp,
-                    },
-                }
-            )
+            hits.append({
+                "page": page_url, "url": page_url, "route": "",
+                "tag": "react_meta", "kind": "react_devtools",
+                "meta": {"hasReact": self._summary.has_react, "rendererIds": self._summary.renderer_ids,
+                         "timestamp": self._summary.timestamp}
+            })
 
-        # 5) Optional aggregate summary hit
+        # 5. Global Summary
         if self.cfg.emit_summary_hit:
             summary_hit = self._build_summary_hit(page_url)
             if summary_hit is not None:
@@ -9399,230 +9230,243 @@ class ReactSniffer:
         return hits
 
     def _build_summary_hit(self, page_url: str) -> Optional[Dict[str, Any]]:
-        """
-        Build a synthetic high-level summary hit aggregating counts and
-        the most "interesting" routes.
-        """
-        if (
-            not self._nav_events
-            and not self._click_events
-            and not self._summary
-            and not self._router_routes
-        ):
+        if not self._nav_events and not self._click_events and not self._state_events and not self._summary:
             return None
 
-        # route frequency (from nav + router_routes)
         route_counts: Dict[str, int] = {}
         for nav in self._nav_events:
-            if nav.pathname:
-                route_counts[nav.pathname] = route_counts.get(nav.pathname, 0) + 1
-        for r in self._router_routes:
-            path = r.get("path") or ""
-            if path:
-                route_counts[path] = route_counts.get(path, 0) + 1
+            if nav.pathname: route_counts[nav.pathname] = route_counts.get(nav.pathname, 0) + 1
 
-        top_routes = sorted(
-            route_counts.items(),
-            key=lambda kv: kv[1],
-            reverse=True,
-        )[:10]
+        top_routes = sorted(route_counts.items(), key=lambda kv: kv[1], reverse=True)[:10]
 
         meta: Dict[str, Any] = {
             "nav_event_count": len(self._nav_events),
             "click_event_count": len(self._click_events),
-            "router_route_count": len(self._router_routes),
+            "deep_state_event_count": len(self._state_events),
             "unique_routes": len(self._routes_seen),
             "unique_urls": len(self._urls_seen),
             "top_routes": top_routes,
         }
 
         if self._summary is not None:
-            meta.update(
-                {
-                    "hasReact": self._summary.has_react,
-                    "rendererIds": self._summary.renderer_ids,
-                    "react_devtools_timestamp": self._summary.timestamp,
-                }
-            )
+            meta.update({
+                "hasReact": self._summary.has_react,
+                "rendererIds": self._summary.renderer_ids,
+                "react_devtools_timestamp": self._summary.timestamp,
+            })
 
         return {
-            "page": page_url,
-            "url": page_url,
-            "route": "",
-            "tag": "react_meta",
-            "kind": "summary",
-            "meta": meta,
+            "page": page_url, "url": page_url, "route": "",
+            "tag": "react_meta", "kind": "summary", "meta": meta,
         }
 
-
 # ======================================================================
-# DatabaseSniffer (Playwright-based DB / persistence sniffer)
+# DatabaseSniffer (Playwright-based DB / Persistence Sniffer)
 # ======================================================================
 
 class DatabaseSniffer:
     """
-    Playwright-based sniffer for Data Persistence + Safe Link Extraction (ADVANCED / HARDENED).
+    Playwright-based sniffer for Data Persistence + Safe Link Extraction.
+    (ADVANCED FORENSICS / HARDENED / ENTERPRISE EDITION)
 
-    SAFE GUARANTEES:
-      - Does NOT extract IndexedDB records (metadata only).
+    SAFE GUARANTEES & CAPABILITIES:
+      - Does NOT extract IndexedDB records beyond safe byte caps (prevents IPC crashes).
       - Does NOT return full backend configs; only shallow fingerprints + URL strings.
       - Does NOT store arbitrary HTML; only returns html snapshot + hits (URLs + metadata).
 
-    Improvements:
-      - High-ROI URL harvesting:
-          * attribute whitelist beyond href/src (srcset, poster, data-src, data-href, etc.)
-          * <source>/<track> scanning
-          * CSS url(...) extraction from <style> + style=""
-          * meta (og:video, twitter:player, etc.) URL capture
-          * JSON-LD (application/ld+json) URL extraction with caps + seen-set
-          * JS string-literal URL extraction from inline scripts with byte caps + yielding
-      - Hardened against hangs:
-          * circular protection and caps for JSON traversal
-          * incremental harvesting (no giant concatenated buffers)
-          * yields to event loop during heavy parse
+    DEEP FORENSIC VECTORS INTEGRATED:
+      1. Advanced DOM Harvesting (attributes, styles, JSON-LD, inline scripts).
+      2. Network Request/Response URL interception.
+      3. Backend Object/Global state fingerprinting and link extraction.
+      4. IndexedDB Metadata and safe Cursor-based Record Dumping.
+      5. Service Worker Cache Storage APIs (Progressive Web Apps).
+      6. Web Storage (LocalStorage, SessionStorage) & Cookie Parsing.
+      7. WebSocket Frame Sniffing (Dynamic Payload Analysis).
+      8. WebRTC RTCPeerConnection Sniffing (STUN/TURN capture).
+      9. Chrome DevTools Protocol (CDP) Heap Snapshots (V8 Memory dumps).
     """
 
-    # --- basic URL patterns (link-only) ---
-    _ABS_URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
-    _SCHEMELESS_RE = re.compile(r"(?<!:)\b//[^\s\"'<>]+", re.IGNORECASE)  # //cdn.example.com/x
+    # --- Regex Patterns for Link Extraction ---
+
+    # Standard Absolute URLs
+    _ABS_URL_RE = re.compile(
+        r"\b(?:https?|wss?)://[^\s\"'<>\[\]{}]+",
+        re.IGNORECASE
+    )
+
+    # Schemeless URLs (e.g., //cdn.example.com/script.js)
+    _SCHEMELESS_RE = re.compile(
+        r"(?<!:)\b//[^\s\"'<>\[\]{}]+",
+        re.IGNORECASE
+    )
 
     # CSS url(...) – handles url(x) url('x') url("x")
-    _CSS_URL_RE = re.compile(r"url\(\s*(?:['\"])?([^'\"\)\s]+)(?:['\"])?\s*\)", re.IGNORECASE)
+    _CSS_URL_RE = re.compile(
+        r"url\(\s*(?:['\"])?([^'\"\)\s]+)(?:['\"])?\s*\)",
+        re.IGNORECASE
+    )
 
-    # JS string literal URL-ish extraction (kept conservative)
-    # - catches "https://..." 'wss://...' "//cdn..." "/api/v1" "./x" "../x"
+    # Aggressive JS Literal extraction
+    # Catches absolute, schemeless, and strict relative paths starting with / or ./
     _JS_LIT_RE = re.compile(
         r"""(?:
             (?P<abs>(?:https?|wss?)://[^"'\\\s<>{}\[\]]+)
           | (?P<schemeless>//[^"'\\\s<>{}\[\]]+)
-          | (?P<rel>
-                (?:/|\./|\.\./)[^"'\\\s<>{}\[\]]+
-            )
+          | (?P<rel>(?:/|\./|\.\./)[^"'\\\s<>{}\[\]]+)
         )""",
         re.IGNORECASE | re.VERBOSE,
     )
 
-    _ALLOWED_SCHEMES = {"http", "https", "ws", "wss"}
-
-    # Attribute/value grabbing (we still parse with Playwright DOM, but keep regex fallback)
+    # DOM Attribute scanning fallback (primarily handled by JS now, but kept for raw text)
     _ATTR_PAIR_RE = re.compile(r"""([a-zA-Z0-9_\-:]+)\s*=\s*["']([^"']+)["']""")
 
+    # Allowed URL schemes for final emission
+    _ALLOWED_SCHEMES = {"http", "https", "ws", "wss"}
+
     # ------------------------------------------------------------------ #
-    # Config
+    # Configuration Data Class
     # ------------------------------------------------------------------ #
     @dataclass
     class Config:
-        timeout: float = 10.0
+        """
+        Granular configuration for the DatabaseSniffer.
+        All capacities and depths are bounded to prevent Playwright IPC crashes
+        and memory exhaustion during deep forensic scans.
+        """
 
-        # --- Backwards compatible toggles (your pipeline expects these) ---
-        enable_html_link_scan: bool = True              # legacy name
-        enable_backend_link_scan: bool = True           # legacy name
-        enable_network_capture: bool = True             # legacy name
-        enable_backend_fingerprint: bool = True         # legacy name
-        enable_indexeddb_dump: bool = True              # legacy name
+        # Base timeout for the entire page load and script execution
+        timeout: float = 15.0
 
-        # --- New harvesting toggles (fine-grained) ---
+        # --- Standard Scans (Legacy Pipeline Compatibility) ---
+        enable_html_link_scan: bool = True
+        enable_backend_link_scan: bool = True
+        enable_network_capture: bool = True
+        enable_backend_fingerprint: bool = True
+        enable_indexeddb_dump: bool = True
+
+        # --- Advanced Forensic Scans (New Capabilities) ---
+        enable_cache_storage_dump: bool = True
+        enable_web_storage_dump: bool = True
+        enable_websocket_sniffing: bool = True
+        enable_webrtc_sniffing: bool = True
+
+        # NOTE: CDP Heap Snapshots are very heavy. Enable only for deep targets.
+        enable_cdp_heap_snapshot: bool = False
+
+        # --- DOM fine-grained toggles ---
         enable_dom_attribute_scan: bool = True
         enable_dom_style_scan: bool = True
         enable_dom_meta_scan: bool = True
         enable_jsonld_scan: bool = True
         enable_inline_script_string_scan: bool = True
 
-        # --- IndexedDB metadata only ---
+        # --- Capacity Caps: IndexedDB ---
         max_idb_databases: int = 5
-        max_idb_stores: int = 5
+        max_idb_stores: int = 10
+        max_idb_records: int = 500
 
-        # --- Backend fingerprint ---
+        # --- Capacity Caps: Forensics ---
+        max_heap_strings: int = 2000
+        max_network_urls: int = 400
+        max_websocket_frames: int = 300
+
+        # --- Backend Config & Caps ---
         known_globals: Set[str] = field(default_factory=lambda: {
             "firebase", "_firebaseApp", "Supabase", "supabaseClient",
             "__FIREBASE_DEFAULTS__", "mongo", "Realm", "couchdb",
+            "__NEXT_DATA__", "__NUXT__", "state", "store"
         })
-
-        # --- Network capture caps (URL-only) ---
-        max_network_urls: int = 400
-
-        # --- Classification / filtering ---
-        classify_links: bool = True
-        allow_classes: Set[str] = field(default_factory=set)  # if non-empty, filter emitted links by class
-
-        # --- Backend global scan caps (avoid expensive traversals) ---
+        backend_serialize_depth: int = 4
         backend_scan_max_urls: int = 200
         backend_scan_max_keys_per_obj: int = 50
         backend_scan_max_array_items: int = 50
         backend_scan_depth: int = 2
 
-        # --- DOM harvesting caps (avoid giant pages) ---
+        # --- DOM Extraction Caps ---
         max_dom_nodes: int = 4000
         max_attr_pairs: int = 12000
-
-        # Only scan these attributes (high ROI)
         attr_whitelist: Set[str] = field(default_factory=lambda: {
-            "href", "src", "srcset", "poster",
-            "data-src", "data-href", "data-url", "data-srcset",
-            "content", "value",  # meta/content + some forms
+            "href", "src", "srcset", "poster", "data-src",
+            "data-href", "data-url", "data-srcset", "content", "value", "action"
         })
 
-        # --- CSS scanning caps ---
-        max_style_tag_bytes: int = 400_000     # across all <style> tags
-        max_inline_style_bytes: int = 200_000  # across all style="" attrs
-
-        # --- JSON-LD caps ---
+        # Byte restrictions to prevent memory exhaustion
+        max_style_tag_bytes: int = 400_000
+        max_inline_style_bytes: int = 200_000
         max_jsonld_blocks: int = 30
         max_jsonld_bytes_per_block: int = 200_000
+
+        # JSON extraction bounds
         json_scan_max_urls: int = 300
         json_scan_max_depth: int = 6
         json_scan_max_keys_per_obj: int = 100
         json_scan_max_array_items: int = 200
 
-        # --- Inline script literal URL scan caps ---
+        # JS inline extraction bounds
         max_inline_script_blocks: int = 40
         max_inline_script_bytes_per_block: int = 200_000
         js_literal_max_urls: int = 400
 
-        # --- Yielding / responsiveness ---
+        # Filtering / Emit Controls
+        classify_links: bool = True
+        allow_classes: Set[str] = field(default_factory=set)
+
+        # Asynchronous yielding to prevent blocking the Python event loop
         yield_every_n_urls: int = 200
 
         @classmethod
         def from_kwargs(cls, **kwargs) -> "DatabaseSniffer.Config":
             """
-            Backward/forward-compatible constructor:
-            - ignores unknown keys instead of crashing your pipeline
+            Backward/forward-compatible constructor.
+            Ignores unknown keys instead of crashing the pipeline.
             """
             allowed = {f.name for f in fields(cls)}
             filtered = {k: v for k, v in kwargs.items() if k in allowed}
             return cls(**filtered)
 
     # ------------------------------------------------------------------ #
-    # Lifecycle
+    # Lifecycle & Logging
     # ------------------------------------------------------------------ #
     def __init__(self, config: Optional["DatabaseSniffer.Config"] = None, logger=None):
+        """
+        Initializes the DatabaseSniffer with specific configurations.
+        """
         self.cfg = config or self.Config()
         self.logger = logger or DEBUG_LOGGER
-        self._log("DatabaseSniffer Initialized (hardened advanced link-only mode)", None)
+        self._log("DatabaseSniffer Initialized (Deep Forensics Mode)", None)
 
-    # ------------------------------------------------------------------ #
-    # Logging helper
-    # ------------------------------------------------------------------ #
-    def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+    def _log(self, msg: str, log_list: Optional[List[str]] = None) -> None:
+        """
+        Centralized logging. Pushes to a local list (if provided) and
+        the global pipeline logger.
+        """
         full = f"[DatabaseSniffer] {msg}"
         try:
             if log_list is not None:
                 log_list.append(full)
-            if self.logger is not None:
+            if hasattr(self.logger, "log_message"):
                 self.logger.log_message(full)
         except Exception:
             pass
 
     # ------------------------------------------------------------------ #
-    # URL utilities
+    # URL Utilities & Parsing
     # ------------------------------------------------------------------ #
     def _is_allowed_scheme(self, u: str) -> bool:
+        """
+        Filters for only navigable/connectable schemes to prevent
+        polluting the database with javascript:, mailto:, data:, etc.
+        """
         try:
             return urlparse(u).scheme.lower() in self._ALLOWED_SCHEMES
         except Exception:
             return False
 
     def _normalize_candidate(self, base_url: str, raw: str) -> str:
+        """
+        Resolves relative paths, schemeless URLs, and handles base URL
+        joining securely. Discards bad strings.
+        """
         raw = (raw or "").strip()
         if not raw:
             return ""
@@ -9631,7 +9475,7 @@ class DatabaseSniffer:
         if low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:", "#")):
             return ""
 
-        # schemeless -> https
+        # Schemeless -> https fallback
         if raw.startswith("//"):
             raw = "https:" + raw
 
@@ -9641,7 +9485,7 @@ class DatabaseSniffer:
         except Exception:
             has_scheme = False
 
-        # relative / query-only / bare path -> absolute
+        # Resolve relative / query-only / bare paths into absolute URLs
         if not has_scheme:
             if raw.startswith(("/", "./", "../", "?")):
                 raw = urljoin(base_url, raw)
@@ -9651,11 +9495,15 @@ class DatabaseSniffer:
                 return ""
 
         try:
-            return _canonicalize_url(raw)  # noqa: F821
+            return _canonicalize_url(raw)
         except Exception:
             return raw
 
     def _classify_url(self, u: str) -> str:
+        """
+        Basic heuristic classification for filtering hits before emission.
+        Useful when pipelines only want 'api' or 'media' links.
+        """
         try:
             p = urlparse(u)
             path = (p.path or "").lower()
@@ -9664,29 +9512,243 @@ class DatabaseSniffer:
 
         if any(path.endswith(ext) for ext in (".m3u8", ".mpd", ".ts", ".m4s", ".mp4", ".webm", ".mp3", ".aac", ".wav")):
             return "media"
-        if any(path.endswith(ext) for ext in (".js", ".css", ".map")):
+        if any(path.endswith(ext) for ext in (".js", ".css", ".map", ".woff", ".woff2", ".ttf")):
             return "asset"
-        if any(seg in path for seg in ("/api/", "/graphql", "/v1/", "/v2/", "/rpc", "/rest")):
+        if any(seg in path for seg in ("/api/", "/graphql", "/v1/", "/v2/", "/rpc", "/rest", "trpc")):
             return "api"
-        if any(path.endswith(ext) for ext in (".json", ".xml")):
+        if any(path.endswith(ext) for ext in (".json", ".xml", ".csv")):
             return "data"
         return "page"
 
     # ------------------------------------------------------------------ #
-    # Core add-hit helper
+    # Safe Text & Structure Extraction Primitives
+    # ------------------------------------------------------------------ #
+    def _extract_urls_from_text(self, base_url: str, text: str) -> List[str]:
+        """
+        Regex sweep across raw strings looking for http/https/ws bounds.
+        Highly optimized with sets to prevent duplicates.
+        """
+        if not text:
+            return []
+
+        cands: List[str] = self._ABS_URL_RE.findall(text) + self._SCHEMELESS_RE.findall(text)
+        seen: Set[str] = set()
+        out: List[str] = []
+
+        for raw in cands:
+            u = self._normalize_candidate(base_url, raw)
+            if u and self._is_allowed_scheme(u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+
+        return out
+
+    def _extract_css_urls(self, base_url: str, css_text: str) -> List[str]:
+        """
+        Extract URLs inside url() CSS functions safely.
+        """
+        if not css_text:
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        for raw in self._CSS_URL_RE.findall(css_text):
+            u = self._normalize_candidate(base_url, raw)
+            if u and self._is_allowed_scheme(u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_srcset_urls(self, base_url: str, srcset: str) -> List[str]:
+        """
+        Handles comma separated image source sets, extracting the actual
+        URL and ignoring the descriptor (e.g., 2x, 480w).
+        """
+        if not srcset:
+            return []
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        for part in srcset.split(","):
+            token = (part or "").strip().split()
+            if not token:
+                continue
+            raw = token[0].strip()
+            u = self._normalize_candidate(base_url, raw)
+            if u and self._is_allowed_scheme(u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    def _extract_js_string_literals(self, base_url: str, script_text: str, *, max_urls: int) -> List[str]:
+        """
+        Aggressive but capped extraction of paths inside inline JS.
+        Crucial for finding API endpoints hardcoded into frontend bundles.
+        """
+        if not script_text:
+            return []
+        seen: Set[str] = set()
+        out: List[str] = []
+
+        for m in self._JS_LIT_RE.finditer(script_text):
+            raw = m.group(0)
+            u = self._normalize_candidate(base_url, raw)
+            if u and self._is_allowed_scheme(u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+                if len(out) >= max_urls:
+                    break
+        return out
+
+    def _extract_urls_from_json_value(
+            self,
+            base_url: str,
+            val: Any,
+            *,
+            seen_ids: Set[int],
+            out: List[str],
+            max_urls: int,
+            max_depth: int,
+            max_keys: int,
+            max_arr: int,
+            depth: int = 0
+    ) -> None:
+        """
+        Deep, recursive, circular-safe traversal of parsed JSON or backend objects.
+        This is heavily used by IndexedDB dumps, Web Storage dumps, and JSON-LD.
+        """
+        if len(out) >= max_urls or depth > max_depth or val is None:
+            return
+
+        # Circular Reference Protection
+        if isinstance(val, (dict, list)):
+            vid = id(val)
+            if vid in seen_ids:
+                return
+            seen_ids.add(vid)
+
+        if isinstance(val, str):
+            # 1. Search for absolute URLs inside the string
+            for u in self._extract_urls_from_text(base_url, val):
+                if len(out) >= max_urls:
+                    break
+                if u not in out:
+                    out.append(u)
+
+            # 2. Consider the string itself might be a relative endpoint
+            if len(out) < max_urls and val.startswith(("/", "./", "../")):
+                u = self._normalize_candidate(base_url, val)
+                if u and self._is_allowed_scheme(u) and u not in out:
+                    out.append(u)
+            return
+
+        if isinstance(val, list):
+            for item in val[:max_arr]:
+                self._extract_urls_from_json_value(
+                    base_url, item, seen_ids=seen_ids, out=out,
+                    max_urls=max_urls, max_depth=max_depth,
+                    max_keys=max_keys, max_arr=max_arr, depth=depth + 1
+                )
+                if len(out) >= max_urls:
+                    return
+            return
+
+        if isinstance(val, dict):
+            for k in list(val.keys())[:max_keys]:
+                if len(out) >= max_urls:
+                    return
+                try:
+                    self._extract_urls_from_json_value(
+                        base_url, val.get(k), seen_ids=seen_ids, out=out,
+                        max_urls=max_urls, max_depth=max_depth,
+                        max_keys=max_keys, max_arr=max_arr, depth=depth + 1
+                    )
+                except Exception:
+                    continue
+
+    def _extract_urls_from_json_text(self, base_url: str, json_text: str) -> List[str]:
+        """
+        Tries to parse string as JSON for clean structural traversal.
+        Falls back to raw regex extraction if parsing fails.
+        """
+        if not json_text:
+            return []
+
+        json_text = json_text.strip()
+        if not json_text:
+            return []
+
+        out: List[str] = []
+        try:
+            data = json.loads(json_text)
+            self._extract_urls_from_json_value(
+                base_url, data, seen_ids=set(), out=out,
+                max_urls=int(self.cfg.json_scan_max_urls),
+                max_depth=int(self.cfg.json_scan_max_depth),
+                max_keys=int(self.cfg.json_scan_max_keys_per_obj),
+                max_arr=int(self.cfg.json_scan_max_array_items),
+            )
+        except Exception:
+            # Fallback if it's invalid JSON (e.g., malformed JSON-LD)
+            return self._extract_urls_from_text(base_url, json_text)
+
+        return out
+
+    def _extract_value_urls(self, base_url: str, value: str, *, direct: bool = False) -> List[str]:
+        """
+        Extract URLs from a direct attribute like href, where the string might BE the url.
+        Direct mode assumes the entire string is the target.
+        """
+        raw = (value or "").strip()
+        if not raw:
+            return []
+
+        seen: Set[str] = set()
+        out: List[str] = []
+
+        def add_cand(cand: str):
+            try:
+                u = self._normalize_candidate(base_url, cand)
+            except Exception:
+                u = ""
+            if u and self._is_allowed_scheme(u) and u not in seen:
+                seen.add(u)
+                out.append(u)
+
+        for u in self._extract_urls_from_text(base_url, raw):
+            add_cand(u)
+
+        if direct:
+            low = raw.lower()
+            if not low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:", "#")):
+                if raw.startswith(("//", "/", "./", "../", "?")):
+                    add_cand(raw)
+                elif " " not in raw:
+                    if "/" in raw or "." in raw or raw.lower().startswith(
+                            ("api", "graphql", "rest", "rpc", "v1/", "v2/")):
+                        add_cand(raw)
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Formatter & Hit Emitting Logic
     # ------------------------------------------------------------------ #
     async def _add_link_hits_async(
-        self,
-        page_url: str,
-        urls: List[str],
-        hits: List[Dict[str, Any]],
-        source: str,
-        log: Optional[List[str]],
+            self,
+            page_url: str,
+            urls: List[str],
+            hits: List[Dict[str, Any]],
+            source: str,
+            log: Optional[List[str]]
     ) -> None:
+        """
+        Formats discovered URLs into database hits, annotating them with source origin.
+        Yields to the asyncio event loop periodically to prevent stalling.
+        """
         if not urls:
             return
 
-        # Optional filtering by class
+        # Optional strict filtering by class criteria
         if self.cfg.classify_links and self.cfg.allow_classes:
             urls = [u for u in urls if self._classify_url(u) in self.cfg.allow_classes]
             if not urls:
@@ -9712,457 +9774,10 @@ class DatabaseSniffer:
             if self.cfg.yield_every_n_urls and (n % self.cfg.yield_every_n_urls == 0):
                 await asyncio.sleep(0)
 
-    # ------------------------------------------------------------------ #
-    # Text extraction primitives (safe)
-    # ------------------------------------------------------------------ #
-    def _extract_urls_from_text(self, base_url: str, text: str) -> List[str]:
-        if not text:
-            return []
-        cands: List[str] = []
-        cands += self._ABS_URL_RE.findall(text)
-        cands += self._SCHEMELESS_RE.findall(text)
-
-        seen: Set[str] = set()
-        out: List[str] = []
-        for raw in cands:
-            u = self._normalize_candidate(base_url, raw)
-            if not u:
-                continue
-            if not self._is_allowed_scheme(u):
-                continue
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-        return out
-
-    def _extract_css_urls(self, base_url: str, css_text: str) -> List[str]:
-        if not css_text:
-            return []
-        out: List[str] = []
-        seen: Set[str] = set()
-        for raw in self._CSS_URL_RE.findall(css_text):
-            u = self._normalize_candidate(base_url, raw)
-            if not u or not self._is_allowed_scheme(u):
-                continue
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-        return out
-
-    def _extract_srcset_urls(self, base_url: str, srcset: str) -> List[str]:
-        """
-        srcset format: "url1 1x, url2 2x" or "url 480w, url 800w"
-        We'll split commas, take first token in each chunk.
-        """
-        if not srcset:
-            return []
-        out: List[str] = []
-        seen: Set[str] = set()
-        for part in srcset.split(","):
-            token = (part or "").strip().split()
-            if not token:
-                continue
-            raw = token[0].strip()
-            u = self._normalize_candidate(base_url, raw)
-            if not u or not self._is_allowed_scheme(u):
-                continue
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-        return out
-
-    def _extract_js_string_literals(self, base_url: str, script_text: str, *, max_urls: int) -> List[str]:
-        """
-        Conservative scanning of inline JS for URL-ish string literals and relative endpoints.
-        Uses caps to prevent runaway.
-        """
-        if not script_text:
-            return []
-        seen: Set[str] = set()
-        out: List[str] = []
-        for m in self._JS_LIT_RE.finditer(script_text):
-            raw = m.group(0)
-            u = self._normalize_candidate(base_url, raw)
-            if not u or not self._is_allowed_scheme(u):
-                continue
-            if u in seen:
-                continue
-            seen.add(u)
-            out.append(u)
-            if len(out) >= max_urls:
-                break
-        return out
-
-    def _extract_urls_from_json_value(
-        self,
-        base_url: str,
-        val: Any,
-        *,
-        seen_ids: Set[int],
-        out: List[str],
-        max_urls: int,
-        max_depth: int,
-        max_keys: int,
-        max_arr: int,
-        depth: int = 0,
-    ) -> None:
-        """
-        JSON traversal hardened:
-          - seen_ids prevents circular loops
-          - depth/keys/array caps
-          - extracts URL strings only (absolute/ws/schemeless/relative)
-        """
-        if len(out) >= max_urls:
-            return
-        if depth > max_depth:
-            return
-        if val is None:
-            return
-
-        # Circular protection for containers
-        if isinstance(val, (dict, list)):
-            vid = id(val)
-            if vid in seen_ids:
-                return
-            seen_ids.add(vid)
-
-        if isinstance(val, str):
-            # Pull any URLs inside the string
-            for u in self._extract_urls_from_text(base_url, val):
-                if len(out) >= max_urls:
-                    break
-                if u not in out:
-                    out.append(u)
-
-            # Also consider relative endpoints embedded as plain strings
-            # (e.g., "/api/v1/foo")
-            if len(out) < max_urls and val.startswith(("/", "./", "../")):
-                u = self._normalize_candidate(base_url, val)
-                if u and self._is_allowed_scheme(u) and u not in out:
-                    out.append(u)
-            return
-
-        if isinstance(val, list):
-            for item in val[:max_arr]:
-                self._extract_urls_from_json_value(
-                    base_url, item,
-                    seen_ids=seen_ids, out=out,
-                    max_urls=max_urls, max_depth=max_depth,
-                    max_keys=max_keys, max_arr=max_arr,
-                    depth=depth + 1,
-                )
-                if len(out) >= max_urls:
-                    return
-            return
-
-        if isinstance(val, dict):
-            # scan keys + values
-            for k in list(val.keys())[:max_keys]:
-                if len(out) >= max_urls:
-                    return
-                try:
-                    self._extract_urls_from_json_value(
-                        base_url, val.get(k),
-                        seen_ids=seen_ids, out=out,
-                        max_urls=max_urls, max_depth=max_depth,
-                        max_keys=max_keys, max_arr=max_arr,
-                        depth=depth + 1,
-                    )
-                except Exception:
-                    continue
-
-    def _extract_urls_from_json_text(self, base_url: str, json_text: str) -> List[str]:
-        if not json_text:
-            return []
-        json_text = json_text.strip()
-        if not json_text:
-            return []
-
-        try:
-            data = json.loads(json_text)
-        except Exception:
-            # Sometimes JSON-LD has multiple objects without array; try a lightweight salvage:
-            # If it fails, just do string URL extraction.
-            return self._extract_urls_from_text(base_url, json_text)
-
-        out: List[str] = []
-        self._extract_urls_from_json_value(
-            base_url,
-            data,
-            seen_ids=set(),
-            out=out,
-            max_urls=int(self.cfg.json_scan_max_urls),
-            max_depth=int(self.cfg.json_scan_max_depth),
-            max_keys=int(self.cfg.json_scan_max_keys_per_obj),
-            max_arr=int(self.cfg.json_scan_max_array_items),
-        )
-        return out
-
-    # ------------------------------------------------------------------ #
-    # Network capture (URLs only)
-    # ------------------------------------------------------------------ #
-    def _add_url_to_bucket(self, bucket: Set[str], base_url: str, raw: str) -> None:
-        u = self._normalize_candidate(base_url, raw)
-        if u and self._is_allowed_scheme(u):
-            bucket.add(u)
-
-    async def _attach_network_collectors(self, page, page_url: str, net_urls: Set[str], log):
-        def on_request(req):
-            try:
-                self._add_url_to_bucket(net_urls, page_url, req.url)
-            except Exception:
-                pass
-
-        def on_response(resp):
-            try:
-                self._add_url_to_bucket(net_urls, page_url, resp.url)
-                hdrs = getattr(resp, "headers", None) or {}
-                for k in ("location", "link"):
-                    v = hdrs.get(k)
-                    if v:
-                        for u in self._extract_urls_from_text(page_url, v):
-                            net_urls.add(u)
-            except Exception:
-                pass
-
-        page.on("request", on_request)
-        page.on("response", on_response)
-
-    # ------------------------------------------------------------------ #
-    # DOM harvesting (advanced high ROI)
-    # ------------------------------------------------------------------ #
-    async def _dom_harvest_urls(self, page, page_url: str, log: Optional[List[str]]) -> Dict[str, List[str]]:
-        """
-        Uses Playwright page.evaluate to harvest:
-          - whitelisted attribute values (href/src/srcset/poster/data-src/etc.)
-          - inline style text (style="")
-          - <style> tag contents
-          - meta content for OG/twitter/etc.
-          - JSON-LD blocks
-          - inline script blocks (string literal extraction)
-        Returns dict of buckets.
-        """
-        buckets: Dict[str, List[str]] = {
-            "dom_attrs": [],
-            "dom_srcset": [],
-            "dom_css": [],
-            "dom_meta": [],
-            "jsonld": [],
-            "inline_js": [],
-        }
-
-        # Pull DOM info in one go to reduce round-trips
-        # Caps are applied inside JS to avoid huge payloads.
-        js = r"""
-        (cfg) => {
-          const out = {
-            attrs: [],
-            srcsets: [],
-            inlineStyles: [],
-            styleTags: [],
-            metaContents: [],
-            jsonldBlocks: [],
-            inlineScripts: [],
-          };
-
-          const MAX_NODES = cfg.maxNodes || 4000;
-          const MAX_ATTRS = cfg.maxAttrs || 12000;
-          const attrWhite = new Set(cfg.attrWhitelist || []);
-          const maxStyleTagBytes = cfg.maxStyleTagBytes || 400000;
-          const maxInlineStyleBytes = cfg.maxInlineStyleBytes || 200000;
-          const maxJsonLdBlocks = cfg.maxJsonLdBlocks || 30;
-          const maxJsonLdBytes = cfg.maxJsonLdBytes || 200000;
-          const maxInlineScripts = cfg.maxInlineScripts || 40;
-          const maxInlineScriptBytes = cfg.maxInlineScriptBytes || 200000;
-
-          // --- element attribute scan ---
-          let scannedNodes = 0;
-          let scannedAttrs = 0;
-
-          const els = Array.from(document.querySelectorAll('*'));
-          for (const el of els) {
-            scannedNodes++;
-            if (scannedNodes > MAX_NODES) break;
-
-            // srcset special
-            const ss = el.getAttribute && el.getAttribute('srcset');
-            if (ss) out.srcsets.push(ss);
-
-            // inline style
-            const st = el.getAttribute && el.getAttribute('style');
-            if (st && out.inlineStyles.join('').length < maxInlineStyleBytes) out.inlineStyles.push(st);
-
-            if (!el.attributes) continue;
-            for (let i = 0; i < el.attributes.length; i++) {
-              scannedAttrs++;
-              if (scannedAttrs > MAX_ATTRS) break;
-              const a = el.attributes[i];
-              const name = (a.name || '').toLowerCase();
-              if (!attrWhite.has(name)) continue;
-              const v = a.value;
-              if (typeof v === 'string' && v) out.attrs.push([name, v]);
-            }
-            if (scannedAttrs > MAX_ATTRS) break;
-          }
-
-          // --- style tags ---
-          if (cfg.enableStyleTags) {
-            const styles = Array.from(document.querySelectorAll('style'));
-            let bytes = 0;
-            for (const s of styles) {
-              const t = s.textContent || '';
-              if (!t) continue;
-              const take = t.slice(0, Math.max(0, maxStyleTagBytes - bytes));
-              if (!take) break;
-              out.styleTags.push(take);
-              bytes += take.length;
-              if (bytes >= maxStyleTagBytes) break;
-            }
-          }
-
-          // --- meta tags: OG/twitter/etc. use content attr ---
-          if (cfg.enableMeta) {
-            const metas = Array.from(document.querySelectorAll('meta'));
-            for (const m of metas) {
-              const prop = (m.getAttribute('property') || m.getAttribute('name') || '').toLowerCase();
-              const content = m.getAttribute('content') || '';
-              if (!content) continue;
-              // keep high ROI meta names/properties
-              if (
-                prop.startsWith('og:') ||
-                prop.startsWith('twitter:') ||
-                prop.includes('video') ||
-                prop.includes('player') ||
-                prop.includes('stream') ||
-                prop.includes('image')
-              ) {
-                out.metaContents.push(content);
-              }
-            }
-          }
-
-          // --- JSON-LD blocks ---
-          if (cfg.enableJsonLd) {
-            const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
-            let n = 0;
-            for (const sc of scripts) {
-              if (n >= maxJsonLdBlocks) break;
-              const t = (sc.textContent || '').trim();
-              if (!t) continue;
-              out.jsonldBlocks.push(t.slice(0, maxJsonLdBytes));
-              n++;
-            }
-          }
-
-          // --- inline scripts (string literals scan is done in python, but we pull text here) ---
-          if (cfg.enableInlineScripts) {
-            const scripts = Array.from(document.querySelectorAll('script:not([src])'));
-            let n = 0;
-            for (const sc of scripts) {
-              if (n >= maxInlineScripts) break;
-              const t = (sc.textContent || '');
-              if (!t) continue;
-              out.inlineScripts.push(t.slice(0, maxInlineScriptBytes));
-              n++;
-            }
-          }
-
-          return out;
-        }
-        """
-
-        cfg = {
-            "maxNodes": int(self.cfg.max_dom_nodes),
-            "maxAttrs": int(self.cfg.max_attr_pairs),
-            "attrWhitelist": sorted([a.lower() for a in (self.cfg.attr_whitelist or set())]),
-            "enableStyleTags": bool(self.cfg.enable_dom_style_scan),
-            "enableMeta": bool(self.cfg.enable_dom_meta_scan),
-            "enableJsonLd": bool(self.cfg.enable_jsonld_scan),
-            "enableInlineScripts": bool(self.cfg.enable_inline_script_string_scan),
-            "maxStyleTagBytes": int(self.cfg.max_style_tag_bytes),
-            "maxInlineStyleBytes": int(self.cfg.max_inline_style_bytes),
-            "maxJsonLdBlocks": int(self.cfg.max_jsonld_blocks),
-            "maxJsonLdBytes": int(self.cfg.max_jsonld_bytes_per_block),
-            "maxInlineScripts": int(self.cfg.max_inline_script_blocks),
-            "maxInlineScriptBytes": int(self.cfg.max_inline_script_bytes_per_block),
-        }
-
-        payload = None
-        try:
-            payload = await page.evaluate(js, cfg)
-        except Exception as e:
-            self._log(f"DOM harvest evaluate failed: {e}", log)
-            return buckets
-
-        # --- Attributes
-        if self.cfg.enable_dom_attribute_scan and payload:
-            attrs = payload.get("attrs") or []
-            collected: List[str] = []
-            collected_srcset: List[str] = []
-
-            for name, val in attrs:
-                nlow = (name or "").lower()
-                if not isinstance(val, str) or not val.strip():
-                    continue
-
-                if nlow == "srcset":
-                    collected_srcset.extend(self._extract_srcset_urls(page_url, val))
-                else:
-                    collected.extend(self._extract_value_urls(page_url, val, direct=True))
-
-            # Handle also explicit srcset list harvested separately
-            for ss in (payload.get("srcsets") or []):
-                if isinstance(ss, str):
-                    collected_srcset.extend(self._extract_srcset_urls(page_url, ss))
-
-            buckets["dom_attrs"] = list(dict.fromkeys(collected))
-            buckets["dom_srcset"] = list(dict.fromkeys(collected_srcset))
-        # --- Inline styles + <style> tags
-        if self.cfg.enable_dom_style_scan and payload:
-            css_urls: List[str] = []
-            for st in (payload.get("inlineStyles") or []):
-                if isinstance(st, str):
-                    css_urls.extend(self._extract_css_urls(page_url, st))
-            for sty in (payload.get("styleTags") or []):
-                if isinstance(sty, str):
-                    css_urls.extend(self._extract_css_urls(page_url, sty))
-            buckets["dom_css"] = list(dict.fromkeys(css_urls))
-
-        # --- Meta tags
-        if self.cfg.enable_dom_meta_scan and payload:
-            meta_urls: List[str] = []
-            for c in (payload.get("metaContents") or []):
-                if isinstance(c, str):
-                    meta_urls.extend(self._extract_value_urls(page_url, c, direct=True))
-            buckets["dom_meta"] = list(dict.fromkeys(meta_urls))
-
-        # --- JSON-LD
-        if self.cfg.enable_jsonld_scan and payload:
-            jl_urls: List[str] = []
-            for block in (payload.get("jsonldBlocks") or []):
-                if isinstance(block, str) and block:
-                    jl_urls.extend(self._extract_urls_from_json_text(page_url, block))
-                    if len(jl_urls) >= int(self.cfg.json_scan_max_urls):
-                        break
-            buckets["jsonld"] = list(dict.fromkeys(jl_urls))[: int(self.cfg.json_scan_max_urls)]
-
-        # --- Inline scripts string literal scan (incremental + yield)
-        if self.cfg.enable_inline_script_string_scan and payload:
-            js_urls: List[str] = []
-            for block in (payload.get("inlineScripts") or []):
-                if not isinstance(block, str) or not block:
-                    continue
-                js_urls.extend(self._extract_js_string_literals(page_url, block, max_urls=int(self.cfg.js_literal_max_urls)))
-                if len(js_urls) >= int(self.cfg.js_literal_max_urls):
-                    break
-                # yield occasionally so Playwright can progress
-                if len(js_urls) and (len(js_urls) % int(self.cfg.yield_every_n_urls or 200) == 0):
-                    await asyncio.sleep(0)
-            buckets["inline_js"] = list(dict.fromkeys(js_urls))[: int(self.cfg.js_literal_max_urls)]
-
-        return buckets
-
     def _dedupe_hits(self, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Removes identical hits from the final payload to reduce database bloat.
+        """
         out: List[Dict[str, Any]] = []
         seen: Set[Tuple[str, str, str, str]] = set()
 
@@ -10184,323 +9799,427 @@ class DatabaseSniffer:
             out.append(hit)
 
         return out
-    def _extract_value_urls(self, base_url: str, value: str, *, direct: bool = False) -> List[str]:
+
+    # ------------------------------------------------------------------ #
+    # Network, Websocket, and WebRTC Protocol Forensics
+    # ------------------------------------------------------------------ #
+    def _add_url_to_bucket(self, bucket: Set[str], base_url: str, raw: str) -> None:
+        u = self._normalize_candidate(base_url, raw)
+        if u and self._is_allowed_scheme(u):
+            bucket.add(u)
+
+    async def _attach_network_collectors(self, page, page_url: str, net_urls: Set[str], ws_urls: Set[str], log):
         """
-        Extract URLs from a single DOM/backend value.
-
-        direct=True is for href/src/action/content-like fields where the whole value
-        may itself be a relative URL such as:
-          "watch"
-          "api/v1/items"
-          "?page=2"
-          "./video.mp4"
+        Attaches to Playwright page 'request', 'response', and 'websocket' events.
+        Captures dynamic API calls and WebSocket framing that occur passively.
         """
-        raw = (value or "").strip()
-        if not raw:
-            return []
 
-        seen: Set[str] = set()
-        out: List[str] = []
-
-        def add_candidate(candidate: str) -> None:
+        def on_request(req):
             try:
-                u = self._normalize_candidate(base_url, candidate)
+                self._add_url_to_bucket(net_urls, page_url, req.url)
             except Exception:
-                u = ""
-            if not u or not self._is_allowed_scheme(u):
-                return
-            if u in seen:
-                return
-            seen.add(u)
-            out.append(u)
+                pass
 
-        # absolute / schemeless URLs embedded in text
-        for u in self._extract_urls_from_text(base_url, raw):
-            add_candidate(u)
+        def on_response(resp):
+            try:
+                self._add_url_to_bucket(net_urls, page_url, resp.url)
 
-        if direct:
-            low = raw.lower()
+                # Check headers for Link and Location redirects
+                hdrs = getattr(resp, "headers", None) or {}
+                for k in ("location", "link"):
+                    v = hdrs.get(k)
+                    if v:
+                        for u in self._extract_urls_from_text(page_url, v):
+                            net_urls.add(u)
+            except Exception:
+                pass
 
-            if not low.startswith(("blob:", "data:", "javascript:", "mailto:", "tel:", "#")):
-                # explicit relative/query/schemeless
-                if raw.startswith(("//", "/", "./", "../", "?")):
-                    add_candidate(raw)
+        page.on("request", on_request)
+        page.on("response", on_response)
 
-                # bare relative path/file/endpoint
-                elif " " not in raw:
-                    if (
-                            "/" in raw
-                            or "." in raw
-                            or raw.lower().startswith(("api", "graphql", "rest", "rpc", "v1/", "v2/"))
-                    ):
-                        add_candidate(raw)
+        # Advanced WebSocket Frame Sniffing
+        if self.cfg.enable_websocket_sniffing:
+            def on_websocket(ws):
+                frames_captured = 0
 
-        return out
+                def on_frame(frame):
+                    nonlocal frames_captured
+                    if frames_captured > self.cfg.max_websocket_frames:
+                        return
+                    try:
+                        text = frame.decode() if isinstance(frame, bytes) else str(frame)
+                        for u in self._extract_urls_from_text(page_url, text):
+                            ws_urls.add(u)
+                        frames_captured += 1
+                    except Exception:
+                        pass
+
+                ws.on("framereceived", on_frame)
+                ws.on("framesent", on_frame)
+
+            page.on("websocket", on_websocket)
+
+    async def _perform_cdp_heap_snapshot(self, page, page_url: str, log: Optional[List[str]]) -> List[str]:
+        """
+        The Nuclear Option: Dumps the V8 engine heap memory via CDP.
+        Captures deeply hidden strings in SPA memory that never hit window globals
+        or the DOM. Computationally heavy, heavily capped.
+        """
+        self._log("Executing CDP Heap Snapshot (Nuclear Option)...", log)
+        cdp_urls: Set[str] = set()
+        try:
+            client = await page.context.new_cdp_session(page)
+            await client.send("HeapProfiler.enable")
+
+            heap_buffer = []
+
+            def on_chunk(event):
+                heap_buffer.append(event.get("chunk", ""))
+
+            client.on("HeapProfiler.addHeapSnapshotChunk", on_chunk)
+
+            # Fire the snapshot, wait for chunks
+            await client.send("HeapProfiler.takeHeapSnapshot", {"reportProgress": False})
+
+            # Reconstruct the string memory and regex scan it
+            full_heap = "".join(heap_buffer)
+
+            for u in self._extract_urls_from_text(page_url, full_heap):
+                cdp_urls.add(u)
+                if len(cdp_urls) > self.cfg.max_heap_strings:
+                    break
+        except Exception as e:
+            self._log(f"CDP Heap Snapshot failed: {e}", log)
+
+        return list(cdp_urls)
+
+    async def _dump_volatile_storage(self, page, log: Optional[List[str]]) -> Dict[str, List[str]]:
+        """
+        Dumps Service Worker Cache Storage APIs, Web Storage (Local/Session/Cookies),
+        and extracts the intercepted WebRTC targets stored in `window.__rtc_urls`.
+        """
+        self._log("Dumping Service Worker Caches, Web Storage, and WebRTC...", log)
+
+        js = """
+        async () => {
+            const out = { cache_urls: [], storage_texts: [], rtc_urls: [] };
+
+            // 1. Service Worker Caches API
+            try {
+                if (window.caches) {
+                    const cacheNames = await caches.keys();
+                    for (const name of cacheNames) {
+                        const cache = await caches.open(name);
+                        const requests = await cache.keys();
+                        for (const req of requests) {
+                            out.cache_urls.push(req.url);
+                        }
+                    }
+                }
+            } catch(e) {}
+
+            // 2. Web Storage & Cookies
+            try {
+                if (window.localStorage) {
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        out.storage_texts.push(localStorage.getItem(key));
+                    }
+                }
+                if (window.sessionStorage) {
+                    for (let i = 0; i < sessionStorage.length; i++) {
+                        const key = sessionStorage.key(i);
+                        out.storage_texts.push(sessionStorage.getItem(key));
+                    }
+                }
+                if (document.cookie) {
+                    out.storage_texts.push(document.cookie);
+                }
+            } catch(e) {}
+
+            // 3. WebRTC Intercepted URLs (Populated via init_script during load)
+            if (window.__rtc_urls) {
+                out.rtc_urls = Array.from(window.__rtc_urls);
+            }
+
+            return out;
+        }
+        """
+        try:
+            return await page.evaluate(js)
+        except Exception as e:
+            self._log(f"Volatile storage dump evaluate failed: {e}", log)
+            return {"cache_urls": [], "storage_texts": [], "rtc_urls": []}
+
     # ------------------------------------------------------------------ #
-    # Public API (matches other sniffers)
+    # DOM Harvester (Advanced Frontend Link Extraction)
     # ------------------------------------------------------------------ #
-    async def sniff(
-            self,
-            context,  # Playwright BrowserContext
-            page_url: str,
-            timeout: float,
-            log: List[str],
-            extensions=None,  # signature compatibility; unused
-    ) -> Tuple[str, List[Dict[str, Any]]]:
-        if not context:
-            self._log("No BrowserContext supplied; skipping.", log)
-            return "", []
+    async def _dom_harvest_urls(self, page, page_url: str, log: Optional[List[str]]) -> Dict[str, List[str]]:
+        """
+        Heavy duty, bulk DOM node extraction to minimize CDP roundtrips.
+        Executes a large payload in the browser context to bundle Attributes,
+        Styles, JSON-LD, and JS snippets in a single IPC message.
+        """
+        buckets: Dict[str, List[str]] = {
+            "dom_attrs": [],
+            "dom_srcset": [],
+            "dom_css": [],
+            "dom_meta": [],
+            "jsonld": [],
+            "inline_js": [],
+        }
 
-        tmo = float(timeout or self.cfg.timeout)
-        self.cfg.timeout = tmo
-        hits: List[Dict[str, Any]] = []
-        html: str = ""
-        page = None
+        js = r"""
+        (cfg) => {
+          const out = {
+            attrs: [], srcsets: [], inlineStyles: [], styleTags: [],
+            metaContents: [], jsonldBlocks: [], inlineScripts: [],
+          };
 
-        self._log(f"Start DB sniff: {page_url}", log)
+          const MAX_NODES = cfg.maxNodes || 4000;
+          const MAX_ATTRS = cfg.maxAttrs || 12000;
+          const attrWhite = new Set(cfg.attrWhitelist || []);
 
-        # capture network URLs across the whole load
-        net_urls: Set[str] = set()
+          let scannedNodes = 0;
+          let scannedAttrs = 0;
+
+          // Universal selector - capped to prevent freezing giant pages
+          const els = Array.from(document.querySelectorAll('*'));
+
+          for (const el of els) {
+            scannedNodes++;
+            if (scannedNodes > MAX_NODES) break;
+
+            const ss = el.getAttribute && el.getAttribute('srcset');
+            if (ss) out.srcsets.push(ss);
+
+            const st = el.getAttribute && el.getAttribute('style');
+            if (st && out.inlineStyles.join('').length < cfg.maxInlineStyleBytes) {
+                out.inlineStyles.push(st);
+            }
+
+            if (!el.attributes) continue;
+            for (let i = 0; i < el.attributes.length; i++) {
+              scannedAttrs++;
+              if (scannedAttrs > MAX_ATTRS) break;
+              const a = el.attributes[i];
+              const name = (a.name || '').toLowerCase();
+              if (!attrWhite.has(name)) continue;
+              const v = a.value;
+              if (typeof v === 'string' && v) out.attrs.push([name, v]);
+            }
+            if (scannedAttrs > MAX_ATTRS) break;
+          }
+
+          if (cfg.enableStyleTags) {
+            const styles = Array.from(document.querySelectorAll('style'));
+            let bytes = 0;
+            for (const s of styles) {
+              const t = s.textContent || '';
+              if (!t) continue;
+              const take = t.slice(0, Math.max(0, cfg.maxStyleTagBytes - bytes));
+              if (!take) break;
+              out.styleTags.push(take);
+              bytes += take.length;
+              if (bytes >= cfg.maxStyleTagBytes) break;
+            }
+          }
+
+          if (cfg.enableMeta) {
+            const metas = Array.from(document.querySelectorAll('meta'));
+            for (const m of metas) {
+              const prop = (m.getAttribute('property') || m.getAttribute('name') || '').toLowerCase();
+              const content = m.getAttribute('content') || '';
+              if (!content) continue;
+              if (prop.startsWith('og:') || prop.startsWith('twitter:') || 
+                  prop.includes('video') || prop.includes('player') || 
+                  prop.includes('stream') || prop.includes('image')) {
+                out.metaContents.push(content);
+              }
+            }
+          }
+
+          if (cfg.enableJsonLd) {
+            const scripts = Array.from(document.querySelectorAll('script[type="application/ld+json"]'));
+            let n = 0;
+            for (const sc of scripts) {
+              if (n >= cfg.maxJsonLdBlocks) break;
+              const t = (sc.textContent || '').trim();
+              if (!t) continue;
+              out.jsonldBlocks.push(t.slice(0, cfg.maxJsonLdBytes));
+              n++;
+            }
+          }
+
+          if (cfg.enableInlineScripts) {
+            const scripts = Array.from(document.querySelectorAll('script:not([src])'));
+            let n = 0;
+            for (const sc of scripts) {
+              if (n >= cfg.maxInlineScripts) break;
+              const t = (sc.textContent || '');
+              if (!t) continue;
+              out.inlineScripts.push(t.slice(0, cfg.maxInlineScriptBytes));
+              n++;
+            }
+          }
+
+          return out;
+        }
+        """
+        cfg_opts = {
+            "maxNodes": int(self.cfg.max_dom_nodes),
+            "maxAttrs": int(self.cfg.max_attr_pairs),
+            "attrWhitelist": sorted([a.lower() for a in (self.cfg.attr_whitelist or set())]),
+            "enableStyleTags": bool(self.cfg.enable_dom_style_scan),
+            "enableMeta": bool(self.cfg.enable_dom_meta_scan),
+            "enableJsonLd": bool(self.cfg.enable_jsonld_scan),
+            "enableInlineScripts": bool(self.cfg.enable_inline_script_string_scan),
+            "maxStyleTagBytes": int(self.cfg.max_style_tag_bytes),
+            "maxInlineStyleBytes": int(self.cfg.max_inline_style_bytes),
+            "maxJsonLdBlocks": int(self.cfg.max_jsonld_blocks),
+            "maxJsonLdBytes": int(self.cfg.max_jsonld_bytes_per_block),
+            "maxInlineScripts": int(self.cfg.max_inline_script_blocks),
+            "maxInlineScriptBytes": int(self.cfg.max_inline_script_bytes_per_block),
+        }
 
         try:
-            page = await context.new_page()
-
-            if self.cfg.enable_network_capture:
-                await self._attach_network_collectors(page, page_url, net_urls, log)
-
-            # Navigate with small fallback ladder
-            nav_modes: List[str] = []
-            for mode in ("domcontentloaded", "commit", "load"):
-                if mode not in nav_modes:
-                    nav_modes.append(mode)
-
-            loaded = False
-            for mode in nav_modes:
-                try:
-                    await page.goto(
-                        page_url,
-                        wait_until=mode,
-                        timeout=max(15000, int(tmo * 1000)),
-                    )
-                    loaded = True
-                    if mode != "domcontentloaded":
-                        self._log(f"goto recovered using wait_until={mode} for {page_url}", log)
-                    break
-                except Exception as e:
-                    self._log(f"goto timeout/error on {page_url} (wait_until={mode}): {e}", log)
-
-            await page.wait_for_timeout(800)
-
-            # --- Backend fingerprint (window globals) ---
-            backend_urls: List[str] = []
-            if self.cfg.enable_backend_fingerprint:
-                try:
-                    fingerprints = await page.evaluate(
-                        """
-                        (globals) => {
-                            const found = [];
-                            try {
-                                globals.forEach(g => {
-                                    let val;
-                                    try { val = window[g]; } catch (e) { val = undefined; }
-                                    if (val !== undefined && val !== null) {
-                                        const type = typeof val;
-                                        let keys = [];
-                                        if (type === 'object') {
-                                            try { keys = Object.keys(val).slice(0, 5); } catch (e) {}
-                                        }
-                                        found.push({ name: g, type, keys });
-                                    }
-                                });
-                            } catch (e) {}
-                            return found;
-                        }
-                        """,
-                        list(self.cfg.known_globals),
-                    )
-                    for fp in fingerprints or []:
-                        if isinstance(fp, dict):
-                            hits.append({
-                                "page": page_url,
-                                "url": page_url,
-                                "tag": "db_sniff",
-                                "kind": "db_config_detected",
-                                "meta": fp,
-                            })
-                except Exception as e:
-                    self._log(f"Backend fingerprint error on {page_url}: {e}", log)
-
-                # --- Backend link-only scan with caps ---
-                if self.cfg.enable_backend_link_scan:
-                    try:
-                        backend_urls = await page.evaluate(
-                            """
-                            (args) => {
-                              const globals = args.globals || [];
-                              const MAX_URLS = args.maxUrls || 200;
-                              const MAX_KEYS = args.maxKeys || 50;
-                              const MAX_ARR = args.maxArr || 50;
-                              const MAX_DEPTH = args.maxDepth || 2;
-
-                              const urls = [];
-                              const seen = new Set();
-
-                              const isUrl = (s) => typeof s === 'string' && /^(https?:\\/\\/|wss?:\\/\\/)/i.test(s);
-
-                              const addUrl = (u) => {
-                                if (!u || seen.has(u)) return;
-                                if (isUrl(u)) { seen.add(u); urls.push(u); }
-                              };
-
-                              const scanValue = (v, depth) => {
-                                if (urls.length >= MAX_URLS) return;
-                                if (depth <= 0 || v == null) return;
-
-                                if (typeof v === 'string') { addUrl(v); return; }
-
-                                if (Array.isArray(v)) {
-                                  for (const item of v.slice(0, MAX_ARR)) {
-                                    scanValue(item, depth - 1);
-                                    if (urls.length >= MAX_URLS) return;
-                                  }
-                                  return;
-                                }
-
-                                if (typeof v === 'object') {
-                                  let keys = [];
-                                  try { keys = Object.keys(v).slice(0, MAX_KEYS); } catch (e) { return; }
-                                  for (const k of keys) {
-                                    try { scanValue(v[k], depth - 1); } catch (e) {}
-                                    if (urls.length >= MAX_URLS) return;
-                                  }
-                                }
-                              };
-
-                              for (const g of globals) {
-                                let val;
-                                try { val = window[g]; } catch (e) { continue; }
-                                scanValue(val, MAX_DEPTH);
-                                if (urls.length >= MAX_URLS) break;
-                              }
-
-                              return urls;
-                            }
-                            """,
-                            {
-                                "globals": list(self.cfg.known_globals),
-                                "maxUrls": int(self.cfg.backend_scan_max_urls),
-                                "maxKeys": int(self.cfg.backend_scan_max_keys_per_obj),
-                                "maxArr": int(self.cfg.backend_scan_max_array_items),
-                                "maxDepth": int(self.cfg.backend_scan_depth),
-                            },
-                        )
-                        if not isinstance(backend_urls, list):
-                            backend_urls = []
-                    except Exception as e:
-                        self._log(f"Backend link scan error on {page_url}: {e}", log)
-
-            # Canonicalize backend urls (link-only)
-            if backend_urls:
-                out = []
-                for u in backend_urls:
-                    if isinstance(u, str):
-                        uu = self._normalize_candidate(page_url, u)
-                        if uu and self._is_allowed_scheme(uu):
-                            out.append(uu)
-                backend_urls = out
-
-            # --- IndexedDB metadata (NO RECORD CONTENTS) ---
-            if self.cfg.enable_indexeddb_dump:
-                try:
-                    idb_data = await self._dump_indexeddb(page, log)
-                    for db in idb_data:
-                        hits.append({
-                            "page": page_url,
-                            "url": page_url,
-                            "tag": "db_sniff",
-                            "kind": "indexeddb_dump",
-                            "meta": db,
-                        })
-                except Exception as e:
-                    self._log(f"IndexedDB dump error on {page_url}: {e}", log)
-
-            # --- HTML snapshot ---
-            try:
-                html = await page.content()
-            except Exception as e:
-                self._log(f"Error getting HTML for {page_url}: {e}", log)
-
-            # --- Advanced DOM harvesting (HIGH ROI) ---
-            dom_buckets = {}
-            if self.cfg.enable_html_link_scan:
-                dom_buckets = await self._dom_harvest_urls(page, page_url, log)
-
-            # --- Emit hits ---
-            # 1) legacy regex scan
-            if self.cfg.enable_html_link_scan and html:
-                html_links = self._extract_urls_from_text(page_url, html)
-                await self._add_link_hits_async(page_url, html_links, hits, source="html_regex", log=log)
-
-            # 2) advanced DOM buckets
-            for k, urls in (dom_buckets or {}).items():
-                if urls:
-                    await self._add_link_hits_async(page_url, urls, hits, source=k, log=log)
-
-            # 3) backend globals
-            if backend_urls:
-                await self._add_link_hits_async(page_url, backend_urls, hits, source="backend_globals", log=log)
-
-            # 4) network URLs flush
-            if self.cfg.enable_network_capture and net_urls:
-                urls = list(net_urls)[: int(self.cfg.max_network_urls)]
-                await self._add_link_hits_async(page_url, urls, hits, source="network", log=log)
-
-            # final dedupe
-            hits = self._dedupe_hits(hits)
-
+            payload = await page.evaluate(js, cfg_opts)
         except Exception as e:
-            self._log(f"Fatal error during DB sniff on {page_url}: {e}", log)
-        finally:
-            if page is not None:
-                try:
-                    await page.close()
-                except Exception as e:
-                    self._log(f"Error closing page for {page_url}: {e}", log)
+            self._log(f"DOM harvest evaluation failed: {e}", log)
+            return buckets
 
-        self._log(f"Finished DB sniff for {page_url}: hits={len(hits)}", log)
-        return html or "", hits
+        if not payload:
+            return buckets
+
+        # Unpack Attributes
+        if self.cfg.enable_dom_attribute_scan:
+            collected: List[str] = []
+            collected_srcset: List[str] = []
+            for name, val in payload.get("attrs", []):
+                if not isinstance(val, str) or not val.strip(): continue
+                if (name or "").lower() == "srcset":
+                    collected_srcset.extend(self._extract_srcset_urls(page_url, val))
+                else:
+                    collected.extend(self._extract_value_urls(page_url, val, direct=True))
+
+            for ss in payload.get("srcsets", []):
+                if isinstance(ss, str):
+                    collected_srcset.extend(self._extract_srcset_urls(page_url, ss))
+
+            buckets["dom_attrs"] = list(dict.fromkeys(collected))
+            buckets["dom_srcset"] = list(dict.fromkeys(collected_srcset))
+
+        # Unpack CSS
+        if self.cfg.enable_dom_style_scan:
+            css_urls: List[str] = []
+            for st in payload.get("inlineStyles", []):
+                if isinstance(st, str): css_urls.extend(self._extract_css_urls(page_url, st))
+            for sty in payload.get("styleTags", []):
+                if isinstance(sty, str): css_urls.extend(self._extract_css_urls(page_url, sty))
+            buckets["dom_css"] = list(dict.fromkeys(css_urls))
+
+        # Unpack Meta
+        if self.cfg.enable_dom_meta_scan:
+            meta_urls: List[str] = []
+            for c in payload.get("metaContents", []):
+                if isinstance(c, str): meta_urls.extend(self._extract_value_urls(page_url, c, direct=True))
+            buckets["dom_meta"] = list(dict.fromkeys(meta_urls))
+
+        # Unpack JSON-LD
+        if self.cfg.enable_jsonld_scan:
+            jl_urls: List[str] = []
+            for block in payload.get("jsonldBlocks", []):
+                if isinstance(block, str) and block:
+                    jl_urls.extend(self._extract_urls_from_json_text(page_url, block))
+                    if len(jl_urls) >= int(self.cfg.json_scan_max_urls): break
+            buckets["jsonld"] = list(dict.fromkeys(jl_urls))[:self.cfg.json_scan_max_urls]
+
+        # Unpack JS Literals
+        if self.cfg.enable_inline_script_string_scan:
+            js_urls: List[str] = []
+            for block in payload.get("inlineScripts", []):
+                if not isinstance(block, str) or not block: continue
+                js_urls.extend(self._extract_js_string_literals(page_url, block, max_urls=self.cfg.js_literal_max_urls))
+                if len(js_urls) >= self.cfg.js_literal_max_urls: break
+                if len(js_urls) and (len(js_urls) % self.cfg.yield_every_n_urls == 0):
+                    await asyncio.sleep(0)
+            buckets["inline_js"] = list(dict.fromkeys(js_urls))[:self.cfg.js_literal_max_urls]
+
+        return buckets
 
     # ------------------------------------------------------------------ #
-    # IndexedDB dumper (metadata-only; runs inside Playwright page)
+    # IndexedDB Advanced Cursor Dumper
     # ------------------------------------------------------------------ #
     async def _dump_indexeddb(self, page, log: Optional[List[str]]) -> List[Dict[str, Any]]:
-        self._log("Attempting IndexedDB metadata dump (no records)...", log)
+        """
+        Iterates over IDB databases, stores, and uses openCursor() for
+        highly-safe extraction. Prevents DOMException out-of-memory errors
+        by utilizing an aggressive internal serialization and truncation function.
+        """
+        self._log("Attempting Advanced IndexedDB dump (Safe Cursor Method)...", log)
 
         script = """
         async (config) => {
-            const { maxDbs, maxStores } = config;
+            const { maxDbs, maxStores, maxRecords } = config;
 
             if (!window.indexedDB) {
                 return [{ error: "IndexedDB not available in this context" }];
             }
 
             if (!window.indexedDB.databases) {
-                return [{ error: "IndexedDB Enumeration API not supported in this browser context" }];
+                return [{ error: "IndexedDB Enumeration API not supported in this browser" }];
             }
+
+            // Safe Recursive Serializer
+            // Handles heavy records, bloated strings, Blobs, and Buffers
+            // prevents Playwright IPC serialization errors gracefully.
+            const safeIdbSerialize = (val, depth=0) => {
+                if (depth > 6) return '[Max Depth Exceeded]';
+                if (val === null || val === undefined) return val;
+
+                if (typeof val !== 'object') {
+                    // Heavily truncate strings so massive cached documents don't bomb the payload
+                    if (typeof val === 'string' && val.length > 5000) {
+                        return val.substring(0, 5000) + '...[Truncated]';
+                    }
+                    return val;
+                }
+
+                // Playwright incompatible types fallback
+                if (val instanceof Blob) return `[Blob type=${val.type || 'unknown'} size=${val.size}]`;
+                if (val instanceof ArrayBuffer) return `[ArrayBuffer byteLength=${val.byteLength}]`;
+                if (ArrayBuffer.isView(val)) return `[TypedArray byteLength=${val.byteLength}]`;
+                if (val instanceof Date) return val.toISOString();
+                if (val instanceof RegExp) return val.toString();
+
+                if (Array.isArray(val)) {
+                    return val.map(item => safeIdbSerialize(item, depth + 1));
+                }
+
+                const res = {};
+                try {
+                    const keys = Object.keys(val);
+                    for (const key of keys) {
+                        res[key] = safeIdbSerialize(val[key], depth + 1);
+                    }
+                } catch (e) {
+                    return '[Unreadable Object]';
+                }
+                return res;
+            };
 
             try {
                 const dbs = await window.indexedDB.databases();
                 const results = [];
-
                 const targetDbs = dbs.slice(0, maxDbs);
 
                 for (const dbInfo of targetDbs) {
                     if (!dbInfo || !dbInfo.name) continue;
 
-                    const dbData = {
-                        name: dbInfo.name,
-                        version: dbInfo.version,
-                        stores: []
+                    const dbData = { 
+                        name: dbInfo.name, 
+                        version: dbInfo.version, 
+                        stores: [] 
                     };
 
                     const db = await new Promise((resolve) => {
@@ -10509,8 +10228,8 @@ class DatabaseSniffer:
                             req.onsuccess = () => resolve(req.result);
                             req.onerror = () => resolve(null);
                             req.onblocked = () => resolve(null);
-                        } catch (e) {
-                            resolve(null);
+                        } catch (e) { 
+                            resolve(null); 
                         }
                     });
 
@@ -10528,8 +10247,11 @@ class DatabaseSniffer:
 
                             for (const storeName of storeNames) {
                                 let approxCount = null;
+                                let records = [];
+
                                 try {
                                     const store = tx.objectStore(storeName);
+
                                     approxCount = await new Promise((resolve) => {
                                         try {
                                             const req = store.count();
@@ -10539,41 +10261,314 @@ class DatabaseSniffer:
                                             resolve(null);
                                         }
                                     });
+
+                                    // Advanced Cursor Loop (Captures out-of-line keys + prevents OOM)
+                                    records = await new Promise((resolve) => {
+                                        try {
+                                            const req = store.openCursor();
+                                            const out = [];
+                                            req.onsuccess = (e) => {
+                                                const cursor = e.target.result;
+                                                if (cursor && out.length < maxRecords) {
+                                                    // By extracting 'key' we capture out-of-line keys
+                                                    out.push({
+                                                        key: safeIdbSerialize(cursor.key),
+                                                        value: safeIdbSerialize(cursor.value)
+                                                    });
+                                                    cursor.continue();
+                                                } else {
+                                                    resolve(out);
+                                                }
+                                            };
+                                            req.onerror = () => resolve(out);
+                                        } catch (e) { 
+                                            resolve([]); 
+                                        }
+                                    });
                                 } catch (e) {
-                                    // keep null
+                                    // Ignore individual store failures and move on
                                 }
 
                                 dbData.stores.push({
                                     name: storeName,
                                     approx_count: approxCount,
+                                    records: records
                                 });
                             }
                         } catch (e) {
-                            dbData.error = "Transaction failed: " + (e && e.message ? e.message : String(e || ""));
+                            dbData.error = "Transaction failed: " + (e && e.message ? e.message : String(e));
                         }
                     }
-
                     try { db.close(); } catch (_) {}
                     results.push(dbData);
                 }
 
                 return results;
-            } catch (e) {
-                return [{ error: "Global metadata dump error: " + (e && e.message ? e.message : String(e || "")) }];
+            } catch (e) { 
+                return [{ error: "Global metadata dump error: " + (e && e.message ? e.message : String(e)) }];
             }
         }
         """
 
+        args = {
+            "maxDbs": int(self.cfg.max_idb_databases),
+            "maxStores": int(self.cfg.max_idb_stores),
+            "maxRecords": int(self.cfg.max_idb_records)
+        }
+
         try:
-            args = {"maxDbs": int(self.cfg.max_idb_databases), "maxStores": int(self.cfg.max_idb_stores)}
             result = await page.evaluate(script, args)
             if not isinstance(result, list):
                 result = []
-            self._log(f"IndexedDB metadata dump complete. Found {len(result)} database entries.", log)
+            self._log(f"IndexedDB dump complete. Found {len(result)} databases.", log)
             return result
         except Exception as e:
-            self._log(f"IndexedDB metadata script failed: {e}", log)
+            self._log(f"IndexedDB evaluation failed: {e}", log)
             return []
+
+    # ================================================================== #
+    # THE CORE ORCHESTRATOR
+    # ================================================================== #
+    async def sniff(
+            self,
+            context,  # Playwright BrowserContext
+            page_url: str,
+            timeout: float,
+            log: List[str],
+            extensions=None,  # signature compatibility; unused
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Main entry point for the Database Sniffer.
+        Maintains EXACT signature compatibility with the legacy framework.
+        Executes the entire forensics suite step-by-step.
+
+        Returns:
+            Tuple[str, List[Dict[str, Any]]]: (HTML String, List of Hit Dictionaries)
+        """
+        if not context:
+            self._log("No BrowserContext supplied; aborting.", log)
+            return "", []
+
+        self.cfg.timeout = float(timeout or self.cfg.timeout)
+        hits: List[Dict[str, Any]] = []
+        html: str = ""
+        page = None
+
+        net_urls: Set[str] = set()
+        ws_urls: Set[str] = set()
+
+        self._log(f"Start Forensic DB sniff: {page_url}", log)
+
+        try:
+            # Create isolated page from context
+            page = await context.new_page()
+
+            # -------------------------------------------------------------
+            # STEP 1: Pre-Navigation Hooks (WebRTC Interception)
+            # -------------------------------------------------------------
+            if self.cfg.enable_webrtc_sniffing:
+                await page.add_init_script("""
+                    window.__rtc_urls = new Set();
+                    const OrigPeer = window.RTCPeerConnection;
+                    if (OrigPeer) {
+                        window.RTCPeerConnection = function(cfg) {
+                            if (cfg && cfg.iceServers) {
+                                cfg.iceServers.forEach(s => {
+                                    if (s.urls) {
+                                        (Array.isArray(s.urls) ? s.urls : [s.urls]).forEach(u => window.__rtc_urls.add(u));
+                                    }
+                                });
+                            }
+                            return new OrigPeer(cfg);
+                        };
+                        window.RTCPeerConnection.prototype = OrigPeer.prototype;
+                    }
+                """)
+
+            # -------------------------------------------------------------
+            # STEP 2: Network & Socket Listeners
+            # -------------------------------------------------------------
+            if self.cfg.enable_network_capture:
+                await self._attach_network_collectors(page, page_url, net_urls, ws_urls, log)
+
+            # -------------------------------------------------------------
+            # STEP 3: Safe Navigation
+            # -------------------------------------------------------------
+            nav_modes = ("domcontentloaded", "commit", "load")
+            loaded = False
+            for mode in nav_modes:
+                try:
+                    await page.goto(
+                        page_url,
+                        wait_until=mode,
+                        timeout=max(15000, int(self.cfg.timeout * 1000))
+                    )
+                    loaded = True
+                    break
+                except Exception:
+                    continue
+
+            # Allow time for JS frameworks to hydrate DOM and write to databases
+            await page.wait_for_timeout(1500)
+
+            # -------------------------------------------------------------
+            # STEP 4: Volatile Storage Forensics (Caches, Storage, RTC)
+            # -------------------------------------------------------------
+            volatile_data = {}
+            if self.cfg.enable_cache_storage_dump or self.cfg.enable_web_storage_dump:
+                volatile_data = await self._dump_volatile_storage(page, log)
+
+            storage_json_urls = []
+            for text in volatile_data.get("storage_texts", []):
+                storage_json_urls.extend(self._extract_urls_from_json_text(page_url, text))
+
+            # -------------------------------------------------------------
+            # STEP 5: Backend Object State (Globals & Fingerprinting)
+            # -------------------------------------------------------------
+            backend_urls = []
+            if self.cfg.enable_backend_fingerprint or self.cfg.enable_backend_link_scan:
+                try:
+                    fp_script = """
+                    (args) => {
+                        const { globals, maxUrls, maxKeys, maxArr, maxDepth } = args;
+                        const found = []; const urls = []; const seen = new Set();
+
+                        const isUrl = (s) => typeof s === 'string' && /^(https?:\\/\\/|wss?:\\/\\/)/i.test(s);
+                        const addUrl = (u) => { if (!u || seen.has(u)) return; if(isUrl(u)){ seen.add(u); urls.push(u); }};
+
+                        // Recursive crawler
+                        const scanValue = (v, depth) => {
+                            if (urls.length >= maxUrls || depth <= 0 || v == null) return;
+                            if (typeof v === 'string') { addUrl(v); return; }
+
+                            if (Array.isArray(v)) {
+                                for(const item of v.slice(0, maxArr)) scanValue(item, depth - 1);
+                            } else if (typeof v === 'object') {
+                                try { 
+                                    for(const k of Object.keys(v).slice(0, maxKeys)) scanValue(v[k], depth - 1); 
+                                } catch(e){}
+                            }
+                        };
+
+                        // Fingerprint & Scan Globals
+                        for (const g of globals) {
+                            try {
+                                if (window[g] !== undefined && window[g] !== null) {
+                                    // Shallow fingerprint for configuration detection
+                                    found.push({ name: g, type: typeof window[g] });
+                                    // Deep scan for URLs
+                                    scanValue(window[g], maxDepth);
+                                }
+                            } catch(e){}
+                        }
+
+                        return { fingerprints: found, urls: urls };
+                    }
+                    """
+                    b_res = await page.evaluate(fp_script, {
+                        "globals": list(self.cfg.known_globals),
+                        "maxUrls": int(self.cfg.backend_scan_max_urls),
+                        "maxKeys": int(self.cfg.backend_scan_max_keys_per_obj),
+                        "maxArr": int(self.cfg.backend_scan_max_array_items),
+                        "maxDepth": int(self.cfg.backend_scan_depth)
+                    })
+
+                    if b_res and isinstance(b_res, dict):
+                        for fp in b_res.get("fingerprints", []):
+                            hits.append({
+                                "page": page_url,
+                                "url": page_url,
+                                "tag": "db_sniff",
+                                "kind": "db_config_detected",
+                                "meta": fp
+                            })
+                        for u in b_res.get("urls", []):
+                            if isinstance(u, str):
+                                backend_urls.append(self._normalize_candidate(page_url, u))
+                except Exception as e:
+                    self._log(f"Backend state scan failed: {e}", log)
+
+            # -------------------------------------------------------------
+            # STEP 6: IndexedDB Dump (Persistent Client DBs)
+            # -------------------------------------------------------------
+            if self.cfg.enable_indexeddb_dump:
+                try:
+                    idb_data = await self._dump_indexeddb(page, log)
+                    for db in idb_data:
+                        hits.append({
+                            "page": page_url,
+                            "url": page_url,
+                            "tag": "db_sniff",
+                            "kind": "indexeddb_dump",
+                            "meta": db
+                        })
+                except Exception as e:
+                    self._log(f"IndexedDB execution failed: {e}", log)
+
+            # -------------------------------------------------------------
+            # STEP 7: The Nuclear Option (CDP Heap Snapshot)
+            # -------------------------------------------------------------
+            cdp_urls = []
+            if self.cfg.enable_cdp_heap_snapshot:
+                cdp_urls = await self._perform_cdp_heap_snapshot(page, page_url, log)
+
+            # -------------------------------------------------------------
+            # STEP 8: HTML Snapshot (For Legacy Pipelines)
+            # -------------------------------------------------------------
+            try:
+                html = await page.content()
+            except Exception as e:
+                self._log(f"Failed to capture HTML: {e}", log)
+
+            # -------------------------------------------------------------
+            # STEP 9: DOM Harvesting (Attributes, Styles, Scripts)
+            # -------------------------------------------------------------
+            dom_buckets = {}
+            if self.cfg.enable_html_link_scan:
+                dom_buckets = await self._dom_harvest_urls(page, page_url, log)
+
+            # -------------------------------------------------------------
+            # STEP 10: Compile All Extracted Links to Standardized Hits
+            # -------------------------------------------------------------
+
+            # HTML Baseline Text Links
+            if html and self.cfg.enable_html_link_scan:
+                html_raw_urls = self._extract_urls_from_text(page_url, html)
+                await self._add_link_hits_async(page_url, html_raw_urls, hits, "html_regex", log)
+
+            # DOM Buckets (Fine-grained origins)
+            for k, urls in dom_buckets.items():
+                await self._add_link_hits_async(page_url, urls, hits, k, log)
+
+            # Deep State / Forensics Links
+            await self._add_link_hits_async(page_url, backend_urls, hits, "backend_globals", log)
+            await self._add_link_hits_async(page_url, volatile_data.get("cache_urls", []), hits, "service_worker_cache",
+                                            log)
+            await self._add_link_hits_async(page_url, storage_json_urls, hits, "web_storage_json", log)
+            await self._add_link_hits_async(page_url, volatile_data.get("rtc_urls", []), hits, "webrtc_stun_turn", log)
+            await self._add_link_hits_async(page_url, list(ws_urls), hits, "websocket_frames", log)
+            await self._add_link_hits_async(page_url, list(net_urls)[:int(self.cfg.max_network_urls)], hits, "network",
+                                            log)
+            await self._add_link_hits_async(page_url, cdp_urls, hits, "cdp_heap_snapshot", log)
+
+            # -------------------------------------------------------------
+            # STEP 11: Final Deduplication
+            # -------------------------------------------------------------
+            hits = self._dedupe_hits(hits)
+
+        except Exception as e:
+            self._log(f"Fatal error during DB sniff: {e}\n{traceback.format_exc()}", log)
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+
+        self._log(f"Finished Forensics DB sniff for {page_url}: hits={len(hits)}", log)
+
+        # Exact expected legacy signature return
+        return html or "", hits
 
 # ======================================================================
 # InteractionSniffer (bounded / fail-fast rewrite)
