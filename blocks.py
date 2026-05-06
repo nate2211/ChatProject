@@ -13705,7 +13705,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     # 1. NETWORK SNIFFER (Priority #1)
                     # This is the heaviest sniffer. We give it the full timeout and run it first.
-                    if use_network_sniff and profile["allow_network"] and pw_context:
+                    if use_network_sniff and pw_context:
                         try:
                             # Run alone to prevent resource contention
                             res_net = await self._pw_fetch_with_sniff(pw_context, page_url, timeout, local_log)
@@ -13746,7 +13746,7 @@ class VideoLinkTrackerBlock(BaseBlock):
 
                     # 2. RUNTIME SNIFFER (Priority #2)
                     # Good for capturing DOM state if Network failed, or getting console logs.
-                    if use_runtime_sniff and profile["allow_runtime"] and pw_context:
+                    if use_runtime_sniff and pw_context:
                         try:
                             res_runtime = await self._pw_fetch_runtime_hits(pw_context, page_url, timeout / 2,
                                                                             local_log)
@@ -13784,7 +13784,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                     # 3. SPECIALIZED SNIFFERS (Sequential Fallbacks)
                     # Run these only if enabled. They reuse the context but won't fight for bandwidth.
 
-                    if use_react_sniff and profile["allow_react"] and pw_context:
+                    if use_react_sniff and pw_context:
                         try:
                             res_react = await self._pw_fetch_react_hits(pw_context, page_url, timeout / 2, local_log)
                             if isinstance(res_react, tuple):
@@ -13798,7 +13798,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         except:
                             pass
 
-                    if use_database_sniff and profile["allow_database"] and pw_context:
+                    if use_database_sniff and pw_context:
                         try:
                             res_db = await self._pw_fetch_database_hits(pw_context, page_url, timeout / 2, local_log)
                             if isinstance(res_db, tuple):
@@ -13813,7 +13813,7 @@ class VideoLinkTrackerBlock(BaseBlock):
                         except:
                             pass
 
-                    if use_interaction_sniff and profile["allow_interaction"] and pw_context:
+                    if use_interaction_sniff and pw_context:
                         try:
                             res_interaction = await self._pw_fetch_interaction_hits(pw_context, page_url, timeout / 2,
                                                                                     local_log)
