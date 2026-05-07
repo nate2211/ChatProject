@@ -8999,33 +8999,176 @@ class LinkTrackerBlock(BaseBlock):
 
                     # Next-level pages
                     if depth < max_depth:
+                        next_page_candidates: list[tuple[int, str]] = []
+                        max_next_pages_per_page = int(params.get("max_next_pages_per_page", 25))
+                        min_next_link_score = int(params.get("min_next_link_score", 1))
+
+                        def _query_link_score(full_url: str, anchor_text: str = "") -> int:
+                            """
+                            Score a possible next crawl page against the current query.
+                            Higher score = more related to the requested query.
+                            """
+                            score = 0
+
+                            try:
+                                parsed = urlparse(full_url)
+                                path = (parsed.path or "").lower()
+                                query_part = (parsed.query or "").lower()
+                            except Exception:
+                                path = ""
+                                query_part = ""
+
+                            url_low = full_url.lower().replace("%20", " ")
+                            text_low = (anchor_text or "").lower()
+
+                            # Direct keyword overlap in anchor text or URL.
+                            for k in keywords:
+                                if not k:
+                                    continue
+                                if k in text_low:
+                                    score += 4
+                                if k in url_low:
+                                    score += 3
+                                if k in path:
+                                    score += 2
+                                if k in query_part:
+                                    score += 1
+
+                            # If the parent page itself matched keywords, allow nearby internal links,
+                            # but still require some relevance unless there are no keywords.
+                            if page_has_keywords:
+                                score += 1
+
+                            # Strong positive page types.
+                            if any(tok in path for tok in (
+                                    "/details/",
+                                    "/item/",
+                                    "/watch/",
+                                    "/download/",
+                                    "/file/",
+                                    "/post/",
+                                    "/article/",
+                                    "/project/",
+                                    "/docs/",
+                                    "/document/",
+                                    "/release/",
+                            )):
+                                score += 2
+
+                            # Penalize broad navigation pages.
+                            if any(tok in path for tok in (
+                                    "/tag/",
+                                    "/tags/",
+                                    "/category/",
+                                    "/categories/",
+                                    "/browse",
+                                    "/archive",
+                                    "/archives",
+                                    "/author/",
+                                    "/users/",
+                                    "/login",
+                                    "/signup",
+                                    "/account",
+                                    "/about",
+                                    "/contact",
+                                    "/privacy",
+                                    "/terms",
+                            )):
+                                score -= 3
+
+                            # Search URLs are usually too broad unless explicitly seeded.
+                            if _is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                score -= 6
+
+                            # Never expand ignored/static files.
+                            if any(path.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                score -= 10
+
+                            # Never crawl target assets as pages; assets are handled elsewhere.
+                            if any(path.endswith(ext) for ext in targets):
+                                score -= 10
+
+                            return score
+
                         for link in links_on_page:
                             raw_link = link.get("url") or ""
                             if not raw_link:
                                 continue
+
                             full_url = urljoin(page_url, raw_link)
+
                             if not _allowed_by_required_sites(full_url):
                                 continue
 
                             lpath = urlparse(full_url).path.lower()
+
+                            # Do not increase depth into direct target assets.
                             if any(lpath.endswith(ext) for ext in targets):
                                 continue
 
-                            if keywords and not page_has_keywords:
-                                haystack = (link.get("text") or "") + " " + full_url
-                                if not _term_overlap_ok(haystack):
+                            # Do not increase depth into static junk.
+                            if any(lpath.endswith(ext) for ext in self.IGNORED_EXTENSIONS):
+                                continue
+
+                            anchor_text = link.get("text") or ""
+                            haystack = f"{anchor_text} {full_url}"
+
+                            # Hard relevance gate:
+                            # If keywords exist, the child link itself must overlap,
+                            # OR the parent page must already be query-relevant and the child has score.
+                            if keywords:
+                                link_overlap_ok = _term_overlap_ok(haystack)
+                                link_score = _query_link_score(full_url, anchor_text)
+
+                                if not link_overlap_ok and not (
+                                        page_has_keywords and link_score >= min_next_link_score):
                                     continue
+                            else:
+                                link_score = _query_link_score(full_url, anchor_text)
 
                             if engine == "sites":
                                 if _is_search_url(full_url) and full_url not in explicit_site_seeds:
                                     continue
 
-                            next_pages.append(full_url)
+                            if link_score >= min_next_link_score or not keywords:
+                                next_page_candidates.append((link_score, full_url))
 
+                        # Highest query relevance first.
+                        next_page_candidates.sort(key=lambda x: x[0], reverse=True)
+
+                        for _, u in next_page_candidates[:max_next_pages_per_page]:
+                            next_pages.append(u)
+
+                        # Parent pages discovered by sniffers can explode depth.
+                        # Only follow them when they are still query-related.
                     if depth < max_depth and sniff_parent_pages:
+                        parent_candidates: list[tuple[int, str]] = []
+
                         for parent_url in sniff_parent_pages:
-                            if _allowed_by_required_sites(parent_url):
-                                next_pages.append(parent_url)
+                            if not _allowed_by_required_sites(parent_url):
+                                continue
+
+                            parent_score = 0
+                            parent_low = parent_url.lower().replace("%20", " ")
+
+                            for k in keywords:
+                                if k and k in parent_low:
+                                    parent_score += 3
+
+                            # Only add parent URLs if they match the query,
+                            # or if the current page was already query-relevant.
+                            if keywords and parent_score <= 0 and not page_has_keywords:
+                                continue
+
+                            parent_candidates.append((parent_score, parent_url))
+
+                        parent_candidates.sort(key=lambda x: x[0], reverse=True)
+
+                        for _, parent_url in parent_candidates[:10]:
+                            next_pages.append(parent_url)
+
+                    if use_database and store and _should_persist_page(page_url):
+                        store.mark_page_scanned(page_url)
 
                     if use_database and store and _should_persist_page(page_url):
                         store.mark_page_scanned(page_url)

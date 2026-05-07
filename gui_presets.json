@@ -317,5 +317,13 @@
     ],
     "extras": "linktracker.query={payload}\nlinktracker.mode=media\nlinktracker.scan_limit=10\nlinktracker.verify=true\nlinktracker.site_require=\nlinktracker.engine=searxng\nlinktracker.use_js=true\nlinktracker.return_all_js_links=true\nlinktracker.use_database=true\nlinktracker.db_path=link_corpus.db\nlinktracker.min_term_overlap={payload.length}\nlinktracker.max_depth=40\nlinktracker.max_pages_total=1000\nlinktracker.max_links_per_page=100\nlinktracker.timeout=80\nlinktracker.subpipeline=xml|sitemap\nlinktracker.block_resources=false\nlinktracker.block_domains=false\nlinktracker.search_results_cap=100\nlinktracker.search_page_limit=5\nlinktracker.search_per_page=100\nlinktracker.use_camoufox=false\nlinktracker.blocked_resource_types=\"image,stylesheet,font,media,video,audio\"\n\n# --- Full Sniffer Suite ---\nlinktracker.use_network_sniff=true\nlinktracker.return_network_sniff_links=true\nlinktracker.use_runtime_sniff=true\nlinktracker.return_runtime_sniff_links=true\nlinktracker.use_react_sniff=true\nlinktracker.return_react_sniff_hits=true\nlinktracker.use_interaction_sniff=true\nlinktracker.return_interaction_sniff_hits=true\nlinktracker.use_database_sniff=true\nlinktracker.return_database_sniff_hits=true\n\n",
     "model": "lexicon"
+  },
+  {
+    "name": "VideoTracker Normal",
+    "blocks": [
+      "videotracker"
+    ],
+    "extras": "videotracker.query={payload}\nvideotracker.source=search\nvideotracker.sites=\nvideotracker.scan_limit=10\nvideotracker.timeout=80\nvideotracker.engine=searxng\nvideotracker.verify=true\nvideotracker.use_js=true\nvideotracker.return_all_js_links=true\nvideotracker.smart_sniff=true\nvideotracker.max_depth=40\nvideotracker.child_page_limit=8\nvideotracker.max_pages_total=1000\nvideotracker.max_links_per_page=60\nvideotracker.max_assets=200\nvideotracker.min_term_overlap={payload.length}\nvideotracker.subpipeline=xml|sitemap\nvideotracker.use_database=true\nvideotracker.db_path=video_corpus.db\nvideotracker.block_resources=false\nvideotracker.blocked_resource_types=image,stylesheet,font,video,media,audio\nvideotracker.block_domains=false\nvideotracker.blocked_domains=\nvideotracker.search_results_cap=256\nvideotracker.search_page_limit=5\nvideotracker.search_per_page=50\nvideotracker.use_camoufox=false\n\n# --- Full Sniffer Suite ---\nvideotracker.use_network_sniff=true\nvideotracker.return_network_sniff_links=true\nvideotracker.use_runtime_sniff=true\nvideotracker.return_runtime_sniff_links=true\nvideotracker.use_react_sniff=true\nvideotracker.return_react_sniff_hits=true\nvideotracker.use_interaction_sniff=true\nvideotracker.return_interaction_sniff_hits=true\nvideotracker.use_database_sniff=true\nvideotracker.return_database_sniff_hits=true",
+    "model": "lexicon"
   }
 ]
