@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import collections  # For collections.Counter
 import hashlib
 import html
@@ -10834,25 +10835,162 @@ class InteractionSniffer:
             """
             () => {
                 try {
-                    const nodes = document.querySelectorAll("*").length;
-                    const scripts = document.scripts ? document.scripts.length : 0;
-                    const title = (document.title || "").trim().slice(0, 120);
-                    const bodyText = ((document.body && document.body.innerText) || "").trim();
-                    const textLen = bodyText.length;
-                    const buttons = document.querySelectorAll("button, [role='button'], a[role='button']").length;
-                    const forms = document.querySelectorAll("form").length;
-                    const links = document.links ? document.links.length : 0;
+                    // ====================
+                    // ADVANCED LINK DISCOVERY
+                    // ====================
+
+                    // 1. Deep recursive tree traversal to find ALL anchor-like elements
+                    function findDeepLinks(node) {
+                        const links = [];
+                        if (node.nodeType !== 1 || 
+                            (node.tagName !== 'A' && 
+                             node.tagName !== 'BUTTON' && 
+                             node.tagName !== 'DIV' && 
+                             node.tagName !== 'SECTION' && 
+                             node.tagName !== 'ARTICLE' && 
+                             node.tagName !== 'NAV' && 
+                             node.tagName !== 'FOOTER' && 
+                             node.tagName !== 'HEADER' && 
+                             node.tagName !== 'SIDEBAR')) {
+                            return links;
+                        }
+
+                        // 2. Check for anchor-like behavior
+                        if (node.tagName === 'A' && node.href) {
+                            links.push({
+                                tag: 'A',
+                                url: node.href,
+                                text: node.innerText.trim(),
+                                rel: node.rel,
+                                type: 'direct'
+                            });
+                        }
+
+                        // 3. Check for button-like links
+                        if ((node.tagName === 'BUTTON' || node.hasAttribute('role="button"')) &&
+                            (node.onclick || node.getAttribute('href'))) {
+                            let url = node.getAttribute('href');
+                            if (!url) url = window.location.href; // Fallback
+                            links.push({
+                                tag: 'BUTTON',
+                                url: url,
+                                text: node.innerText.trim(),
+                                type: 'button-link'
+                            });
+                        }
+
+                        // 4. Check for link-like spans/divs (CSS tricks, JS handlers)
+                        if ((node.tagName === 'SPAN' || node.tagName === 'DIV') && 
+                            (node.getAttribute('onclick') || 
+                             node.getAttribute('data-link') ||
+                             node.getAttribute('data-href'))) {
+                            let url = node.getAttribute('data-href') || 
+                                     node.getAttribute('onclick') ? node.getAttribute('onclick') :
+                                     node.getAttribute('data-link');
+                            // Extract URL from onclick if needed
+                            if (url && url.includes('href')) {
+                                url = url.split('href="')[1]?.split('"')[0] || url.split("'")[1] || url;
+                            }
+                            links.push({
+                                tag: 'SPAN/DIV',
+                                url: url || 'unknown',
+                                text: node.innerText.trim().slice(0, 50),
+                                type: 'js-link'
+                            });
+                        }
+
+                        // 5. Recurse through all children
+                        for (let child of node.children) {
+                            links.push(...findDeepLinks(child));
+                        }
+                        return links;
+                    }
+
+                    // 6. Enhanced anchor detection
+                    function findAllAnchors() {
+                        let allAnchors = document.querySelectorAll('[href], a[onclick], a[data-]');
+                        let deepAnchors = findDeepLinks(document.body || document.documentElement);
+
+                        // 7. Remove duplicates and filter
+                        let linksMap = new Map();
+                        for (let link of [...allAnchors, ...deepAnchors]) {
+                            let url = link.url || '#';
+                            if (!linksMap.has(url)) {
+                                linksMap.set(url, {
+                                    ...link,
+                                    discovery: link.discovery || 'all-anchors'
+                                });
+                            }
+                        }
+                        return Array.from(linksMap.values());
+                    }
+
+                    // 8. Check for meta/JSON-LD hidden links
+                    function findHiddenLinks() {
+                        let hidden = [];
+                        for (let meta of document.querySelectorAll('meta[property="og:see_also"], [property="og:url"], [property="article:author_url"]')) {
+                            hidden.push({
+                                tag: 'META',
+                                url: meta.content,
+                                text: 'meta-link',
+                                type: 'meta'
+                            });
+                        }
+
+                        // 9. Check JSON-LD for linked entities
+                        for (let json of document.querySelectorAll('script[type="application/ld+json"]')) {
+                            try {
+                                let data = JSON.parse(json.textContent);
+                                if (data.seeAlso || data.url) {
+                                    hidden.push({
+                                        tag: 'JSON-LD',
+                                        url: data.seeAlso || data.url,
+                                        text: 'jsonld',
+                                        type: 'jsonld'
+                                    });
+                                }
+                            } catch (e) {}
+                        }
+                        return hidden;
+                    }
+
+                    // ====================
+                    // FINAL COMBINED RESULTS
+                    // ====================
+                    let allLinks = findAllAnchors();
+                    let hiddenLinks = findHiddenLinks();
+
+                    // 10. Add parent/child navigation (breadcrumbs, pagination)
+                    for (let nav of document.querySelectorAll('[class*="nav"], [class*="breadcrumb"]')) {
+                        if (nav.children.length > 0) {
+                            allLinks.push({
+                                tag: 'NAV-SECTION',
+                                url: nav.getAttribute('href') || '#',
+                                text: nav.innerText.trim().slice(0, 30),
+                                type: 'navigation'
+                            });
+                        }
+                    }
+
                     return {
                         ok: true,
                         ready: document.readyState || "",
-                        nodes,
-                        scripts,
-                        title,
-                        textLen,
-                        buttons,
-                        forms,
-                        links,
-                        bodySample: bodyText.slice(0, 220),
+                        nodes: document.querySelectorAll("*").length,
+                        scripts: document.scripts ? document.scripts.length : 0,
+                        title: (document.title || "").trim().slice(0, 120),
+                        textLen: ((document.body && document.body.innerText) || "").length,
+                        buttons: document.querySelectorAll("button, [role='button']").length,
+                        forms: document.querySelectorAll("form").length,
+                        links: allLinks.length,
+                        directLinks: allLinks.length,
+                        hiddenLinks: hiddenLinks.length,
+                        bodySample: ((document.body && document.body.innerText) || "").trim().slice(0, 220),
+                        method: 'advanced-recursive',
+                        linkSample: allLinks.slice(0, 20).map(l => ({
+                            url: l.url,
+                            text: l.text,
+                            type: l.type
+                        })),
                     };
                 } catch (e) {
                     return { ok: false, error: String(e || "") };
@@ -11414,73 +11552,1180 @@ class InteractionSniffer:
                 pass
         return devices
 
-    def _extract_libpcap_urls_from_packets(self, packets: List[Dict[str, Any]], *, page_url: str) -> List[Dict[str, Any]]:
+    def _extract_libpcap_urls_from_packets(
+            self,
+            packets: List[Dict[str, Any]],
+            *,
+            page_url: str,
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         seen: Set[str] = set()
+
         page_host = ""
         try:
             page_host = (urlparse(page_url).netloc or "").lower().split(":")[0]
         except Exception:
             page_host = ""
 
-        def push(url: str, *, source: str, evidence: str, pkt: Dict[str, Any], text_preview: str = "") -> None:
+        def _raw_bytes(pkt: Dict[str, Any]) -> bytes:
+            raw = pkt.get("raw_bytes") or b""
+
+            if isinstance(raw, memoryview):
+                return raw.tobytes()
+
+            if isinstance(raw, bytearray):
+                return bytes(raw)
+
+            if isinstance(raw, bytes):
+                return raw
+
+            try:
+                return bytes(raw)
+            except Exception:
+                return b""
+
+        def _deduplicate_url(url: str, priority: int = 0) -> Optional[str]:
             clean = self._clean_packet_url(url)
             if not clean:
-                return
+                return None
+
             key = clean.lower()
             if key in seen:
-                return
+                return None
+
             seen.add(key)
-            out.append({
-                "url": clean,
-                "source": source,
-                "evidence": evidence,
-                "datalink": pkt.get("datalink"),
-                "timestamp": pkt.get("timestamp"),
-                "text_preview": text_preview[:160],
-            })
+            return clean
+
+        def _push(
+                url: str,
+                *,
+                source: str,
+                evidence: str,
+                pkt: Dict[str, Any],
+                text_preview: str = "",
+                priority: int = 0,
+        ) -> None:
+            clean = _deduplicate_url(url, priority)
+            if not clean:
+                return
+
+            out.append(
+                {
+                    "url": clean,
+                    "source": source,
+                    "evidence": evidence,
+                    "datalink": pkt.get("datalink"),
+                    "timestamp": pkt.get("timestamp"),
+                    "text_preview": str(text_preview or "")[:160],
+                    "raw_priority": priority,
+                }
+            )
+
+        # ================================
+        # PHASE 1: TCP/UDP PAYLOAD RECONSTRUCTION
+        # ================================
+        packets_by_conn: Dict[Tuple[Any, Any, Any, Any, Any], List[Dict[str, Any]]] = collections.defaultdict(list)
 
         for pkt in packets or []:
-            if not isinstance(pkt, dict):
-                continue
-            raw = pkt.get("raw_bytes") or b""
+            raw = _raw_bytes(pkt)
             if not raw:
                 continue
-            if isinstance(raw, memoryview):
-                raw = raw.tobytes()
-            elif isinstance(raw, bytearray):
-                raw = bytes(raw)
-            elif not isinstance(raw, bytes):
-                try:
-                    raw = bytes(raw)
-                except Exception:
+
+            pkt["bytes_len"] = len(raw)
+
+            src = pkt.get("src_ip", "")
+            dst = pkt.get("dst_ip", "")
+            src_p = pkt.get("src_port", 0)
+            dst_p = pkt.get("dst_port", 0)
+            proto = pkt.get("protocol", "")
+
+            conn_key = (src, dst, src_p, dst_p, proto)
+            packets_by_conn[conn_key].append(pkt)
+
+        for _conn_key, conn_pkts in packets_by_conn.items():
+            if not conn_pkts:
+                continue
+
+            conn_pkts = sorted(conn_pkts, key=lambda p: p.get("timestamp", 0) or 0)
+            tcp_payloads: List[bytes] = []
+
+            for pkt in conn_pkts:
+                raw = _raw_bytes(pkt)
+                if len(raw) < 20:
                     continue
+
+                payload = pkt.get("payload")
+
+                if isinstance(payload, str):
+                    payload_bytes = payload.encode("utf-8", errors="ignore")
+                elif isinstance(payload, bytes):
+                    payload_bytes = payload
+                else:
+                    payload_bytes = raw
+
+                if payload_bytes:
+                    tcp_payloads.append(payload_bytes)
+
+            if not tcp_payloads:
+                continue
+
+            full_stream = b"".join(tcp_payloads)
+            if len(full_stream) > 10_000:
+                full_stream = full_stream[:10_000]
+
+            text = full_stream.decode("utf-8", errors="ignore")
+
+            for u in self._extract_urls_from_text(text):
+                _push(
+                    u,
+                    source="tcp_reassembly",
+                    evidence="stream_reconstructed_url",
+                    pkt=conn_pkts[0],
+                    text_preview=text[:160],
+                    priority=10,
+                )
+
+        # ================================
+        # PHASE 2: DEEP PROTOCOL ANALYSIS
+        # ================================
+        for pkt in packets or []:
+            raw = _raw_bytes(pkt)
+            if not raw:
+                continue
 
             text = self._packet_bytes_to_text(raw)
             if not text:
+                text = raw.decode("utf-8", errors="ignore")
+
+            lower_raw = raw.lower()
+
+            # === HTTP/2 HEADERS / HPACK-ish payloads ===
+            if raw[:3] == b"\x0d\x0a\x00" or any(
+                    sig in raw[:1000]
+                    for sig in (
+                            b"\x82",
+                            b"\x84",
+                            b"\x87",
+                            b":authority",
+                            b":path",
+                    )
+            ):
+                for u in self._extract_hpack_headers(raw):
+                    _push(
+                        u,
+                        source="http2_hpack",
+                        evidence="hpack_decoded_header",
+                        pkt=pkt,
+                        text_preview=u,
+                        priority=15,
+                    )
+
+            # === HTTP/3 / QUIC-ish payloads ===
+            if raw[:2] == b"\x00\x0d" or b"\x00\x00\x00\x01" in raw[:20]:
+                for host in self._extract_quic_streams(raw, page_host=page_host):
+                    _push(
+                        f"https://{host}/",
+                        source="http3_quic",
+                        evidence="quic_stream_origin",
+                        pkt=pkt,
+                        text_preview=host,
+                        priority=20,
+                    )
+
+            # === WebSocket upgrade headers ===
+            if b"upgrade: websocket" in lower_raw or b"sec-websocket-key:" in lower_raw:
+                for u in self._extract_websocket_headers(raw, page_host=page_host):
+                    _push(
+                        u,
+                        source="websocket",
+                        evidence="ws_upgrade_header",
+                        pkt=pkt,
+                        text_preview=u,
+                        priority=12,
+                    )
+
+            # === WebSocket frames ===
+            if self._has_websocket_binary(raw):
+                for u in self._extract_binary_websocket_urls(raw, page_host=page_host):
+                    _push(
+                        u,
+                        source="websocket_binary",
+                        evidence="ws_binary_payload",
+                        pkt=pkt,
+                        text_preview=u,
+                        priority=14,
+                    )
+
+            # === SPDY / NGHTTP2-ish frames ===
+            if raw[:1] in (b"\x00", b"\x80"):
+                for u in self._extract_spdy_frames(raw):
+                    _push(
+                        u,
+                        source="spdy",
+                        evidence="spdy_frame_payload",
+                        pkt=pkt,
+                        text_preview=u,
+                        priority=13,
+                    )
+
+            # === TLS ClientHello / SNI / ALPN ===
+            if raw[:1] == b"\x16" and len(raw) > 5:
+                for host in self._extract_tls_sni(raw, page_host=page_host):
+                    _push(
+                        f"https://{host}/",
+                        source="tls_sni",
+                        evidence="tls_client_hello_sni",
+                        pkt=pkt,
+                        text_preview=host,
+                        priority=25,
+                    )
+
+                for proto in self._extract_tls_alpn(raw):
+                    if proto and ".well-known/" in proto:
+                        for u in self._extract_wellknown_paths(proto, page_host):
+                            _push(
+                                u,
+                                source="tls_alpn_wellknown",
+                                evidence="alpn_wellknown_path",
+                                pkt=pkt,
+                                text_preview=u,
+                                priority=22,
+                            )
+
+            # === HTTP Upgrade Headers ===
+            for u, preview in self._extract_upgrade_headers(text, page_host=page_host):
+                _push(
+                    u,
+                    source="http_upgrade",
+                    evidence="upgrade_header",
+                    pkt=pkt,
+                    text_preview=preview,
+                    priority=11,
+                )
+
+            # === Cookie / Session Headers ===
+            for cookie_url in self._extract_cookie_urls(text, page_host=page_host):
+                _push(
+                    cookie_url,
+                    source="cookie_url",
+                    evidence="cookie_session_url",
+                    pkt=pkt,
+                    text_preview=cookie_url,
+                    priority=16,
+                )
+
+            # === Data URI / Embedded Resources ===
+            for u in self._extract_datauri_urls(text):
+                _push(
+                    u,
+                    source="datauri",
+                    evidence="dataurl_in_payload",
+                    pkt=pkt,
+                    text_preview=u,
+                    priority=17,
+                )
+
+            # === Base64 Encoded URLs ===
+            for u in self._extract_base64_urls(text):
+                _push(
+                    u,
+                    source="base64_encoded",
+                    evidence="base64_url_decode",
+                    pkt=pkt,
+                    text_preview=u,
+                    priority=18,
+                )
+
+            # === JavaScript Obfuscated URLs ===
+            for u in self._extract_jsobf_urls(text, page_host=page_host):
+                _push(
+                    u,
+                    source="js_obfuscated",
+                    evidence="javascript_encoded_url",
+                    pkt=pkt,
+                    text_preview=u,
+                    priority=19,
+                )
+
+            # === URL Fragment / Hash Extraction ===
+            for u in self._extract_url_fragments(text, page_host=page_host):
+                _push(
+                    u,
+                    source="url_fragment",
+                    evidence="fragment_id_in_text",
+                    pkt=pkt,
+                    text_preview=u,
+                    priority=21,
+                )
+
+            # === Relative URL Resolution ===
+            for rel_url in self._extract_relative_urls(text, page_host=page_host):
+                _push(
+                    rel_url,
+                    source="relative_url",
+                    evidence="relative_url_resolved",
+                    pkt=pkt,
+                    text_preview=rel_url,
+                    priority=9,
+                )
+
+        # ================================
+        # PHASE 3: ADVANCED PAYLOAD PATTERNS
+        # ================================
+        for pkt in packets or []:
+            raw = _raw_bytes(pkt)
+            if not raw:
                 continue
-            cap = int(getattr(self.cfg, "libpcap_scan_text_chars", 262_144))
-            if cap > 0:
-                text = text[:cap]
 
-            # Absolute URL leakage from HTTP, headers, manifests, JSON, websocket URLs, etc.
+            lower_raw = raw.lower()
+
+            # Multipart boundary detection
+            if b"boundary=" in lower_raw:
+                boundary_match = self._find_multipart_boundaries(raw)
+                if boundary_match:
+                    for u in self._extract_multipart_urls(raw, boundary_match):
+                        _push(
+                            u,
+                            source="multipart",
+                            evidence="multipart_boundary_url",
+                            pkt=pkt,
+                            text_preview=u,
+                            priority=23,
+                        )
+
+            # Form POST data extraction
+            if (
+                    b"content-type: application/x-www-form-urlencoded" in lower_raw
+                    or b"content-type: multipart/form-data" in lower_raw
+            ):
+                for u in self._extract_form_urls(raw, page_host=page_host):
+                    _push(
+                        u,
+                        source="form_post",
+                        evidence="form_submission_url",
+                        pkt=pkt,
+                        text_preview=u,
+                        priority=24,
+                    )
+
+            # File download signatures
+            download_patterns = [
+                b"content-disposition: attachment",
+                b"content-disposition: filename",
+                b"attachment; filename=",
+                b"inline; filename=",
+            ]
+
+            for pattern in download_patterns:
+                if pattern in lower_raw:
+                    for u in self._extract_download_urls(raw, page_host=page_host):
+                        _push(
+                            u,
+                            source="download_content",
+                            evidence="file_download_header",
+                            pkt=pkt,
+                            text_preview=u,
+                            priority=26,
+                        )
+                    break
+
+        # ================================
+        # PHASE 4: DNS & PROXY CHAINS
+        # ================================
+        for pkt in packets or []:
+            raw = _raw_bytes(pkt)
+            if not raw:
+                continue
+
+            src_port = int(pkt.get("src_port") or 0)
+            dst_port = int(pkt.get("dst_port") or 0)
+
+            # DNS query / response detection
+            if src_port == 53 or dst_port == 53 or self._looks_like_dns(raw):
+                for host in self._extract_dns_queries(raw):
+                    if host and not host.startswith(("http://", "https://")):
+                        _push(
+                            f"http://{host}/",
+                            source="dns_query",
+                            evidence="dns_query_name",
+                            pkt=pkt,
+                            text_preview=host,
+                            priority=8,
+                        )
+
+            # Proxy hop detection
+            proxy_headers = self._extract_proxy_headers(
+                raw,
+                text=self._packet_bytes_to_text(raw),
+            )
+
+            for u in proxy_headers:
+                _push(
+                    u,
+                    source="proxy_chain",
+                    evidence="proxy_forward_header",
+                    pkt=pkt,
+                    text_preview=u,
+                    priority=30,
+                )
+
+        # ================================
+        # FINAL CLEANUP
+        # ================================
+        if out:
+            out.sort(
+                key=lambda x: (
+                    -int(x.get("raw_priority", 0) or 0),
+                    x.get("timestamp", 0) or 0,
+                )
+            )
+
+            limit = int(getattr(self.cfg, "libpcap_max_link_hits", 80))
+            out = out[:limit]
+
+        out = self._sanitize_packet_urls(out)
+        out = self._filter_common_noise(out, page_host=page_host)
+
+        return out
+
+    # ===============================
+    # ADVANCED HELPER FUNCTIONS
+    # ===============================
+
+    def _extract_hpack_headers(self, raw: bytes) -> List[str]:
+        """Best-effort URL extraction from HTTP/2 / HPACK-ish payload bytes."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
             for u in self._extract_urls_from_text(text):
-                push(u, source="libpcap_url", evidence="absolute_url_in_packet", pkt=pkt, text_preview=u)
+                urls.append(u)
 
-            # Plain HTTP request reconstruction: GET /path HTTP/1.1 + Host: example.com
-            for u, preview in self._extract_http_request_urls(text):
-                push(u, source="libpcap_http_request", evidence="http_request_line_host", pkt=pkt, text_preview=preview)
+            authority_matches = re.findall(
+                r":authority\s*([a-z0-9.-]+\.[a-z]{2,})",
+                text,
+                re.I,
+            )
 
-            # Header mining: Location/Referer can expose URLs. Relative Location can be joined against Host.
-            for u, preview in self._extract_http_header_urls(text):
-                push(u, source="libpcap_http_header", evidence="http_header_url", pkt=pkt, text_preview=preview)
+            path_matches = re.findall(
+                r":path\s*([/][^\s\r\n\x00]+)",
+                text,
+                re.I,
+            )
 
-            # HTTPS encrypts paths, but TLS ClientHello often leaks SNI hostnames. Emit conservative host roots.
-            if bool(getattr(self.cfg, "libpcap_emit_host_hints", True)):
-                for host in self._extract_host_hints(text, page_host=page_host)[: int(getattr(self.cfg, "libpcap_host_hint_limit", 24))]:
-                    push(f"https://{host}/", source="libpcap_host_hint", evidence="probable_sni_or_host_string", pkt=pkt, text_preview=host)
+            for host in authority_matches:
+                urls.append(f"https://{host}/")
 
-        return out[: int(getattr(self.cfg, "libpcap_max_link_hits", 80))]
+            for host in authority_matches:
+                for path in path_matches:
+                    urls.append(f"https://{host}{path}")
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_quic_streams(self, raw: bytes, page_host: str) -> List[str]:
+        """Extract hostnames from QUIC-like packet bytes."""
+        hosts: List[str] = []
+
+        if not raw:
+            return hosts
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            if page_host and page_host in text:
+                hosts.append(page_host)
+
+            for match in re.findall(
+                    r"(?<![a-z0-9.-])([a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8})(?=[:/\s\r\n\x00]|$)",
+                    text,
+                    re.I,
+            ):
+                host = str(match).strip(".").lower()
+                if host and "." in host:
+                    hosts.append(host)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(hosts))[:24]
+
+    def _extract_websocket_headers(self, raw: bytes, page_host: str) -> List[str]:
+        """Extract URLs from WebSocket upgrade headers."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            origin_match = re.search(r"Origin:\s*(https?://[^\s\r\n]+)", text, re.I)
+            host_match = re.search(r"Host:\s*([^\s\r\n]+)", text, re.I)
+            get_match = re.search(r"GET\s+([^\s\r\n]+)\s+HTTP/", text, re.I)
+
+            host = page_host
+
+            if host_match:
+                host = host_match.group(1).split(":")[0].strip().lower() or host
+
+            if origin_match:
+                origin = origin_match.group(1).rstrip("/")
+                urls.append(origin)
+
+            if host and get_match:
+                path = get_match.group(1)
+
+                if path.startswith(("ws://", "wss://")):
+                    urls.append(path)
+                else:
+                    urls.append(f"wss://{host}{path if path.startswith('/') else '/' + path}")
+
+            if host:
+                urls.append(f"wss://{host}/ws")
+                urls.append(f"wss://{host}/websocket")
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _has_websocket_binary(self, raw: bytes) -> bool:
+        """Check if raw bytes look like a WebSocket binary/text frame."""
+        if not raw:
+            return False
+
+        first = raw[0]
+        opcode = first & 0x0F
+
+        # 0x1 = text frame, 0x2 = binary frame.
+        return opcode in (0x1, 0x2) and len(raw) >= 2
+
+    def _extract_binary_websocket_urls(self, raw: bytes, page_host: str) -> List[str]:
+        """Extract URLs from WebSocket binary/text payloads."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            for u in self._extract_urls_from_text(text):
+                urls.append(u)
+
+            if page_host:
+                for rel in re.findall(
+                        r'["\'](/(?:api|ws|websocket|socket|live)/[^"\']*)["\']',
+                        text,
+                        re.I,
+                ):
+                    urls.append(f"https://{page_host}{rel}")
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_spdy_frames(self, raw: bytes) -> List[str]:
+        """Extract URLs from SPDY / NGHTTP2-like frames."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            for u in self._extract_urls_from_text(text):
+                urls.append(u)
+
+            max_scan = min(2048, len(raw))
+
+            for i in range(0, max_scan - 4):
+                frame_len = int.from_bytes(raw[i + 1:i + 4], "big", signed=False)
+
+                if 0 < frame_len <= 4096 and i + 4 + frame_len <= len(raw):
+                    payload = raw[i + 4:i + 4 + frame_len]
+                    payload_text = payload.decode("utf-8", errors="ignore")
+
+                    for u in self._extract_urls_from_text(payload_text):
+                        urls.append(u)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_tls_sni(self, raw: bytes, page_host: str = "") -> List[str]:
+        """Extract probable SNI hostnames from TLS ClientHello bytes."""
+        hosts: List[str] = []
+
+        if not raw:
+            return hosts
+
+        try:
+            text = raw.decode("latin1", errors="ignore")
+
+            host_matches = re.findall(
+                r"(?<![a-z0-9.-])([a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63}){1,8})(?=[\x00\s:/]|$)",
+                text,
+                re.I,
+            )
+
+            for host in host_matches:
+                host = host.strip(".").lower()
+
+                if host and "." in host and not host.endswith(
+                        (
+                                ".png",
+                                ".jpg",
+                                ".jpeg",
+                                ".gif",
+                                ".css",
+                                ".js",
+                                ".svg",
+                                ".ico",
+                        )
+                ):
+                    hosts.append(host)
+
+            if page_host and page_host in text:
+                hosts.append(page_host)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(hosts))[:24]
+
+    def _extract_tls_alpn(self, raw: bytes) -> List[str]:
+        """Extract ALPN-ish protocol strings from TLS handshake bytes."""
+        protocols: List[str] = []
+
+        if not raw:
+            return protocols
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            for proto in ("h2", "http/1.1", "h3", "h3-29", "acme-tls/1"):
+                if proto in text:
+                    protocols.append(proto)
+
+            for m in re.findall(
+                    r"(\.well-known/[a-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)",
+                    text,
+                    re.I,
+            ):
+                protocols.append("/" + m.lstrip("/"))
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(protocols))
+
+    def _extract_wellknown_paths(self, proto: str, page_host: str) -> List[str]:
+        """Extract .well-known paths from ALPN/protocol text."""
+        paths: List[str] = []
+
+        if not proto or not page_host:
+            return paths
+
+        wellknown_paths = [
+            "/.well-known/acme-challenge/",
+            "/.well-known/apple-app-site-association/",
+            "/.well-known/apple-devices-configuration/",
+            "/.well-known/webappsec.txt",
+            "/.well-known/security.txt",
+        ]
+
+        for path in wellknown_paths:
+            if path in proto:
+                paths.append(f"https://{page_host}{path}")
+
+        for m in re.findall(
+                r"(/?\.well-known/[a-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)",
+                proto,
+                re.I,
+        ):
+            path = "/" + m.lstrip("/")
+            paths.append(f"https://{page_host}{path}")
+
+        return list(dict.fromkeys(paths))
+
+    def _extract_upgrade_headers(self, text: str, page_host: str = "") -> List[Tuple[str, str]]:
+        """Extract URLs from HTTP Upgrade headers."""
+        urls: List[Tuple[str, str]] = []
+
+        if not text:
+            return urls
+
+        try:
+            upgrade_match = re.search(r"Upgrade:\s*([a-z0-9._/-]+)", text, re.I)
+            host_match = re.search(r"Host:\s*([^\s\r\n]+)", text, re.I)
+            path_match = re.search(r"(?:GET|POST)\s+([^\s\r\n]+)\s+HTTP/", text, re.I)
+
+            host = page_host
+
+            if host_match:
+                host = host_match.group(1).split(":")[0].strip().lower() or host
+
+            if upgrade_match:
+                upgrade_value = upgrade_match.group(1).strip()
+                lower = upgrade_value.lower()
+
+                if lower == "websocket" and host:
+                    path = "/ws"
+
+                    if path_match:
+                        path = path_match.group(1)
+
+                    urls.append(
+                        (
+                            f"wss://{host}{path if path.startswith('/') else '/' + path}",
+                            upgrade_value,
+                        )
+                    )
+
+                elif lower.startswith(("http://", "https://", "ws://", "wss://")):
+                    urls.append((upgrade_value, upgrade_value))
+
+            for m in re.findall(r"(wss?://[^\s\"'<>]+)", text, re.I):
+                urls.append((m, m))
+
+            if host:
+                for rel in re.findall(
+                        r"(/[a-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:ws|websocket|socket|api)[a-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)",
+                        text,
+                        re.I,
+                ):
+                    urls.append((f"https://{host}{rel}", rel))
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_cookie_urls(self, text: str, page_host: str = "") -> List[str]:
+        """Extract URL-like auth/session paths from cookie/session headers."""
+        urls: List[str] = []
+
+        if not text or not page_host:
+            return urls
+
+        try:
+            cookie_patterns = [
+                r"(?:session_id|session|sid)=([a-z0-9._~-]{8,})",
+                r"(?:token|access_token|auth_token)['\"]?\s*[:=]\s*['\"]?([a-z0-9._~-]{8,})",
+                r"(?:redirect|return_to|next)=((?:https?%3A%2F%2F|https?://|/)[^;\s]+)",
+            ]
+
+            for pattern in cookie_patterns:
+                for m in re.findall(pattern, text, re.I):
+                    value = m[0] if isinstance(m, tuple) else m
+                    value = str(value).strip()
+
+                    if not value:
+                        continue
+
+                    if value.startswith(("http://", "https://")):
+                        urls.append(value)
+                    elif value.startswith("/"):
+                        urls.append(f"https://{page_host}{value}")
+                    else:
+                        urls.append(f"https://{page_host}/auth?token={value}")
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_datauri_urls(self, text: str) -> List[str]:
+        """Extract Data URI schemes and decode text/html base64 payloads when possible."""
+        urls: List[str] = []
+
+        if not text:
+            return urls
+
+        try:
+            data_uri_patterns = [
+                r"data:[\w.+/-]+;base64,([a-z0-9+/=]{40,})",
+                r"(data:text/html,[^\s\"'<>]{20,})",
+            ]
+
+            for pattern in data_uri_patterns:
+                for m in re.findall(pattern, text, re.I):
+                    value = m[0] if isinstance(m, tuple) else m
+                    value = str(value)
+
+                    if value.startswith("data:text/html,"):
+                        urls.append(value)
+                        continue
+
+                    try:
+                        decoded = base64.b64decode(value + "==="[: len(value) % 4]).decode(
+                            "utf-8",
+                            errors="ignore",
+                        )
+
+                        for u in self._extract_urls_from_text(decoded):
+                            urls.append(u)
+
+                    except Exception:
+                        pass
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_base64_urls(self, text: str) -> List[str]:
+        """Extract Base64 encoded URLs."""
+        urls: List[str] = []
+
+        if not text:
+            return urls
+
+        patterns = [
+            r"base64,([a-z0-9+/=]{40,})",
+            r"window\.location\.href\s*=\s*[\"']([a-z0-9+/=]{20,})",
+            r"location\.href\s*=\s*[\"']([a-z0-9+/=]{20,})",
+            r"eval\([\"']([a-z0-9+/=]{20,})[\"']\)",
+        ]
+
+        for pattern in patterns:
+            for m in re.findall(pattern, text, re.I):
+                value = m[0] if isinstance(m, tuple) else m
+                value = str(value).strip()
+
+                try:
+                    decoded = base64.b64decode(value + "==="[: len(value) % 4]).decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+
+                    for u in self._extract_urls_from_text(decoded):
+                        urls.append(u)
+
+                except Exception:
+                    pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_jsobf_urls(self, text: str, page_host: str) -> List[str]:
+        """Extract JavaScript obfuscated URL-ish tokens."""
+        urls: List[str] = []
+
+        if not text:
+            return urls
+
+        patterns = [
+            r'window\["\w+"\]\.href\s*=\s*["\']?([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)["\']?',
+            r'eval\(["\']([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)["\']\)',
+            r'location\.href\s*=\s*["\']?([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)["\']?',
+            r"'\.join\(['\"]([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)['\"],\s*['\"]([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)['\"],\s*['\"]([a-z0-9+/=._~:/?#\[\]@!$&()*+,;%-]+)['\"]",
+        ]
+
+        for pattern in patterns:
+            for m in re.findall(pattern, text, re.I):
+                if isinstance(m, tuple):
+                    value = "".join(str(x) for x in m if x)
+                else:
+                    value = str(m)
+
+                value = value.strip()
+                if not value:
+                    continue
+
+                if value.startswith(("http://", "https://")):
+                    urls.append(value)
+                elif value.startswith("/") and page_host:
+                    urls.append(f"https://{page_host}{value}")
+                elif page_host:
+                    urls.append(f"https://{page_host}/{value.lstrip('/')}")
+
+                try:
+                    decoded = base64.b64decode(value + "==="[: len(value) % 4]).decode(
+                        "utf-8",
+                        errors="ignore",
+                    )
+
+                    for u in self._extract_urls_from_text(decoded):
+                        urls.append(u)
+
+                except Exception:
+                    pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_url_fragments(self, text: str, page_host: str = "") -> List[str]:
+        """Extract URL fragments/anchors as full page URLs when page_host is known."""
+        urls: List[str] = []
+
+        if not text:
+            return urls
+
+        patterns = [
+            r'id=["\']([a-z0-9._:-]+)["\']',
+            r'name=["\']([a-z0-9._:-]+)["\']',
+            r'href=["\']#([a-z0-9._:-]+)["\']',
+        ]
+
+        for pattern in patterns:
+            for frag in re.findall(pattern, text, re.I):
+                frag = str(frag).strip()
+
+                if not frag:
+                    continue
+
+                if page_host:
+                    urls.append(f"https://{page_host}/#{frag}")
+                else:
+                    urls.append(f"#{frag}")
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_relative_urls(self, text: str, page_host: str) -> List[str]:
+        """Extract and resolve relative URLs."""
+        urls: List[str] = []
+
+        if not text or not page_host:
+            return urls
+
+        patterns = [
+            r'href=["\'](/[^"\'>\s]+)["\']',
+            r'src=["\'](/[^"\'>\s]+)["\']',
+            r'action=["\'](/[^"\'>\s]+)["\']',
+            r'fetch\(["\'](/[^"\']+)["\']',
+            r'url\(["\']?(/[^"\'\)\s]+)',
+        ]
+
+        for pattern in patterns:
+            for m in re.findall(pattern, text, re.I):
+                path = str(m).strip()
+
+                if path:
+                    urls.append(f"https://{page_host}{path if path.startswith('/') else '/' + path}")
+
+        return list(dict.fromkeys(urls))
+
+    def _find_multipart_boundaries(self, raw: bytes) -> Optional[bytes]:
+        """Find multipart boundary string."""
+        if not raw:
+            return None
+
+        try:
+            boundary_match = re.search(
+                rb'boundary=["\']?([^\s"\'\r\n;]{1,100})["\']?',
+                raw,
+                re.I,
+            )
+
+            if boundary_match:
+                return boundary_match.group(1)
+
+        except Exception:
+            pass
+
+        return None
+
+    def _extract_multipart_urls(self, raw: bytes, boundary: bytes) -> List[str]:
+        """Extract URLs from multipart body parts."""
+        urls: List[str] = []
+
+        if not raw or not boundary:
+            return urls
+
+        try:
+            marker = b"--" + boundary
+            parts = raw.split(marker)
+
+            for part in parts:
+                text = part.decode("utf-8", errors="ignore")
+
+                for u in self._extract_urls_from_text(text):
+                    urls.append(u)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_form_urls(self, raw: bytes, page_host: str) -> List[str]:
+        """Extract URLs from form submissions."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            action_match = re.search(
+                r'action=["\']?(/[^"\'\s>]+)["\']?',
+                text,
+                re.I,
+            )
+
+            if action_match and page_host:
+                urls.append(f"https://{page_host}{action_match.group(1)}")
+
+            for u in self._extract_urls_from_text(text):
+                urls.append(u)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _extract_download_urls(self, raw: bytes, page_host: str) -> List[str]:
+        """Extract URLs from download content."""
+        urls: List[str] = []
+
+        if not raw:
+            return urls
+
+        try:
+            text = raw.decode("utf-8", errors="ignore")
+
+            download_patterns = [
+                r'href=["\']?(/download/[^"\'\s>]+)["\']?',
+                r'href=["\']?(/files/[^"\'\s>]+)["\']?',
+                r'Location:\s*(/[^\s\r\n]+)',
+            ]
+
+            for pattern in download_patterns:
+                for m in re.findall(pattern, text, re.I):
+                    path = str(m).strip()
+
+                    if page_host and path.startswith("/"):
+                        urls.append(f"https://{page_host}{path}")
+
+            for u in self._extract_urls_from_text(text):
+                urls.append(u)
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(urls))
+
+    def _looks_like_dns(self, raw: bytes) -> bool:
+        """Cheap DNS packet sanity check."""
+        if not raw or len(raw) < 12:
+            return False
+
+        try:
+            qdcount = int.from_bytes(raw[4:6], "big")
+            return 0 < qdcount <= 10
+        except Exception:
+            return False
+
+    def _extract_dns_queries(self, raw: bytes) -> List[str]:
+        """Extract DNS query names from DNS packet bytes."""
+        hosts: List[str] = []
+
+        if not raw or len(raw) < 12:
+            return hosts
+
+        try:
+            qdcount = int.from_bytes(raw[4:6], "big")
+            offset = 12
+
+            for _ in range(min(qdcount, 10)):
+                labels: List[str] = []
+
+                while offset < len(raw):
+                    length = raw[offset]
+                    offset += 1
+
+                    if length == 0:
+                        break
+
+                    # DNS compression pointer.
+                    if length & 0xC0 == 0xC0:
+                        offset += 1
+                        break
+
+                    if length > 63 or offset + length > len(raw):
+                        break
+
+                    label = raw[offset:offset + length].decode("utf-8", errors="ignore")
+                    offset += length
+
+                    if label:
+                        labels.append(label)
+
+                if labels:
+                    host = ".".join(labels).strip(".").lower()
+
+                    if "." in host:
+                        hosts.append(host)
+
+                # Skip QTYPE + QCLASS.
+                if offset + 4 <= len(raw):
+                    offset += 4
+                else:
+                    break
+
+        except Exception:
+            pass
+
+        return list(dict.fromkeys(hosts))
+
+    def _extract_proxy_headers(self, raw: bytes, text: str) -> List[str]:
+        """Extract proxy chain URLs from headers."""
+        urls: List[str] = []
+
+        if not text and raw:
+            text = raw.decode("utf-8", errors="ignore")
+
+        if not text:
+            return urls
+
+        proxy_patterns = [
+            r"X-Forwarded-For:\s*([^\s,;\r\n]+)",
+            r"X-Real-IP:\s*([^\s,;\r\n]+)",
+            r"CF-Connecting-IP:\s*([^\s,;\r\n]+)",
+            r"Forwarded:\s*for=([^\s,;\r\n]+)",
+        ]
+
+        for pattern in proxy_patterns:
+            for m in re.findall(pattern, text, re.I):
+                host = str(m).strip().strip('"[]')
+
+                if host:
+                    urls.append(f"http://{host}/")
+
+        return list(dict.fromkeys(urls))
+
+    def _sanitize_packet_urls(self, out: List[Dict]) -> List[Dict]:
+        """Sanitize and clean URLs"""
+        for item in out:
+            if "url" in item:
+                item["url"] = self._clean_packet_url(item["url"])
+        return out
+
+    def _filter_common_noise(self, out: List[Dict], page_host: str) -> List[Dict]:
+        """Filter out common noise patterns"""
+        noise_urls = [
+            "javascript:", "data:text/html", "data:application",
+            "mailto:", "tel:", "ftp://", "https://",
+            f"http://{page_host}/", f"https://{page_host}/",
+        ]
+        filtered = []
+        for item in out:
+            if "url" in item:
+                url = item["url"]
+                if url and not any(noise in url for noise in noise_urls):
+                    if url and "http" in url:
+                        filtered.append(item)
+        return filtered
 
     def _packet_bytes_to_text(self, raw: bytes) -> str:
         try:
