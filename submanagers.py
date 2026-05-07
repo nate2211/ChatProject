@@ -17,6 +17,7 @@ import zlib
 from dataclasses import dataclass, field, fields
 from html import unescape
 from html.parser import HTMLParser
+from http.cookies import SimpleCookie
 from pathlib import Path
 import random  # For random delays
 import json  # For JSON parsing in NetworkSniffer and JSSniffer
@@ -14378,17 +14379,874 @@ class _ResponseMemo:
     last_seen: float = field(default_factory=time.time)
 
 
+@dataclass
+class _SessionToken:
+    host: str
+    name: str
+    value: str
+    kind: str = "csrf"
+    location: str = "unknown"
+    source_url: str = ""
+    header_name: str = ""
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    uses: int = 0
+
+    def redacted(self) -> str:
+        if not self.value:
+            return "[empty]"
+        if len(self.value) <= 8:
+            return "[redacted]"
+        return f"{self.value[:4]}…{self.value[-4:]}"
+
+
+@dataclass
+class _AccessPage:
+    url: str
+    canonical_url: str
+    host: str
+    kind: str
+    label: str
+    method: str = "GET"
+    status: Optional[int] = None
+    content_type: str = ""
+    parent: str = ""
+    requires_auth: bool = False
+    requires_csrf: bool = False
+    csrf_names: Tuple[str, ...] = field(default_factory=tuple)
+    required_headers: Tuple[str, ...] = field(default_factory=tuple)
+    evidence: Tuple[str, ...] = field(default_factory=tuple)
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    hits: int = 0
+
+    def human_row(self) -> Dict[str, Any]:
+        return {
+            "url": self.url,
+            "kind": self.kind,
+            "label": self.label,
+            "method": self.method,
+            "status": self.status,
+            "content_type": self.content_type,
+            "requires_auth": self.requires_auth,
+            "requires_csrf": self.requires_csrf,
+            "csrf_names": list(self.csrf_names),
+            "required_headers": list(self.required_headers),
+            "parent": self.parent,
+            "evidence": list(self.evidence),
+            "last_seen": self.last_seen,
+            "hits": self.hits,
+        }
+
+
+class SessionClass:
+    """
+    SessionClass keeps browser-like session state for HTTPSSubmanager.
+
+    What it stores:
+      - aiohttp CookieJar
+      - CSRF/XSRF tokens discovered from HTML, JSON, headers, and cookies
+      - API/auth endpoint metadata
+      - per-host headers that should be replayed only same-origin
+
+    Safety behavior:
+      - DEBUG logs never print full token values
+      - CSRF tokens are only replayed to same-host requests
+      - bearer/auth tokens are recorded as metadata but are not auto-replayed unless
+        allow_auth_header_replay=True
+    """
+
+    CSRF_NAME_RE = re.compile(
+        r"(csrf|xsrf|csrfmiddlewaretoken|_csrf|x-csrf-token|x-xsrf-token|requestverificationtoken)",
+        re.I,
+    )
+
+    AUTH_NAME_RE = re.compile(
+        r"(authorization|bearer|access[_-]?token|id[_-]?token|jwt|session)",
+        re.I,
+    )
+
+    UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+    DEFAULT_CSRF_HEADER_NAMES = (
+        "X-CSRF-Token",
+        "X-XSRF-Token",
+        "X-CSRFToken",
+        "X-Requested-With",
+    )
+
+    def __init__(
+        self,
+        *,
+        logger: Any = None,
+        enable_cookies: bool = True,
+        allow_auth_header_replay: bool = False,
+        max_tokens_per_host: int = 64,
+    ) -> None:
+        self.logger = logger or DEBUG_LOGGER
+        self.enable_cookies = bool(enable_cookies)
+        self.allow_auth_header_replay = bool(allow_auth_header_replay)
+        self.max_tokens_per_host = int(max(8, max_tokens_per_host))
+        self.cookie_jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
+
+        self._tokens_by_host: Dict[str, Dict[str, _SessionToken]] = {}
+        self._headers_by_host: Dict[str, Dict[str, str]] = {}
+        self._last_page_by_host: Dict[str, str] = {}
+        self._mu = asyncio.Lock()
+
+    def _log(self, msg: str) -> None:
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            try:
+                print(msg)
+            except Exception:
+                pass
+
+    def _host(self, url: str) -> str:
+        try:
+            return urlparse(str(url or "")).netloc.lower().split(":")[0]
+        except Exception:
+            return ""
+
+    def _origin(self, url: str) -> str:
+        try:
+            p = urlparse(str(url or ""))
+            if p.scheme and p.netloc:
+                return f"{p.scheme}://{p.netloc}"
+        except Exception:
+            pass
+        return ""
+
+    def _same_host(self, a: str, b: str) -> bool:
+        ha = self._host(a)
+        hb = self._host(b)
+        return bool(ha and hb and ha == hb)
+
+    def _token_key(self, name: str, location: str) -> str:
+        return f"{str(location or '').lower()}::{str(name or '').lower()}"
+
+    def _guess_header_name(self, token_name: str, location: str) -> str:
+        name = str(token_name or "").strip()
+        loc = str(location or "").lower()
+
+        if name.lower() in {
+            "x-csrf-token",
+            "x-xsrf-token",
+            "x-csrftoken",
+            "requestverificationtoken",
+        }:
+            return name
+
+        if "cookie" in loc and "xsrf" in name.lower():
+            return "X-XSRF-Token"
+
+        if "csrfmiddlewaretoken" in name.lower():
+            return "X-CSRFToken"
+
+        return "X-CSRF-Token"
+
+    async def remember_page(self, url: str) -> None:
+        host = self._host(url)
+        if not host:
+            return
+        async with self._mu:
+            self._last_page_by_host[host] = url
+
+    async def remember_header(self, url: str, key: str, value: str) -> None:
+        host = self._host(url)
+        key = str(key or "").strip()
+        value = str(value or "").strip()
+        if not host or not key or not value:
+            return
+
+        if self.AUTH_NAME_RE.search(key) and not self.allow_auth_header_replay:
+            return
+
+        async with self._mu:
+            bucket = self._headers_by_host.setdefault(host, {})
+            bucket[key] = value
+
+    async def remember_token(
+        self,
+        *,
+        url: str,
+        name: str,
+        value: str,
+        kind: str = "csrf",
+        location: str = "unknown",
+        header_name: str = "",
+    ) -> None:
+        host = self._host(url)
+        name = str(name or "").strip()
+        value = str(value or "").strip()
+
+        if not host or not name or not value:
+            return
+
+        if len(value) > 4096:
+            return
+
+        kind = str(kind or "csrf").lower().strip()
+        location = str(location or "unknown").strip()
+        header_name = str(header_name or "").strip()
+
+        if kind == "csrf" and not header_name:
+            header_name = self._guess_header_name(name, location)
+
+        async with self._mu:
+            bucket = self._tokens_by_host.setdefault(host, {})
+            key = self._token_key(name, location)
+
+            existing = bucket.get(key)
+            if existing is None:
+                tok = _SessionToken(
+                    host=host,
+                    name=name,
+                    value=value,
+                    kind=kind,
+                    location=location,
+                    source_url=url,
+                    header_name=header_name,
+                )
+                bucket[key] = tok
+                self._log(
+                    f"[HTTPS][SESSION][TOKEN] kind={kind} host={host} "
+                    f"name={name} location={location} value={tok.redacted()} source={url}"
+                )
+            else:
+                existing.value = value
+                existing.kind = kind
+                existing.location = location
+                existing.header_name = header_name or existing.header_name
+                existing.source_url = url or existing.source_url
+                existing.last_seen = time.time()
+                self._log(
+                    f"[HTTPS][SESSION][TOKEN-REFRESH] kind={kind} host={host} "
+                    f"name={name} location={location} value={existing.redacted()}"
+                )
+
+            if len(bucket) > self.max_tokens_per_host:
+                oldest = sorted(bucket.items(), key=lambda kv: kv[1].last_seen)
+                for dead_key, _ in oldest[: max(1, len(bucket) - self.max_tokens_per_host)]:
+                    bucket.pop(dead_key, None)
+
+    async def ingest_set_cookie_headers(self, url: str, headers: Dict[str, str]) -> None:
+        if not headers:
+            return
+
+        for k, v in headers.items():
+            if str(k).lower() != "set-cookie":
+                continue
+
+            cookie = SimpleCookie()
+            try:
+                cookie.load(str(v))
+            except Exception:
+                continue
+
+            for name, morsel in cookie.items():
+                val = morsel.value
+                if self.CSRF_NAME_RE.search(name):
+                    await self.remember_token(
+                        url=url,
+                        name=name,
+                        value=val,
+                        kind="csrf",
+                        location="cookie",
+                        header_name=self._guess_header_name(name, "cookie"),
+                    )
+                elif self.AUTH_NAME_RE.search(name):
+                    await self.remember_token(
+                        url=url,
+                        name=name,
+                        value=val,
+                        kind="auth",
+                        location="cookie",
+                    )
+
+    async def ingest_html_tokens(self, url: str, text: str) -> None:
+        if not text:
+            return
+
+        await self.remember_page(url)
+
+        # input name="csrfmiddlewaretoken" value="..."
+        input_re = re.compile(
+            r"<input\b[^>]*(?:name|id)=['\"]([^'\"]*(?:csrf|xsrf|requestverificationtoken)[^'\"]*)['\"][^>]*>",
+            re.I,
+        )
+        value_re = re.compile(r"\bvalue=['\"]([^'\"]{1,4096})['\"]", re.I)
+
+        for m in input_re.finditer(text[:700_000]):
+            tag = m.group(0)
+            name = m.group(1)
+            vm = value_re.search(tag)
+            if vm:
+                await self.remember_token(
+                    url=url,
+                    name=name,
+                    value=html.unescape(vm.group(1)),
+                    kind="csrf",
+                    location="form_input",
+                )
+
+        # meta name="csrf-token" content="..."
+        meta_re = re.compile(
+            r"<meta\b[^>]*(?:name|property)=['\"]([^'\"]*(?:csrf|xsrf)[^'\"]*)['\"][^>]*>",
+            re.I,
+        )
+        content_re = re.compile(r"\bcontent=['\"]([^'\"]{1,4096})['\"]", re.I)
+
+        for m in meta_re.finditer(text[:700_000]):
+            tag = m.group(0)
+            name = m.group(1)
+            cm = content_re.search(tag)
+            if cm:
+                await self.remember_token(
+                    url=url,
+                    name=name,
+                    value=html.unescape(cm.group(1)),
+                    kind="csrf",
+                    location="meta",
+                )
+
+        # JS variables: csrfToken = "..."
+        js_re = re.compile(
+            r"(?i)\b(csrfToken|xsrfToken|csrf_token|xsrf_token|_csrf|csrfmiddlewaretoken)\b"
+            r"\s*[:=]\s*['\"]([^'\"]{6,4096})['\"]"
+        )
+        for name, value in js_re.findall(text[:700_000]):
+            await self.remember_token(
+                url=url,
+                name=name,
+                value=html.unescape(value),
+                kind="csrf",
+                location="javascript",
+            )
+
+    async def ingest_json_tokens(self, url: str, text: str) -> None:
+        if not text:
+            return
+
+        # Regex first because many API responses are JSON-ish but not strict JSON.
+        token_re = re.compile(
+            r"(?i)['\"]([^'\"]*(?:csrf|xsrf|requestverificationtoken|access[_-]?token|id[_-]?token|jwt)[^'\"]*)['\"]"
+            r"\s*:\s*['\"]([^'\"]{6,4096})['\"]"
+        )
+
+        for name, value in token_re.findall(text[:700_000]):
+            kind = "csrf" if self.CSRF_NAME_RE.search(name) else "auth"
+            await self.remember_token(
+                url=url,
+                name=name,
+                value=value,
+                kind=kind,
+                location="json",
+            )
+
+    async def headers_for(
+        self,
+        *,
+        url: str,
+        method: str,
+        referer: str = "",
+        existing_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        method = (method or "GET").upper().strip()
+        host = self._host(url)
+        out: Dict[str, str] = dict(existing_headers or {})
+
+        if not host:
+            return out
+
+        async with self._mu:
+            stored_headers = dict(self._headers_by_host.get(host) or {})
+            tokens = list((self._tokens_by_host.get(host) or {}).values())
+            last_page = self._last_page_by_host.get(host) or ""
+
+        for k, v in stored_headers.items():
+            if k not in out:
+                out[k] = v
+
+        if referer and "Referer" not in out:
+            out["Referer"] = referer
+        elif last_page and "Referer" not in out and method in self.UNSAFE_METHODS:
+            out["Referer"] = last_page
+
+        origin_source = out.get("Referer") or last_page or url
+        origin = self._origin(origin_source)
+        if origin and method in self.UNSAFE_METHODS and "Origin" not in out:
+            out["Origin"] = origin
+
+        if method in self.UNSAFE_METHODS:
+            csrf_tokens = [t for t in tokens if t.kind == "csrf" and t.value]
+            if csrf_tokens:
+                csrf_tokens.sort(key=lambda t: t.last_seen, reverse=True)
+                tok = csrf_tokens[0]
+                header_name = tok.header_name or self._guess_header_name(tok.name, tok.location)
+                if header_name and header_name not in out:
+                    out[header_name] = tok.value
+                if "X-Requested-With" not in out:
+                    out["X-Requested-With"] = "XMLHttpRequest"
+                tok.uses += 1
+                tok.last_seen = time.time()
+                self._log(
+                    f"[HTTPS][SESSION][CSRF-APPLY] host={host} method={method} "
+                    f"header={header_name} token={tok.name} value={tok.redacted()} url={url}"
+                )
+
+        return out
+
+    async def snapshot(self, *, include_values: bool = False) -> Dict[str, Any]:
+        async with self._mu:
+            tokens_out: Dict[str, List[Dict[str, Any]]] = {}
+            for host, bucket in self._tokens_by_host.items():
+                tokens_out[host] = []
+                for tok in bucket.values():
+                    tokens_out[host].append(
+                        {
+                            "name": tok.name,
+                            "kind": tok.kind,
+                            "location": tok.location,
+                            "header_name": tok.header_name,
+                            "source_url": tok.source_url,
+                            "value": tok.value if include_values else tok.redacted(),
+                            "uses": tok.uses,
+                            "last_seen": tok.last_seen,
+                        }
+                    )
+
+            return {
+                "hosts": sorted(set(self._tokens_by_host) | set(self._headers_by_host)),
+                "tokens": tokens_out,
+                "headers_by_host": {
+                    h: sorted(v.keys())
+                    for h, v in self._headers_by_host.items()
+                },
+                "last_page_by_host": dict(self._last_page_by_host),
+            }
+
+
+class AccessibilityManager:
+    """
+    AccessibilityManager converts discovered URLs into human-usable pages:
+      - API endpoints
+      - auth/login/logout/session pages
+      - CSRF sources
+      - forms
+      - GraphQL endpoints
+      - JSON endpoints
+      - pages with usable browser context
+
+    It feeds same-origin CSRF/session metadata into SessionClass and emits
+    DEBUG_LOGGER lines that humans can search for.
+    """
+
+    API_RE = re.compile(r"(/api/|/ajax/|/rest/|/rpc|/graphql|/v\d+/|endpoint|json|query|search)", re.I)
+    AUTH_RE = re.compile(r"(login|logout|signin|sign-in|signup|sign-up|auth|oauth|session|account)", re.I)
+    CSRF_RE = SessionClass.CSRF_NAME_RE
+
+    def __init__(
+        self,
+        *,
+        session_class: Optional[SessionClass] = None,
+        logger: Any = None,
+        max_pages: int = 4096,
+        log_token_values: bool = False,
+    ) -> None:
+        self.session_class = session_class or SessionClass(logger=logger or DEBUG_LOGGER)
+        self.logger = logger or DEBUG_LOGGER
+        self.max_pages = int(max(256, max_pages))
+        self.log_token_values = bool(log_token_values)
+        self._pages: Dict[str, _AccessPage] = {}
+        self._mu = asyncio.Lock()
+
+    def _log(self, msg: str) -> None:
+        try:
+            self.logger.log_message(msg)
+        except Exception:
+            try:
+                print(msg)
+            except Exception:
+                pass
+
+    def _host(self, url: str) -> str:
+        try:
+            return urlparse(str(url or "")).netloc.lower().split(":")[0]
+        except Exception:
+            return ""
+
+    def _canonicalize_url(self, u: str) -> str:
+        try:
+            p = urlparse(str(u or "").strip())
+            if p.scheme not in ("http", "https", "ws", "wss") or not p.netloc:
+                return ""
+            host = p.netloc.lower().split(":")[0]
+            path = p.path or "/"
+            qs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=False)]
+            query = urlencode(qs, doseq=True)
+            return urlunparse((p.scheme.lower(), host, path, p.params, query, ""))
+        except Exception:
+            return ""
+
+    def _classify(self, url: str, content_type: str = "", source: str = "") -> str:
+        ul = str(url or "").lower()
+        ct = str(content_type or "").lower()
+        src = str(source or "").lower()
+
+        if ul.startswith(("ws://", "wss://")):
+            return "websocket"
+        if "/graphql" in ul or "graphql" in src:
+            return "graphql"
+        if self.AUTH_RE.search(ul):
+            return "auth"
+        if self.API_RE.search(ul) or "application/json" in ct:
+            return "api"
+        if self.CSRF_RE.search(ul):
+            return "csrf"
+        if "text/html" in ct:
+            return "page"
+        if "form" in src:
+            return "form"
+        return "link"
+
+    def _label_for(self, kind: str, url: str) -> str:
+        path = urlparse(url).path or "/"
+        if kind == "api":
+            return f"API endpoint {path}"
+        if kind == "graphql":
+            return "GraphQL endpoint"
+        if kind == "auth":
+            return f"Auth/session page {path}"
+        if kind == "csrf":
+            return f"CSRF/token source {path}"
+        if kind == "form":
+            return f"Form endpoint {path}"
+        if kind == "websocket":
+            return f"WebSocket endpoint {path}"
+        if kind == "page":
+            return f"Human page {path}"
+        return f"Discovered link {path}"
+
+    async def remember_access_page(
+        self,
+        *,
+        url: str,
+        kind: str = "",
+        method: str = "GET",
+        status: Optional[int] = None,
+        content_type: str = "",
+        parent: str = "",
+        source: str = "",
+        evidence: Iterable[str] = (),
+        requires_auth: bool = False,
+        requires_csrf: bool = False,
+        csrf_names: Iterable[str] = (),
+        required_headers: Iterable[str] = (),
+    ) -> None:
+        canonical = self._canonicalize_url(url)
+        if not canonical:
+            return
+
+        host = self._host(canonical)
+        resolved_kind = kind or self._classify(canonical, content_type, source)
+        ev = tuple(str(x) for x in evidence if str(x).strip())[:12]
+        csrf_tuple = tuple(dict.fromkeys(str(x) for x in csrf_names if str(x).strip()))
+        header_tuple = tuple(dict.fromkeys(str(x) for x in required_headers if str(x).strip()))
+
+        async with self._mu:
+            existing = self._pages.get(canonical)
+            if existing is None:
+                page = _AccessPage(
+                    url=url,
+                    canonical_url=canonical,
+                    host=host,
+                    kind=resolved_kind,
+                    label=self._label_for(resolved_kind, canonical),
+                    method=(method or "GET").upper(),
+                    status=status,
+                    content_type=content_type,
+                    parent=parent,
+                    requires_auth=requires_auth,
+                    requires_csrf=requires_csrf,
+                    csrf_names=csrf_tuple,
+                    required_headers=header_tuple,
+                    evidence=ev,
+                    hits=1,
+                )
+                self._pages[canonical] = page
+                self._emit_access_log(page)
+            else:
+                existing.last_seen = time.time()
+                existing.hits += 1
+                existing.status = status if status is not None else existing.status
+                existing.content_type = content_type or existing.content_type
+                existing.requires_auth = existing.requires_auth or requires_auth
+                existing.requires_csrf = existing.requires_csrf or requires_csrf
+                existing.csrf_names = tuple(dict.fromkeys(list(existing.csrf_names) + list(csrf_tuple)))
+                existing.required_headers = tuple(dict.fromkeys(list(existing.required_headers) + list(header_tuple)))
+                if ev:
+                    existing.evidence = tuple(dict.fromkeys(list(existing.evidence) + list(ev)))[:12]
+                self._emit_access_log(existing, refresh=True)
+
+            if len(self._pages) > self.max_pages:
+                oldest = sorted(self._pages.items(), key=lambda kv: kv[1].last_seen)
+                for dead_key, _ in oldest[: max(1, len(self._pages) - self.max_pages)]:
+                    self._pages.pop(dead_key, None)
+
+    def _emit_access_log(self, page: _AccessPage, *, refresh: bool = False) -> None:
+        prefix = "REFRESH" if refresh else "FOUND"
+        """
+        self._log(
+            f"[HTTPS][ACCESS][{prefix}] kind={page.kind} method={page.method} "
+            f"status={page.status} auth={page.requires_auth} csrf={page.requires_csrf} "
+            f"host={page.host} label={page.label} url={page.canonical_url}"
+        )
+        """
+        if page.kind in {"api", "graphql"}:
+            self._log(f"[HTTPS][ACCESS][API] human_open={page.canonical_url} headers={list(page.required_headers)}")
+
+        if page.kind == "auth":
+            self._log(f"[HTTPS][ACCESS][AUTH] human_open={page.canonical_url}")
+
+        if page.requires_csrf or page.kind == "csrf":
+            self._log(
+                f"[HTTPS][ACCESS][CSRF] source={page.canonical_url} "
+                f"csrf_names={list(page.csrf_names)} values=redacted"
+            )
+
+    async def observe_response(
+        self,
+        *,
+        requested_url: str,
+        final_url: str,
+        status: Optional[int],
+        headers: Dict[str, str],
+        body: bytes,
+        request_headers: Dict[str, str],
+        decode_body_func: Any,
+    ) -> None:
+        url = final_url or requested_url
+        ctype = self._header_get(headers, "content-type")
+        kind = self._classify(url, ctype, "response")
+
+        requires_auth = bool(status in {401, 403}) or self.AUTH_RE.search(url) is not None
+        requires_csrf = False
+        csrf_names: List[str] = []
+        required_headers: List[str] = []
+
+        await self.session_class.ingest_set_cookie_headers(url, headers)
+
+        text = ""
+        if body and self._looks_textlike(ctype):
+            try:
+                text = decode_body_func(body)
+            except Exception:
+                text = body.decode("utf-8", errors="ignore")
+
+        if text:
+            if "html" in ctype.lower() or "<html" in text[:2048].lower() or "<input" in text[:4096].lower():
+                await self.session_class.ingest_html_tokens(url, text)
+            if "json" in ctype.lower() or text.lstrip().startswith(("{", "[")):
+                await self.session_class.ingest_json_tokens(url, text)
+
+            csrf_names.extend(self._find_csrf_names(text))
+            requires_csrf = bool(csrf_names)
+
+            for form_url, method, form_csrf in self._extract_forms(text, base_url=url):
+                await self.remember_access_page(
+                    url=form_url,
+                    kind="form",
+                    method=method,
+                    status=None,
+                    content_type="",
+                    parent=url,
+                    source="form",
+                    evidence=("html_form",),
+                    requires_auth=requires_auth,
+                    requires_csrf=bool(form_csrf),
+                    csrf_names=form_csrf,
+                    required_headers=("Referer", "Origin", "Cookie", "X-CSRF-Token") if form_csrf else ("Referer",),
+                )
+
+            for api_url in self._extract_api_urls(text, base_url=url):
+                api_kind = self._classify(api_url, "", "body_api")
+                await self.remember_access_page(
+                    url=api_url,
+                    kind=api_kind,
+                    method="GET",
+                    parent=url,
+                    source="body_api",
+                    evidence=("body_api_discovery",),
+                    requires_auth=False,
+                    requires_csrf=False,
+                    required_headers=("User-Agent", "Accept", "Referer"),
+                )
+
+        if requires_csrf:
+            required_headers.extend(["Referer", "Origin", "Cookie", "X-CSRF-Token"])
+
+        if requires_auth:
+            required_headers.extend(["Cookie", "Authorization/session-if-authorized"])
+
+        await self.remember_access_page(
+            url=url,
+            kind=kind,
+            method=str(request_headers.get(":method") or "GET"),
+            status=status,
+            content_type=ctype,
+            parent=requested_url if requested_url != final_url else "",
+            source="response",
+            evidence=(f"status:{status}", f"content-type:{ctype}"),
+            requires_auth=requires_auth,
+            requires_csrf=requires_csrf,
+            csrf_names=csrf_names,
+            required_headers=required_headers,
+        )
+
+    async def prepare_headers(
+        self,
+        *,
+        url: str,
+        method: str,
+        headers: Dict[str, str],
+        referer: str = "",
+    ) -> Dict[str, str]:
+        return await self.session_class.headers_for(
+            url=url,
+            method=method,
+            referer=referer,
+            existing_headers=headers,
+        )
+
+    async def register_linktracker_hits(
+        self,
+        *,
+        page_url: str,
+        items: Sequence[Dict[str, Any]],
+        source: str = "sniffer",
+    ) -> None:
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or item.get("href") or item.get("link") or "").strip()
+            if not url:
+                continue
+            if url.startswith("/"):
+                url = urljoin(page_url, url)
+            kind = self._classify(url, str(item.get("content_type") or ""), source)
+            await self.remember_access_page(
+                url=url,
+                kind=kind,
+                method=str(item.get("method") or "GET"),
+                status=item.get("status"),
+                content_type=str(item.get("content_type") or ""),
+                parent=page_url,
+                source=source,
+                evidence=(str(item.get("tag") or ""), str(item.get("kind") or ""), str(item.get("evidence") or "")),
+                requires_auth=bool(item.get("requires_auth") or False),
+                requires_csrf=bool(item.get("requires_csrf") or False),
+                csrf_names=item.get("csrf_names") or (),
+                required_headers=item.get("required_headers") or (),
+            )
+
+    async def snapshot(self) -> Dict[str, Any]:
+        async with self._mu:
+            pages = [p.human_row() for p in self._pages.values()]
+        pages.sort(key=lambda x: (x["kind"], x["host"] if "host" in x else "", x["url"]))
+        session = await self.session_class.snapshot(include_values=self.log_token_values)
+        return {
+            "pages": pages,
+            "session": session,
+            "counts": {
+                "pages": len(pages),
+                "apis": sum(1 for p in pages if p.get("kind") == "api"),
+                "graphql": sum(1 for p in pages if p.get("kind") == "graphql"),
+                "auth": sum(1 for p in pages if p.get("kind") == "auth"),
+                "csrf": sum(1 for p in pages if p.get("requires_csrf") or p.get("kind") == "csrf"),
+            },
+        }
+
+    def _header_get(self, headers: Dict[str, str], key: str) -> str:
+        key_l = key.lower()
+        for k, v in (headers or {}).items():
+            if str(k).lower() == key_l:
+                return str(v)
+        return ""
+
+    def _looks_textlike(self, ctype: str) -> bool:
+        ct = str(ctype or "").lower()
+        return (
+            ct.startswith("text/")
+            or "json" in ct
+            or "xml" in ct
+            or "javascript" in ct
+            or "x-www-form-urlencoded" in ct
+            or not ct
+        )
+
+    def _find_csrf_names(self, text: str) -> List[str]:
+        names: List[str] = []
+        for m in re.findall(
+            r"(?i)\b(csrfmiddlewaretoken|csrf[_-]?token|xsrf[_-]?token|_csrf|requestverificationtoken|x-csrf-token|x-xsrf-token)\b",
+            text[:700_000] or "",
+        ):
+            if m not in names:
+                names.append(m)
+        return names[:32]
+
+    def _extract_forms(self, text: str, *, base_url: str) -> List[Tuple[str, str, List[str]]]:
+        out: List[Tuple[str, str, List[str]]] = []
+        if not text:
+            return out
+
+        for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", text[:700_000]):
+            attrs = fm.group(1) or ""
+            inner = fm.group(2) or ""
+
+            action = ""
+            method = "GET"
+
+            am = re.search(r"(?i)\baction=['\"]([^'\"]+)['\"]", attrs)
+            if am:
+                action = html.unescape(am.group(1))
+
+            mm = re.search(r"(?i)\bmethod=['\"]([^'\"]+)['\"]", attrs)
+            if mm:
+                method = mm.group(1).upper()
+
+            form_url = urljoin(base_url, action or base_url)
+            csrf_names = self._find_csrf_names(inner)
+
+            out.append((form_url, method, csrf_names))
+
+        return out[:128]
+
+    def _extract_api_urls(self, text: str, *, base_url: str) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        patterns = [
+            r"['\"]((?:https?://[^'\"]+|/[^'\"]*)(?:/api/|/ajax/|/rest/|/graphql|/v\d+/)[^'\"]*)['\"]",
+            r"\bfetch\(\s*['\"]([^'\"]+)['\"]",
+            r"\baxios\.(?:get|post|put|patch|delete)\(\s*['\"]([^'\"]+)['\"]",
+            r"\burl\s*:\s*['\"]([^'\"]+)['\"]",
+        ]
+
+        for pat in patterns:
+            for raw in re.findall(pat, text[:700_000], re.I):
+                u = urljoin(base_url, html.unescape(str(raw).replace("\\/", "/")))
+                if u.startswith(("http://", "https://")) and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+                    if len(out) >= 256:
+                        return out
+
+        return out
+
+
 class _PastLinkGuard:
-    """
-    Learns which exact URLs are runtime traps.
-
-    Main idea:
-    - repeated request failures become cheap
-    - repeated giant/same-body parses downgrade from full -> light -> skip
-    - repeated pages that produce the same exact child set get parse-cooled down
-    - body-level penalties do not have to block HEAD requests forever
-    """
-
     _HARD_ERRORS = {
         "chunk_timeout",
         "decompression_failed",
@@ -14473,6 +15331,7 @@ class _PastLinkGuard:
         state.hits += 1
         state.failures += 1
         state.consecutive_failures += 1
+
         if "timeout" in err:
             state.timeout_hits += 1
 
@@ -14482,7 +15341,7 @@ class _PastLinkGuard:
         if status in {404, 410}:
             penalty = 240.0
         elif status in {401, 403, 416, 429}:
-            penalty = 90.0
+            penalty = 60.0
         elif err in self._HARD_ERRORS:
             body_penalty = 300.0 if want_body else 120.0
         elif err.startswith("body_cooldown"):
@@ -14530,7 +15389,7 @@ class _PastLinkGuard:
         huge = body_size >= 700_000
         giant = body_size >= 1_500_000
 
-        if state.same_fingerprint_hits >= 4 and (large or huge):
+        if state.same_fingerprint_hits >= 4 and large:
             state.deep_parse_skips += 1
             state.parse_cooldown_until = max(state.parse_cooldown_until, now + 240.0)
             return "skip"
@@ -14563,6 +15422,7 @@ class _PastLinkGuard:
         if mode == "skip":
             state.deep_parse_skips += 1
             return
+
         if mode == "memo":
             state.memo_hits += 1
             return
@@ -14573,11 +15433,15 @@ class _PastLinkGuard:
         if not urls:
             state.consecutive_zero_child_parses += 1
             if state.consecutive_zero_child_parses >= 2:
-                state.parse_cooldown_until = max(state.parse_cooldown_until, now + min(180.0, 30.0 * state.consecutive_zero_child_parses))
+                state.parse_cooldown_until = max(
+                    state.parse_cooldown_until,
+                    now + min(180.0, 30.0 * state.consecutive_zero_child_parses),
+                )
             return
 
         state.consecutive_zero_child_parses = 0
         digest = hashlib.sha1("\n".join(sorted(set(urls))[:256]).encode("utf-8", errors="ignore")).hexdigest()
+
         if digest and digest == state.last_child_digest:
             state.same_child_digest_hits += 1
         else:
@@ -14589,10 +15453,6 @@ class _PastLinkGuard:
 
 
 class _ResponseMemoStore:
-    """
-    Caches extraction work for repeated identical bodies/final URLs.
-    """
-
     def __init__(self, *, max_entries: int = 2048, max_urls_per_entry: int = 300):
         self.max_entries = int(max(64, max_entries))
         self.max_urls_per_entry = int(max(8, max_urls_per_entry))
@@ -14642,6 +15502,7 @@ class _ResponseMemoStore:
         now = time.time()
         urls: List[str] = []
         seen: Set[str] = set()
+
         for raw in extracted_urls:
             s = str(raw or "").strip()
             if not s or s in seen:
@@ -14671,12 +15532,14 @@ class _ResponseMemoStore:
         item.final_url = final_url or item.final_url
         item.status = status if status is not None else item.status
         item.content_type = content_type or item.content_type
+
         if urls:
             merged = list(item.extracted_urls)
             for u in urls:
                 if u not in merged:
                     merged.append(u)
             item.extracted_urls = tuple(merged[: self.max_urls_per_entry])
+
         item.mode = mode or item.mode
         item.hits += 1
         item.last_seen = now
@@ -14685,8 +15548,10 @@ class _ResponseMemoStore:
     def _prune_if_needed(self) -> None:
         if len(self._items) <= self.max_entries:
             return
+
         drop_n = max(16, len(self._items) - self.max_entries)
         oldest = sorted(self._items.items(), key=lambda kv: kv[1].last_seen)[:drop_n]
+
         for key, _ in oldest:
             self._items.pop(key, None)
 
@@ -14700,8 +15565,10 @@ class _RelationBudget:
     def add_child(self, mapping: Dict[str, Set[str]], parent: str, child: str, *, intel: Dict[str, _LinkIntel]) -> None:
         if not parent or not child or parent == child:
             return
+
         bucket = mapping.setdefault(parent, set())
         bucket.add(child)
+
         if len(bucket) > self.max_children_per_parent:
             ranked = sorted(
                 bucket,
@@ -14713,6 +15580,7 @@ class _RelationBudget:
                 reverse=True,
             )
             mapping[parent] = set(ranked[: self.max_children_per_parent])
+
         if len(mapping) > self.max_parents:
             ranked_parents = sorted(
                 mapping.items(),
@@ -14726,22 +15594,16 @@ class _RelationBudget:
     def add_referer(self, host_buckets: Dict[str, Dict[str, float]], host: str, referer: str, weight: float) -> None:
         if not host or not referer:
             return
+
         bucket = host_buckets.setdefault(host, {})
         bucket[referer] = float(bucket.get(referer, 0.0)) + float(weight)
+
         if len(bucket) > self.max_referers_per_host:
             ranked = sorted(bucket.items(), key=lambda kv: kv[1], reverse=True)[: self.max_referers_per_host]
             host_buckets[host] = dict(ranked)
 
+
 class _CDNLinkPrioritizer:
-    """
-    Small scoring helper for CDN / media-delivery links.
-
-    Goal:
-      - prioritize delivery hosts and asset URLs
-      - avoid changing external call signatures
-      - stay additive to your existing score logic
-    """
-
     CDN_HOST_HINTS = (
         "cdn", "cloudfront.net", "akamaized.net", "akamai.net", "fastly.net",
         "fastlylb.net", "b-cdn.net", "cdn77", "edgekey.net", "edgesuite.net",
@@ -14785,27 +15647,21 @@ class _CDNLinkPrioritizer:
         src = str(source or "").lower()
         score = 0.0
 
-        # Host-based CDN boost
         if any(h in u for h in self.CDN_HOST_HINTS):
             score += 2.25
 
-        # Path-based delivery boost
         if any(h in u for h in self.CDN_PATH_HINTS):
             score += 1.10
 
-        # Extension-based asset boost
         if any(u.endswith(ext) for ext in self.ASSET_EXTS):
             score += 1.35
 
-        # Content-type boost
         if any(h in ct for h in self.MEDIA_CT_HINTS):
             score += 1.25
 
-        # Existing kind-based reinforcement
         if kind in {"video", "audio", "image", "manifest", "asset", "json"}:
             score += 0.90
 
-        # Sniffer/runtime-discovered links often matter more
         if src in {"sniffer", "body_extract", "response_link_header"}:
             score += 0.35
 
@@ -14814,19 +15670,18 @@ class _CDNLinkPrioritizer:
     def is_probable_cdn(self, url: str, content_type: str = "", kind: str = "unknown") -> bool:
         return self.score(url=url, content_type=content_type, kind=kind) >= 2.0
 
+
 class HTTPSSubmanager:
     """
-    Industrial-grade shared HTTPS engine (aiohttp-only), now with built-in link intelligence:
-      - keeps the existing request surface used by the rest of the codebase
-      - learns from redirects, HTML, text payloads, Link/Location headers, and prior success
-      - scores related URLs by similarity and can guide follow-up fetches automatically
-      - improves per-request headers (referer / accept) using its own observed context
+    Shared aiohttp HTTPS engine with:
+      - existing request surface
+      - link intelligence
+      - API/auth/CSRF accessibility pages
+      - SessionClass-backed CSRF/session header replay
+      - DEBUG_LOGGER output for human-findable pages
 
-    Small internal additions in this rewrite:
-      - per-request coalescing for identical in-flight fetches
-      - stronger body/parse cooldowns for repeated trap links
-      - same-child-set detection so giant pages stop being reparsed forever
-      - slightly stricter canonicalization and HTML extraction caps
+    This does not print live token values. Tokens are stored in SessionClass and
+    replayed only for same-host unsafe methods.
     """
 
     _MAGIC_EXE = (b"MZ",)
@@ -14856,10 +15711,12 @@ class HTTPSSubmanager:
     }
 
     _URL_RE = re.compile(r"\bhttps?://[^\s\"'<>]+", re.I)
+
     _HTML_ATTR_RE = re.compile(
         r"(?:href|src|data-src|data-href|poster|content)=[\"']([^\"']+)[\"']",
         re.I,
     )
+
     _TOKEN_RE = re.compile(r"[a-z0-9]{2,}", re.I)
 
     _ASSETISH_HINTS = (
@@ -14932,6 +15789,10 @@ class HTTPSSubmanager:
             "sedoparking", "parkingcrew", "bodis", "domainparking", "namebright",
             "dan.com", "hugedomains", "afternic", "parking", "buythisdomain",
         ),
+
+        # ------------------ Accessibility/session additions ------------------
+        session_class: Optional[SessionClass] = None,
+        accessibility_manager: Optional[AccessibilityManager] = None,
     ):
         self.ua = user_agent
         self.timeout = float(timeout)
@@ -14971,6 +15832,18 @@ class HTTPSSubmanager:
         self.domain_denylist = tuple((domain_denylist or ()))
         self.parked_domain_hints = tuple(x.lower() for x in parked_domain_hints)
 
+        self.session_class = session_class or SessionClass(
+            logger=DEBUG_LOGGER,
+            enable_cookies=self.enable_cookies,
+            allow_auth_header_replay=False,
+        )
+
+        self.accessibility_manager = accessibility_manager or AccessibilityManager(
+            session_class=self.session_class,
+            logger=DEBUG_LOGGER,
+            log_token_values=False,
+        )
+
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
@@ -14979,7 +15852,6 @@ class HTTPSSubmanager:
         self._host_last_ok_url: Dict[str, str] = {}
         self._cooldown_lock = asyncio.Lock()
 
-        # intelligence / self-guidance
         self._intel_by_url: Dict[str, _LinkIntel] = {}
         self._children_by_parent: Dict[str, Set[str]] = {}
         self._seed_to_candidates: Dict[str, Set[str]] = {}
@@ -14987,15 +15859,14 @@ class HTTPSSubmanager:
         self._host_referers: Dict[str, Dict[str, float]] = {}
         self._intel_lock = asyncio.Lock()
 
-        # runtime helpers for long-lived sniffers
         self._past_link_guard = _PastLinkGuard()
         self._response_memo = _ResponseMemoStore()
         self._relation_budget = _RelationBudget()
 
-        # identical in-flight request coalescing
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
         self._cdn_priority = _CDNLinkPrioritizer()
+
     async def __aenter__(self):
         self._ssl_context = self._build_ssl_context()
         self._connector = aiohttp.TCPConnector(
@@ -15007,7 +15878,9 @@ class HTTPSSubmanager:
             keepalive_timeout=30,
             happy_eyeballs_delay=0.25,
         )
-        jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
+
+        jar = self.session_class.cookie_jar if self.enable_cookies else None
+
         self._session = aiohttp.ClientSession(
             connector=self._connector,
             cookie_jar=jar,
@@ -15015,11 +15888,14 @@ class HTTPSSubmanager:
             auto_decompress=False,
             trust_env=True,
         )
+
+        DEBUG_LOGGER.log_message("[HTTPS][SESSION] HTTPSSubmanager entered with SessionClass + AccessibilityManager")
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
         if self._session:
             await self._session.close()
+
         self._session = None
         self._connector = None
         self._ssl_context = None
@@ -15030,11 +15906,14 @@ class HTTPSSubmanager:
         self._host_referers.clear()
         self._past_link_guard.clear()
         self._response_memo.clear()
+
         async with self._inflight_lock:
             self._inflight.clear()
 
+        DEBUG_LOGGER.log_message("[HTTPS][SESSION] HTTPSSubmanager closed")
+
     # ------------------------------------------------------------------
-    # Public additions for sniffers / trackers (optional, no caller changes required)
+    # Public additions for sniffers / trackers
     # ------------------------------------------------------------------
 
     async def register_sniffer_candidates(
@@ -15047,14 +15926,24 @@ class HTTPSSubmanager:
         seed = self._canonicalize_url(page_url)
         if not seed or not items:
             return
+
+        await self.accessibility_manager.register_linktracker_hits(
+            page_url=page_url,
+            items=items,
+            source=source,
+        )
+
         for item in items:
             if not isinstance(item, dict):
                 continue
+
             url = self._canonicalize_url(str(item.get("url") or ""))
             if not url:
                 continue
+
             kind = self._classify_url_kind(url, str(item.get("content_type") or ""))
             score = 2.0 + self._score_url_similarity(seed, url)
+
             if kind in ("video", "audio", "image", "manifest", "json"):
                 score += 1.0
 
@@ -15064,6 +15953,7 @@ class HTTPSSubmanager:
                 kind=kind,
                 source=source,
             )
+
             await self._remember_candidate(
                 url=url,
                 source=source,
@@ -15076,15 +15966,30 @@ class HTTPSSubmanager:
 
     async def get_guidance(self, seed_url: str, *, limit: int = 24) -> Dict[str, Any]:
         bundle = await self._build_guidance_bundle(seed_url, limit=limit)
+        access = await self.accessibility_manager.snapshot()
+
         return {
             "seed_url": bundle.seed_url,
             "canonical_seed": bundle.canonical_seed,
             "referer": bundle.referer,
             "accept": bundle.accept,
             "candidates": bundle.candidates,
+            "accessibility": access,
         }
 
-    async def head(self, url: str, *, allow_redirects: Optional[bool] = None, headers: Optional[Dict[str, str]] = None) -> Tuple[Optional[int], Dict[str, str]]:
+    async def get_accessibility_pages(self) -> Dict[str, Any]:
+        return await self.accessibility_manager.snapshot()
+
+    async def get_session_snapshot(self, *, include_values: bool = False) -> Dict[str, Any]:
+        return await self.session_class.snapshot(include_values=include_values)
+
+    async def head(
+        self,
+        url: str,
+        *,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Tuple[Optional[int], Dict[str, str]]:
         r = await self._request("HEAD", url, want_body=False, allow_redirects=allow_redirects, headers=headers)
         return r.status, r.headers
 
@@ -15112,6 +16017,54 @@ class HTTPSSubmanager:
             return ""
         return self._decode_body(raw)
 
+    async def post_json(
+        self,
+        url: str,
+        payload: Any,
+        *,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+    ) -> _HTTPResult:
+        h = dict(headers or {})
+        h.setdefault("Content-Type", "application/json")
+        h.setdefault("Accept", "application/json,text/plain,*/*")
+
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return await self._request(
+            "POST",
+            url,
+            want_body=True,
+            allow_redirects=allow_redirects,
+            headers=h,
+            max_bytes=max_bytes,
+            data=body,
+        )
+
+    async def post_form(
+        self,
+        url: str,
+        payload: Dict[str, Any],
+        *,
+        allow_redirects: Optional[bool] = None,
+        headers: Optional[Dict[str, str]] = None,
+        max_bytes: Optional[int] = None,
+    ) -> _HTTPResult:
+        h = dict(headers or {})
+        h.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        h.setdefault("Accept", "text/html,application/json,*/*")
+
+        body = urlencode(payload or {}, doseq=True).encode("utf-8")
+        return await self._request(
+            "POST",
+            url,
+            want_body=True,
+            allow_redirects=allow_redirects,
+            headers=h,
+            max_bytes=max_bytes,
+            data=body,
+        )
+
     async def get_prefix(
         self,
         url: str,
@@ -15123,8 +16076,10 @@ class HTTPSSubmanager:
     ) -> bytes:
         url = str(url or "")
         size = max(0, int(size))
+
         if not url or size <= 0:
             return b""
+
         h = dict(headers or {})
         if not any(k.lower() == "range" for k in h):
             h["Range"] = f"bytes=0-{max(0, size - 1)}"
@@ -15140,6 +16095,7 @@ class HTTPSSubmanager:
                 return await asyncio.wait_for(_do(), timeout=float(timeout_ms) / 1000.0)
             except Exception:
                 return b""
+
         try:
             return await _do()
         except Exception:
@@ -15167,6 +16123,7 @@ class HTTPSSubmanager:
             "hash_algo": hash_algo,
             "error": "",
         }
+
         if not url:
             out["error"] = "empty_url"
             return out
@@ -15187,6 +16144,7 @@ class HTTPSSubmanager:
                 headers=headers,
                 allow_redirects=allow_redirects,
             )
+
             if prefix:
                 algo = (hash_algo or "sha256").lower()
                 if algo == "sha1":
@@ -15215,6 +16173,7 @@ class HTTPSSubmanager:
         allow_redirects: Optional[bool] = None,
         headers: Optional[Dict[str, str]] = None,
         max_bytes: Optional[int] = None,
+        data: Optional[bytes] = None,
     ) -> _HTTPResult:
         method = (method or "GET").upper().strip()
         allow_redirects = self.allow_redirects if allow_redirects is None else bool(allow_redirects)
@@ -15227,35 +16186,47 @@ class HTTPSSubmanager:
             allow_redirects=allow_redirects,
             headers=headers,
             max_bytes=max_bytes,
+            data=data,
         )
 
-        # Coalesce only body-bearing GET requests or HEADs with the same request shape.
-        async with self._inflight_lock:
-            existing = self._inflight.get(key)
-            if existing is not None:
-                try:
-                    return await existing
-                except Exception as e:
-                    return _HTTPResult(False, None, {}, str(url or ""), b"", error=str(e) or "request_failed")
-
-            task = asyncio.create_task(
-                self._request_uncached(
-                    method,
-                    url,
-                    want_body=want_body,
-                    allow_redirects=allow_redirects,
-                    headers=headers,
-                    max_bytes=max_bytes,
-                )
-            )
-            self._inflight[key] = task
-
-        try:
-            return await task
-        finally:
+        if method in {"GET", "HEAD"} and data is None:
             async with self._inflight_lock:
-                if self._inflight.get(key) is task:
-                    self._inflight.pop(key, None)
+                existing = self._inflight.get(key)
+                if existing is not None:
+                    try:
+                        return await existing
+                    except Exception as e:
+                        return _HTTPResult(False, None, {}, str(url or ""), b"", error=str(e) or "request_failed")
+
+                task = asyncio.create_task(
+                    self._request_uncached(
+                        method,
+                        url,
+                        want_body=want_body,
+                        allow_redirects=allow_redirects,
+                        headers=headers,
+                        max_bytes=max_bytes,
+                        data=data,
+                    )
+                )
+                self._inflight[key] = task
+
+            try:
+                return await task
+            finally:
+                async with self._inflight_lock:
+                    if self._inflight.get(key) is task:
+                        self._inflight.pop(key, None)
+
+        return await self._request_uncached(
+            method,
+            url,
+            want_body=want_body,
+            allow_redirects=allow_redirects,
+            headers=headers,
+            max_bytes=max_bytes,
+            data=data,
+        )
 
     async def _request_uncached(
         self,
@@ -15266,9 +16237,10 @@ class HTTPSSubmanager:
         allow_redirects: bool,
         headers: Optional[Dict[str, str]],
         max_bytes: int,
+        data: Optional[bytes] = None,
     ) -> _HTTPResult:
         if not self._session:
-            raise RuntimeError("HTTPSSubmanager must be used in an async context (async with HTTPSSubmanager(...) as http).")
+            raise RuntimeError("HTTPSSubmanager must be used in an async context: async with HTTPSSubmanager(...) as http:")
 
         host = self._host(url)
         canonical_req = self._canonicalize_url(url)
@@ -15276,7 +16248,12 @@ class HTTPSSubmanager:
         if self.enable_domain_reputation_filter and self._is_toxic_domain(host):
             return _HTTPResult(False, None, {}, str(url or ""), b"", error="domain_reputation_blocked")
 
-        allowed, reason = self._past_link_guard.allow_request(canonical_req or str(url or ""), method=method, want_body=want_body)
+        allowed, reason = self._past_link_guard.allow_request(
+            canonical_req or str(url or ""),
+            method=method,
+            want_body=want_body,
+        )
+
         if not allowed:
             return _HTTPResult(False, None, {}, str(url or ""), b"", error=reason)
 
@@ -15286,12 +16263,22 @@ class HTTPSSubmanager:
         for attempt in range(self.retries + 1):
             await self._respect_host_cooldown(host)
             proxy = self._choose_proxy()
+
             req_headers: Dict[str, str] = {}
             req_headers.update(self._per_request_headers(url))
             if headers:
                 req_headers.update(headers)
 
+            referer = req_headers.get("Referer") or self._pick_best_referer(url) or ""
+            req_headers = await self.accessibility_manager.prepare_headers(
+                url=url,
+                method=method,
+                headers=req_headers,
+                referer=referer,
+            )
+
             started = time.perf_counter()
+
             try:
                 async with sem:
                     timeout = ClientTimeout(
@@ -15299,6 +16286,7 @@ class HTTPSSubmanager:
                         connect=self.connect_timeout_s,
                         sock_read=self.sock_read_timeout_s,
                     )
+
                     async with self._session.request(
                         method,
                         url,
@@ -15307,6 +16295,7 @@ class HTTPSSubmanager:
                         proxy=proxy,
                         timeout=timeout,
                         headers=req_headers,
+                        data=data,
                     ) as resp:
                         final_url = str(resp.url)
                         final_canonical = self._canonicalize_url(final_url) or canonical_req or str(url or "")
@@ -15320,10 +16309,17 @@ class HTTPSSubmanager:
 
                         body = b""
                         err = ""
+
                         if want_body:
                             body, err = await self._read_bounded_secure(resp, url=final_url, max_bytes=max_bytes)
                             if err:
-                                self._past_link_guard.note_failure(final_canonical, error=err, status=status, want_body=True)
+                                self._past_link_guard.note_failure(
+                                    final_canonical,
+                                    error=err,
+                                    status=status,
+                                    want_body=True,
+                                )
+
                                 await self._learn_from_response(
                                     requested_url=str(url or ""),
                                     final_url=final_url,
@@ -15332,14 +16328,31 @@ class HTTPSSubmanager:
                                     body=b"",
                                     request_headers=req_headers,
                                 )
+
+                                await self.accessibility_manager.observe_response(
+                                    requested_url=str(url or ""),
+                                    final_url=final_url,
+                                    status=status,
+                                    headers=hdrs,
+                                    body=b"",
+                                    request_headers=req_headers,
+                                    decode_body_func=self._decode_body,
+                                )
+
                                 return _HTTPResult(False, status, hdrs, final_url, b"", error=err)
 
                         elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
+
                         if 200 <= status < 300:
                             self._host_last_ok_url[host] = final_url
                             self._past_link_guard.note_success(final_canonical, status=status, elapsed_ms=elapsed_ms)
                         else:
-                            self._past_link_guard.note_failure(final_canonical, error=f"http_status:{status}", status=status, want_body=want_body)
+                            self._past_link_guard.note_failure(
+                                final_canonical,
+                                error=f"http_status:{status}",
+                                status=status,
+                                want_body=want_body,
+                            )
 
                         await self._learn_from_response(
                             requested_url=str(url or ""),
@@ -15348,6 +16361,16 @@ class HTTPSSubmanager:
                             headers=hdrs,
                             body=body,
                             request_headers=req_headers,
+                        )
+
+                        await self.accessibility_manager.observe_response(
+                            requested_url=str(url or ""),
+                            final_url=final_url,
+                            status=status,
+                            headers=hdrs,
+                            body=body,
+                            request_headers=req_headers,
+                            decode_body_func=self._decode_body,
                         )
 
                         if self._is_retryable_status(status) and attempt < self.retries:
@@ -15363,6 +16386,7 @@ class HTTPSSubmanager:
                             body=body,
                             error="",
                         )
+
             except asyncio.TimeoutError:
                 last_exc = "timeout"
                 self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
@@ -15394,6 +16418,7 @@ class HTTPSSubmanager:
     ) -> None:
         req_c = self._canonicalize_url(requested_url)
         fin_c = self._canonicalize_url(final_url)
+
         if not req_c and not fin_c:
             return
 
@@ -15446,11 +16471,13 @@ class HTTPSSubmanager:
         accept_kind = self._classify_url_kind(seed, ctype)
         if accept_kind != "unknown":
             self._host_accept_bias[self._host(seed)] = accept_kind
+
         if request_headers.get("Referer"):
             self._note_referer(seed, request_headers["Referer"], weight=1.0)
 
         if not body:
             return
+
         if not self._looks_textlike(ctype) and kind not in {"html", "json"}:
             return
 
@@ -15460,6 +16487,7 @@ class HTTPSSubmanager:
             content_type=ctype,
             body=body,
         )
+
         memo = self._response_memo.get(fingerprint)
         if memo is not None:
             self._past_link_guard.note_parse(seed, mode="memo", extracted_urls=memo.extracted_urls)
@@ -15472,6 +16500,7 @@ class HTTPSSubmanager:
             body_size=len(body),
             content_type=ctype,
         )
+
         if mode == "skip":
             self._response_memo.remember(
                 fingerprint=fingerprint,
@@ -15491,6 +16520,7 @@ class HTTPSSubmanager:
             kind=kind,
             mode=mode,
         )
+
         self._response_memo.remember(
             fingerprint=fingerprint,
             final_url=seed,
@@ -15499,6 +16529,7 @@ class HTTPSSubmanager:
             extracted_urls=extracted_urls,
             mode=mode,
         )
+
         self._past_link_guard.note_parse(seed, mode=mode, extracted_urls=extracted_urls)
         await self._remember_children_from_cache(seed, extracted_urls)
 
@@ -15506,14 +16537,18 @@ class HTTPSSubmanager:
         seed_c = self._canonicalize_url(seed)
         if not seed_c:
             return
+
         for child in list(urls)[:300]:
             c_child = self._canonicalize_url(child)
             if not c_child or c_child == seed_c:
                 continue
+
             score = 0.75 + self._score_url_similarity(seed_c, c_child)
             child_kind = self._classify_url_kind(c_child, "")
+
             if child_kind in {"video", "audio", "image", "manifest", "json"}:
                 score += 0.6
+
             await self._remember_candidate(
                 url=c_child,
                 source="body_extract",
@@ -15540,11 +16575,12 @@ class HTTPSSubmanager:
         text_cap = self.max_html_chars
         if mode == "light":
             text_cap = min(text_cap, 180_000)
+
         text = text[:text_cap]
 
         urls: Set[str] = set(self._extract_urls_from_text(text))
         lowered = (content_type or "").lower()
-        htmlish = ("html" in lowered) or (text[:256].lower().count("<html") > 0) or (text[:2048].lower().count("href=") > 0)
+        htmlish = ("html" in lowered) or ("<html" in text[:256].lower()) or ("href=" in text[:2048].lower())
         jsonish = (kind == "json") or self._looks_jsonish(text)
 
         if htmlish:
@@ -15559,10 +16595,10 @@ class HTTPSSubmanager:
                             urls.add(full)
                             if len(urls) >= 300:
                                 break
+
         elif jsonish:
             urls.update(self._extract_urls_from_jsonish(text, base_url, limit=300))
 
-        # Stable return order reduces churn in child-digest tracking.
         return list(sorted(urls))[:300]
 
     async def _build_guidance_bundle(self, seed_url: str, *, limit: int = 24) -> _GuidanceBundle:
@@ -15573,30 +16609,37 @@ class HTTPSSubmanager:
         accept = self._MEDIA_ACCEPTS.get(accept_kind, self._MEDIA_ACCEPTS["generic"])
 
         candidates: List[Tuple[float, Dict[str, Any]]] = []
+
         for cand_url in self._seed_to_candidates.get(seed, set()):
             intel = self._intel_by_url.get(cand_url)
             if not intel:
                 continue
+
             sim = self._score_url_similarity(seed, cand_url)
             total = float(intel.score) + sim + min(1.5, 0.2 * intel.hits)
+
             if intel.kind in {"video", "audio", "manifest", "json", "image"}:
                 total += 0.6
-            candidates.append((
-                total,
-                {
-                    "url": intel.canonical_url,
-                    "score": round(total, 3),
-                    "kind": intel.kind,
-                    "source": intel.source,
-                    "hits": intel.hits,
-                    "content_type": intel.content_type or "",
-                    "status": intel.status,
-                    "parent": intel.parent,
-                    "evidence": list(intel.evidence[:8]),
-                },
-            ))
+
+            candidates.append(
+                (
+                    total,
+                    {
+                        "url": intel.canonical_url,
+                        "score": round(total, 3),
+                        "kind": intel.kind,
+                        "source": intel.source,
+                        "hits": intel.hits,
+                        "content_type": intel.content_type or "",
+                        "status": intel.status,
+                        "parent": intel.parent,
+                        "evidence": list(intel.evidence[:8]),
+                    },
+                )
+            )
 
         candidates.sort(key=lambda x: (x[0], x[1]["hits"]), reverse=True)
+
         return _GuidanceBundle(
             seed_url=seed_url,
             canonical_seed=seed,
@@ -15620,9 +16663,37 @@ class HTTPSSubmanager:
         cu = self._canonicalize_url(url)
         if not cu:
             return
+
         parent_c = self._canonicalize_url(parent) if parent else ""
         if parent_c and parent_c == cu:
             parent_c = ""
+
+        if kind in {"json", "html"}:
+            access_kind = "api" if kind == "json" and ("/api/" in cu.lower() or "graphql" in cu.lower()) else ("page" if kind == "html" else kind)
+            await self.accessibility_manager.remember_access_page(
+                url=cu,
+                kind=access_kind,
+                method="GET",
+                status=status,
+                content_type=content_type,
+                parent=parent_c,
+                source=source,
+                evidence=evidence,
+                required_headers=("User-Agent", "Accept", "Referer"),
+            )
+
+        if "/api/" in cu.lower() or "graphql" in cu.lower() or "auth" in cu.lower() or "login" in cu.lower():
+            await self.accessibility_manager.remember_access_page(
+                url=cu,
+                kind=self.accessibility_manager._classify(cu, content_type, source),
+                method="GET",
+                status=status,
+                content_type=content_type,
+                parent=parent_c,
+                source=source,
+                evidence=evidence,
+                required_headers=("User-Agent", "Accept", "Referer"),
+            )
 
         async with self._intel_lock:
             now = time.time()
@@ -15631,6 +16702,7 @@ class HTTPSSubmanager:
             tokens = tuple(self._url_tokens(cu))
             ev = tuple(str(x) for x in evidence if str(x).strip())[:12]
             existing = self._intel_by_url.get(cu)
+
             if existing is None:
                 self._intel_by_url[cu] = _LinkIntel(
                     url=url,
@@ -15678,14 +16750,18 @@ class HTTPSSubmanager:
     def _prune_intel_if_needed(self) -> None:
         if len(self._intel_by_url) <= self._MAX_INTEL_URLS:
             return
+
         drop_n = max(64, len(self._intel_by_url) - self._MAX_INTEL_URLS)
         oldest = sorted(
             self._intel_by_url.items(),
             key=lambda kv: (kv[1].last_seen, kv[1].hits, kv[1].score),
         )[:drop_n]
+
         dead = {k for k, _ in oldest}
+
         for k in dead:
             self._intel_by_url.pop(k, None)
+
         for mapping in (self._children_by_parent, self._seed_to_candidates):
             for parent in list(mapping.keys()):
                 mapping[parent].difference_update(dead)
@@ -15695,8 +16771,10 @@ class HTTPSSubmanager:
     def _note_referer(self, url: str, referer: str, *, weight: float) -> None:
         u = self._canonicalize_url(url)
         r = self._canonicalize_url(referer)
+
         if not u or not r or u == r:
             return
+
         host = self._host(u)
         self._relation_budget.add_referer(self._host_referers, host, r, max(0.1, weight))
 
@@ -15704,13 +16782,17 @@ class HTTPSSubmanager:
         cu = self._canonicalize_url(url)
         if not cu:
             return None
+
         intel = self._intel_by_url.get(cu)
         if intel and intel.parent:
             return intel.parent
+
         host = self._host(cu)
         bucket = self._host_referers.get(host) or {}
+
         if bucket:
             return max(bucket.items(), key=lambda kv: kv[1])[0]
+
         return self._host_last_ok_url.get(host)
 
     # ------------------------------------------------------------------
@@ -15726,21 +16808,31 @@ class HTTPSSubmanager:
         allow_redirects: bool,
         headers: Optional[Dict[str, str]],
         max_bytes: int,
+        data: Optional[bytes] = None,
     ) -> str:
         canon = self._canonicalize_url(url) or str(url or "")
         h = []
+
         for k, v in sorted((headers or {}).items(), key=lambda kv: str(kv[0]).lower()):
             kl = str(k).lower()
-            if kl in {"range", "accept", "referer"}:
+            if kl in {"range", "accept", "referer", "content-type"}:
                 h.append(f"{kl}={v}")
-        return "|".join([
-            method.upper().strip(),
-            "1" if want_body else "0",
-            "1" if allow_redirects else "0",
-            str(int(max_bytes)),
-            canon,
-            "&".join(h),
-        ])
+
+        data_hash = ""
+        if data:
+            data_hash = hashlib.sha1(data[:65536]).hexdigest()
+
+        return "|".join(
+            [
+                method.upper().strip(),
+                "1" if want_body else "0",
+                "1" if allow_redirects else "0",
+                str(int(max_bytes)),
+                canon,
+                "&".join(h),
+                data_hash,
+            ]
+        )
 
     def _build_ssl_context(self) -> ssl.SSLContext:
         if self.verify:
@@ -15748,6 +16840,7 @@ class HTTPSSubmanager:
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
             return ctx
+
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -15766,9 +16859,11 @@ class HTTPSSubmanager:
         out: Dict[str, str] = {"User-Agent": self.ua}
         kind = self._host_accept_bias.get(self._host(url)) or self._classify_url_kind(url, "")
         out["Accept"] = self._MEDIA_ACCEPTS.get(kind, self._MEDIA_ACCEPTS["generic"])
+
         referer = self._pick_best_referer(url)
         if referer and referer != self._canonicalize_url(url):
             out["Referer"] = referer
+
         return out
 
     def _host(self, url: str) -> str:
@@ -15802,20 +16897,26 @@ class HTTPSSubmanager:
 
     async def _set_host_cooldown(self, host: str, seconds: float) -> None:
         async with self._cooldown_lock:
-            self._host_cooldown_until[host] = max(self._host_cooldown_until.get(host, 0.0), time.time() + max(0.0, seconds))
+            self._host_cooldown_until[host] = max(
+                self._host_cooldown_until.get(host, 0.0),
+                time.time() + max(0.0, seconds),
+            )
 
     def _parse_retry_after(self, headers: Dict[str, str]) -> Optional[float]:
         raw = self._header_get(headers, "retry-after")
         if not raw:
             return None
+
         raw = raw.strip()
         if raw.isdigit():
             return float(int(raw))
+
         return None
 
     def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
         if server_hint is not None:
             return max(0.0, float(server_hint))
+
         base = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
         return base + random.random() * min(0.25, base / 3.0)
 
@@ -15826,8 +16927,10 @@ class HTTPSSubmanager:
         host = (host or "").lower()
         if not host:
             return False
+
         if any(d and (host == d.lower() or host.endswith("." + d.lower())) for d in self.domain_denylist):
             return True
+
         return any(h in host for h in self.parked_domain_hints)
 
     def _header_get(self, headers: Dict[str, str], key: str) -> str:
@@ -15857,30 +16960,37 @@ class HTTPSSubmanager:
     def _magic_byte_violation(self, url: str, ctype: str, probe: bytes) -> bool:
         ct = (ctype or "").lower()
         path = (urlparse(url).path or "").lower()
+
         if probe.startswith(self._MAGIC_EXE):
             if any(ct.startswith(ok) for ok in self.magic_pe_kill_mime_allow):
                 return False
             if any(path.endswith(ext) for ext in self.magic_pe_kill_ext_block):
                 return True
+
         return False
 
     def _shannon_entropy(self, data: bytes) -> float:
         if not data:
             return 0.0
+
         counts = [0] * 256
         for b in data:
             counts[b] += 1
+
         total = float(len(data))
         ent = 0.0
+
         for c in counts:
             if c:
                 p = c / total
                 ent -= p * math.log2(p)
+
         return ent
 
     def _printable_ratio(self, data: bytes) -> float:
         if not data:
             return 1.0
+
         printable = sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126)
         return printable / max(1, len(data))
 
@@ -15938,6 +17048,7 @@ class HTTPSSubmanager:
 
             compressed_read += len(chunk)
             produced = chunk
+
             if decompressor is not None:
                 try:
                     produced = decompressor.decompress(chunk)
@@ -15983,6 +17094,7 @@ class HTTPSSubmanager:
                             return bytes(out), "decompression_ratio_blocked"
                         if (len(out) + len(tail)) > self.decompress_hard_cap_bytes:
                             return bytes(out), "decompression_hard_cap_blocked"
+
                     out.extend(tail)
                     if len(out) > max_bytes:
                         del out[max_bytes:]
@@ -16002,15 +17114,19 @@ class HTTPSSubmanager:
             p = urlparse(str(u or "").strip())
             if p.scheme not in ("http", "https") or not p.netloc:
                 return ""
+
             host = p.netloc.lower().split(":")[0]
             path = p.path or "/"
+
             if not path.startswith("/"):
                 path = "/" + path
+
             qs = [
                 (k, v)
                 for (k, v) in parse_qsl(p.query, keep_blank_values=False)
                 if k.lower() not in self._TRACKING_QS
             ]
+
             query = urlencode(qs, doseq=True)
             return urlunparse((p.scheme.lower(), host, path, p.params, query, ""))
         except Exception:
@@ -16022,24 +17138,30 @@ class HTTPSSubmanager:
         toks = [m.group(0).lower() for m in self._TOKEN_RE.finditer(base)]
         out: List[str] = []
         seen: Set[str] = set()
+
         for t in toks:
             if len(t) < 2:
                 continue
             if t not in seen:
                 seen.add(t)
                 out.append(t)
+
         return out[:64]
 
     def _score_url_similarity(self, seed_url: str, cand_url: str) -> float:
         seed = self._canonicalize_url(seed_url)
         cand = self._canonicalize_url(cand_url)
+
         if not seed or not cand:
             return 0.0
+
         if seed == cand:
             return 4.0
+
         ps = urlparse(seed)
         pc = urlparse(cand)
         score = 0.0
+
         if ps.netloc == pc.netloc:
             score += 1.4
         else:
@@ -16047,13 +17169,16 @@ class HTTPSSubmanager:
             hc = pc.netloc.split(".")
             if len(hs) >= 2 and len(hc) >= 2 and hs[-2:] == hc[-2:]:
                 score += 0.7
+
         if ps.path and pc.path:
             if pc.path.startswith(ps.path.rsplit("/", 1)[0]):
                 score += 0.8
             if ps.path.split("/")[-1] and ps.path.split("/")[-1] in pc.path:
                 score += 0.35
+
         ts = set(self._url_tokens(seed))
         tc = set(self._url_tokens(cand))
+
         if ts and tc:
             inter = len(ts & tc)
             union = len(ts | tc)
@@ -16065,20 +17190,18 @@ class HTTPSSubmanager:
                 cand_host = pc.netloc.lower()
                 cand_path = pc.path.lower()
 
-                if any(h in cand_host for h in (
-                        "cdn", "cloudfront.net", "akamaized.net", "fastly.net", "b-cdn.net", "jsdelivr.net"
-                )):
+                if any(h in cand_host for h in ("cdn", "cloudfront.net", "akamaized.net", "fastly.net", "b-cdn.net", "jsdelivr.net")):
                     score += 1.6
 
-                if any(p in cand_path for p in (
-                        "/cdn/", "/media/", "/assets/", "/static/", "/video/", "/audio/", "/playback/", "/segment/", "/chunk/"
-                )):
+                if any(p in cand_path for p in ("/cdn/", "/media/", "/assets/", "/static/", "/video/", "/audio/", "/playback/", "/segment/", "/chunk/")):
                     score += 0.8
+
         return round(score, 4)
 
     def _classify_url_kind(self, url: str, content_type: str) -> str:
         ul = (url or "").lower()
         ct = (content_type or "").lower()
+
         if "text/html" in ct:
             return "html"
         if "application/json" in ct:
@@ -16093,33 +17216,40 @@ class HTTPSSubmanager:
             return "audio"
         if ct.startswith("image/") or any(x in ul for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
             return "image"
-        if "json" in ct or "/api/" in ul or "graphql" in ul:
+        if "graphql" in ul:
+            return "json"
+        if "json" in ct or "/api/" in ul:
             return "json"
         if any(x in ul for x in self._ASSETISH_HINTS):
             return "asset"
+
         return "unknown"
 
     def _extract_urls_from_text(self, text: str) -> List[str]:
         out: List[str] = []
         seen: Set[str] = set()
+
         for m in self._URL_RE.finditer(text or ""):
             raw = m.group(0).strip().rstrip(")],.;:'\"")
             u = self._canonicalize_url(unescape(raw))
             if u and u not in seen:
                 seen.add(u)
                 out.append(u)
+
         return out
 
     def _extract_urls_from_jsonish(self, text: str, base_url: str, *, limit: int) -> List[str]:
         out: List[str] = []
         seen: Set[str] = set()
+
         for u in self._extract_urls_from_text(text):
             if u not in seen:
                 seen.add(u)
                 out.append(u)
                 if len(out) >= limit:
                     return out
-        for m in re.finditer(r'"(?:url|src|href|manifest|playlist|download|file)"\s*:\s*"([^\"]+)"', text or "", re.I):
+
+        for m in re.finditer(r'"(?:url|src|href|manifest|playlist|download|file|endpoint|api)"\s*:\s*"([^"]+)"', text or "", re.I):
             raw = m.group(1)
             cand = self._canonicalize_url(urljoin(base_url, raw.replace("\\/", "/")))
             if cand and cand not in seen:
@@ -16127,33 +17257,37 @@ class HTTPSSubmanager:
                 out.append(cand)
                 if len(out) >= limit:
                     break
+
         return out
 
-    def _extract_asset_urls_from_html(self, html: str, base_url: str, *, max_assets: int) -> List[str]:
+    def _extract_asset_urls_from_html(self, html_text: str, base_url: str, *, max_assets: int) -> List[str]:
         out: List[str] = []
         seen: Set[str] = set()
-        if not html:
+
+        if not html_text:
             return out
 
         def _add(raw: str) -> None:
             if len(out) >= max_assets:
                 return
+
             raw = (raw or "").strip()
             if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
                 return
+
             full = self._canonicalize_url(urljoin(base_url, raw))
             if full and full not in seen:
                 seen.add(full)
                 out.append(full)
 
         parse_cap = min(self.max_html_chars, 250_000)
-        html_slice = html[:parse_cap]
+        html_slice = html_text[:parse_cap]
 
         if BeautifulSoup is not None and len(html_slice) <= 250_000:
             try:
                 soup = BeautifulSoup(html_slice, "html.parser")
-                for tag in soup.find_all(["a", "img", "video", "audio", "source", "link", "meta", "iframe"]):
-                    for attr in ("href", "src", "data-src", "data-href", "poster", "content"):
+                for tag in soup.find_all(["a", "img", "video", "audio", "source", "link", "meta", "iframe", "script", "form"]):
+                    for attr in ("href", "src", "data-src", "data-href", "poster", "content", "action"):
                         val = tag.get(attr)
                         if isinstance(val, str):
                             _add(val)
@@ -16162,33 +17296,23 @@ class HTTPSSubmanager:
             except Exception:
                 pass
 
-        if len(out) < max_assets:
-            for m in self._HTML_ATTR_RE.finditer(html_slice):
-                _add(m.group(1))
-                if len(out) >= max_assets:
-                    return out
+        for m in self._HTML_ATTR_RE.finditer(html_slice):
+            _add(m.group(1))
+            if len(out) >= max_assets:
+                break
 
-        if len(out) < max_assets:
-            for u in self._extract_urls_from_text(html_slice):
-                if u not in seen:
-                    seen.add(u)
-                    out.append(u)
-                    if len(out) >= max_assets:
-                        return out
         return out
 
     def _extract_header_links(self, headers: Dict[str, str], *, base_url: str) -> List[str]:
-        raw = self._header_get(headers, "link")
-        if not raw:
-            return []
         out: List[str] = []
-        seen: Set[str] = set()
-        for part in raw.split(","):
-            m = re.search(r"<([^>]+)>", part)
-            if not m:
-                continue
-            u = self._canonicalize_url(urljoin(base_url, m.group(1).strip()))
-            if u and u not in seen:
-                seen.add(u)
+        raw = self._header_get(headers, "link")
+
+        if not raw:
+            return out
+
+        for m in re.finditer(r"<([^>]+)>", raw):
+            u = self._canonicalize_url(urljoin(base_url, m.group(1)))
+            if u and u not in out:
                 out.append(u)
-        return out
+
+        return out[:128]
