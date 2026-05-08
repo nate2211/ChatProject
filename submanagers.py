@@ -5,6 +5,7 @@ import base64
 import collections  # For collections.Counter
 import hashlib
 import html
+import ipaddress
 import math
 import os
 import re
@@ -26,11 +27,12 @@ import xml.etree.ElementTree as ET
 import aiohttp
 import playwright
 from aiohttp import ClientTimeout
+
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable
+from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable, Mapping
 import asyncio, json, re, hashlib, time
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin, urldefrag
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin, urldefrag, unquote
 
 from loggers import DEBUG_LOGGER
 import libpcap_backend
@@ -17585,102 +17587,195 @@ class _ResponseMemo:
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
 
+class TokenState:
+    FRESH = "fresh"
+    USED = "used"
+    STALE = "stale"
+    EXPIRED = "expired"
+
 
 @dataclass
-class _SessionToken:
-    host: str
+class TokenMetadata:
+    """
+    Safe token storage. Same-origin CSRF by default, optional auth tokens.
+    """
+
     name: str
     value: str
-    kind: str = "csrf"
-    location: str = "unknown"
-    source_url: str = ""
-    header_name: str = ""
-    first_seen: float = field(default_factory=time.time)
-    last_seen: float = field(default_factory=time.time)
+    kind: str
+    location: str
+    source: str
+    last_seen: float
+    state: str = TokenState.FRESH
     uses: int = 0
+
+    def is_csrf(self) -> bool:
+        s = f"{self.kind} {self.name} {self.location}".lower()
+        return "csrf" in s or "xsrf" in s or "requestverificationtoken" in s
+
+    def is_auth(self) -> bool:
+        s = f"{self.kind} {self.name}".lower()
+        return any(x in s for x in ("auth", "bearer", "jwt", "access_token", "id_token", "session_id"))
+
+    def fingerprint(self) -> str:
+        raw = str(self.value or "").encode("utf-8", errors="ignore")
+        return hashlib.sha256(raw).hexdigest()[:12]
 
     def redacted(self) -> str:
         if not self.value:
-            return "[empty]"
-        if len(self.value) <= 8:
-            return "[redacted]"
-        return f"{self.value[:4]}…{self.value[-4:]}"
+            val = "<empty>"
+        elif len(self.value) <= 10:
+            val = "<redacted>"
+        else:
+            val = f"{self.value[:4]}…{self.value[-4:]}"
+        return f"<Token {self.kind}:{self.name}={val} fp={self.fingerprint()} src={self.source}>"
+
+    def __repr__(self) -> str:
+        return self.redacted()
 
 
 @dataclass
-class _AccessPage:
+class LinkHit:
     url: str
-    canonical_url: str
-    host: str
-    kind: str
-    label: str
-    method: str = "GET"
-    status: Optional[int] = None
-    content_type: str = ""
-    parent: str = ""
-    requires_auth: bool = False
-    requires_csrf: bool = False
-    csrf_names: Tuple[str, ...] = field(default_factory=tuple)
-    required_headers: Tuple[str, ...] = field(default_factory=tuple)
-    evidence: Tuple[str, ...] = field(default_factory=tuple)
-    first_seen: float = field(default_factory=time.time)
-    last_seen: float = field(default_factory=time.time)
-    hits: int = 0
+    source: str
+    score: int = 1
+    kind: str = "link"
+    text: str = ""
+
+
+class AccessPage:
+    """State for one discovered page/API/form endpoint."""
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        canonical_url: str,
+        kind: str,
+        method: str = "GET",
+        host: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        parent: str = "",
+        requires_auth: bool = False,
+        requires_csrf: bool = False,
+        csrf_names: Optional[Iterable[str]] = None,
+        required_headers: Optional[Iterable[str]] = None,
+        evidence: Optional[Iterable[str]] = None,
+        hits: int = 0,
+    ):
+        self.url = str(url or "")
+        self.canonical_url = str(canonical_url or "")
+        self.kind = str(kind or "link")
+        self.method = (method or "GET").upper()
+        self.host = str(host or "")
+        self.status = status
+        self.content_type = str(content_type or "")
+        self.parent = str(parent or "")
+        self.requires_auth = bool(requires_auth)
+        self.requires_csrf = bool(requires_csrf)
+        self.csrf_names = {str(x).strip() for x in (csrf_names or ()) if str(x).strip()}
+        self.required_headers = {str(x).strip() for x in (required_headers or ()) if str(x).strip()}
+        self.evidence = {str(x).strip() for x in (evidence or ()) if str(x).strip()}
+        self.hits = int(hits or 0)
+        self.last_seen = time.time()
+        self.consecutive_failures = 0
+
+    def is_api(self) -> bool:
+        return self.kind in {"api", "graphql", "json", "xhr", "webhook"}
+
+    def is_human_page(self) -> bool:
+        return self.kind in {"page", "auth", "form", "csrf"}
+
+    def needs_body(self, method: Optional[str] = None) -> bool:
+        return (method or self.method or "GET").upper() in {"POST", "PUT", "PATCH", "DELETE"}
 
     def human_row(self) -> Dict[str, Any]:
         return {
             "url": self.url,
+            "canonical_url": self.canonical_url,
             "kind": self.kind,
-            "label": self.label,
             "method": self.method,
             "status": self.status,
             "content_type": self.content_type,
             "requires_auth": self.requires_auth,
             "requires_csrf": self.requires_csrf,
-            "csrf_names": list(self.csrf_names),
-            "required_headers": list(self.required_headers),
-            "parent": self.parent,
-            "evidence": list(self.evidence),
-            "last_seen": self.last_seen,
+            "csrf_names": sorted(self.csrf_names)[:4],
+            "required_headers": sorted(self.required_headers)[:8],
             "hits": self.hits,
+            "evidence": sorted(self.evidence)[:8],
         }
+
+
+class AwaitableDict(dict):
+    """
+    Lets prepare_headers() work from both sync and async call sites:
+
+        headers = access.prepare_headers(...)
+        headers = await access.prepare_headers(...)
+    """
+
+    def __await__(self):
+        async def _done():
+            return self
+
+        return _done().__await__()
 
 
 class SessionClass:
     """
-    SessionClass keeps browser-like session state for HTTPSSubmanager.
+    Safer session/header helper with sync-safe locking and guarded retry metadata.
 
-    What it stores:
-      - aiohttp CookieJar
-      - CSRF/XSRF tokens discovered from HTML, JSON, headers, and cookies
-      - API/auth endpoint metadata
-      - per-host headers that should be replayed only same-origin
-
-    Safety behavior:
-      - DEBUG logs never print full token values
-      - CSRF tokens are only replayed to same-host requests
-      - bearer/auth tokens are recorded as metadata but are not auto-replayed unless
-        allow_auth_header_replay=True
+    Important:
+      - Uses threading.RLock because several call sites are synchronous.
+      - Never uses `async with self._mu`.
+      - Does not replay auth/cookie headers unless explicitly allowed.
+      - Detects blocked pages without trying to bypass access controls.
     """
 
-    CSRF_NAME_RE = re.compile(
-        r"(csrf|xsrf|csrfmiddlewaretoken|_csrf|x-csrf-token|x-xsrf-token|requestverificationtoken)",
-        re.I,
-    )
+    CSRF_NAME_RE = re.compile(r"(?i)(csrf|xsrf|request[_-]?verification[_-]?token)")
+    AUTH_NAME_RE = re.compile(r"(?i)(authorization|bearer|jwt|access[_-]?token|id[_-]?token|session[_-]?id)")
 
-    AUTH_NAME_RE = re.compile(
-        r"(authorization|bearer|access[_-]?token|id[_-]?token|jwt|session)",
-        re.I,
-    )
+    SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+    BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
-    UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+    TRACKING_PARAMS = {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "gclid",
+        "dclid",
+        "fbclid",
+        "mc_cid",
+        "mc_eid",
+        "ref",
+        "referral",
+    }
 
-    DEFAULT_CSRF_HEADER_NAMES = (
-        "X-CSRF-Token",
-        "X-XSRF-Token",
-        "X-CSRFToken",
-        "X-Requested-With",
-    )
+    SENSITIVE_HEADERS = {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-amz-security-token",
+    }
+
+    BLOCK_HEADERS = {
+        "cf-mitigated",
+        "cf-ray",
+        "cf-cache-status",
+        "x-cache",
+        "x-varnish",
+        "x-served-by",
+        "x-timer",
+        "server",
+        "retry-after",
+    }
 
     def __init__(
         self,
@@ -17688,42 +17783,77 @@ class SessionClass:
         logger: Any = None,
         enable_cookies: bool = True,
         allow_auth_header_replay: bool = False,
+        allow_cookie_header_export: bool = False,
         max_tokens_per_host: int = 64,
-    ) -> None:
-        self.logger = logger or DEBUG_LOGGER
+        max_scan_chars: int = 300_000,
+        retry_on: int = 400,
+        max_retries: int = 1,
+        backoff_factor: float = 1.0,
+    ):
+        self.logger = logger
         self.enable_cookies = bool(enable_cookies)
         self.allow_auth_header_replay = bool(allow_auth_header_replay)
-        self.max_tokens_per_host = int(max(8, max_tokens_per_host))
-        self.cookie_jar = aiohttp.CookieJar(unsafe=True) if self.enable_cookies else None
+        self.allow_cookie_header_export = bool(allow_cookie_header_export)
+        self.max_tokens_per_host = int(max_tokens_per_host)
+        self.max_scan_chars = int(max_scan_chars)
+        self.retry_on = retry_on
+        self.max_retries = max(0, int(max_retries))
+        self.backoff_factor = float(backoff_factor)
 
-        self._tokens_by_host: Dict[str, Dict[str, _SessionToken]] = {}
+        self.cookie_jar = aiohttp.CookieJar(unsafe=True) if (aiohttp and enable_cookies) else None
+
+        self._tokens_by_host: Dict[str, Dict[str, TokenMetadata]] = {}
         self._headers_by_host: Dict[str, Dict[str, str]] = {}
         self._last_page_by_host: Dict[str, str] = {}
-        self._mu = asyncio.Lock()
+
+        # FIXED: this is sync-safe and works in normal def methods.
+        self._mu = threading.RLock()
 
     def _log(self, msg: str) -> None:
         try:
-            self.logger.log_message(msg)
-        except Exception:
-            try:
+            if self.logger and hasattr(self.logger, "log_message"):
+                self.logger.log_message(msg)
+            else:
                 print(msg)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def _host(self, url: str) -> str:
         try:
-            return urlparse(str(url or "")).netloc.lower().split(":")[0]
+            p = urlparse(str(url or ""))
+            return (p.hostname or "").lower()
         except Exception:
             return ""
+
+    def _is_safe_host(self, host: str) -> bool:
+        host = str(host or "").strip().lower().strip("[]")
+        if not host:
+            return False
+
+        if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+            return False
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return not (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        except ValueError:
+            return True
+        except Exception:
+            return False
 
     def _origin(self, url: str) -> str:
         try:
             p = urlparse(str(url or ""))
-            if p.scheme and p.netloc:
-                return f"{p.scheme}://{p.netloc}"
+            return f"{p.scheme}://{p.netloc}" if p.scheme in {"http", "https"} and p.netloc else ""
         except Exception:
-            pass
-        return ""
+            return ""
 
     def _same_host(self, a: str, b: str) -> bool:
         ha = self._host(a)
@@ -17733,326 +17863,330 @@ class SessionClass:
     def _token_key(self, name: str, location: str) -> str:
         return f"{str(location or '').lower()}::{str(name or '').lower()}"
 
-    def _guess_header_name(self, token_name: str, location: str) -> str:
-        name = str(token_name or "").strip()
-        loc = str(location or "").lower()
+    def _ci_get(self, headers: Mapping[str, str], name: str, default: str = "") -> str:
+        n = name.lower()
+        for k, v in (headers or {}).items():
+            if str(k).lower() == n:
+                return str(v)
+        return default
 
-        if name.lower() in {
-            "x-csrf-token",
-            "x-xsrf-token",
-            "x-csrftoken",
-            "requestverificationtoken",
-        }:
-            return name
-
-        if "cookie" in loc and "xsrf" in name.lower():
-            return "X-XSRF-Token"
-
-        if "csrfmiddlewaretoken" in name.lower():
-            return "X-CSRFToken"
-
-        return "X-CSRF-Token"
+    def _looks_textlike(self, content_type: str) -> bool:
+        ct = str(content_type or "").lower()
+        return any(x in ct for x in ("text", "json", "html", "xml", "javascript", "ecmascript"))
 
     async def remember_page(self, url: str) -> None:
+        self.remember_page_sync(url)
+
+    def remember_page_sync(self, url: str) -> None:
         host = self._host(url)
-        if not host:
-            return
-        async with self._mu:
-            self._last_page_by_host[host] = url
+        if host:
+            with self._mu:
+                self._last_page_by_host[host] = str(url or "")
 
-    async def remember_header(self, url: str, key: str, value: str) -> None:
-        host = self._host(url)
-        key = str(key or "").strip()
-        value = str(value or "").strip()
-        if not host or not key or not value:
-            return
+    async def ingest_response_headers(self, url: str, headers: Mapping[str, str]) -> None:
+        await self.ingest_set_cookie_headers(url, headers)
 
-        if self.AUTH_NAME_RE.search(key) and not self.allow_auth_header_replay:
-            return
-
-        async with self._mu:
-            bucket = self._headers_by_host.setdefault(host, {})
-            bucket[key] = value
-
-    async def remember_token(
-        self,
-        *,
-        url: str,
-        name: str,
-        value: str,
-        kind: str = "csrf",
-        location: str = "unknown",
-        header_name: str = "",
-    ) -> None:
-        host = self._host(url)
-        name = str(name or "").strip()
-        value = str(value or "").strip()
-
-        if not host or not name or not value:
-            return
-
-        if len(value) > 4096:
-            return
-
-        kind = str(kind or "csrf").lower().strip()
-        location = str(location or "unknown").strip()
-        header_name = str(header_name or "").strip()
-
-        if kind == "csrf" and not header_name:
-            header_name = self._guess_header_name(name, location)
-
-        async with self._mu:
-            bucket = self._tokens_by_host.setdefault(host, {})
-            key = self._token_key(name, location)
-
-            existing = bucket.get(key)
-            if existing is None:
-                tok = _SessionToken(
-                    host=host,
-                    name=name,
-                    value=value,
-                    kind=kind,
-                    location=location,
-                    source_url=url,
-                    header_name=header_name,
-                )
-                bucket[key] = tok
-                self._log(
-                    f"[HTTPS][SESSION][TOKEN] kind={kind} host={host} "
-                    f"name={name} location={location} value={tok.redacted()} source={url}"
-                )
-            else:
-                existing.value = value
-                existing.kind = kind
-                existing.location = location
-                existing.header_name = header_name or existing.header_name
-                existing.source_url = url or existing.source_url
-                existing.last_seen = time.time()
-                self._log(
-                    f"[HTTPS][SESSION][TOKEN-REFRESH] kind={kind} host={host} "
-                    f"name={name} location={location} value={existing.redacted()}"
+        for k, v in (headers or {}).items():
+            lk = str(k).lower()
+            if self.CSRF_NAME_RE.search(lk) and v:
+                await self._register_token(
+                    url,
+                    k,
+                    str(v),
+                    kind="csrf",
+                    location="response_header",
+                    source="header",
                 )
 
-            if len(bucket) > self.max_tokens_per_host:
-                oldest = sorted(bucket.items(), key=lambda kv: kv[1].last_seen)
-                for dead_key, _ in oldest[: max(1, len(bucket) - self.max_tokens_per_host)]:
-                    bucket.pop(dead_key, None)
-
-    async def ingest_set_cookie_headers(self, url: str, headers: Dict[str, str]) -> None:
-        if not headers:
-            return
-
-        for k, v in headers.items():
-            if str(k).lower() != "set-cookie":
+    async def ingest_set_cookie_headers(self, url: str, headers: Mapping[str, str]) -> None:
+        for key, val in (headers or {}).items():
+            if not str(key).lower().startswith("set-cookie") or not val:
                 continue
 
             cookie = SimpleCookie()
             try:
-                cookie.load(str(v))
+                cookie.load(str(val))
             except Exception:
+                self._log(f"[SESSION][COOKIE] ignored malformed Set-Cookie from {self._host(url)}")
                 continue
 
-            for name, morsel in cookie.items():
-                val = morsel.value
-                if self.CSRF_NAME_RE.search(name):
-                    await self.remember_token(
-                        url=url,
-                        name=name,
-                        value=val,
-                        kind="csrf",
-                        location="cookie",
-                        header_name=self._guess_header_name(name, "cookie"),
-                    )
-                elif self.AUTH_NAME_RE.search(name):
-                    await self.remember_token(
-                        url=url,
-                        name=name,
-                        value=val,
-                        kind="auth",
-                        location="cookie",
-                    )
+            if self.cookie_jar is not None:
+                try:
+                    self.cookie_jar.update_cookies({name: morsel.value for name, morsel in cookie.items()})
+                except Exception:
+                    pass
+
+            names = ",".join(sorted(cookie.keys())[:8]) or "<none>"
+            self._log(f"[SESSION][COOKIE] stored cookie metadata host={self._host(url)} names={names}")
 
     async def ingest_html_tokens(self, url: str, text: str) -> None:
         if not text:
             return
 
-        await self.remember_page(url)
+        self.remember_page_sync(url)
+        src = text[: self.max_scan_chars]
 
-        # input name="csrfmiddlewaretoken" value="..."
-        input_re = re.compile(
-            r"<input\b[^>]*(?:name|id)=['\"]([^'\"]*(?:csrf|xsrf|requestverificationtoken)[^'\"]*)['\"][^>]*>",
-            re.I,
-        )
-        value_re = re.compile(r"\bvalue=['\"]([^'\"]{1,4096})['\"]", re.I)
-
-        for m in input_re.finditer(text[:700_000]):
+        for m in re.finditer(r"<input\b[^>]*>", src, re.I | re.S):
             tag = m.group(0)
-            name = m.group(1)
-            vm = value_re.search(tag)
-            if vm:
-                await self.remember_token(
-                    url=url,
-                    name=name,
-                    value=html.unescape(vm.group(1)),
+            name = self._attr(tag, "name") or self._attr(tag, "id")
+            value = self._attr(tag, "value")
+            if name and value and self.CSRF_NAME_RE.search(name):
+                await self._register_token(
+                    url,
+                    name,
+                    value,
                     kind="csrf",
                     location="form_input",
+                    source="html",
                 )
 
-        # meta name="csrf-token" content="..."
-        meta_re = re.compile(
-            r"<meta\b[^>]*(?:name|property)=['\"]([^'\"]*(?:csrf|xsrf)[^'\"]*)['\"][^>]*>",
-            re.I,
-        )
-        content_re = re.compile(r"\bcontent=['\"]([^'\"]{1,4096})['\"]", re.I)
-
-        for m in meta_re.finditer(text[:700_000]):
+        for m in re.finditer(r"<meta\b[^>]*>", src, re.I | re.S):
             tag = m.group(0)
-            name = m.group(1)
-            cm = content_re.search(tag)
-            if cm:
-                await self.remember_token(
-                    url=url,
-                    name=name,
-                    value=html.unescape(cm.group(1)),
+            name = self._attr(tag, "name") or self._attr(tag, "property")
+            value = self._attr(tag, "content")
+            if name and value and self.CSRF_NAME_RE.search(name):
+                await self._register_token(
+                    url,
+                    name,
+                    value,
                     kind="csrf",
                     location="meta",
+                    source="html",
                 )
 
-        # JS variables: csrfToken = "..."
-        js_re = re.compile(
-            r"(?i)\b(csrfToken|xsrfToken|csrf_token|xsrf_token|_csrf|csrfmiddlewaretoken)\b"
-            r"\s*[:=]\s*['\"]([^'\"]{6,4096})['\"]"
+        assign_re = re.compile(
+            r"(?P<name>\b[a-zA-Z_$][\w$]*(?:csrf|xsrf|requestVerificationToken)[\w$]*\b)"
+            r"\s*[:=]\s*['\"](?P<value>[^'\"]{8,4096})['\"]",
+            re.I,
         )
-        for name, value in js_re.findall(text[:700_000]):
-            await self.remember_token(
-                url=url,
-                name=name,
-                value=html.unescape(value),
+
+        for m in assign_re.finditer(src):
+            await self._register_token(
+                url,
+                m.group("name"),
+                m.group("value"),
                 kind="csrf",
                 location="javascript",
+                source="html",
             )
 
-    async def ingest_json_tokens(self, url: str, text: str) -> None:
-        if not text:
+        if not self.allow_auth_header_replay and self.AUTH_NAME_RE.search(src):
+            self._log(
+                f"[SESSION][SAFEGUARD] auth-like token markers observed "
+                f"for host={self._host(url)}; values not stored"
+            )
+
+    def _attr(self, tag: str, name: str) -> str:
+        m = re.search(rf"\b{re.escape(name)}\s*=\s*(['\"])(.*?)\1", tag or "", re.I | re.S)
+        return html.unescape(m.group(2)).strip() if m else ""
+
+    async def _register_token(
+        self,
+        url: str,
+        name: str,
+        value: str,
+        kind: str,
+        location: str,
+        source: str,
+    ) -> None:
+        name = str(name or "").strip()[:128]
+        value = str(value or "").strip()
+        kind = str(kind or "").lower().strip()
+        location = str(location or "").lower().strip()
+        host = self._host(url)
+
+        if not host or not name or not value:
             return
 
-        # Regex first because many API responses are JSON-ish but not strict JSON.
-        token_re = re.compile(
-            r"(?i)['\"]([^'\"]*(?:csrf|xsrf|requestverificationtoken|access[_-]?token|id[_-]?token|jwt)[^'\"]*)['\"]"
-            r"\s*:\s*['\"]([^'\"]{6,4096})['\"]"
-        )
+        is_csrf = bool(self.CSRF_NAME_RE.search(name) or kind == "csrf")
+        is_auth = bool(self.AUTH_NAME_RE.search(name) or kind == "auth")
 
-        for name, value in token_re.findall(text[:700_000]):
-            kind = "csrf" if self.CSRF_NAME_RE.search(name) else "auth"
-            await self.remember_token(
-                url=url,
-                name=name,
-                value=value,
-                kind=kind,
-                location="json",
-            )
+        if is_auth and not self.allow_auth_header_replay:
+            self._log(f"[SESSION][SAFEGUARD] ignored auth-like token name={name!r} host={host}")
+            return
+
+        if not is_csrf and not (is_auth and self.allow_auth_header_replay):
+            return
+
+        token_key = self._token_key(name, location)
+        now = time.time()
+
+        with self._mu:
+            bucket = dict(self._tokens_by_host.get(host, {}))
+            existing = bucket.get(token_key)
+
+            if existing:
+                if existing.value != value:
+                    existing.value = value
+                    existing.last_seen = now
+                    existing.state = TokenState.FRESH
+                    self._log(f"[SESSION][UPDATE] host={host} {existing.redacted()}")
+            else:
+                tok = TokenMetadata(
+                    name=name,
+                    value=value,
+                    kind=kind,
+                    location=location,
+                    source=source,
+                    last_seen=now,
+                )
+                bucket[token_key] = tok
+                self._log(f"[SESSION][NEW] host={host} {tok.redacted()}")
+
+            if len(bucket) > self.max_tokens_per_host:
+                bucket = dict(
+                    sorted(bucket.items(), key=lambda kv: kv[1].last_seen, reverse=True)[
+                        : self.max_tokens_per_host
+                    ]
+                )
+
+            self._tokens_by_host[host] = bucket
 
     async def headers_for(
         self,
         *,
         url: str,
-        method: str,
+        method: str = "GET",
+        headers: Optional[Mapping[str, str]] = None,
         referer: str = "",
-        existing_headers: Optional[Dict[str, str]] = None,
+        source: str = "api",
+        needs_csrf: Optional[bool] = None,
+        retry_attempt: int = 0,
     ) -> Dict[str, str]:
+        return dict(
+            self.headers_for_sync(
+                url=url,
+                method=method,
+                headers=headers,
+                referer=referer,
+                source=source,
+                needs_csrf=needs_csrf,
+                retry_attempt=retry_attempt,
+            )
+        )
+
+    def headers_for_sync(
+        self,
+        *,
+        url: str,
+        method: str = "GET",
+        headers: Optional[Mapping[str, str]] = None,
+        referer: str = "",
+        source: str = "api",
+        needs_csrf: Optional[bool] = None,
+        retry_attempt: int = 0,
+    ) -> AwaitableDict:
         method = (method or "GET").upper().strip()
         host = self._host(url)
-        out: Dict[str, str] = dict(existing_headers or {})
+        out: Dict[str, str] = {}
 
         if not host:
-            return out
+            return AwaitableDict(out)
 
-        async with self._mu:
-            stored_headers = dict(self._headers_by_host.get(host) or {})
+        for k, v in (headers or {}).items():
+            if not k or v is None:
+                continue
+
+            lk = str(k).lower().strip()
+
+            if lk in self.SENSITIVE_HEADERS:
+                if lk == "cookie" and not self.allow_cookie_header_export:
+                    continue
+                if lk != "cookie" and not self.allow_auth_header_replay:
+                    continue
+                if referer and not self._same_host(url, referer):
+                    continue
+
+            out[str(k)] = str(v)
+
+        out.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+        )
+        out.setdefault("Accept-Language", "en-US,en;q=0.9")
+        out.setdefault("Cache-Control", "no-cache")
+        out.setdefault("Pragma", "no-cache")
+        out.setdefault("User-Agent", "Mozilla/5.0 (compatible; SafeDiscoveryBot/1.0; +link-discovery)")
+
+        with self._mu:
+            stored_headers = dict(self._headers_by_host.get(host, {}))
             tokens = list((self._tokens_by_host.get(host) or {}).values())
-            last_page = self._last_page_by_host.get(host) or ""
+            last_page = self._last_page_by_host.get(host, "")
 
         for k, v in stored_headers.items():
-            if k not in out:
-                out[k] = v
+            if str(k).lower() in self.SENSITIVE_HEADERS and not self.allow_auth_header_replay:
+                continue
+            out.setdefault(k, v)
 
-        if referer and "Referer" not in out:
-            out["Referer"] = referer
-        elif last_page and "Referer" not in out and method in self.UNSAFE_METHODS:
-            out["Referer"] = last_page
+        ref = referer if (referer and self._same_host(url, referer)) else last_page
 
-        origin_source = out.get("Referer") or last_page or url
-        origin = self._origin(origin_source)
-        if origin and method in self.UNSAFE_METHODS and "Origin" not in out:
-            out["Origin"] = origin
+        if ref and self._same_host(url, ref):
+            out.setdefault("Referer", ref)
 
-        if method in self.UNSAFE_METHODS:
-            csrf_tokens = [t for t in tokens if t.kind == "csrf" and t.value]
+        if method in self.BODY_METHODS:
+            origin = self._origin(ref or url)
+            if origin:
+                out.setdefault("Origin", origin)
+
+        inject_csrf = bool(needs_csrf) if needs_csrf is not None else (
+            method in self.BODY_METHODS or source in {"form", "api", "xhr", "graphql"}
+        )
+
+        if inject_csrf:
+            csrf_tokens = [t for t in tokens if t.is_csrf() and t.value]
+            csrf_tokens.sort(key=lambda t: t.last_seen, reverse=True)
+
             if csrf_tokens:
-                csrf_tokens.sort(key=lambda t: t.last_seen, reverse=True)
                 tok = csrf_tokens[0]
-                header_name = tok.header_name or self._guess_header_name(tok.name, tok.location)
-                if header_name and header_name not in out:
-                    out[header_name] = tok.value
-                if "X-Requested-With" not in out:
-                    out["X-Requested-With"] = "XMLHttpRequest"
-                tok.uses += 1
-                tok.last_seen = time.time()
-                self._log(
-                    f"[HTTPS][SESSION][CSRF-APPLY] host={host} method={method} "
-                    f"header={header_name} token={tok.name} value={tok.redacted()} url={url}"
-                )
+                header_name = self._guess_csrf_header(tok)
+                out.setdefault(header_name, tok.value)
+                out.setdefault("X-Requested-With", "XMLHttpRequest")
 
-        return out
+                with self._mu:
+                    tok.uses += 1
+                    tok.last_seen = time.time()
+                    tok.state = TokenState.USED
 
-    async def snapshot(self, *, include_values: bool = False) -> Dict[str, Any]:
-        async with self._mu:
-            tokens_out: Dict[str, List[Dict[str, Any]]] = {}
-            for host, bucket in self._tokens_by_host.items():
-                tokens_out[host] = []
-                for tok in bucket.values():
-                    tokens_out[host].append(
-                        {
-                            "name": tok.name,
-                            "kind": tok.kind,
-                            "location": tok.location,
-                            "header_name": tok.header_name,
-                            "source_url": tok.source_url,
-                            "value": tok.value if include_values else tok.redacted(),
-                            "uses": tok.uses,
-                            "last_seen": tok.last_seen,
-                        }
-                    )
+        return AwaitableDict(out)
 
-            return {
-                "hosts": sorted(set(self._tokens_by_host) | set(self._headers_by_host)),
-                "tokens": tokens_out,
-                "headers_by_host": {
-                    h: sorted(v.keys())
-                    for h, v in self._headers_by_host.items()
-                },
-                "last_page_by_host": dict(self._last_page_by_host),
-            }
+    def _guess_csrf_header(self, tok: TokenMetadata) -> str:
+        n = f"{tok.name} {tok.location}".lower()
+
+        if "xsrf" in n:
+            return "X-XSRF-Token"
+
+        if "csrfmiddleware" in n or "csrftoken" in n:
+            return "X-CSRFToken"
+
+        if "requestverification" in n:
+            return "RequestVerificationToken"
+
+        return "X-CSRF-Token"
 
 
 class AccessibilityManager:
     """
-    AccessibilityManager converts discovered URLs into human-usable pages:
-      - API endpoints
-      - auth/login/logout/session pages
-      - CSRF sources
-      - forms
-      - GraphQL endpoints
-      - JSON endpoints
-      - pages with usable browser context
+    Tracks discovered pages/APIs/forms and exposes prepare_headers().
 
-    It feeds same-origin CSRF/session metadata into SessionClass and emits
-    DEBUG_LOGGER lines that humans can search for.
+    Handles:
+      - 401, 403, 429, 5xx, Varnish/CDN block pages without crashing.
+      - Safe retry planning for normal missing-header/navigation cases.
+      - Deep valid-link extraction from accessible HTML/JS/CSS/JSON/text.
+      - Same-origin discovery by default.
+      - Private/local host filtering by default.
     """
 
-    API_RE = re.compile(r"(/api/|/ajax/|/rest/|/rpc|/graphql|/v\d+/|endpoint|json|query|search)", re.I)
-    AUTH_RE = re.compile(r"(login|logout|signin|sign-in|signup|sign-up|auth|oauth|session|account)", re.I)
-    CSRF_RE = SessionClass.CSRF_NAME_RE
+    BLOCK_BODY_RE = re.compile(
+        r"(?is)\b("
+        r"403\s+forbidden|forbidden|error\s+54113|varnish\s+cache\s+server|"
+        r"access\s+denied|request\s+blocked|temporarily\s+blocked|captcha|"
+        r"cloudflare|akamai|datadome|perimeterx|kasada|bot\s+detection"
+        r")\b"
+    )
+
+    BAD_LINK_TEXT_RE = re.compile(
+        r"(?i)(logout|log_out|signout|sign_out|delete|remove|destroy|checkout|cart|unsubscribe)"
+    )
 
     def __init__(
         self,
@@ -18060,40 +18194,117 @@ class AccessibilityManager:
         session_class: Optional[SessionClass] = None,
         logger: Any = None,
         max_pages: int = 4096,
-        log_token_values: bool = False,
-    ) -> None:
-        self.session_class = session_class or SessionClass(logger=logger or DEBUG_LOGGER)
-        self.logger = logger or DEBUG_LOGGER
-        self.max_pages = int(max(256, max_pages))
-        self.log_token_values = bool(log_token_values)
-        self._pages: Dict[str, _AccessPage] = {}
-        self._mu = asyncio.Lock()
+        allow_cross_origin_discovery: bool = False,
+        retry_on: int = 400,
+        max_retries: int = 1,
+        backoff_factor: float = 1.0,
+    ):
+        self.session_class = session_class or SessionClass(
+            logger=logger,
+            retry_on=retry_on,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
+        )
+        self.logger = logger
+        self.max_pages = int(max_pages)
+        self.allow_cross_origin_discovery = bool(allow_cross_origin_discovery)
+
+        self._pages: Dict[str, AccessPage] = {}
+        self._api_cache: Set[str] = set()
+
+        # FIXED: this is sync-safe and works inside normal def methods.
+        self._mu = threading.RLock()
+
+    def prepare_headers(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: Optional[Mapping[str, str]] = None,
+        referer: str = "",
+        source: str = "probe",
+        needs_csrf: Optional[bool] = None,
+        **_: Any,
+    ) -> AwaitableDict:
+        """
+        Compatibility method for NetworkSniffer.
+        Works both ways:
+
+            headers = access.prepare_headers(...)
+            headers = await access.prepare_headers(...)
+        """
+        return self.session_class.headers_for_sync(
+            url=url,
+            method=method,
+            headers=headers,
+            referer=referer,
+            source=source,
+            needs_csrf=needs_csrf,
+        )
 
     def _log(self, msg: str) -> None:
         try:
-            self.logger.log_message(msg)
-        except Exception:
-            try:
+            logger = self.logger or getattr(self.session_class, "logger", None)
+            if logger and hasattr(logger, "log_message"):
+                logger.log_message(msg)
+            else:
                 print(msg)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     def _host(self, url: str) -> str:
         try:
-            return urlparse(str(url or "")).netloc.lower().split(":")[0]
+            p = urlparse(str(url or ""))
+            return (p.hostname or "").lower()
         except Exception:
             return ""
 
     def _canonicalize_url(self, u: str) -> str:
         try:
             p = urlparse(str(u or "").strip())
-            if p.scheme not in ("http", "https", "ws", "wss") or not p.netloc:
+
+            if p.scheme not in {"http", "https"} or not p.netloc:
                 return ""
-            host = p.netloc.lower().split(":")[0]
+
+            host = p.netloc.lower()
             path = p.path or "/"
-            qs = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=False)]
+
+            qs = [
+                (k, v)
+                for (k, v) in parse_qsl(p.query, keep_blank_values=False)
+                if k.lower() not in SessionClass.TRACKING_PARAMS
+            ]
+
             query = urlencode(qs, doseq=True)
-            return urlunparse((p.scheme.lower(), host, path, p.params, query, ""))
+            return urlunparse((p.scheme.lower(), host, path, "", query, ""))
+        except Exception:
+            return ""
+
+    def _safe_abs_url(self, raw: str, base_url: str) -> str:
+        raw = html.unescape(str(raw or "").strip())
+
+        if not raw:
+            return ""
+
+        if raw.startswith(("#", "javascript:", "data:", "blob:", "mailto:", "tel:", "sms:")):
+            return ""
+
+        if self.BAD_LINK_TEXT_RE.search(raw):
+            return ""
+
+        try:
+            full = urljoin(base_url, raw)
+            p = urlparse(full)
+
+            if p.scheme not in {"http", "https"} or not p.netloc:
+                return ""
+
+            if not self.session_class._is_safe_host(p.hostname or ""):
+                return ""
+
+            if not self.allow_cross_origin_discovery and self._host(full) != self._host(base_url):
+                return ""
+
+            return self._canonicalize_url(full)
         except Exception:
             return ""
 
@@ -18102,41 +18313,36 @@ class AccessibilityManager:
         ct = str(content_type or "").lower()
         src = str(source or "").lower()
 
-        if ul.startswith(("ws://", "wss://")):
-            return "websocket"
-        if "/graphql" in ul or "graphql" in src:
+        if "/graphql" in ul or "graphql" in ct:
             return "graphql"
-        if self.AUTH_RE.search(ul):
-            return "auth"
-        if self.API_RE.search(ul) or "application/json" in ct:
+
+        if any(x in ul for x in ("/api/", "/rest/", "/v1/", "/v2/", "/ajax/")):
             return "api"
-        if self.CSRF_RE.search(ul):
-            return "csrf"
-        if "text/html" in ct:
-            return "page"
+
+        if "json" in ct or ul.endswith(".json"):
+            return "json"
+
+        if any(x in ul for x in ("/login", "/signin", "/auth", "/oauth")):
+            return "auth"
+
         if "form" in src:
             return "form"
+
+        if "html" in ct or "page" in src:
+            return "page"
+
         return "link"
 
-    def _label_for(self, kind: str, url: str) -> str:
-        path = urlparse(url).path or "/"
-        if kind == "api":
-            return f"API endpoint {path}"
-        if kind == "graphql":
-            return "GraphQL endpoint"
-        if kind == "auth":
-            return f"Auth/session page {path}"
-        if kind == "csrf":
-            return f"CSRF/token source {path}"
-        if kind == "form":
-            return f"Form endpoint {path}"
-        if kind == "websocket":
-            return f"WebSocket endpoint {path}"
-        if kind == "page":
-            return f"Human page {path}"
-        return f"Discovered link {path}"
+    def _ci_get(self, headers: Mapping[str, str], name: str, default: str = "") -> str:
+        return self.session_class._ci_get(headers, name, default)
 
-    async def remember_access_page(
+    def _looks_textlike(self, content_type: str) -> bool:
+        return self.session_class._looks_textlike(content_type)
+
+    async def remember_access_page(self, **kwargs: Any) -> None:
+        self.remember_access_page_sync(**kwargs)
+
+    def remember_access_page_sync(
         self,
         *,
         url: str,
@@ -18145,7 +18351,7 @@ class AccessibilityManager:
         status: Optional[int] = None,
         content_type: str = "",
         parent: str = "",
-        source: str = "",
+        source: str = "response",
         evidence: Iterable[str] = (),
         requires_auth: bool = False,
         requires_csrf: bool = False,
@@ -18153,75 +18359,78 @@ class AccessibilityManager:
         required_headers: Iterable[str] = (),
     ) -> None:
         canonical = self._canonicalize_url(url)
+
         if not canonical:
             return
 
         host = self._host(canonical)
         resolved_kind = kind or self._classify(canonical, content_type, source)
-        ev = tuple(str(x) for x in evidence if str(x).strip())[:12]
-        csrf_tuple = tuple(dict.fromkeys(str(x) for x in csrf_names if str(x).strip()))
-        header_tuple = tuple(dict.fromkeys(str(x) for x in required_headers if str(x).strip()))
 
-        async with self._mu:
-            existing = self._pages.get(canonical)
-            if existing is None:
-                page = _AccessPage(
+        ev = {str(x).strip() for x in evidence if str(x).strip()}
+        csrf_set = {str(x).strip() for x in csrf_names if str(x).strip()}
+        hdr_set = {str(x).strip() for x in required_headers if str(x).strip()}
+
+        with self._mu:
+            page = self._pages.get(canonical)
+
+            if page is None:
+                page = AccessPage(
                     url=url,
                     canonical_url=canonical,
                     host=host,
                     kind=resolved_kind,
-                    label=self._label_for(resolved_kind, canonical),
                     method=(method or "GET").upper(),
                     status=status,
-                    content_type=content_type,
-                    parent=parent,
-                    requires_auth=requires_auth,
-                    requires_csrf=requires_csrf,
-                    csrf_names=csrf_tuple,
-                    required_headers=header_tuple,
+                    content_type=content_type or "",
+                    parent=parent or "",
+                    requires_auth=bool(requires_auth),
+                    requires_csrf=bool(requires_csrf),
+                    csrf_names=csrf_set,
+                    required_headers=hdr_set,
                     evidence=ev,
                     hits=1,
                 )
                 self._pages[canonical] = page
-                self._emit_access_log(page)
+                log_refresh = False
             else:
-                existing.last_seen = time.time()
-                existing.hits += 1
-                existing.status = status if status is not None else existing.status
-                existing.content_type = content_type or existing.content_type
-                existing.requires_auth = existing.requires_auth or requires_auth
-                existing.requires_csrf = existing.requires_csrf or requires_csrf
-                existing.csrf_names = tuple(dict.fromkeys(list(existing.csrf_names) + list(csrf_tuple)))
-                existing.required_headers = tuple(dict.fromkeys(list(existing.required_headers) + list(header_tuple)))
-                if ev:
-                    existing.evidence = tuple(dict.fromkeys(list(existing.evidence) + list(ev)))[:12]
-                self._emit_access_log(existing, refresh=True)
+                page.last_seen = time.time()
+                page.hits += 1
+                page.kind = page.kind or resolved_kind
+                page.method = (method or page.method or "GET").upper()
+                page.status = status if status is not None else page.status
+                page.content_type = content_type or page.content_type
+                page.parent = parent or page.parent
+                page.requires_auth = page.requires_auth or bool(requires_auth)
+                page.requires_csrf = page.requires_csrf or bool(requires_csrf)
+                page.csrf_names |= csrf_set
+                page.required_headers |= hdr_set
+                page.evidence |= ev
+                log_refresh = True
+
+            if page.is_api():
+                self._api_cache.add(canonical)
 
             if len(self._pages) > self.max_pages:
-                oldest = sorted(self._pages.items(), key=lambda kv: kv[1].last_seen)
-                for dead_key, _ in oldest[: max(1, len(self._pages) - self.max_pages)]:
-                    self._pages.pop(dead_key, None)
+                overflow = len(self._pages) - self.max_pages
+                oldest = sorted(self._pages.items(), key=lambda kv: kv[1].last_seen)[: max(1, overflow)]
 
-    def _emit_access_log(self, page: _AccessPage, *, refresh: bool = False) -> None:
-        prefix = "REFRESH" if refresh else "FOUND"
-        """
+                for key, _old_page in oldest:
+                    self._pages.pop(key, None)
+                    self._api_cache.discard(key)
+
+        self._log_api_update(page, refresh=log_refresh)
+
+    def _log_api_update(self, page: AccessPage, *, refresh: bool = False) -> None:
+        if refresh and page.hits > 10:
+            return
+
+        prefix = "UPDATED" if refresh else "FOUND"
+
         self._log(
-            f"[HTTPS][ACCESS][{prefix}] kind={page.kind} method={page.method} "
+            f"[ACCESS][{prefix}] kind={page.kind} method={page.method} "
             f"status={page.status} auth={page.requires_auth} csrf={page.requires_csrf} "
-            f"host={page.host} label={page.label} url={page.canonical_url}"
+            f"host={page.host} url={page.canonical_url}"
         )
-        """
-        if page.kind in {"api", "graphql"}:
-            self._log(f"[HTTPS][ACCESS][API] human_open={page.canonical_url} headers={list(page.required_headers)}")
-
-        if page.kind == "auth":
-            self._log(f"[HTTPS][ACCESS][AUTH] human_open={page.canonical_url}")
-
-        if page.requires_csrf or page.kind == "csrf":
-            self._log(
-                f"[HTTPS][ACCESS][CSRF] source={page.canonical_url} "
-                f"csrf_names={list(page.csrf_names)} values=redacted"
-            )
 
     async def observe_response(
         self,
@@ -18229,229 +18438,439 @@ class AccessibilityManager:
         requested_url: str,
         final_url: str,
         status: Optional[int],
-        headers: Dict[str, str],
-        body: bytes,
-        request_headers: Dict[str, str],
-        decode_body_func: Any,
+        headers: Mapping[str, str],
+        body: bytes = b"",
+        request_headers: Optional[Mapping[str, str]] = None,
+        decode_body_func: Any = None,
     ) -> None:
-        url = final_url or requested_url
-        ctype = self._header_get(headers, "content-type")
-        kind = self._classify(url, ctype, "response")
+        headers = headers or {}
+        request_headers = request_headers or {}
 
-        requires_auth = bool(status in {401, 403}) or self.AUTH_RE.search(url) is not None
-        requires_csrf = False
-        csrf_names: List[str] = []
-        required_headers: List[str] = []
+        await self.session_class.ingest_response_headers(final_url, headers)
 
-        await self.session_class.ingest_set_cookie_headers(url, headers)
-
+        content_type = self._ci_get(headers, "Content-Type")
+        method = self._ci_get(request_headers, ":method") or self._ci_get(request_headers, "method") or "GET"
         text = ""
-        if body and self._looks_textlike(ctype):
+
+        if body and self._looks_textlike(content_type):
             try:
-                text = decode_body_func(body)
+                text = decode_body_func(body) if decode_body_func else body.decode("utf-8", errors="ignore")
             except Exception:
                 text = body.decode("utf-8", errors="ignore")
 
-        if text:
-            if "html" in ctype.lower() or "<html" in text[:2048].lower() or "<input" in text[:4096].lower():
-                await self.session_class.ingest_html_tokens(url, text)
-            if "json" in ctype.lower() or text.lstrip().startswith(("{", "[")):
-                await self.session_class.ingest_json_tokens(url, text)
+        blocked = self._is_blocked_response(status=status, headers=headers, text=text)
 
-            csrf_names.extend(self._find_csrf_names(text))
-            requires_csrf = bool(csrf_names)
+        if text and not blocked:
+            if "html" in content_type.lower() or "<input" in text[:4096].lower() or "<meta" in text[:4096].lower():
+                await self.session_class.ingest_html_tokens(final_url, text)
 
-            for form_url, method, form_csrf in self._extract_forms(text, base_url=url):
-                await self.remember_access_page(
-                    url=form_url,
-                    kind="form",
-                    method=method,
-                    status=None,
-                    content_type="",
-                    parent=url,
-                    source="form",
-                    evidence=("html_form",),
-                    requires_auth=requires_auth,
-                    requires_csrf=bool(form_csrf),
-                    csrf_names=form_csrf,
-                    required_headers=("Referer", "Origin", "Cookie", "X-CSRF-Token") if form_csrf else ("Referer",),
-                )
-
-            for api_url in self._extract_api_urls(text, base_url=url):
-                api_kind = self._classify(api_url, "", "body_api")
-                await self.remember_access_page(
-                    url=api_url,
-                    kind=api_kind,
+            for hit in self.extract_valid_links(text, base_url=final_url):
+                self.remember_access_page_sync(
+                    url=hit.url,
+                    kind=hit.kind,
                     method="GET",
-                    parent=url,
-                    source="body_api",
-                    evidence=("body_api_discovery",),
-                    requires_auth=False,
-                    requires_csrf=False,
+                    parent=final_url,
+                    source=hit.source,
+                    evidence=(f"link_source:{hit.source}",),
                     required_headers=("User-Agent", "Accept", "Referer"),
                 )
 
-        if requires_csrf:
-            required_headers.extend(["Referer", "Origin", "Cookie", "X-CSRF-Token"])
+            for form_url, form_method, form_csrf in self._extract_forms_from_html(text, base_url=final_url):
+                self.remember_access_page_sync(
+                    url=form_url,
+                    kind="form",
+                    method=form_method,
+                    content_type="text/html",
+                    parent=final_url,
+                    source="html_form",
+                    evidence=("html_form",),
+                    requires_csrf=bool(form_csrf),
+                    csrf_names=form_csrf,
+                    required_headers=("Referer", "Origin", "X-CSRF-Token") if form_csrf else ("Referer",),
+                )
 
-        if requires_auth:
-            required_headers.extend(["Cookie", "Authorization/session-if-authorized"])
+            for api_url in self._extract_api_urls_from_source(text, base_url=final_url):
+                self.remember_access_page_sync(
+                    url=api_url,
+                    kind=self._classify(api_url, content_type, "body_api"),
+                    method="GET",
+                    parent=final_url,
+                    source="body_api",
+                    evidence=("body_api_discovery",),
+                    required_headers=("User-Agent", "Accept", "Referer"),
+                )
 
-        await self.remember_access_page(
-            url=url,
-            kind=kind,
-            method=str(request_headers.get(":method") or "GET"),
+        self.remember_access_page_sync(
+            url=final_url,
+            kind=self._classify(final_url, content_type, "response"),
+            method=method.upper(),
             status=status,
-            content_type=ctype,
+            content_type=content_type,
             parent=requested_url if requested_url != final_url else "",
             source="response",
-            evidence=(f"status:{status}", f"content-type:{ctype}"),
-            requires_auth=requires_auth,
-            requires_csrf=requires_csrf,
-            csrf_names=csrf_names,
-            required_headers=required_headers,
+            evidence=(f"status:{status}", f"content-type:{content_type}"),
+            requires_auth=(status in {401, 403}) if status is not None else False,
         )
 
-    async def prepare_headers(
+        if blocked:
+            challenge = self._detect_challenge(headers, text)
+            self._log(f"[ACCESS][BLOCKED] challenge={challenge or 'generic'} status={status} url={final_url}")
+        elif status and 400 <= int(status) < 500:
+            self._log(f"[ACCESS][HTTP-{status}] guarded observer recorded failure url={final_url}")
+
+    def _detect_challenge(self, headers: Mapping[str, str], text: str = "") -> Optional[str]:
+        lower_headers = {str(k).lower(): str(v).lower() for k, v in (headers or {}).items()}
+        server = lower_headers.get("server", "")
+
+        if "varnish" in server or "x-varnish" in lower_headers:
+            return "varnish"
+
+        if "cloudflare" in server or "cf-ray" in lower_headers or "cf-mitigated" in lower_headers:
+            return "cloudflare"
+
+        if "akamai" in server or any("akamai" in k or "akamai" in v for k, v in lower_headers.items()):
+            return "akamai"
+
+        if "datadome" in " ".join(lower_headers.values()):
+            return "datadome"
+
+        if text and self.BLOCK_BODY_RE.search(text[:20_000]):
+            m = self.BLOCK_BODY_RE.search(text[:20_000])
+            return m.group(1).lower().replace("\n", " ")[:80] if m else "blocked"
+
+        return None
+
+    def _is_blocked_response(
+        self,
+        *,
+        status: Optional[int],
+        headers: Mapping[str, str],
+        text: str = "",
+    ) -> bool:
+        if status in {401, 403, 407, 451, 429}:
+            return True
+
+        if status and 500 <= int(status) <= 599 and self._detect_challenge(headers, text):
+            return True
+
+        if text and self.BLOCK_BODY_RE.search(text[:20_000]):
+            return True
+
+        return False
+
+    def recovery_plan(
         self,
         *,
         url: str,
-        method: str,
-        headers: Dict[str, str],
+        status: Optional[int],
+        headers: Mapping[str, str],
+        text: str = "",
+        attempt: int = 0,
         referer: str = "",
-    ) -> Dict[str, str]:
-        return await self.session_class.headers_for(
-            url=url,
-            method=method,
-            referer=referer,
-            existing_headers=headers,
-        )
+    ) -> Dict[str, Any]:
+        """
+        Return a safe action for fetch loops.
 
-    async def register_linktracker_hits(
-        self,
-        *,
-        page_url: str,
-        items: Sequence[Dict[str, Any]],
-        source: str = "sniffer",
-    ) -> None:
-        for item in items or []:
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("url") or item.get("href") or item.get("link") or "").strip()
-            if not url:
-                continue
-            if url.startswith("/"):
-                url = urljoin(page_url, url)
-            kind = self._classify(url, str(item.get("content_type") or ""), source)
-            await self.remember_access_page(
-                url=url,
-                kind=kind,
-                method=str(item.get("method") or "GET"),
-                status=item.get("status"),
-                content_type=str(item.get("content_type") or ""),
-                parent=page_url,
-                source=source,
-                evidence=(str(item.get("tag") or ""), str(item.get("kind") or ""), str(item.get("evidence") or "")),
-                requires_auth=bool(item.get("requires_auth") or False),
-                requires_csrf=bool(item.get("requires_csrf") or False),
-                csrf_names=item.get("csrf_names") or (),
-                required_headers=item.get("required_headers") or (),
+        This does not bypass auth, paywalls, CAPTCHA, WAF, or forbidden pages.
+        It only allows one normal navigation-header retry when the first request
+        may have failed because it was missing ordinary Accept/User-Agent headers.
+        """
+        challenge = self._detect_challenge(headers, text)
+        blocked = self._is_blocked_response(status=status, headers=headers, text=text)
+
+        if status in {401, 407}:
+            return {
+                "action": "auth_required",
+                "reason": "authentication_required",
+                "retry": False,
+                "challenge": challenge,
+            }
+
+        if status == 429:
+            retry_after = self._ci_get(headers, "Retry-After", "")
+            return {
+                "action": "rate_limited",
+                "reason": "rate_limited",
+                "retry": False,
+                "retry_after": retry_after,
+                "challenge": challenge,
+            }
+
+        if blocked and attempt <= 0 and status in {403, 406, 409} and not challenge:
+            safe_headers = self.prepare_headers(
+                url,
+                method="GET",
+                headers={},
+                referer=referer,
+                source="navigation",
             )
+            return {
+                "action": "retry_once",
+                "reason": "retry_with_normal_navigation_headers",
+                "retry": True,
+                "headers": dict(safe_headers),
+                "challenge": challenge,
+            }
 
-    async def snapshot(self) -> Dict[str, Any]:
-        async with self._mu:
-            pages = [p.human_row() for p in self._pages.values()]
-        pages.sort(key=lambda x: (x["kind"], x["host"] if "host" in x else "", x["url"]))
-        session = await self.session_class.snapshot(include_values=self.log_token_values)
+        if blocked:
+            return {
+                "action": "skip",
+                "reason": "blocked_or_forbidden",
+                "retry": False,
+                "challenge": challenge,
+            }
+
+        if status and 500 <= int(status) <= 599 and attempt < self.session_class.max_retries:
+            delay = self.session_class.backoff_factor * (2 ** max(0, attempt))
+            return {
+                "action": "retry_later",
+                "reason": "server_error",
+                "retry": True,
+                "delay": delay,
+                "challenge": challenge,
+            }
+
         return {
-            "pages": pages,
-            "session": session,
-            "counts": {
-                "pages": len(pages),
-                "apis": sum(1 for p in pages if p.get("kind") == "api"),
-                "graphql": sum(1 for p in pages if p.get("kind") == "graphql"),
-                "auth": sum(1 for p in pages if p.get("kind") == "auth"),
-                "csrf": sum(1 for p in pages if p.get("requires_csrf") or p.get("kind") == "csrf"),
-            },
+            "action": "continue",
+            "reason": "ok",
+            "retry": False,
+            "challenge": challenge,
         }
 
-    def _header_get(self, headers: Dict[str, str], key: str) -> str:
-        key_l = key.lower()
-        for k, v in (headers or {}).items():
-            if str(k).lower() == key_l:
-                return str(v)
-        return ""
+    async def _retry_on_challenge(self, url: str, headers: Mapping[str, str], challenge: str) -> Dict[str, Any]:
+        """
+        Compatibility shim for older callers.
 
-    def _looks_textlike(self, ctype: str) -> bool:
-        ct = str(ctype or "").lower()
-        return (
-            ct.startswith("text/")
-            or "json" in ct
-            or "xml" in ct
-            or "javascript" in ct
-            or "x-www-form-urlencoded" in ct
-            or not ct
-        )
+        It intentionally does not perform network retries or WAF evasion.
+        It returns a safe recovery plan that your fetch loop can inspect.
+        """
+        await asyncio.sleep(0)
+        return self.recovery_plan(url=url, status=403, headers=headers, text="", attempt=1)
 
-    def _find_csrf_names(self, text: str) -> List[str]:
-        names: List[str] = []
-        for m in re.findall(
-            r"(?i)\b(csrfmiddlewaretoken|csrf[_-]?token|xsrf[_-]?token|_csrf|requestverificationtoken|x-csrf-token|x-xsrf-token)\b",
-            text[:700_000] or "",
-        ):
-            if m not in names:
-                names.append(m)
-        return names[:32]
+    def _rotate_ua(self, challenge: str, current_headers: Optional[Mapping[str, str]] = None) -> str:
+        """
+        Compatibility shim. Do not rotate fingerprints to bypass blocks.
+        Return current UA if present; otherwise return the safe default UA.
+        """
+        current_ua = ""
 
-    def _extract_forms(self, text: str, *, base_url: str) -> List[Tuple[str, str, List[str]]]:
-        out: List[Tuple[str, str, List[str]]] = []
-        if not text:
-            return out
+        if current_headers:
+            current_ua = self._ci_get(current_headers, "User-Agent", "")
 
-        for fm in re.finditer(r"(?is)<form\b([^>]*)>(.*?)</form>", text[:700_000]):
-            attrs = fm.group(1) or ""
-            inner = fm.group(2) or ""
+        return current_ua or "Mozilla/5.0 (compatible; SafeDiscoveryBot/1.0; +link-discovery)"
 
-            action = ""
-            method = "GET"
+    def _last_page(self, url: str) -> str:
+        host = self._host(url)
 
-            am = re.search(r"(?i)\baction=['\"]([^'\"]+)['\"]", attrs)
-            if am:
-                action = html.unescape(am.group(1))
+        with self.session_class._mu:
+            return self.session_class._last_page_by_host.get(host, "")
 
-            mm = re.search(r"(?i)\bmethod=['\"]([^'\"]+)['\"]", attrs)
-            if mm:
-                method = mm.group(1).upper()
+    def _extract_forms_from_html(self, html: str, base_url: str) -> List[Tuple[str, str, Tuple[str, ...]]]:
+        src = (html or "")[:300_000]
+        forms: List[Tuple[str, str, Tuple[str, ...]]] = []
 
-            form_url = urljoin(base_url, action or base_url)
-            csrf_names = self._find_csrf_names(inner)
+        for m in re.finditer(r"<form\b(?P<attrs>[^>]*)>(?P<body>.*?)</form>", src, re.I | re.S):
+            attrs = m.group("attrs") or ""
+            body = m.group("body") or ""
 
-            out.append((form_url, method, csrf_names))
+            action = self._attr(attrs, "action") or base_url
+            method = (self._attr(attrs, "method") or "POST").upper()
 
-        return out[:128]
+            if method not in {"GET", "POST", "PUT", "PATCH", "DELETE"}:
+                method = "POST"
 
-    def _extract_api_urls(self, text: str, *, base_url: str) -> List[str]:
+            form_url = self._safe_abs_url(action, base_url)
+
+            if not form_url:
+                continue
+
+            csrf_names = tuple(
+                sorted(
+                    {
+                        n
+                        for n in re.findall(r"\bname\s*=\s*['\"]([^'\"]+)['\"]", body, re.I)
+                        if SessionClass.CSRF_NAME_RE.search(n)
+                    }
+                )
+            )
+
+            forms.append((form_url, method, csrf_names))
+
+        return forms
+
+    def _attr(self, tag_or_attrs: str, name: str) -> str:
+        m = re.search(rf"\b{re.escape(name)}\s*=\s*(['\"])(.*?)\1", tag_or_attrs or "", re.I | re.S)
+        return html.unescape(m.group(2)).strip() if m else ""
+
+    def _extract_api_urls_from_source(self, source: str, base_url: str) -> List[str]:
+        src = (source or "")[:500_000]
+
+        patterns = [
+            r"\bfetch\(\s*['\"]([^'\"]{1,2048})['\"]",
+            r"\baxios\.(?:get|post|put|patch|delete)\(\s*['\"]([^'\"]{1,2048})['\"]",
+            r"\bopen\(\s*['\"](?:GET|POST|PUT|PATCH|DELETE)['\"]\s*,\s*['\"]([^'\"]{1,2048})['\"]",
+            r"['\"]((?:/api/|/rest/|/graphql|/v\d+/|/ajax/)[^'\"<>\s]{0,2048})['\"]",
+            r"['\"]([^'\"<>\s]{1,2048}\.json(?:\?[^'\"<>\s]*)?)['\"]",
+        ]
+
         out: List[str] = []
         seen: Set[str] = set()
 
-        patterns = [
-            r"['\"]((?:https?://[^'\"]+|/[^'\"]*)(?:/api/|/ajax/|/rest/|/graphql|/v\d+/)[^'\"]*)['\"]",
-            r"\bfetch\(\s*['\"]([^'\"]+)['\"]",
-            r"\baxios\.(?:get|post|put|patch|delete)\(\s*['\"]([^'\"]+)['\"]",
-            r"\burl\s*:\s*['\"]([^'\"]+)['\"]",
-        ]
-
         for pat in patterns:
-            for raw in re.findall(pat, text[:700_000], re.I):
-                u = urljoin(base_url, html.unescape(str(raw).replace("\\/", "/")))
-                if u.startswith(("http://", "https://")) and u not in seen:
+            for m in re.finditer(pat, src, re.I):
+                u = self._safe_abs_url(m.group(1), base_url)
+
+                if u and u not in seen:
                     seen.add(u)
                     out.append(u)
-                    if len(out) >= 256:
-                        return out
+
+                if len(out) >= 512:
+                    return out
 
         return out
 
+    def extract_valid_links(self, source: str, base_url: str, *, max_links: int = 1200) -> List[LinkHit]:
+        """
+        Extract valid, safe links from accessible text/HTML/JS/CSS/JSON.
+
+        Returns LinkHit objects. Use `hit.url` for the URL.
+        """
+        if not source or not base_url:
+            return []
+
+        src = source[:1_500_000]
+        seen: Set[str] = set()
+        hits: List[LinkHit] = []
+
+        def add(raw: str, where: str, score: int = 1, text: str = "") -> None:
+            if len(hits) >= max_links:
+                return
+
+            u = self._safe_abs_url(raw, base_url)
+
+            if not u or u in seen:
+                return
+
+            seen.add(u)
+            hits.append(
+                LinkHit(
+                    url=u,
+                    source=where,
+                    score=score,
+                    kind=self._classify(u, "", where),
+                    text=text[:200],
+                )
+            )
+
+        attr_re = re.compile(
+            r"""\b(?:href|src|action|poster|data-url|data-href|data-src|content)\s*=\s*(['"])(?P<u>.*?)\1""",
+            re.I | re.S,
+        )
+
+        for m in attr_re.finditer(src):
+            add(m.group("u"), "dom_attrs", 5)
+
+        for m in re.finditer(r"""\bsrcset\s*=\s*(['"])(?P<v>.*?)\1""", src, re.I | re.S):
+            for part in (m.group("v") or "").split(","):
+                add(part.strip().split(" ")[0], "dom_srcset", 4)
+
+        for m in re.finditer(
+            r"""http-equiv\s*=\s*['"]refresh['"][^>]*content\s*=\s*['"][^'"]*url=(?P<u>[^'">]+)""",
+            src,
+            re.I | re.S,
+        ):
+            add(m.group("u"), "meta_refresh", 4)
+
+        for m in re.finditer(r"""url\(\s*(['"]?)(?P<u>[^'")]+)\1\s*\)""", src, re.I):
+            add(m.group("u"), "css_url", 2)
+
+        for u in self._extract_api_urls_from_source(src, base_url):
+            add(u, "inline_js", 5)
+
+        for m in re.finditer(r"""https?://[^\s'"<>)\\]+""", src, re.I):
+            raw = unquote(m.group(0).rstrip(".,;:]}"))
+            add(raw, "raw_url", 3)
+
+        quoted_path_re = re.compile(
+            r"""['"](?P<u>/(?:[^'"<>\s]|\\/){1,2048})['"]""",
+            re.I,
+        )
+
+        for m in quoted_path_re.finditer(src):
+            raw = m.group("u").replace("\\/", "/")
+
+            if any(
+                x in raw.lower()
+                for x in (
+                    "/api/",
+                    "/rest/",
+                    "/graphql",
+                    ".json",
+                    ".m3u8",
+                    ".mpd",
+                    "/page",
+                    "/artist",
+                    "/album",
+                    "/track",
+                )
+            ):
+                add(raw, "quoted_path", 3)
+
+        if "{" in src[:5000] or "[" in src[:5000]:
+            for raw in self._json_string_candidates(src[:300_000]):
+                add(raw, "json_string", 2)
+
+        hits.sort(key=lambda h: (-h.score, h.url))
+        return hits[:max_links]
+
+    def _json_string_candidates(self, src: str) -> Iterable[str]:
+        """
+        Extract URL-like strings from JSON without dumping full records.
+        """
+        candidates: List[str] = []
+
+        try:
+            data = json.loads(src)
+        except Exception:
+            data = None
+
+        def walk(obj: Any, depth: int = 0) -> None:
+            if depth > 6 or len(candidates) > 1000:
+                return
+
+            if isinstance(obj, str):
+                if obj.startswith(("http://", "https://", "/")) or any(
+                    x in obj for x in ("/api/", ".json", ".m3u8", ".mpd")
+                ):
+                    candidates.append(obj)
+
+            elif isinstance(obj, list):
+                for item in obj[:200]:
+                    walk(item, depth + 1)
+
+            elif isinstance(obj, dict):
+                for _k, v in list(obj.items())[:200]:
+                    walk(v, depth + 1)
+
+        if data is not None:
+            walk(data)
+            return candidates
+
+        for m in re.finditer(r"""['"](?P<u>(?:https?://|/)[^'"<>\s]{2,2048})['"]""", src, re.I):
+            candidates.append(m.group("u").replace("\\/", "/"))
+
+            if len(candidates) > 1000:
+                break
+
+        return candidates
+
+    def rows(self) -> List[Dict[str, Any]]:
+        with self._mu:
+            return [p.human_row() for p in sorted(self._pages.values(), key=lambda x: x.last_seen, reverse=True)]
+
+    def api_urls(self) -> List[str]:
+        with self._mu:
+            return sorted(self._api_cache)
 
 class _PastLinkGuard:
     _HARD_ERRORS = {
@@ -19048,7 +19467,6 @@ class HTTPSSubmanager:
         self.accessibility_manager = accessibility_manager or AccessibilityManager(
             session_class=self.session_class,
             logger=DEBUG_LOGGER,
-            log_token_values=False,
         )
 
         self._session: Optional[aiohttp.ClientSession] = None
