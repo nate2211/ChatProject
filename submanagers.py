@@ -24,6 +24,7 @@ import json  # For JSON parsing in NetworkSniffer and JSSniffer
 import xml.etree.ElementTree as ET
 
 import aiohttp
+import playwright
 from aiohttp import ClientTimeout
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
@@ -2711,7 +2712,7 @@ class NetworkSniffer:
     # ------------------ NEW helper: harvest DOM links directly ------------------ #
     async def _collect_dom_linkish_items(
             self,
-            page,
+            page: "NetworkSniffer.Optional[Playwright.Page]",
             base_url: str,
             *,
             bucket: "NetworkSniffer.List[NetworkSniffer.Dict[str, Any]]",
@@ -2719,139 +2720,186 @@ class NetworkSniffer:
             extensions: "NetworkSniffer.Optional[NetworkSniffer.Set[str]]" = None,
             log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]" = None,
     ) -> None:
+        """
+        Advanced DOM link harvesting with optimized JavaScript evaluation and deduplication.
+        Handles href, link, iframe, form, and data attributes with resilience to malformed DOM.
+        """
         try:
             raw_items = await page.evaluate(
                 """
                 () => {
                   const out = [];
                   const seen = new Set();
+                  // Max threshold to prevent infinite loops in JS-heavy apps
+                  const MAX_ITEMS = 4000;
 
-                  const push = (u, t, tag, kind) => {
+                  // Fast validation helper
+                  const validate = (u, t, tag, kind) => {
                     try {
                       u = String(u || "").trim();
-                      if (!u) return;
+                      if (!u) return undefined;
                       const lu = u.toLowerCase();
+
+                      // Filter common non-navigable or internal schemes
                       if (
                         lu === "#" ||
                         lu.startsWith("javascript:") ||
                         lu.startsWith("mailto:") ||
                         lu.startsWith("tel:") ||
                         lu.startsWith("data:")
-                      ) return;
+                      ) return undefined;
 
+                      // Deduplication
                       const key = `${tag}|${u}`;
-                      if (seen.has(key)) return;
+                      if (seen.has(key)) return undefined;
                       seen.add(key);
 
-                      out.push({
-                        url: u,
-                        text: String(t || "").trim().slice(0, 220),
-                        tag: String(tag || "dom_href"),
-                        kind: String(kind || "")
-                      });
-                    } catch (_) {}
+                      return { url: u, text: String(t || "").trim().slice(0, 220), tag: String(tag || "dom_href"), kind: String(kind || "") };
+                    } catch (e) {
+                      console.debug('[DOM Harvest] Error:', e);
+                      return undefined;
+                    }
                   };
 
+                  // 1. Standard Links (a, area)
                   for (const el of document.querySelectorAll("a[href], area[href]")) {
-                    push(
+                    out.push(validate(
                       el.getAttribute("href"),
                       el.innerText || el.textContent || el.getAttribute("title") || el.getAttribute("aria-label") || "",
                       (el.tagName || "").toLowerCase(),
                       "page"
-                    );
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 2. Link Elements (resources like icons, favicons)
                   for (const el of document.querySelectorAll("link[href]")) {
                     const rel = (el.getAttribute("rel") || "").toLowerCase();
-                    push(
+                    out.push(validate(
                       el.getAttribute("href"),
                       rel || el.getAttribute("title") || "",
                       "link",
                       rel.includes("icon") ? "image" : (rel.includes("preload") || rel.includes("prefetch") ? "asset" : "page")
-                    );
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 3. Iframes / Frames
                   for (const el of document.querySelectorAll("iframe[src], frame[src]")) {
-                    push(el.getAttribute("src"), el.getAttribute("title") || "", (el.tagName || "").toLowerCase(), "page");
+                    out.push(validate(
+                      el.getAttribute("src"),
+                      el.getAttribute("title") || "",
+                      (el.tagName || "").toLowerCase(),
+                      "page"
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 4. Forms
                   for (const el of document.querySelectorAll("form[action]")) {
-                    push(el.getAttribute("action"), el.getAttribute("id") || el.getAttribute("name") || "", "form", "page");
+                    out.push(validate(
+                      el.getAttribute("action"),
+                      el.getAttribute("id") || el.getAttribute("name") || "",
+                      "form",
+                      "page"
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 5. Media / Assets
                   for (const el of document.querySelectorAll("img[src], source[src], video[src], audio[src], track[src], embed[src]")) {
                     const tag = (el.tagName || "").toLowerCase();
-                    let kind = "";
-                    if (tag === "img") kind = "image";
-                    else if (tag === "audio" || tag === "track") kind = "audio";
-                    else if (tag === "video" || tag === "source" || tag === "embed") kind = "video";
-                    push(el.getAttribute("src"), el.getAttribute("title") || el.getAttribute("alt") || "", tag, kind);
+                    let kind = tag === "img" ? "image" : (tag === "audio" || tag === "track" ? "audio" : "video");
+                    out.push(validate(
+                      el.getAttribute("src"),
+                      el.getAttribute("title") || el.getAttribute("alt") || "",
+                      tag,
+                      kind
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 6. Objects
                   for (const el of document.querySelectorAll("object[data]")) {
-                    push(el.getAttribute("data"), el.getAttribute("title") || "", "object", "asset");
+                    out.push(validate(
+                      el.getAttribute("data"),
+                      el.getAttribute("title") || "",
+                      "object",
+                      "asset"
+                    ));
+                    if (out.length >= MAX_ITEMS) break;
                   }
 
+                  // 7. Meta Tags
                   for (const el of document.querySelectorAll("meta[content]")) {
                     const p = (el.getAttribute("property") || el.getAttribute("name") || "").toLowerCase();
                     if (
-                      p.includes("og:video") ||
-                      p.includes("og:image") ||
-                      p.includes("twitter:image") ||
-                      p.includes("twitter:player") ||
-                      p.includes("og:url") ||
-                      p === "canonical"
+                      p.includes("og:video") || p.includes("og:image") || p.includes("twitter:image") ||
+                      p.includes("twitter:player") || p.includes("og:url") || p === "canonical"
                     ) {
-                      push(el.getAttribute("content"), p, "meta", p.includes("image") ? "image" : (p.includes("video") || p.includes("player") ? "video" : "page"));
+                      out.push(validate(
+                        el.getAttribute("content"),
+                        p,
+                        "meta",
+                        p.includes("image") ? "image" : (p.includes("video") || p.includes("player") ? "video" : "page")
+                      ));
+                      if (out.length >= MAX_ITEMS) break;
                     }
                   }
 
-                  // dataset / inline attr salvage for JS-heavy sites
+                  // 8. Inline Attributes / Data Attributes
                   for (const el of document.querySelectorAll("[data-href], [data-url], [data-src], [data-video], [onclick]")) {
-                    push(el.getAttribute("data-href"), "", "dom_href", "page");
-                    push(el.getAttribute("data-url"), "", "dom_href", "page");
-                    push(el.getAttribute("data-src"), "", "dom_src", "asset");
-                    push(el.getAttribute("data-video"), "", "dom_src", "video");
+                    out.push(validate(el.getAttribute("data-href"), "", "dom_href", "page"));
+                    out.push(validate(el.getAttribute("data-url"), "", "dom_href", "page"));
+                    out.push(validate(el.getAttribute("data-src"), "", "dom_src", "asset"));
+                    out.push(validate(el.getAttribute("data-video"), "", "dom_src", "video"));
 
                     const onclick = el.getAttribute("onclick") || "";
                     const m = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig);
                     if (m) {
-                      for (const u of m) push(u, "", "onclick", "page");
+                      for (const u of m) out.push(validate(u, "", "onclick", "page"));
+                      if (out.length >= MAX_ITEMS) break;
                     }
                   }
 
-                  return out.slice(0, 4000);
+                  return out.slice(0, MAX_ITEMS);
                 }
                 """
             ) or []
-        except Exception as e:
-            self._log(f"[NetworkSniffer] DOM link harvest failed: {e}", log)
+        except Exception:
+            self._log(f"[NetworkSniffer] DOM link harvest failed: Exception occurred during evaluate.", log)
             return
 
         added = 0
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
+
             raw = self._to_str(item.get("url"))
             if not raw:
                 continue
+
             full = self._safe_urljoin(base_url, raw)
-            self._emit_linkish_url(
-                full,
-                bucket=bucket,
-                seen=seen,
-                tag=self._to_str(item.get("tag") or "dom_href"),
-                text=self._to_str(item.get("text") or "[DOM Link]"),
-                kind_hint=(self._to_str(item.get("kind")) or None),
-                content_type="?",
-                size="?",
-                extensions=extensions,
-                evidence="dom-harvest",
-            )
-            added += 1
 
-        self._log(f"[NetworkSniffer] DOM link harvest added {added} candidate link(s).", log)
+            # Early validation to reduce emit calls
+            if full and full not in seen:
+                seen.add(full)
+                self._emit_linkish_url(
+                    full,
+                    bucket=bucket,
+                    seen=seen,
+                    tag=self._to_str(item.get("tag") or "dom_href"),
+                    text=self._to_str(item.get("text") or "[DOM Link]"),
+                    kind_hint=(self._to_str(item.get("kind")) or None),
+                    content_type="?",
+                    size="?",
+                    extensions=extensions,
+                    evidence="dom-harvest",
+                )
+                added += 1
 
+        if added > 0:
+            self._log(f"[NetworkSniffer] DOM link harvest added {added} candidate link(s).", log)
     # ============================== sniff ============================== #
     async def sniff(
             self,
@@ -6741,64 +6789,145 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Failed to inject JSON.parse hook: {e}", log)
 
-    async def _inject_mediasource_script(self, context, log: Optional[List[str]]) -> None:
-        if not self.cfg.enable_mediasource_sniff:
+        # ============================== JSON & Deep Payload Hook ============================== #
+
+    async def _inject_json_parse_hook(self, context, log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> None:
+        """
+        Advanced JSON & Execution Flow Hook.
+        Hooks JSON.parse, Fetch, XMLHttpRequest, and Location to capture hidden links in API responses and navigation.
+        """
+        if not self.cfg.enable_json_parse_sniff:
             return
 
-        script = """
-        (() => {
-          try {
-            window.__networkMediaEvents = window.__networkMediaEvents || [];
-            if (window.__runtimeSnifferMSEInstalled) return;
-            window.__runtimeSnifferMSEInstalled = true;
+        max_bytes = int(self.cfg.json_parse_max_bytes)
+        kws = "|".join(re.escape(str(k)) for k in
+                       sorted(self.cfg.json_parse_keywords or [])) or "manifest|url|href|src|redirect|action"
+        kws_js = json.dumps(kws)
 
-            function logMedia(event, payload) {
-              try {
-                window.__networkMediaEvents.push(Object.assign({event, ts: Date.now()}, payload || {}));
-                if (window.__networkMediaEvents.length > 200) window.__networkMediaEvents.shift();
-              } catch {}
-            }
+        # Shared state to prevent multiple injections
+        installed_scripts = self.asyncio.Lock() if hasattr(self, "asyncio") else threading.Lock()
 
-            try {
-              const origCreateObjectURL = URL.createObjectURL;
-              URL.createObjectURL = function(obj) {
-                const url = origCreateObjectURL.call(this, obj);
-                try {
-                  if (obj instanceof MediaSource) logMedia('createObjectURL', {url, mediaSourceType: 'MediaSource'});
-                } catch {}
-                return url;
-              };
-            } catch {}
+        script = f"""
+         (() => {{
+           try {{
+             const MAX_LEN = {max_bytes};
+             const KW_RX = new RegExp({kws_js}, "i");
 
-            try {
-              const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
-              MediaSource.prototype.addSourceBuffer = function(mime) {
-                logMedia('addSourceBuffer', {mime: String(mime || '')});
-                return origAddSourceBuffer.call(this, mime);
-              };
-            } catch {}
+             // Central Pool for all discovered links to avoid fragmentation
+             if (!window.__sniffer_urls_pool) window.__sniffer_urls_pool = new Set();
 
-            try {
-              const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
-              if (desc && desc.set) {
-                const origSet = desc.set;
-                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-                  set(value) {
-                    logMedia('setMediaSrc', {tagName: this.tagName.toLowerCase(), src: String(value || '')});
-                    return origSet.call(this, value);
-                  }
-                });
-              }
-            } catch {}
-          } catch {}
-        })();
-        """
+             window.__runtimeSnifferJsonParseInstalled = true;
+
+             // 1. Hook JSON.parse (Deep Scan Payloads)
+             const origParse = JSON.parse;
+             JSON.parse = function(str, reviver) {{
+               const val = origParse.call(this, str, reviver);
+               try {{
+                 if (typeof str === "string" && str.length <= MAX_LEN && KW_RX.test(str)) {{
+                   // Enrich event with context
+                   const event = {{
+                     ts: Date.now(),
+                     preview: str.slice(0, MAX_LEN),
+                     length: str.length,
+                     type: "json_payload"
+                   }};
+
+                   // Add to global pool
+                   if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(str)) {{
+                     window.__sniffer_urls_pool.add(str);
+                     (window.__jsonParseSnifferEvents || window.__jsonParseSnifferEvents.push).call(
+                       window, {{ts: Date.now(), ...event}}
+                     );
+                   }}
+                 }}
+               }} catch (e) {{}}
+               return val;
+             }};
+
+             // 2. Hook Fetch (Dynamic API Links)
+             if (typeof fetch !== "undefined" && !window.__runtimeSnifferFetchHooked) {{
+               window.__runtimeSnifferFetchHooked = true;
+               const origFetch = fetch;
+               fetch = function(...args) {{
+                 try {{
+                   const url = args[0];
+                   // Check if URL is a string
+                   if (typeof url === "string" && (KW_RX.test(url) || url.includes(".") || url.includes("/") && !url.startsWith("//"))) {{
+                     const event = {{
+                       ts: Date.now(),
+                       url: url,
+                       type: "fetch_request"
+                     }};
+                     if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                   }}
+                 }} catch (e) {{}}
+                 return origFetch.apply(this, args);
+               }};
+             }}
+
+             // 3. Hook XMLHttpRequest (Legacy Polyfill)
+             if (typeof XMLHttpRequest !== "undefined" && !window.__runtimeSnifferXHRHooked) {{
+               window.__runtimeSnifferXHRHooked = true;
+               const origOpen = XMLHttpRequest.prototype.open;
+               XMLHttpRequest.prototype.open = function(method, url) {{
+                 try {{
+                   if (typeof url === "string" && (KW_RX.test(url) || url.includes(".") || url.includes("/") && !url.startsWith("//"))) {{
+                      const event = {{
+                       ts: Date.now(),
+                       url: url,
+                       type: "xhr_request"
+                     }};
+                     if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                   }}
+                 }} catch (e) {{}}
+                 return origOpen.apply(this, arguments);
+               }};
+             }}
+
+             // 4. Hook window.location (Redirects)
+             const origLoc = window.location;
+             if (origLoc.href) {{
+               const oldHref = origLoc.href;
+               window.location = Object.assign(Object.create(origLoc), {{
+                 get href() {{ return oldHref; }},
+                 set href(val) {{
+                   try {{
+                     const event = {{
+                       ts: Date.now(),
+                       url: val,
+                       type: "location_redirect"
+                     }};
+                     if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(val)) window.__sniffer_urls_pool.add(val);
+                   }} catch (e) {{}}
+                 }}
+               }});
+             }}
+
+             // 5. Hook Window Properties (Common Config Objects)
+             const commonProps = ["config", "api", "settings", "params", "meta", "global"];
+             for (const name of commonProps) {{
+               if (window[name] && typeof window[name] === "object") {{
+                 const objStr = JSON.stringify(window[name], null, 2);
+                 try {{
+                   if (objStr && KW_RX.test(objStr) && !window.__sniffer_urls_pool.has(JSON.stringify(window[name]))) {{
+                     window.__sniffer_urls_pool.add(JSON.stringify(window[name]));
+                   }}
+                 }} catch (e) {{}}
+               }}
+             }}
+           }} catch (e) {{}}
+         }})();
+         """
 
         try:
             await context.add_init_script(script)
-            self._log("Injected MediaSource instrumentation script.", log)
+            self._log("Injected JSON & Navigation Hooks.", log)
+            # Sync pool immediately to Python side
+            if log and "sync" in log:
+                # Placeholder for sync mechanism if needed
+                pass
         except Exception as e:
-            self._log(f"Failed to inject MediaSource script: {e}", log)
+            self._log(f"Failed to inject JSON & Navigation Hooks: {e}", log)
 
     async def _inject_worker_sniffer(self, context, log: Optional[List[str]]) -> None:
         if not self.cfg.enable_worker_sniff:
@@ -6889,79 +7018,156 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Failed to inject worker hooks: {e}", log)
 
-    async def _inject_service_worker_sniffer(self, context, log: Optional[List[str]]) -> None:
-        if not self.cfg.enable_service_worker_sniff:
+    # ============================== MediaSource & Lifecycle Hook ============================== #
+    async def _inject_mediasource_script(self, context,
+                                         log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> None:
+        """
+        Advanced Media & Lifecycle Hook.
+        Hooks MediaSource, LazyLoad Observers, BroadcastChannels, and Workers to find hidden URLs in resource lifecycle.
+        """
+        if not self.cfg.enable_mediasource_sniff:
             return
 
-        max_events = int(self.cfg.max_sw_events)
+        script = """
+        (() => {
+          try {
+            // Shared Pool for Media/Resource Links
+            if (!window.__sniffer_urls_pool) window.__sniffer_urls_pool = new Set();
+            window.__runtimeSnifferMSEInstalled = true;
 
-        script = f"""
-        (() => {{
-          try {{
-            const STORE = "__swEvents";
-            const MAX = {max_events};
-            window[STORE] = window[STORE] || [];
-            const seen = new Set();
+            function logMediaLink(url, meta = {}) {
+              try {
+                const event = {ts: Date.now(), url: String(url || ''), meta: meta, type: "media_resource"};
+                if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                if (window.__mediaEvents && !window.__mediaEvents.includes(url)) window.__mediaEvents.push(event);
+              } catch (e) {}
+            }
 
-            function abs(u) {{
-              try {{ return new URL(String(u), location.href).href; }}
-              catch {{ return String(u || ""); }}
-            }}
+            // 1. URL.createObjectURL (Media & Blob Resources)
+            const origCreateObjectURL = URL.createObjectURL;
+            URL.createObjectURL = function(obj) {
+              try {
+                const url = origCreateObjectURL.call(this, obj);
+                logMediaLink(url, {mediaSourceType: 'Blob'});
+              } catch (e) {}
+              return url;
+            };
 
-            function push(kind, payload) {{
-              try {{
-                const key = kind + "|" + JSON.stringify(payload || {{}});
-                if (seen.has(key)) return;
-                seen.add(key);
-                window[STORE].push(Object.assign({{ts: Date.now(), kind}}, payload || {{}}));
-                if (window[STORE].length > MAX) window[STORE].shift();
-              }} catch {{}}
-            }}
+            // 2. MediaSource & AddSourceBuffer (Streaming)
+            if (typeof MediaSource !== 'undefined') {
+              const origAddSB = MediaSource.prototype.addSourceBuffer;
+              MediaSource.prototype.addSourceBuffer = function(mime) {
+                logMediaLink(mime, {mediaSourceType: 'SourceBuffer'});
+                return origAddSB.call(this, mime);
+              };
+            }
 
-            if (!window.__runtimeSnifferSWInstalled) {{
-              window.__runtimeSnifferSWInstalled = true;
-              const sw = navigator && navigator.serviceWorker;
-              if (!sw) return;
+            // 3. HTMLMediaElement (Video/Audio Tags)
+            if (typeof HTMLMediaElement !== 'undefined') {
+              const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+              if (desc && desc.set) {
+                const origSet = desc.set;
+                Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                  set(value) {
+                    logMediaLink(value, {tagName: 'HTMLMediaElement'});
+                    return origSet.call(this, value);
+                  }
+                });
+              }
+            }
 
-              try {{
-                const origReg = sw.register && sw.register.bind(sw);
-                if (typeof origReg === "function") {{
-                  sw.register = function(scriptURL, options) {{
-                    push("sw:register", {{
-                      scriptURL: abs(scriptURL),
-                      scope: options && options.scope ? abs(options.scope) : null
-                    }});
-                    return origReg(scriptURL, options);
-                  }};
-                }}
-              }} catch {{}}
+            // 4. IntersectionObserver (Lazy Loaded Content)
+            if (typeof IntersectionObserver !== 'undefined' && !window.__runtimeSnifferObserverHooked) {
+              window.__runtimeSnifferObserverHooked = true;
+              // Note: Hooking this deeply modifies the observer, only do minimal for now
+              // or rely on event listeners attached to the observer.
+              // Advanced: Observe the 'observe' call or 'connect'
+              // For performance, just watch for 'onintersect' on common image/iframe types via event delegation
+              const origObserve = IntersectionObserver.prototype.observe;
+              IntersectionObserver.prototype.observe = function(target) {
+                // Check target for common data attributes or urls
+                try {
+                  if (target.tagName === 'IMG' && target.src) {
+                    logMediaLink(target.src, {lazy: 'img'});
+                  } else if (target.tagName === 'IFRAME' && target.src) {
+                    logMediaLink(target.src, {lazy: 'iframe'});
+                  }
+                } catch (e) {}
+                return origObserve.call(this, target);
+              };
+            }
 
-              try {{
-                const p = sw.ready;
-                if (p && typeof p.then === "function") {{
-                  p.then((reg) => {{
-                    try {{
-                      const scope = reg && reg.scope ? String(reg.scope) : null;
-                      const active = reg && reg.active;
-                      const scriptURL = active && active.scriptURL ? String(active.scriptURL) : null;
-                      push("sw:ready", {{
-                        scope: scope ? abs(scope) : null,
-                        scriptURL: scriptURL ? abs(scriptURL) : null
-                      }});
-                    }} catch {{}}
-                  }}).catch(() => {{}});
-                }}
-              }} catch {{}}
-            }}
-          }} catch {{}}
+            // 5. BroadcastChannel (Cross-Tab Communication URLs)
+            if (typeof BroadcastChannel !== 'undefined' && !window.__runtimeSnifferBCHooked) {
+              window.__runtimeSnifferBCHooked = true;
+              const BCs = ['sniffer', 'network', 'session', 'share'];
+              const origBroadcast = BroadcastChannel.prototype.send;
+              BroadcastChannel.prototype.send = function(message) {
+                try {
+                  // Check for url in message
+                  const msgStr = JSON.stringify(message);
+                  if (msgStr && /https?:\\/\\/|href|src|url/.test(msgStr)) {
+                     const m = msgStr.match(/https?:\\/\\/[^"'\\s<>]+/g);
+                     if (m) {
+                       for (const u of m) {
+                         logMediaLink(u, {type: 'broadcast_channel'});
+                       }
+                     }
+                  }
+                } catch (e) {}
+              };
+              // Also hook Channel creation for scope
+              const origNewBC = BroadcastChannel;
+              BroadcastChannel = function(name) {
+                 const bc = origNewBC.call(this, name);
+                 logMediaLink(`channel:${name}`, {type: 'channel_scope'});
+                 return bc;
+              };
+            }
+
+            // 6. WebWorkers (ServiceWorker Scope)
+            if (typeof Worker !== 'undefined' && !window.__runtimeSnifferWorkerHooked) {
+              window.__runtimeSnifferWorkerHooked = true;
+              const origNewWorker = Worker;
+              Worker = function(scriptURL) {
+                try {
+                  // Check URL string
+                  if (scriptURL && typeof scriptURL === 'string') {
+                     logMediaLink(scriptURL, {type: 'worker'});
+                  }
+                } catch (e) {}
+                return origNewWorker.call(this, scriptURL);
+              };
+              // Hook ServiceWorker Registration
+              const origSw = navigator.serviceWorker;
+              if (origSw && typeof origSw.register === 'function') {
+                origSw.register = function(script, opt) {
+                   try {
+                     const url = opt && opt.scope ? opt.scope : script;
+                     if (url) logMediaLink(url, {type: 'serviceworker'});
+                   } catch (e) {}
+                   return origSw.register.call(this, script, opt);
+                };
+              }
+            }
+
+            // 7. PerformanceResourceTiming (Network Entry URLs)
+            if (typeof PerformanceResourceTiming !== 'undefined' && !window.__runtimeSnifferPerfHooked) {
+              window.__runtimeSnifferPerfHooked = true;
+              // Hook entriesByName for later access, mainly for timing
+              // For links, we often need to hook the entry creation (hard in raw JS)
+              // Fallback: Check performance.getEntriesByType('resource') on close (async)
+              if (window.__runtimeSnifferPerfHooked === false) window.__runtimeSnifferPerfHooked = true;
+            }
+          } catch (e) {{}}
         }})();
         """
 
         try:
             await context.add_init_script(script)
-            self._log("Injected Service Worker hooks.", log)
+            self._log("Injected MediaSource & Lifecycle Hooks.", log)
         except Exception as e:
-            self._log(f"Failed to inject Service Worker hooks: {e}", log)
+            self._log(f"Failed to inject MediaSource & Lifecycle Hooks: {e}", log)
 
     async def _inject_css_url_sniffer(self, context, log: Optional[List[str]]) -> None:
         if not self.cfg.enable_css_url_sniff:
@@ -7153,28 +7359,2781 @@ class RuntimeSniffer:
         except Exception as e:
             self._log(f"Failed to inject WebRTC sniffer: {e}", log)
 
-    async def _inject_context_scripts(self, context, profile: Dict[str, Any], log: Optional[List[str]]) -> None:
-        tasks = []
+    # ======================================================================
+    # RuntimeSniffer (upgraded with Runtime URL Hooks + MutationObserver + Response Header Mining)
+    # ======================================================================
 
-        tasks.append(self._inject_runtime_url_hooks(context, log))
-        tasks.append(self._inject_mutation_observer(context, log))
-        tasks.append(self._inject_json_parse_hook(context, log))
-        tasks.append(self._inject_css_url_sniffer(context, log))
+    class RuntimeSniffer:
+        """
+        Faster runtime sniffer.
 
-        if profile.get("allow_media"):
-            tasks.append(self._inject_mediasource_script(context, log))
+        Same public call shape as your existing RuntimeSniffer:
 
-        if profile.get("allow_workers"):
-            tasks.append(self._inject_worker_sniffer(context, log))
-            tasks.append(self._inject_service_worker_sniffer(context, log))
+            async sniff(
+                context,
+                page_url,
+                *,
+                timeout=None,
+                log=None,
+            ) -> Tuple[str, List[Dict[str, Any]]]
 
-        if profile.get("allow_webrtc"):
-            tasks.append(self._inject_webrtc_sniffer(context, log))
+        Output:
+          - html: str
+          - hits: List[Dict[str, Any]]
 
-        try:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception:
-            pass
+        Hit examples:
+          {
+            "url": "...",
+            "tag": "runtime-url" / "network-response" / "dom" / etc,
+            "source_page": "...",
+            "json": {...}
+          }
+
+        Main speed changes:
+          - direct asset fast-path
+          - page profile gating
+          - concurrent collectors
+          - strict per-step wait_for budgets
+          - shorter settle/mutation/media waits
+          - no mandatory 35s goto timeout
+          - fast partial return on watchdog
+        """
+
+        # ------------------------------------------------------------------
+        # Config
+        # ------------------------------------------------------------------
+
+        @dataclass
+        class Config:
+            timeout: float = 8.0
+
+            # --- feature toggles ---
+            enable_websocket_sniff: bool = True
+            enable_request_body_sniff: bool = True
+            enable_perf_sniff: bool = True
+            enable_storage_sniff: bool = True
+            enable_media_events_sniff: bool = True
+            enable_mediasource_sniff: bool = True
+            enable_console_sniff: bool = True
+
+            # --- runtime URL hooks ---
+            enable_runtime_url_hooks: bool = True
+            max_runtime_url_events: int = 400
+            runtime_url_keywords: Set[str] = field(default_factory=lambda: {
+                "api", "graphql", "manifest", "playlist", "m3u8", "mpd",
+                "stream", "vod", "hls", "dash", "media", "cdn", "video", "audio",
+            })
+
+            # --- mutation observer ---
+            enable_mutation_observer: bool = True
+            mutation_observer_ms: int = 500
+            max_mutation_url_events: int = 300
+
+            # --- response header mining ---
+            enable_response_header_mining: bool = True
+            max_header_url_events: int = 180
+
+            # --- JSON.parse hook ---
+            enable_json_parse_sniff: bool = True
+            json_parse_max_bytes: int = 48 * 1024
+            json_parse_keywords: Set[str] = field(default_factory=lambda: {
+                "manifest", "playlist", "m3u8", "mpd", "stream",
+                "video", "audio", "hls", "dash", "api", "graphql", "next",
+                "media", "cdn",
+            })
+            json_parse_store_parsed: bool = False
+
+            # --- hydration globals ---
+            enable_hydration_sniff: bool = True
+            hydration_keys: Set[str] = field(default_factory=lambda: {
+                "__NEXT_DATA__",
+                "__NUXT__",
+                "__REMIX_CONTEXT__",
+                "__INITIAL_STATE__",
+                "__ApolloState__",
+                "__APOLLO_STATE__",
+                "__PRELOADED_STATE__",
+            })
+            hydration_max_bytes: int = 128 * 1024
+
+            # --- WebSocket limits ---
+            max_ws_frames: int = 35
+            max_ws_frame_bytes: int = 3072
+
+            # --- Request body limits ---
+            json_body_max_kb: int = 128
+            json_body_url_hints: Set[str] = field(default_factory=lambda: {
+                "player", "api", "manifest", "playlist", "video", "audio", "graphql"
+            })
+
+            # --- Storage limits ---
+            storage_value_max_bytes: int = 4096
+            storage_key_limit: int = 60
+
+            # --- Perf sniff ---
+            perf_url_regex: str = r"\.(m3u8|mpd|ts|m4s|mp4|webm|mp3|aac|wav|m4a)(\?|$)"
+
+            # --- Media events ---
+            auto_play_media: bool = False
+            media_event_timeout_ms: int = 650
+
+            # --- Console sniff ---
+            console_keywords: Set[str] = field(default_factory=lambda: {
+                "manifest", "m3u8", "mpd", "hls", "dash", "stream",
+                "graphql", "/api/", "media", "video", "audio",
+            })
+
+            # Navigation wait mode.
+            goto_wait_until: str = "domcontentloaded"
+
+            # --- Worker / SharedWorker / Worklet ---
+            enable_worker_sniff: bool = True
+            max_worker_events: int = 200
+            worker_message_max_bytes: int = 2048
+
+            # --- Service Worker ---
+            enable_service_worker_sniff: bool = True
+            max_sw_events: int = 100
+
+            # --- CSS URL mining ---
+            enable_css_url_sniff: bool = True
+            max_css_url_events: int = 250
+            css_url_max_len: int = 2048
+
+            # --- WebRTC ICE visibility ---
+            enable_webrtc_sniff: bool = True
+            max_webrtc_events: int = 80
+
+            # --- fast/runtime budgets ---
+            watchdog_multiplier: float = 1.12
+            max_nav_timeout_s: float = 10.0
+            page_content_timeout_s: float = 1.2
+            page_close_timeout_s: float = 0.8
+            eval_timeout_s: float = 1.2
+            collector_bundle_timeout_s: float = 2.4
+            settle_ratio: float = 0.12
+            max_settle_ms: int = 650
+
+            # --- result caps ---
+            max_total_hits: int = 1200
+            max_promoted_links: int = 800
+            max_html_regex_urls: int = 350
+            max_dom_links: int = 1800
+
+            # --- direct asset fast path ---
+            direct_asset_fast_path: bool = True
+
+            # --- profile gating ---
+            skip_heavy_on_direct_asset: bool = True
+            skip_heavy_on_image_proxy: bool = True
+            skip_heavy_on_large_dom: bool = True
+            large_dom_threshold: int = 3500
+            log_profile_decisions: bool = True
+
+        # ------------------------------------------------------------------
+        # Init / logging
+        # ------------------------------------------------------------------
+
+        def __init__(self, config: Optional["RuntimeSniffer.Config"] = None, logger=None):
+            self.cfg = config or self.Config()
+            self.logger = logger
+
+            try:
+                if self.logger is None and "DEBUG_LOGGER" in globals():
+                    self.logger = globals().get("DEBUG_LOGGER")
+            except Exception:
+                self.logger = None
+
+            self._log("RuntimeSniffer Initialized [fast runtime replacement]", None)
+
+            try:
+                self.cfg.json_body_url_hints.update({
+                    "api-v2.soundcloud.com/tracks",
+                    "api-v2.soundcloud.com/media",
+                    "client_id=",
+                })
+            except Exception:
+                pass
+
+        def _log(self, msg: str, log_list: Optional[List[str]]) -> None:
+            full = f"[RuntimeSniffer] {msg}"
+            try:
+                if log_list is not None:
+                    log_list.append(full)
+                if self.logger is not None and hasattr(self.logger, "log_message"):
+                    self.logger.log_message(full)
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------------
+        # URL helpers
+        # ------------------------------------------------------------------
+
+        def _canonicalize_url(self, u: str) -> str:
+            try:
+                raw = str(u or "").strip()
+                if not raw:
+                    return ""
+
+                raw = raw.replace("\\u0026", "&")
+                raw = raw.replace("\\u003a", ":").replace("\\u002f", "/")
+                raw = raw.replace("\\/", "/")
+
+                raw, _frag = urldefrag(raw)
+                pu = urlparse(raw)
+
+                if raw.startswith("//"):
+                    raw = "https:" + raw
+                    pu = urlparse(raw)
+
+                if pu.scheme not in {"http", "https", "ws", "wss", "stun", "turn", "turns"}:
+                    return raw
+
+                host = (pu.netloc or "").lower()
+                path = pu.path or "/"
+
+                drop_params = {
+                    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+                    "fbclid", "gclid", "yclid", "mc_cid", "mc_eid",
+                }
+                qs = parse_qsl(pu.query, keep_blank_values=False)
+                qs = [(k, v) for k, v in qs if k.lower() not in drop_params]
+                query = urlencode(qs, doseq=True)
+
+                return urlunparse((pu.scheme.lower(), host, path, "", query, ""))
+            except Exception:
+                return str(u or "").strip()
+
+        def _abs_url(self, base: str, u: str) -> str:
+            try:
+                return self._canonicalize_url(urljoin(base, str(u or "").strip()))
+            except Exception:
+                return self._canonicalize_url(u)
+
+        def _extract_urls_from_text(self, s: str) -> List[str]:
+            if not s:
+                return []
+            rx = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>]+", re.IGNORECASE)
+            out: List[str] = []
+            seen: Set[str] = set()
+            for m in rx.findall(str(s)):
+                u = self._canonicalize_url(m)
+                if u and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+            return out
+
+        def _is_junk_url(self, u: str) -> bool:
+            if not u:
+                return True
+            low = str(u).strip().lower()
+            return low.startswith((
+                "blob:", "data:", "javascript:", "mailto:", "tel:", "about:",
+            ))
+
+        def _path_lower(self, u: str) -> str:
+            try:
+                return urlparse(str(u or "")).path.lower()
+            except Exception:
+                return str(u or "").lower()
+
+        def _is_direct_asset_url(self, u: str) -> bool:
+            p = self._path_lower(u)
+            return p.endswith((
+                ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
+                ".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi",
+                ".m3u8", ".mpd", ".ts", ".m4s",
+                ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav",
+                ".pdf", ".json", ".xml", ".txt",
+            ))
+
+        def _asset_kind(self, u: str) -> str:
+            p = self._path_lower(u)
+            if p.endswith((".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi", ".m3u8", ".mpd", ".ts", ".m4s")):
+                return "video"
+            if p.endswith((".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".wav")):
+                return "audio"
+            if p.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
+                return "image"
+            if p.endswith((".pdf", ".json", ".xml", ".txt")):
+                return "document"
+            return "asset"
+
+        def _profile_url(self, u: str) -> Dict[str, Any]:
+            low = str(u or "").lower()
+            try:
+                pu = urlparse(u)
+                host = (pu.netloc or "").lower()
+                path = (pu.path or "").lower()
+                query = (pu.query or "").lower()
+            except Exception:
+                host, path, query = "", low, ""
+
+            direct_asset = self._is_direct_asset_url(u)
+
+            image_proxy = (
+                    host.endswith("wp.com")
+                    or "twimg.com" in host
+                    or "pbs.twimg.com" in host
+                    or "googleusercontent.com" in host
+                    or "blogger.googleusercontent.com" in host
+            )
+
+            search_like = (
+                    "/search" in path
+                    or "/results" in path
+                    or "/find" in path
+                    or "q=" in query
+                    or "query=" in query
+                    or "search=" in query
+            )
+
+            content_like = any(x in path for x in (
+                "/watch", "/video", "/videos", "/post", "/view", "/gallery",
+                "/album", "/details", "/media", "/embed", "/player",
+                "/a/", "/v/", "/g/",
+            ))
+
+            manifest_like = any(x in low for x in (
+                ".m3u8", ".mpd", "manifest", "playlist", "videoplayback",
+                "master.m3u8", "index.m3u8",
+            ))
+
+            if direct_asset:
+                return {
+                    "kind": "direct_asset",
+                    "direct_asset": True,
+                    "allow_goto": False,
+                    "allow_heavy": False,
+                    "allow_media": False,
+                    "allow_storage": False,
+                    "allow_hydration": False,
+                    "allow_workers": False,
+                    "allow_webrtc": False,
+                    "allow_content": False,
+                }
+
+            if image_proxy:
+                return {
+                    "kind": "image_proxy",
+                    "direct_asset": False,
+                    "allow_goto": True,
+                    "allow_heavy": False,
+                    "allow_media": False,
+                    "allow_storage": False,
+                    "allow_hydration": False,
+                    "allow_workers": False,
+                    "allow_webrtc": False,
+                    "allow_content": True,
+                }
+
+            if search_like:
+                return {
+                    "kind": "search_like",
+                    "direct_asset": False,
+                    "allow_goto": True,
+                    "allow_heavy": False,
+                    "allow_media": False,
+                    "allow_storage": False,
+                    "allow_hydration": True,
+                    "allow_workers": False,
+                    "allow_webrtc": False,
+                    "allow_content": True,
+                }
+
+            if content_like or manifest_like:
+                return {
+                    "kind": "content_candidate",
+                    "direct_asset": False,
+                    "allow_goto": True,
+                    "allow_heavy": True,
+                    "allow_media": True,
+                    "allow_storage": True,
+                    "allow_hydration": True,
+                    "allow_workers": True,
+                    "allow_webrtc": True,
+                    "allow_content": True,
+                }
+
+            return {
+                "kind": "default",
+                "direct_asset": False,
+                "allow_goto": True,
+                "allow_heavy": False,
+                "allow_media": False,
+                "allow_storage": True,
+                "allow_hydration": True,
+                "allow_workers": False,
+                "allow_webrtc": False,
+                "allow_content": True,
+            }
+
+        # ------------------------------------------------------------------
+        # Generic async helpers
+        # ------------------------------------------------------------------
+
+        async def _safe_wait(self, coro, *, timeout_s: float, label: str, log: Optional[List[str]], default=None):
+            try:
+                return await asyncio.wait_for(coro, timeout=max(0.05, float(timeout_s)))
+            except asyncio.TimeoutError:
+                self._log(f"{label} timed out after {timeout_s:.2f}s", log)
+                return default
+            except Exception as e:
+                self._log(f"{label} failed: {e}", log)
+                return default
+
+        async def _safe_eval(self, page, script: str, arg: Any = None, *, label: str, log: Optional[List[str]],
+                             default=None):
+            try:
+                if arg is None:
+                    return await asyncio.wait_for(page.evaluate(script), timeout=self.cfg.eval_timeout_s)
+                return await asyncio.wait_for(page.evaluate(script, arg), timeout=self.cfg.eval_timeout_s)
+            except Exception as e:
+                self._log(f"{label} failed: {e}", log)
+                return default
+
+        async def _safe_close_page(self, page, log: Optional[List[str]]) -> None:
+            if page is None:
+                return
+            try:
+                await asyncio.wait_for(page.close(), timeout=float(self.cfg.page_close_timeout_s))
+            except Exception:
+                pass
+
+        def _remaining(self, started: float, hard_cap: float) -> float:
+            return started + hard_cap - time.monotonic()
+
+        # ------------------------------------------------------------------
+        # Hit helpers
+        # ------------------------------------------------------------------
+
+        def _push_link_hit(
+                self,
+                out: List[Dict[str, Any]],
+                seen: Set[str],
+                *,
+                url: Any,
+                source_page: str,
+                tag: str,
+                meta: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            try:
+                u = self._canonicalize_url(str(url or "").strip())
+            except Exception:
+                u = str(url or "").strip()
+
+            if not u or self._is_junk_url(u):
+                return
+
+            key = f"{tag}|{u}"
+            if key in seen:
+                return
+
+            seen.add(key)
+            out.append({
+                "url": u,
+                "tag": tag,
+                "source_page": source_page,
+                "json": meta or {},
+            })
+
+        def _deep_collect_urls(self, obj: Any, *, limit: int = 1000) -> List[str]:
+            out: List[str] = []
+            seen: Set[str] = set()
+            stack: List[Any] = [obj]
+
+            while stack and len(out) < limit:
+                cur = stack.pop()
+
+                if cur is None:
+                    continue
+
+                if isinstance(cur, str):
+                    for u in self._extract_urls_from_text(cur):
+                        cu = self._canonicalize_url(u)
+                        if cu and cu not in seen:
+                            seen.add(cu)
+                            out.append(cu)
+                    continue
+
+                if isinstance(cur, dict):
+                    stack.extend(cur.values())
+                    continue
+
+                if isinstance(cur, (list, tuple, set)):
+                    stack.extend(list(cur))
+                    continue
+
+            return out
+
+        def _promote_runtime_hits_to_links(
+                self,
+                runtime_hits: List[Dict[str, Any]],
+                canonical_page_url: str,
+                out: List[Dict[str, Any]],
+                seen: Set[str],
+        ) -> None:
+            for hit in runtime_hits:
+                if not isinstance(hit, dict):
+                    continue
+
+                top_url = str(hit.get("url") or "").strip()
+                if top_url and top_url != canonical_page_url:
+                    self._push_link_hit(
+                        out,
+                        seen,
+                        url=top_url,
+                        source_page=canonical_page_url,
+                        tag=str(hit.get("tag") or "runtime"),
+                        meta={"reason": "top-level-runtime-hit"},
+                    )
+
+                payload = hit.get("json")
+                for u in self._deep_collect_urls(payload, limit=200):
+                    self._push_link_hit(
+                        out,
+                        seen,
+                        url=u,
+                        source_page=canonical_page_url,
+                        tag="runtime_nested",
+                        meta={"reason": "nested-runtime-url"},
+                    )
+
+                if isinstance(payload, dict):
+                    nested_u = str(payload.get("url") or "").strip()
+                    if nested_u and nested_u != top_url:
+                        self._push_link_hit(
+                            out,
+                            seen,
+                            url=nested_u,
+                            source_page=canonical_page_url,
+                            tag=str(payload.get("header") or "runtime_header"),
+                            meta={"reason": "promoted-nested-url"},
+                        )
+
+        # ------------------------------------------------------------------
+        # Request body sniff
+        # ------------------------------------------------------------------
+
+        def _should_sniff_request_json(
+                self,
+                url_lower: str,
+                ctype: str,
+                content_length: Optional[int],
+        ) -> bool:
+            ct = (ctype or "").lower()
+            if "json" not in ct:
+                return False
+            if not any(h in url_lower for h in self.cfg.json_body_url_hints):
+                return False
+            if content_length is None:
+                return False
+            return content_length <= int(self.cfg.json_body_max_kb) * 1024
+
+        async def _attach_request_body_sniffer(
+                self,
+                page,
+                runtime_hits: List[Dict[str, Any]],
+                canonical_page_url: str,
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_request_body_sniff:
+                return
+
+            async def route_handler(route, request):
+                try:
+                    url = request.url
+                    url_lower = str(url or "").lower()
+                    headers = request.headers or {}
+                    ctype = headers.get("content-type", "")
+                    cl = headers.get("content-length", "")
+
+                    content_length: Optional[int] = None
+                    if cl and str(cl).isdigit():
+                        content_length = int(cl)
+
+                    if self._should_sniff_request_json(url_lower, ctype, content_length):
+                        body = None
+                        try:
+                            pd = getattr(request, "post_data", None)
+                            body = pd() if callable(pd) else pd
+                            if asyncio.iscoroutine(body):
+                                body = await body
+                        except Exception:
+                            body = None
+
+                        if body:
+                            if isinstance(body, bytes):
+                                body = body.decode("utf-8", "ignore")
+                            try:
+                                parsed = json.loads(body)
+                            except Exception:
+                                parsed = None
+
+                            runtime_hits.append({
+                                "url": url,
+                                "tag": "request-body",
+                                "json": {
+                                    "request_body": parsed if parsed is not None else str(body)[:2048],
+                                },
+                                "source_page": canonical_page_url,
+                            })
+                except Exception as e:
+                    self._log(f"route_handler error: {e}", log)
+
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+            try:
+                await page.route("**/*", route_handler)
+                self._log("Attached request body sniffer.", log)
+            except Exception as e:
+                self._log(f"Failed to attach request body sniffer: {e}", log)
+
+        # ------------------------------------------------------------------
+        # Response/network/header mining
+        # ------------------------------------------------------------------
+
+        def _attach_response_header_miner(
+                self,
+                page,
+                runtime_hits: List[Dict[str, Any]],
+                canonical_page_url: str,
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_response_header_mining:
+                return
+
+            seen: Set[str] = set()
+            max_events = int(self.cfg.max_header_url_events)
+
+            def on_response(resp):
+                try:
+                    if len(seen) >= max_events:
+                        return
+
+                    url = getattr(resp, "url", "") or ""
+                    headers = resp.headers or {}
+
+                    # Keep direct media-ish responses too.
+                    ct = str(headers.get("content-type") or "").lower()
+                    if (
+                            ct.startswith(("video/", "audio/", "image/"))
+                            or "mpegurl" in ct
+                            or "dash+xml" in ct
+                            or self._is_direct_asset_url(url)
+                    ):
+                        key = f"response|{url}"
+                        if key not in seen:
+                            seen.add(key)
+                            runtime_hits.append({
+                                "url": url,
+                                "tag": "network-response",
+                                "json": {"content_type": ct, "status": getattr(resp, "status", None)},
+                                "source_page": canonical_page_url,
+                            })
+
+                    # Mine Location/Link headers.
+                    for hk in ("location", "link"):
+                        hv = headers.get(hk)
+                        if not hv:
+                            continue
+
+                        for u in self._extract_urls_from_text(hv):
+                            key = f"{hk}|{u}"
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            runtime_hits.append({
+                                "url": u,
+                                "tag": f"header:{hk}",
+                                "json": {"header": hk, "url": u, "response_url": url},
+                                "source_page": canonical_page_url,
+                            })
+                except Exception:
+                    pass
+
+            try:
+                page.on("response", on_response)
+                self._log("Attached response/header miner.", log)
+            except Exception as e:
+                self._log(f"Failed to attach response/header miner: {e}", log)
+
+        def _attach_console_sniffer(
+                self,
+                page,
+                runtime_hits: List[Dict[str, Any]],
+                canonical_page_url: str,
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_console_sniff:
+                return
+
+            def on_console(msg):
+                try:
+                    text = msg.text()
+                    low = text.lower()
+                    if any(kw in low for kw in self.cfg.console_keywords):
+                        runtime_hits.append({
+                            "url": canonical_page_url,
+                            "tag": "console",
+                            "json": {"console": text[:2048]},
+                            "source_page": canonical_page_url,
+                        })
+                except Exception:
+                    pass
+
+            try:
+                page.on("console", on_console)
+            except Exception:
+                pass
+
+        def _attach_websocket_sniffer(
+                self,
+                page,
+                runtime_hits: List[Dict[str, Any]],
+                canonical_page_url: str,
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_websocket_sniff:
+                return
+
+            max_frames = int(self.cfg.max_ws_frames)
+            max_bytes = int(self.cfg.max_ws_frame_bytes)
+
+            def on_ws(ws):
+                url = getattr(ws, "url", "?")
+                frames_seen = 0
+
+                async def handle_frame(data):
+                    nonlocal frames_seen
+                    if frames_seen >= max_frames:
+                        return
+                    frames_seen += 1
+
+                    try:
+                        if isinstance(data, bytes):
+                            if len(data) > max_bytes:
+                                return
+                            data = data.decode("utf-8", "ignore")
+
+                        text = str(data)
+                        low = text.lower()
+
+                        if (
+                                "http://" in low
+                                or "https://" in low
+                                or "ws://" in low
+                                or "wss://" in low
+                                or ".m3u8" in low
+                                or ".mpd" in low
+                        ):
+                            runtime_hits.append({
+                                "url": url,
+                                "tag": "websocket-frame",
+                                "json": {
+                                    "ws_frame": text[:max_bytes],
+                                    "urls": self._extract_urls_from_text(text)[:40],
+                                },
+                                "source_page": canonical_page_url,
+                            })
+                    except Exception:
+                        pass
+
+                try:
+                    ws.on("framereceived", lambda msg: asyncio.create_task(handle_frame(msg)))
+                    runtime_hits.append({
+                        "url": url,
+                        "tag": "websocket",
+                        "json": {"websocket_url": url},
+                        "source_page": canonical_page_url,
+                    })
+                except Exception:
+                    pass
+
+            try:
+                page.on("websocket", on_ws)
+            except Exception:
+                pass
+
+        # ------------------------------------------------------------------
+        # Init scripts
+        # ------------------------------------------------------------------
+
+        async def _inject_runtime_url_hooks(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_runtime_url_hooks:
+                return
+
+            max_events = int(self.cfg.max_runtime_url_events)
+            kws = sorted({str(k).lower() for k in (self.cfg.runtime_url_keywords or set()) if str(k).strip()})
+            kws_js = json.dumps(kws)
+
+            script = f"""
+            (() => {{
+              try {{
+                const STORE = "__runtimeUrlEvents";
+                const MAX = {max_events};
+                const KWS = {kws_js};
+                window[STORE] = window[STORE] || [];
+                const seen = new Set();
+
+                function want(u) {{
+                  try {{
+                    if (!KWS || !KWS.length) return true;
+                    const low = String(u || "").toLowerCase();
+                    for (const k of KWS) if (low.includes(k)) return true;
+                    return false;
+                  }} catch {{ return true; }}
+                }}
+
+                function abs(u) {{
+                  try {{ return new URL(String(u), location.href).href; }}
+                  catch {{ return String(u || ""); }}
+                }}
+
+                function add(u, kind) {{
+                  try {{
+                    if (!u) return;
+                    u = abs(u);
+                    const low = u.toLowerCase();
+                    if (low.startsWith("blob:") || low.startsWith("data:") || low.startsWith("javascript:")) return;
+                    if (!want(u)) return;
+                    const key = kind + "|" + u;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    window[STORE].push({{ts: Date.now(), kind, url: u}});
+                    if (window[STORE].length > MAX) window[STORE].shift();
+                  }} catch {{}}
+                }}
+
+                if (!window.__runtimeSnifferHooksInstalled) {{
+                  window.__runtimeSnifferHooksInstalled = true;
+
+                  try {{
+                    const oldFetch = window.fetch;
+                    if (typeof oldFetch === "function") {{
+                      window.fetch = function(input, init) {{
+                        try {{
+                          const u = (typeof input === "string") ? input : (input && input.url);
+                          add(u, "fetch");
+                        }} catch {{}}
+                        return oldFetch.apply(this, arguments);
+                      }};
+                    }}
+                  }} catch {{}}
+
+                  try {{
+                    const oldOpen = XMLHttpRequest.prototype.open;
+                    XMLHttpRequest.prototype.open = function(method, url) {{
+                      try {{ add(url, "xhr"); }} catch {{}}
+                      return oldOpen.apply(this, arguments);
+                    }};
+                  }} catch {{}}
+
+                  try {{
+                    const OrigWS = window.WebSocket;
+                    if (typeof OrigWS === "function") {{
+                      window.WebSocket = function(url, protocols) {{
+                        try {{ add(url, "websocket"); }} catch {{}}
+                        return new OrigWS(url, protocols);
+                      }};
+                      window.WebSocket.prototype = OrigWS.prototype;
+                    }}
+                  }} catch {{}}
+
+                  try {{
+                    const OrigES = window.EventSource;
+                    if (typeof OrigES === "function") {{
+                      window.EventSource = function(url, cfg) {{
+                        try {{ add(url, "eventsource"); }} catch {{}}
+                        return new OrigES(url, cfg);
+                      }};
+                      window.EventSource.prototype = OrigES.prototype;
+                    }}
+                  }} catch {{}}
+
+                  try {{
+                    const oldSB = navigator.sendBeacon;
+                    if (typeof oldSB === "function") {{
+                      navigator.sendBeacon = function(url, data) {{
+                        try {{ add(url, "beacon"); }} catch {{}}
+                        return oldSB.apply(this, arguments);
+                      }};
+                    }}
+                  }} catch {{}}
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected runtime URL hooks.", log)
+            except Exception as e:
+                self._log(f"Failed to inject runtime URL hooks: {e}", log)
+
+        async def _inject_mutation_observer(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_mutation_observer:
+                return
+
+            max_events = int(self.cfg.max_mutation_url_events)
+
+            script = f"""
+            (() => {{
+              try {{
+                const STORE = "__mutationUrlEvents";
+                const MAX = {max_events};
+                window[STORE] = window[STORE] || [];
+                const seen = new Set();
+
+                function abs(u) {{
+                  try {{ return new URL(String(u), location.href).href; }}
+                  catch {{ return String(u || ""); }}
+                }}
+
+                function add(u, kind) {{
+                  try {{
+                    if (!u) return;
+                    u = abs(u);
+                    const low = u.toLowerCase();
+                    if (low.startsWith("blob:") || low.startsWith("data:") || low.startsWith("javascript:")) return;
+                    const key = kind + "|" + u;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    window[STORE].push({{ts: Date.now(), kind, url: u}});
+                    if (window[STORE].length > MAX) window[STORE].shift();
+                  }} catch {{}}
+                }}
+
+                function scanEl(el) {{
+                  try {{
+                    if (!el || !el.getAttribute) return;
+                    const attrs = ["href", "src", "poster", "data-src", "data-url", "data-href", "data-video", "data-audio", "data-stream"];
+                    for (const a of attrs) {{
+                      const v = el.getAttribute(a);
+                      if (v) add(v, "attr:" + a);
+                    }}
+                  }} catch {{}}
+                }}
+
+                if (!window.__runtimeSnifferMutationInstalled) {{
+                  window.__runtimeSnifferMutationInstalled = true;
+                  const obs = new MutationObserver((muts) => {{
+                    try {{
+                      for (const m of muts) {{
+                        for (const node of (m.addedNodes || [])) {{
+                          if (!node || node.nodeType !== 1) continue;
+                          scanEl(node);
+                          const kids = node.querySelectorAll ? node.querySelectorAll("[href],[src],[data-src],[data-url],[data-href]") : [];
+                          for (const k of Array.from(kids).slice(0, 150)) scanEl(k);
+                        }}
+                      }}
+                    }} catch {{}}
+                  }});
+                  obs.observe(document.documentElement || document, {{childList: true, subtree: true}});
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected MutationObserver URL collector.", log)
+            except Exception as e:
+                self._log(f"Failed to inject MutationObserver collector: {e}", log)
+
+        async def _inject_json_parse_hook(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_json_parse_sniff:
+                return
+
+            max_bytes = int(self.cfg.json_parse_max_bytes)
+            kws = "|".join(re.escape(str(k)) for k in sorted(self.cfg.json_parse_keywords or [])) or "manifest"
+            kws_js = json.dumps(kws)
+
+            script = f"""
+            (() => {{
+              try {{
+                const MAX_LEN = {max_bytes};
+                const KW_RX = new RegExp({kws_js}, "i");
+                window.__jsonParseSnifferEvents = window.__jsonParseSnifferEvents || [];
+
+                if (!window.__runtimeSnifferJsonParseInstalled) {{
+                  window.__runtimeSnifferJsonParseInstalled = true;
+                  const origParse = JSON.parse;
+
+                  JSON.parse = function(str, reviver) {{
+                    const val = origParse.call(this, str, reviver);
+                    try {{
+                      if (typeof str === "string" && str.length <= MAX_LEN && KW_RX.test(str)) {{
+                        window.__jsonParseSnifferEvents.push({{
+                          ts: Date.now(),
+                          preview: str.slice(0, MAX_LEN),
+                          length: str.length
+                        }});
+                        if (window.__jsonParseSnifferEvents.length > 150) {{
+                          window.__jsonParseSnifferEvents.shift();
+                        }}
+                      }}
+                    }} catch {{}}
+                    return val;
+                  }};
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected JSON.parse hook.", log)
+            except Exception as e:
+                self._log(f"Failed to inject JSON.parse hook: {e}", log)
+
+            # ============================== JSON & Deep Payload Hook ============================== #
+
+        async def _inject_json_parse_hook(self, context,
+                                          log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> None:
+            """
+            Advanced JSON & Execution Flow Hook.
+            Hooks JSON.parse, Fetch, XMLHttpRequest, and Location to capture hidden links in API responses and navigation.
+            """
+            if not self.cfg.enable_json_parse_sniff:
+                return
+
+            max_bytes = int(self.cfg.json_parse_max_bytes)
+            kws = "|".join(re.escape(str(k)) for k in
+                           sorted(self.cfg.json_parse_keywords or [])) or "manifest|url|href|src|redirect|action"
+            kws_js = json.dumps(kws)
+
+            # Shared state to prevent multiple injections
+            installed_scripts = self.asyncio.Lock() if hasattr(self, "asyncio") else threading.Lock()
+
+            script = f"""
+             (() => {{
+               try {{
+                 const MAX_LEN = {max_bytes};
+                 const KW_RX = new RegExp({kws_js}, "i");
+
+                 // Central Pool for all discovered links to avoid fragmentation
+                 if (!window.__sniffer_urls_pool) window.__sniffer_urls_pool = new Set();
+
+                 window.__runtimeSnifferJsonParseInstalled = true;
+
+                 // 1. Hook JSON.parse (Deep Scan Payloads)
+                 const origParse = JSON.parse;
+                 JSON.parse = function(str, reviver) {{
+                   const val = origParse.call(this, str, reviver);
+                   try {{
+                     if (typeof str === "string" && str.length <= MAX_LEN && KW_RX.test(str)) {{
+                       // Enrich event with context
+                       const event = {{
+                         ts: Date.now(),
+                         preview: str.slice(0, MAX_LEN),
+                         length: str.length,
+                         type: "json_payload"
+                       }};
+
+                       // Add to global pool
+                       if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(str)) {{
+                         window.__sniffer_urls_pool.add(str);
+                         (window.__jsonParseSnifferEvents || window.__jsonParseSnifferEvents.push).call(
+                           window, {{ts: Date.now(), ...event}}
+                         );
+                       }}
+                     }}
+                   }} catch (e) {{}}
+                   return val;
+                 }};
+
+                 // 2. Hook Fetch (Dynamic API Links)
+                 if (typeof fetch !== "undefined" && !window.__runtimeSnifferFetchHooked) {{
+                   window.__runtimeSnifferFetchHooked = true;
+                   const origFetch = fetch;
+                   fetch = function(...args) {{
+                     try {{
+                       const url = args[0];
+                       // Check if URL is a string
+                       if (typeof url === "string" && (KW_RX.test(url) || url.includes(".") || url.includes("/") && !url.startsWith("//"))) {{
+                         const event = {{
+                           ts: Date.now(),
+                           url: url,
+                           type: "fetch_request"
+                         }};
+                         if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                       }}
+                     }} catch (e) {{}}
+                     return origFetch.apply(this, args);
+                   }};
+                 }}
+
+                 // 3. Hook XMLHttpRequest (Legacy Polyfill)
+                 if (typeof XMLHttpRequest !== "undefined" && !window.__runtimeSnifferXHRHooked) {{
+                   window.__runtimeSnifferXHRHooked = true;
+                   const origOpen = XMLHttpRequest.prototype.open;
+                   XMLHttpRequest.prototype.open = function(method, url) {{
+                     try {{
+                       if (typeof url === "string" && (KW_RX.test(url) || url.includes(".") || url.includes("/") && !url.startsWith("//"))) {{
+                          const event = {{
+                           ts: Date.now(),
+                           url: url,
+                           type: "xhr_request"
+                         }};
+                         if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                       }}
+                     }} catch (e) {{}}
+                     return origOpen.apply(this, arguments);
+                   }};
+                 }}
+
+                 // 4. Hook window.location (Redirects)
+                 const origLoc = window.location;
+                 if (origLoc.href) {{
+                   const oldHref = origLoc.href;
+                   window.location = Object.assign(Object.create(origLoc), {{
+                     get href() {{ return oldHref; }},
+                     set href(val) {{
+                       try {{
+                         const event = {{
+                           ts: Date.now(),
+                           url: val,
+                           type: "location_redirect"
+                         }};
+                         if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(val)) window.__sniffer_urls_pool.add(val);
+                       }} catch (e) {{}}
+                     }}
+                   }});
+                 }}
+
+                 // 5. Hook Window Properties (Common Config Objects)
+                 const commonProps = ["config", "api", "settings", "params", "meta", "global"];
+                 for (const name of commonProps) {{
+                   if (window[name] && typeof window[name] === "object") {{
+                     const objStr = JSON.stringify(window[name], null, 2);
+                     try {{
+                       if (objStr && KW_RX.test(objStr) && !window.__sniffer_urls_pool.has(JSON.stringify(window[name]))) {{
+                         window.__sniffer_urls_pool.add(JSON.stringify(window[name]));
+                       }}
+                     }} catch (e) {{}}
+                   }}
+                 }}
+               }} catch (e) {{}}
+             }})();
+             """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected JSON & Navigation Hooks.", log)
+                # Sync pool immediately to Python side
+                if log and "sync" in log:
+                    # Placeholder for sync mechanism if needed
+                    pass
+            except Exception as e:
+                self._log(f"Failed to inject JSON & Navigation Hooks: {e}", log)
+
+        async def _inject_worker_sniffer(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_worker_sniff:
+                return
+
+            max_events = int(self.cfg.max_worker_events)
+            max_msg = int(self.cfg.worker_message_max_bytes)
+
+            script = f"""
+            (() => {{
+              try {{
+                const STORE = "__workerEvents";
+                const MAX = {max_events};
+                const MAX_MSG = {max_msg};
+                window[STORE] = window[STORE] || [];
+                const seen = new Set();
+
+                function abs(u) {{
+                  try {{ return new URL(String(u), location.href).href; }}
+                  catch {{ return String(u || ""); }}
+                }}
+
+                function push(kind, payload) {{
+                  try {{
+                    const key = kind + "|" + JSON.stringify(payload || {{}});
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    window[STORE].push(Object.assign({{ts: Date.now(), kind}}, payload || {{}}));
+                    if (window[STORE].length > MAX) window[STORE].shift();
+                  }} catch {{}}
+                }}
+
+                function extractUrls(s) {{
+                  try {{
+                    s = String(s || "");
+                    if (!s || s.length > MAX_MSG) return [];
+                    return s.match(/\\b(?:https?|wss?):\\/\\/[^\\s"'<>]+/ig) || [];
+                  }} catch {{ return []; }}
+                }}
+
+                if (!window.__runtimeSnifferWorkerInstalled) {{
+                  window.__runtimeSnifferWorkerInstalled = true;
+
+                  try {{
+                    const OrigWorker = window.Worker;
+                    if (typeof OrigWorker === "function") {{
+                      window.Worker = function(url, opts) {{
+                        push("worker:new", {{url: abs(url), hasOptions: !!opts}});
+                        const w = new OrigWorker(url, opts);
+                        try {{
+                          const origPM = w.postMessage;
+                          if (typeof origPM === "function") {{
+                            w.postMessage = function(msg) {{
+                              try {{
+                                if (typeof msg === "string") {{
+                                  const urls = extractUrls(msg);
+                                  if (urls.length) push("worker:postMessage", {{urls, preview: msg.slice(0, 512)}});
+                                }}
+                              }} catch {{}}
+                              return origPM.apply(this, arguments);
+                            }};
+                          }}
+                        }} catch {{}}
+                        return w;
+                      }};
+                      window.Worker.prototype = OrigWorker.prototype;
+                    }}
+                  }} catch {{}}
+
+                  try {{
+                    const OrigShared = window.SharedWorker;
+                    if (typeof OrigShared === "function") {{
+                      window.SharedWorker = function(url, nameOrOpts) {{
+                        push("sharedworker:new", {{url: abs(url)}});
+                        return new OrigShared(url, nameOrOpts);
+                      }};
+                      window.SharedWorker.prototype = OrigShared.prototype;
+                    }}
+                  }} catch {{}}
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected Worker/SharedWorker hooks.", log)
+            except Exception as e:
+                self._log(f"Failed to inject worker hooks: {e}", log)
+
+        # ============================== MediaSource & Lifecycle Hook ============================== #
+        async def _inject_mediasource_script(self, context,
+                                             log: "NetworkSniffer.Optional[NetworkSniffer.List[str]]") -> None:
+            """
+            Advanced Media & Lifecycle Hook.
+            Hooks MediaSource, LazyLoad Observers, BroadcastChannels, and Workers to find hidden URLs in resource lifecycle.
+            """
+            if not self.cfg.enable_mediasource_sniff:
+                return
+
+            script = """
+            (() => {
+              try {
+                // Shared Pool for Media/Resource Links
+                if (!window.__sniffer_urls_pool) window.__sniffer_urls_pool = new Set();
+                window.__runtimeSnifferMSEInstalled = true;
+
+                function logMediaLink(url, meta = {}) {
+                  try {
+                    const event = {ts: Date.now(), url: String(url || ''), meta: meta, type: "media_resource"};
+                    if (window.__sniffer_urls_pool && !window.__sniffer_urls_pool.has(url)) window.__sniffer_urls_pool.add(url);
+                    if (window.__mediaEvents && !window.__mediaEvents.includes(url)) window.__mediaEvents.push(event);
+                  } catch (e) {}
+                }
+
+                // 1. URL.createObjectURL (Media & Blob Resources)
+                const origCreateObjectURL = URL.createObjectURL;
+                URL.createObjectURL = function(obj) {
+                  try {
+                    const url = origCreateObjectURL.call(this, obj);
+                    logMediaLink(url, {mediaSourceType: 'Blob'});
+                  } catch (e) {}
+                  return url;
+                };
+
+                // 2. MediaSource & AddSourceBuffer (Streaming)
+                if (typeof MediaSource !== 'undefined') {
+                  const origAddSB = MediaSource.prototype.addSourceBuffer;
+                  MediaSource.prototype.addSourceBuffer = function(mime) {
+                    logMediaLink(mime, {mediaSourceType: 'SourceBuffer'});
+                    return origAddSB.call(this, mime);
+                  };
+                }
+
+                // 3. HTMLMediaElement (Video/Audio Tags)
+                if (typeof HTMLMediaElement !== 'undefined') {
+                  const desc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'src');
+                  if (desc && desc.set) {
+                    const origSet = desc.set;
+                    Object.defineProperty(HTMLMediaElement.prototype, 'src', {
+                      set(value) {
+                        logMediaLink(value, {tagName: 'HTMLMediaElement'});
+                        return origSet.call(this, value);
+                      }
+                    });
+                  }
+                }
+
+                // 4. IntersectionObserver (Lazy Loaded Content)
+                if (typeof IntersectionObserver !== 'undefined' && !window.__runtimeSnifferObserverHooked) {
+                  window.__runtimeSnifferObserverHooked = true;
+                  // Note: Hooking this deeply modifies the observer, only do minimal for now
+                  // or rely on event listeners attached to the observer.
+                  // Advanced: Observe the 'observe' call or 'connect'
+                  // For performance, just watch for 'onintersect' on common image/iframe types via event delegation
+                  const origObserve = IntersectionObserver.prototype.observe;
+                  IntersectionObserver.prototype.observe = function(target) {
+                    // Check target for common data attributes or urls
+                    try {
+                      if (target.tagName === 'IMG' && target.src) {
+                        logMediaLink(target.src, {lazy: 'img'});
+                      } else if (target.tagName === 'IFRAME' && target.src) {
+                        logMediaLink(target.src, {lazy: 'iframe'});
+                      }
+                    } catch (e) {}
+                    return origObserve.call(this, target);
+                  };
+                }
+
+                // 5. BroadcastChannel (Cross-Tab Communication URLs)
+                if (typeof BroadcastChannel !== 'undefined' && !window.__runtimeSnifferBCHooked) {
+                  window.__runtimeSnifferBCHooked = true;
+                  const BCs = ['sniffer', 'network', 'session', 'share'];
+                  const origBroadcast = BroadcastChannel.prototype.send;
+                  BroadcastChannel.prototype.send = function(message) {
+                    try {
+                      // Check for url in message
+                      const msgStr = JSON.stringify(message);
+                      if (msgStr && /https?:\\/\\/|href|src|url/.test(msgStr)) {
+                         const m = msgStr.match(/https?:\\/\\/[^"'\\s<>]+/g);
+                         if (m) {
+                           for (const u of m) {
+                             logMediaLink(u, {type: 'broadcast_channel'});
+                           }
+                         }
+                      }
+                    } catch (e) {}
+                  };
+                  // Also hook Channel creation for scope
+                  const origNewBC = BroadcastChannel;
+                  BroadcastChannel = function(name) {
+                     const bc = origNewBC.call(this, name);
+                     logMediaLink(`channel:${name}`, {type: 'channel_scope'});
+                     return bc;
+                  };
+                }
+
+                // 6. WebWorkers (ServiceWorker Scope)
+                if (typeof Worker !== 'undefined' && !window.__runtimeSnifferWorkerHooked) {
+                  window.__runtimeSnifferWorkerHooked = true;
+                  const origNewWorker = Worker;
+                  Worker = function(scriptURL) {
+                    try {
+                      // Check URL string
+                      if (scriptURL && typeof scriptURL === 'string') {
+                         logMediaLink(scriptURL, {type: 'worker'});
+                      }
+                    } catch (e) {}
+                    return origNewWorker.call(this, scriptURL);
+                  };
+                  // Hook ServiceWorker Registration
+                  const origSw = navigator.serviceWorker;
+                  if (origSw && typeof origSw.register === 'function') {
+                    origSw.register = function(script, opt) {
+                       try {
+                         const url = opt && opt.scope ? opt.scope : script;
+                         if (url) logMediaLink(url, {type: 'serviceworker'});
+                       } catch (e) {}
+                       return origSw.register.call(this, script, opt);
+                    };
+                  }
+                }
+
+                // 7. PerformanceResourceTiming (Network Entry URLs)
+                if (typeof PerformanceResourceTiming !== 'undefined' && !window.__runtimeSnifferPerfHooked) {
+                  window.__runtimeSnifferPerfHooked = true;
+                  // Hook entriesByName for later access, mainly for timing
+                  // For links, we often need to hook the entry creation (hard in raw JS)
+                  // Fallback: Check performance.getEntriesByType('resource') on close (async)
+                  if (window.__runtimeSnifferPerfHooked === false) window.__runtimeSnifferPerfHooked = true;
+                }
+              } catch (e) {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected MediaSource & Lifecycle Hooks.", log)
+            except Exception as e:
+                self._log(f"Failed to inject MediaSource & Lifecycle Hooks: {e}", log)
+
+        async def _inject_css_url_sniffer(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_css_url_sniff:
+                return
+
+            max_events = int(self.cfg.max_css_url_events)
+            max_len = int(self.cfg.css_url_max_len)
+
+            script = f"""
+            (() => {{
+              try {{
+                const STORE = "__cssUrlEvents";
+                const MAX = {max_events};
+                const MAXLEN = {max_len};
+                window[STORE] = window[STORE] || [];
+                const seen = new Set();
+
+                function abs(u) {{
+                  try {{ return new URL(String(u), location.href).href; }}
+                  catch {{ return String(u || ""); }}
+                }}
+
+                function push(kind, url, extra) {{
+                  try {{
+                    if (!url) return;
+                    url = String(url);
+                    if (url.length > MAXLEN) return;
+                    const u = abs(url);
+                    const low = u.toLowerCase();
+                    if (low.startsWith("blob:") || low.startsWith("data:") || low.startsWith("javascript:")) return;
+                    const key = kind + "|" + u;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    window[STORE].push(Object.assign({{ts: Date.now(), kind, url: u}}, extra || {{}}));
+                    if (window[STORE].length > MAX) window[STORE].shift();
+                  }} catch {{}}
+                }}
+
+                function extractCssUrls(txt) {{
+                  try {{
+                    txt = String(txt || "");
+                    if (!txt) return [];
+                    if (txt.length > 20000) txt = txt.slice(0, 20000);
+                    const rx = /url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/ig;
+                    const urls = [];
+                    let m;
+                    while ((m = rx.exec(txt)) !== null) {{
+                      if (m[2]) urls.push(m[2]);
+                      if (urls.length > 50) break;
+                    }}
+                    return urls;
+                  }} catch {{ return []; }}
+                }}
+
+                function scanLinkHints() {{
+                  try {{
+                    const links = document.querySelectorAll ? document.querySelectorAll("link[rel][href]") : [];
+                    for (const el of links) {{
+                      const rel = (el.getAttribute("rel") || "").toLowerCase();
+                      if (!/(preconnect|prefetch|preload|dns-prefetch|modulepreload)/.test(rel)) continue;
+                      const href = el.getAttribute("href");
+                      if (href) push("linkhint:" + rel, href);
+                    }}
+                  }} catch {{}}
+                }}
+
+                if (document.readyState === "loading") {{
+                  document.addEventListener("DOMContentLoaded", scanLinkHints, {{once: true}});
+                }} else {{
+                  scanLinkHints();
+                }}
+
+                if (!window.__runtimeSnifferCSSInstalled) {{
+                  window.__runtimeSnifferCSSInstalled = true;
+
+                  try {{
+                    const origIns = CSSStyleSheet && CSSStyleSheet.prototype && CSSStyleSheet.prototype.insertRule;
+                    if (typeof origIns === "function") {{
+                      CSSStyleSheet.prototype.insertRule = function(rule, index) {{
+                        try {{
+                          for (const u of extractCssUrls(rule)) push("css:insertRule", u);
+                        }} catch {{}}
+                        return origIns.apply(this, arguments);
+                      }};
+                    }}
+                  }} catch {{}}
+
+                  try {{
+                    const origSP = CSSStyleDeclaration && CSSStyleDeclaration.prototype && CSSStyleDeclaration.prototype.setProperty;
+                    if (typeof origSP === "function") {{
+                      CSSStyleDeclaration.prototype.setProperty = function(name, value, priority) {{
+                        try {{
+                          for (const u of extractCssUrls(value)) push("css:setProperty", u, {{prop: String(name || "")}});
+                        }} catch {{}}
+                        return origSP.apply(this, arguments);
+                      }};
+                    }}
+                  }} catch {{}}
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected CSS URL sniffer.", log)
+            except Exception as e:
+                self._log(f"Failed to inject CSS URL sniffer: {e}", log)
+
+        async def _inject_webrtc_sniffer(self, context, log: Optional[List[str]]) -> None:
+            if not self.cfg.enable_webrtc_sniff:
+                return
+
+            max_events = int(self.cfg.max_webrtc_events)
+
+            script = f"""
+            (() => {{
+              try {{
+                const STORE = "__webrtcEvents";
+                const MAX = {max_events};
+                window[STORE] = window[STORE] || [];
+                const seen = new Set();
+
+                function push(kind, payload) {{
+                  try {{
+                    const key = kind + "|" + JSON.stringify(payload || {{}});
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    window[STORE].push(Object.assign({{ts: Date.now(), kind}}, payload || {{}}));
+                    if (window[STORE].length > MAX) window[STORE].shift();
+                  }} catch {{}}
+                }}
+
+                function iceServers(cfg) {{
+                  try {{
+                    const arr = cfg && cfg.iceServers ? cfg.iceServers : [];
+                    const out = [];
+                    for (const s of arr || []) {{
+                      let urls = s.urls || s.url;
+                      if (!urls) continue;
+                      if (!Array.isArray(urls)) urls = [urls];
+                      for (const u of urls) {{
+                        const us = String(u || "");
+                        if (/^(stun:|turn:|turns:)/i.test(us)) out.push(us);
+                      }}
+                    }}
+                    return out.slice(0, 30);
+                  }} catch {{ return []; }}
+                }}
+
+                if (!window.__runtimeSnifferWebRTCInstalled) {{
+                  window.__runtimeSnifferWebRTCInstalled = true;
+                  const OrigPC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+                  if (typeof OrigPC !== "function") return;
+
+                  function WrappedPC(cfg, constraints) {{
+                    try {{ push("webrtc:pc", {{iceServers: iceServers(cfg)}}); }} catch {{}}
+                    const pc = new OrigPC(cfg, constraints);
+
+                    try {{
+                      pc.addEventListener("icecandidate", (ev) => {{
+                        try {{
+                          const c = ev && ev.candidate && ev.candidate.candidate;
+                          if (c) push("webrtc:icecandidate", {{preview: String(c).slice(0, 260)}});
+                        }} catch {{}}
+                      }});
+                    }} catch {{}}
+
+                    try {{
+                      pc.addEventListener("connectionstatechange", () => {{
+                        push("webrtc:connectionstate", {{state: String(pc.connectionState || "")}});
+                      }});
+                    }} catch {{}}
+
+                    return pc;
+                  }}
+
+                  WrappedPC.prototype = OrigPC.prototype;
+                  if (window.RTCPeerConnection) window.RTCPeerConnection = WrappedPC;
+                  if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = WrappedPC;
+                }}
+              }} catch {{}}
+            }})();
+            """
+
+            try:
+                await context.add_init_script(script)
+                self._log("Injected WebRTC sniffer.", log)
+            except Exception as e:
+                self._log(f"Failed to inject WebRTC sniffer: {e}", log)
+
+        async def _inject_context_scripts(
+                self,
+                context,
+                profile: Optional[Dict[str, Any]] = None,
+                log: Optional[List[str]] = None,
+        ) -> None:
+            """
+            Safely install all enabled context-level init scripts.
+
+            Fixes:
+            - avoids leaked/unawaited coroutine warnings
+            - handles profile=None
+            - logs individual injector failures
+            - keeps all coroutine calls inside awaited wrappers
+            """
+            if log is None:
+                log = []
+
+            profile = profile or {}
+
+            async def _run(label: str, coro_factory):
+                try:
+                    await coro_factory()
+                except Exception as e:
+                    try:
+                        self._log(f"{label} injector failed: {e}", log)
+                    except Exception:
+                        pass
+
+            jobs = [
+                _run(
+                    "runtime_url_hooks",
+                    lambda: self._inject_runtime_url_hooks(context, log),
+                ),
+                _run(
+                    "mutation_observer",
+                    lambda: self._inject_mutation_observer(context, log),
+                ),
+                _run(
+                    "json_parse_hook",
+                    lambda: self._inject_json_parse_hook(context, log),
+                ),
+                _run(
+                    "css_url_sniffer",
+                    lambda: self._inject_css_url_sniffer(context, log),
+                ),
+            ]
+
+            if profile.get("allow_media", True):
+                jobs.append(
+                    _run(
+                        "mediasource",
+                        lambda: self._inject_mediasource_script(context, log),
+                    )
+                )
+
+            if profile.get("allow_workers", True):
+                jobs.append(
+                    _run(
+                        "worker",
+                        lambda: self._inject_worker_sniffer(context, log),
+                    )
+                )
+                jobs.append(
+                    _run(
+                        "service_worker",
+                        lambda: self._inject_service_worker_sniffer(context, log),
+                    )
+                )
+
+            if profile.get("allow_webrtc", True):
+                jobs.append(
+                    _run(
+                        "webrtc",
+                        lambda: self._inject_webrtc_sniffer(context, log),
+                    )
+                )
+
+            if not jobs:
+                return
+
+            await asyncio.gather(*jobs, return_exceptions=True)
+
+        # ------------------------------------------------------------------
+        # Collectors
+        # ------------------------------------------------------------------
+
+        async def _read_event_array(
+                self,
+                page,
+                js_expr: str,
+                *,
+                label: str,
+                tag: str,
+                source_page: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+                limit: int,
+        ) -> None:
+            events = await self._safe_eval(
+                page,
+                js_expr,
+                label=label,
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(events, list) or not events:
+                return
+
+            runtime_hits.append({
+                "url": source_page,
+                "tag": tag,
+                "json": {tag: events[:limit]},
+                "source_page": source_page,
+            })
+
+            self._log(f"{tag} events captured: {len(events)}", log)
+
+        async def _collect_runtime_url_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_runtime_url_hooks:
+                return
+
+            events = await self._safe_eval(
+                page,
+                "() => Array.isArray(window.__runtimeUrlEvents) ? window.__runtimeUrlEvents : []",
+                label="read-runtime-url-events",
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(events, list):
+                return
+
+            seen: Set[str] = set()
+            added = 0
+
+            for ev in events[: int(self.cfg.max_runtime_url_events)]:
+                if not isinstance(ev, dict):
+                    continue
+                u = str(ev.get("url") or "").strip()
+                kind = str(ev.get("kind") or "runtime").strip()
+                if not u:
+                    continue
+
+                key = f"{kind}|{u}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                runtime_hits.append({
+                    "url": u,
+                    "tag": f"runtime:{kind}",
+                    "json": {"runtime_url": u, "kind": kind, "ts": ev.get("ts")},
+                    "source_page": canonical_page_url,
+                })
+                added += 1
+
+            if added:
+                self._log(f"Runtime URL hook events captured: {added}", log)
+
+        async def _collect_mutation_url_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_mutation_observer:
+                return
+
+            events = await self._safe_eval(
+                page,
+                "() => Array.isArray(window.__mutationUrlEvents) ? window.__mutationUrlEvents : []",
+                label="read-mutation-url-events",
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(events, list):
+                return
+
+            seen: Set[str] = set()
+            added = 0
+
+            for ev in events[: int(self.cfg.max_mutation_url_events)]:
+                if not isinstance(ev, dict):
+                    continue
+                u = str(ev.get("url") or "").strip()
+                kind = str(ev.get("kind") or "mutation").strip()
+                if not u:
+                    continue
+
+                key = f"{kind}|{u}"
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                runtime_hits.append({
+                    "url": u,
+                    "tag": f"mutation:{kind}",
+                    "json": {"mutation_url": u, "kind": kind, "ts": ev.get("ts")},
+                    "source_page": canonical_page_url,
+                })
+                added += 1
+
+            if added:
+                self._log(f"Mutation URL events captured: {added}", log)
+
+        async def _collect_json_parse_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_json_parse_sniff:
+                return
+
+            events = await self._safe_eval(
+                page,
+                "() => Array.isArray(window.__jsonParseSnifferEvents) ? window.__jsonParseSnifferEvents : []",
+                label="read-json-parse-events",
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(events, list) or not events:
+                return
+
+            for ev in events[:120]:
+                if not isinstance(ev, dict):
+                    continue
+
+                preview = str(ev.get("preview") or "")
+                payload: Dict[str, Any] = {
+                    "preview": preview[: int(self.cfg.json_parse_max_bytes)],
+                    "length": ev.get("length"),
+                    "timestamp": ev.get("ts"),
+                }
+
+                if self.cfg.json_parse_store_parsed and preview:
+                    try:
+                        payload["parsed"] = json.loads(preview)
+                    except Exception:
+                        pass
+
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "json-parse",
+                    "json": {"json_parse": payload},
+                    "source_page": canonical_page_url,
+                })
+
+            self._log(f"JSON.parse events captured: {len(events)}", log)
+
+        async def _collect_hydration_state(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_hydration_sniff:
+                return
+
+            keys = list(self.cfg.hydration_keys or [])
+            if not keys:
+                return
+
+            max_bytes = int(self.cfg.hydration_max_bytes)
+
+            script = """
+            (args) => {
+              const {keys, maxBytes} = args;
+              const out = [];
+
+              function push(key, value) {
+                try {
+                  let s = "";
+                  if (typeof value === "string") s = value;
+                  else s = JSON.stringify(value);
+                  if (!s) return;
+                  if (s.length > maxBytes) s = s.slice(0, maxBytes);
+                  if (/(https?:\\/\\/|\\.m3u8|\\.mpd|\\/api\\/|graphql|manifest|playlist|media)/i.test(s)) {
+                    out.push({key, json: s});
+                  }
+                } catch {}
+              }
+
+              for (const k of keys || []) {
+                try {
+                  if (window[k] != null) push(k, window[k]);
+                } catch {}
+              }
+
+              try {
+                const next = document.getElementById("__NEXT_DATA__");
+                if (next && next.textContent) push("__NEXT_DATA__#script", next.textContent);
+              } catch {}
+
+              return out;
+            }
+            """
+
+            data = await self._safe_eval(
+                page,
+                script,
+                {"keys": keys, "maxBytes": max_bytes},
+                label="hydration-sniff",
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(data, list) or not data:
+                return
+
+            for item in data[:40]:
+                if not isinstance(item, dict):
+                    continue
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "hydration",
+                    "json": {
+                        "hydration_key": item.get("key"),
+                        "preview": str(item.get("json") or "")[:max_bytes],
+                    },
+                    "source_page": canonical_page_url,
+                })
+
+            self._log(f"Hydration globals captured: {len(data)}", log)
+
+        async def _collect_perf_entries(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_perf_sniff:
+                return
+
+            regex_str = self.cfg.perf_url_regex
+
+            script = """
+            (rxStr) => {
+              let rx;
+              try { rx = new RegExp(rxStr, "i"); }
+              catch { return []; }
+
+              const out = [];
+              const entries = performance.getEntriesByType("resource") || [];
+
+              for (const e of entries) {
+                try {
+                  if (!e || !e.name) continue;
+                  if (rx.test(e.name)) {
+                    out.push({
+                      name: e.name,
+                      type: e.initiatorType || null,
+                      proto: e.nextHopProtocol || null,
+                      startTime: e.startTime || null,
+                      duration: e.duration || null
+                    });
+                  }
+                } catch {}
+                if (out.length >= 200) break;
+              }
+
+              return out;
+            }
+            """
+
+            resources = await self._safe_eval(
+                page,
+                script,
+                regex_str,
+                label="perf-sniff",
+                log=log,
+                default=[],
+            )
+
+            if isinstance(resources, list) and resources:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "perf",
+                    "json": {"perf_entries": resources[:200]},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Perf entries hit: {len(resources)}", log)
+
+        async def _collect_storage(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_storage_sniff:
+                return
+
+            script = """
+            (args) => {
+              const maxBytes = args.maxBytes;
+              const keyLimit = args.keyLimit;
+              const out = [];
+
+              function scan(kind, store) {
+                try {
+                  const len = Math.min(store.length || 0, keyLimit);
+                  for (let i = 0; i < len; i++) {
+                    const key = store.key(i);
+                    const val = store.getItem(key) || "";
+                    if (!val || val.length > maxBytes) continue;
+                    if (/(https?:\\/\\/|\\.m3u8|\\.mpd|\\/api\\/|graphql|manifest|playlist|media)/i.test(val)) {
+                      out.push({kind, key, value: val});
+                    }
+                  }
+                } catch {}
+              }
+
+              try { scan("localStorage", window.localStorage); } catch {}
+              try { scan("sessionStorage", window.sessionStorage); } catch {}
+
+              return out;
+            }
+            """
+
+            hits = await self._safe_eval(
+                page,
+                script,
+                {
+                    "maxBytes": int(self.cfg.storage_value_max_bytes),
+                    "keyLimit": int(self.cfg.storage_key_limit),
+                },
+                label="storage-sniff",
+                log=log,
+                default=[],
+            )
+
+            if isinstance(hits, list) and hits:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "storage",
+                    "json": {"storage": hits[:80]},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Storage hits: {len(hits)}", log)
+
+        async def _collect_mediasource_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_mediasource_sniff:
+                return
+
+            events = await self._safe_eval(
+                page,
+                "() => Array.isArray(window.__networkMediaEvents) ? window.__networkMediaEvents : []",
+                label="mse-events",
+                log=log,
+                default=[],
+            )
+
+            if isinstance(events, list) and events:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "mse",
+                    "json": {"mse_events": events[:200]},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"MSE events captured: {len(events)}", log)
+
+        async def _inject_and_collect_media_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_media_events_sniff:
+                return
+
+            script = """
+            (args) => {
+              const autoPlay = !!args.autoPlay;
+              window.__mediaEvents = [];
+
+              function log(ev, el) {
+                try {
+                  window.__mediaEvents.push({
+                    event: ev.type,
+                    currentTime: el.currentTime,
+                    duration: el.duration,
+                    src: el.currentSrc || el.src || null,
+                    muted: el.muted,
+                    tag: el.tagName.toLowerCase(),
+                    ts: Date.now()
+                  });
+                } catch {}
+              }
+
+              const media = Array.from(document.querySelectorAll("video, audio")).slice(0, 20);
+              for (const el of media) {
+                ["play","pause","ended","timeupdate","error","loadedmetadata"].forEach(evt => {
+                  try { el.addEventListener(evt, e => log(e, el), {once: false}); } catch {}
+                });
+
+                if (autoPlay) {
+                  try {
+                    el.muted = true;
+                    const p = el.play();
+                    if (p && p.catch) p.catch(() => {});
+                  } catch {}
+                }
+              }
+
+              return media.length;
+            }
+            """
+
+            count = await self._safe_eval(
+                page,
+                script,
+                {"autoPlay": bool(self.cfg.auto_play_media)},
+                label="media-event-install",
+                log=log,
+                default=0,
+            )
+
+            if not count:
+                return
+
+            wait_ms = int(self.cfg.media_event_timeout_ms)
+            if wait_ms > 0:
+                try:
+                    await page.wait_for_timeout(wait_ms)
+                except Exception:
+                    pass
+
+            events = await self._safe_eval(
+                page,
+                "() => Array.isArray(window.__mediaEvents) ? window.__mediaEvents : []",
+                label="media-event-read",
+                log=log,
+                default=[],
+            )
+
+            if isinstance(events, list) and events:
+                runtime_hits.append({
+                    "url": canonical_page_url,
+                    "tag": "media-events",
+                    "json": {"media_events": events[:200]},
+                    "source_page": canonical_page_url,
+                })
+                self._log(f"Captured {len(events)} media events.", log)
+
+        async def _collect_worker_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_worker_sniff:
+                return
+            await self._read_event_array(
+                page,
+                "() => Array.isArray(window.__workerEvents) ? window.__workerEvents : []",
+                label="worker-events",
+                tag="worker_events",
+                source_page=canonical_page_url,
+                runtime_hits=runtime_hits,
+                log=log,
+                limit=int(self.cfg.max_worker_events),
+            )
+
+        async def _collect_sw_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_service_worker_sniff:
+                return
+            await self._read_event_array(
+                page,
+                "() => Array.isArray(window.__swEvents) ? window.__swEvents : []",
+                label="sw-events",
+                tag="service_worker_events",
+                source_page=canonical_page_url,
+                runtime_hits=runtime_hits,
+                log=log,
+                limit=int(self.cfg.max_sw_events),
+            )
+
+        async def _collect_css_url_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_css_url_sniff:
+                return
+            await self._read_event_array(
+                page,
+                "() => Array.isArray(window.__cssUrlEvents) ? window.__cssUrlEvents : []",
+                label="css-url-events",
+                tag="css_url_events",
+                source_page=canonical_page_url,
+                runtime_hits=runtime_hits,
+                log=log,
+                limit=int(self.cfg.max_css_url_events),
+            )
+
+        async def _collect_webrtc_events(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                log: Optional[List[str]],
+        ) -> None:
+            if not self.cfg.enable_webrtc_sniff:
+                return
+            await self._read_event_array(
+                page,
+                "() => Array.isArray(window.__webrtcEvents) ? window.__webrtcEvents : []",
+                label="webrtc-events",
+                tag="webrtc_events",
+                source_page=canonical_page_url,
+                runtime_hits=runtime_hits,
+                log=log,
+                limit=int(self.cfg.max_webrtc_events),
+            )
+
+        async def _collect_dom_linkish_hits(
+                self,
+                page,
+                canonical_page_url: str,
+                out: List[Dict[str, Any]],
+                seen: Set[str],
+                log: Optional[List[str]],
+        ) -> None:
+            script = """
+            (args) => {
+              const maxLinks = args.maxLinks || 1500;
+              const out = [];
+              const seen = new Set();
+
+              function push(url, tag, text) {
+                try {
+                  url = String(url || "").trim();
+                  if (!url) return;
+                  const low = url.toLowerCase();
+                  if (
+                    low === "#" ||
+                    low.startsWith("javascript:") ||
+                    low.startsWith("mailto:") ||
+                    low.startsWith("tel:") ||
+                    low.startsWith("data:")
+                  ) return;
+
+                  const key = tag + "|" + url;
+                  if (seen.has(key)) return;
+                  seen.add(key);
+                  out.push({
+                    url,
+                    tag,
+                    text: String(text || "").trim().slice(0, 200)
+                  });
+                } catch {}
+              }
+
+              const selectors = [
+                "a[href]", "area[href]",
+                "iframe[src]", "frame[src]",
+                "img[src]", "video[src]", "audio[src]", "source[src]", "embed[src]",
+                "form[action]", "link[href]", "meta[content]",
+                "[data-href]", "[data-url]", "[data-src]", "[data-video]", "[data-audio]", "[data-stream]", "[onclick]"
+              ];
+
+              const nodes = Array.from(document.querySelectorAll(selectors.join(","))).slice(0, maxLinks);
+
+              for (const el of nodes) {
+                try {
+                  const tagName = (el.tagName || "").toLowerCase();
+
+                  push(el.getAttribute("href"), tagName || "href", el.innerText || el.textContent || el.getAttribute("title") || "");
+                  push(el.getAttribute("src"), tagName || "src", el.getAttribute("alt") || "");
+                  push(el.getAttribute("action"), "form", el.getAttribute("name") || "");
+                  push(el.getAttribute("content"), "meta", el.getAttribute("property") || el.getAttribute("name") || "");
+                  push(el.getAttribute("data-href"), "data-href", "");
+                  push(el.getAttribute("data-url"), "data-url", "");
+                  push(el.getAttribute("data-src"), "data-src", "");
+                  push(el.getAttribute("data-video"), "data-video", "");
+                  push(el.getAttribute("data-audio"), "data-audio", "");
+                  push(el.getAttribute("data-stream"), "data-stream", "");
+
+                  const onclick = el.getAttribute("onclick") || "";
+                  const matches = onclick.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
+                  for (const u of matches) push(u, "onclick", "");
+                } catch {}
+
+                if (out.length >= maxLinks) break;
+              }
+
+              return out.slice(0, maxLinks);
+            }
+            """
+
+            items = await self._safe_eval(
+                page,
+                script,
+                {"maxLinks": int(self.cfg.max_dom_links)},
+                label="dom-link-harvest",
+                log=log,
+                default=[],
+            )
+
+            if not isinstance(items, list):
+                return
+
+            added = 0
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                raw = str(it.get("url") or "").strip()
+                if not raw:
+                    continue
+
+                full = self._abs_url(canonical_page_url, raw)
+                before = len(out)
+
+                self._push_link_hit(
+                    out,
+                    seen,
+                    url=full,
+                    source_page=canonical_page_url,
+                    tag=str(it.get("tag") or "dom"),
+                    meta={
+                        "text": str(it.get("text") or ""),
+                        "reason": "dom-harvest",
+                    },
+                )
+
+                if len(out) > before:
+                    added += 1
+
+            self._log(f"DOM link harvest added {added} link(s).", log)
+
+        async def _get_dom_metrics(self, page, log: Optional[List[str]]) -> Dict[str, Any]:
+            script = """
+            () => {
+              try {
+                return {
+                  nodes: document.querySelectorAll("*").length,
+                  scripts: document.scripts ? document.scripts.length : 0,
+                  links: document.links ? document.links.length : 0,
+                  ready: document.readyState || "",
+                  title: document.title || "",
+                };
+              } catch {
+                return {nodes: 0, scripts: 0, links: 0, ready: ""};
+              }
+            }
+            """
+            result = await self._safe_eval(
+                page,
+                script,
+                label="dom-metrics",
+                log=log,
+                default={"nodes": 0, "scripts": 0, "links": 0, "ready": ""},
+            )
+            return result if isinstance(result, dict) else {"nodes": 0, "scripts": 0, "links": 0, "ready": ""}
+
+        async def _collect_bundle(
+                self,
+                page,
+                canonical_page_url: str,
+                runtime_hits: List[Dict[str, Any]],
+                promoted_links: List[Dict[str, Any]],
+                seen_links: Set[str],
+                profile: Dict[str, Any],
+                log: Optional[List[str]],
+        ) -> None:
+            tasks = [
+                self._collect_perf_entries(page, canonical_page_url, runtime_hits, log),
+                self._collect_json_parse_events(page, canonical_page_url, runtime_hits, log),
+                self._collect_runtime_url_events(page, canonical_page_url, runtime_hits, log),
+                self._collect_mutation_url_events(page, canonical_page_url, runtime_hits, log),
+                self._collect_css_url_events(page, canonical_page_url, runtime_hits, log),
+                self._collect_dom_linkish_hits(page, canonical_page_url, promoted_links, seen_links, log),
+            ]
+
+            if profile.get("allow_storage"):
+                tasks.append(self._collect_storage(page, canonical_page_url, runtime_hits, log))
+
+            if profile.get("allow_hydration"):
+                tasks.append(self._collect_hydration_state(page, canonical_page_url, runtime_hits, log))
+
+            if profile.get("allow_media"):
+                tasks.append(self._collect_mediasource_events(page, canonical_page_url, runtime_hits, log))
+                tasks.append(self._inject_and_collect_media_events(page, canonical_page_url, runtime_hits, log))
+
+            if profile.get("allow_workers"):
+                tasks.append(self._collect_worker_events(page, canonical_page_url, runtime_hits, log))
+                tasks.append(self._collect_sw_events(page, canonical_page_url, runtime_hits, log))
+
+            if profile.get("allow_webrtc"):
+                tasks.append(self._collect_webrtc_events(page, canonical_page_url, runtime_hits, log))
+
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
+
+        def _merge_hits(
+                self,
+                runtime_hits: List[Dict[str, Any]],
+                promoted_links: List[Dict[str, Any]],
+        ) -> List[Dict[str, Any]]:
+            merged: List[Dict[str, Any]] = []
+            seen: Set[str] = set()
+
+            for hit in runtime_hits:
+                if not isinstance(hit, dict):
+                    continue
+                key = f"runtime|{hit.get('tag')}|{hit.get('url')}|{str(hit.get('json'))[:180]}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(hit)
+                if len(merged) >= int(self.cfg.max_total_hits):
+                    return merged
+
+            for hit in promoted_links:
+                if not isinstance(hit, dict):
+                    continue
+                key = f"link|{hit.get('tag')}|{hit.get('url')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(hit)
+                if len(merged) >= int(self.cfg.max_total_hits):
+                    return merged
+
+            return merged
+
+        # ------------------------------------------------------------------
+        # Main entry
+        # ------------------------------------------------------------------
+
+        async def sniff(
+                self,
+                context: "BrowserContext",
+                page_url: str,
+                *,
+                timeout: Optional[float] = None,
+                log: Optional[List[str]] = None,
+        ) -> Tuple[str, List[Dict[str, Any]]]:
+
+            if context is None:
+                self._log("No Playwright context; skipping runtime sniff.", log)
+                return "", []
+
+            tmo = float(timeout if timeout is not None else self.cfg.timeout)
+            tmo = max(1.0, tmo)
+            self.cfg.timeout = tmo
+
+            canonical_page_url = self._canonicalize_url(page_url)
+            profile = self._profile_url(canonical_page_url)
+
+            if self.cfg.log_profile_decisions:
+                self._log(f"Profile={profile.get('kind')} url={canonical_page_url}", log)
+
+            # Fast path: do not open Playwright page for direct assets.
+            if self.cfg.direct_asset_fast_path and profile.get("direct_asset"):
+                kind = self._asset_kind(canonical_page_url)
+                self._log(f"Direct asset fast-path: {canonical_page_url}", log)
+                return "", [{
+                    "url": canonical_page_url,
+                    "tag": f"direct-{kind}",
+                    "source_page": canonical_page_url,
+                    "json": {
+                        "reason": "direct_asset_fast_path",
+                        "kind": kind,
+                    },
+                }]
+
+            runtime_hits: List[Dict[str, Any]] = []
+            promoted_links: List[Dict[str, Any]] = []
+            seen_links: Set[str] = set()
+
+            html: str = ""
+            page = None
+            started = time.monotonic()
+            hard_cap = max(2.5, tmo * float(self.cfg.watchdog_multiplier))
+
+            async def _run() -> Tuple[str, List[Dict[str, Any]]]:
+                nonlocal html, page, profile
+
+                await self._inject_context_scripts(context, profile, log)
+
+                page = await context.new_page()
+
+                try:
+                    # Timeouts.
+                    try:
+                        nav_timeout = max(1000, int(min(max(tmo, 2.0), self.cfg.max_nav_timeout_s) * 1000))
+                        page.set_default_timeout(max(800, int(min(tmo, 6.0) * 1000)))
+                        page.set_default_navigation_timeout(nav_timeout)
+                    except Exception:
+                        pass
+
+                    # Attach page-level listeners before navigation.
+                    self._attach_console_sniffer(page, runtime_hits, canonical_page_url, log)
+                    self._attach_websocket_sniffer(page, runtime_hits, canonical_page_url, log)
+                    self._attach_response_header_miner(page, runtime_hits, canonical_page_url, log)
+                    await self._attach_request_body_sniffer(page, runtime_hits, canonical_page_url, log)
+
+                    self._log(f"Start runtime sniff: {canonical_page_url} timeout={tmo}s", log)
+
+                    # Navigate with fallback modes.
+                    nav_modes: List[str] = []
+                    for mode in (self.cfg.goto_wait_until, "commit", "domcontentloaded"):
+                        mode = str(mode or "").strip() or "domcontentloaded"
+                        if mode not in nav_modes:
+                            nav_modes.append(mode)
+
+                    nav_ok = False
+                    nav_timeout_s = min(max(tmo, 2.0), self.cfg.max_nav_timeout_s)
+
+                    for mode in nav_modes:
+                        if self._remaining(started, hard_cap) <= 0.4:
+                            break
+                        ok = await self._safe_wait(
+                            page.goto(canonical_page_url, wait_until=mode),
+                            timeout_s=min(nav_timeout_s, max(0.5, self._remaining(started, hard_cap) - 0.4)),
+                            label=f"goto[{mode}]",
+                            log=log,
+                            default=None,
+                        )
+                        if ok is not None:
+                            if mode != self.cfg.goto_wait_until:
+                                self._log(f"goto recovered using wait_until={mode}", log)
+                            nav_ok = True
+                            break
+
+                    if not nav_ok:
+                        self._log("Navigation did not fully complete; continuing with partial page state.", log)
+
+                    # Small settle window, not a huge tmo*0.2 wait.
+                    settle_ms = min(
+                        int(self.cfg.max_settle_ms),
+                        max(80, int(tmo * 1000 * float(self.cfg.settle_ratio))),
+                    )
+                    try:
+                        await page.wait_for_timeout(settle_ms)
+                    except Exception:
+                        pass
+
+                    # Re-profile based on DOM size.
+                    metrics = await self._get_dom_metrics(page, log)
+                    nodes = int(metrics.get("nodes") or 0)
+                    self._log(
+                        f"DOM preflight: nodes={nodes}, scripts={metrics.get('scripts')}, links={metrics.get('links')}, ready={metrics.get('ready')}",
+                        log,
+                    )
+
+                    if self.cfg.skip_heavy_on_large_dom and nodes >= int(self.cfg.large_dom_threshold):
+                        profile = dict(profile)
+                        profile["allow_heavy"] = False
+                        profile["allow_media"] = False
+                        profile["allow_workers"] = False
+                        profile["allow_webrtc"] = False
+                        self._log(f"Large DOM detected ({nodes}); downgraded heavy runtime collectors.", log)
+
+                    # Mutation window. Keep it short.
+                    if self.cfg.enable_mutation_observer:
+                        try:
+                            await page.wait_for_timeout(max(0, int(self.cfg.mutation_observer_ms)))
+                        except Exception:
+                            pass
+
+                    # Concurrent collectors.
+                    remaining = max(0.5, self._remaining(started, hard_cap) - 0.6)
+                    bundle_tmo = min(float(self.cfg.collector_bundle_timeout_s), remaining)
+
+                    await self._safe_wait(
+                        self._collect_bundle(
+                            page,
+                            canonical_page_url,
+                            runtime_hits,
+                            promoted_links,
+                            seen_links,
+                            profile,
+                            log,
+                        ),
+                        timeout_s=bundle_tmo,
+                        label="runtime-collector-bundle",
+                        log=log,
+                        default=None,
+                    )
+
+                    # HTML content last and only if time/profile allows.
+                    if profile.get("allow_content") and self._remaining(started, hard_cap) > 0.8:
+                        html = await self._safe_wait(
+                            page.content(),
+                            timeout_s=min(float(self.cfg.page_content_timeout_s),
+                                          max(0.4, self._remaining(started, hard_cap) - 0.4)),
+                            label="page.content",
+                            log=log,
+                            default="",
+                        ) or ""
+
+                        # Raw URL harvest from HTML.
+                        count = 0
+                        for u in self._extract_urls_from_text(html)[: int(self.cfg.max_html_regex_urls)]:
+                            before = len(promoted_links)
+                            self._push_link_hit(
+                                promoted_links,
+                                seen_links,
+                                url=u,
+                                source_page=canonical_page_url,
+                                tag="html_url",
+                                meta={"reason": "html-regex"},
+                            )
+                            if len(promoted_links) > before:
+                                count += 1
+
+                        if count:
+                            self._log(f"HTML regex URL harvest added {count} link(s).", log)
+
+                    # Flatten runtime payloads into link hits.
+                    self._promote_runtime_hits_to_links(
+                        runtime_hits,
+                        canonical_page_url,
+                        promoted_links,
+                        seen_links,
+                    )
+
+                except Exception as e:
+                    self._log(f"Unexpected error during runtime sniff: {e}", log)
+
+                finally:
+                    await self._safe_close_page(page, log)
+
+                merged = self._merge_hits(runtime_hits, promoted_links)
+                elapsed = time.monotonic() - started
+
+                self._log(
+                    f"Finished runtime sniff for {canonical_page_url}: "
+                    f"raw_hits={len(runtime_hits)} promoted_links={len(promoted_links)} "
+                    f"total={len(merged)} elapsed={elapsed:.2f}s",
+                    log,
+                )
+
+                return html, merged
+
+            try:
+                return await asyncio.wait_for(_run(), timeout=hard_cap)
+
+            except asyncio.TimeoutError:
+                self._log(f"Whole-run watchdog fired at {hard_cap:.2f}s; returning partial runtime results.", log)
+
+                await self._safe_close_page(page, log)
+
+                try:
+                    self._promote_runtime_hits_to_links(
+                        runtime_hits,
+                        canonical_page_url,
+                        promoted_links,
+                        seen_links,
+                    )
+                except Exception:
+                    pass
+
+                merged = self._merge_hits(runtime_hits, promoted_links)
+                return html, merged
+
+    async def _inject_context_scripts(
+            self,
+            context,
+            profile: Optional[Dict[str, Any]] = None,
+            log: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Safely install all enabled context-level init scripts.
+
+        Fixes:
+        - avoids leaked/unawaited coroutine warnings
+        - handles profile=None
+        - logs individual injector failures
+        - keeps all coroutine calls inside awaited wrappers
+        """
+        if log is None:
+            log = []
+
+        profile = profile or {}
+
+        async def _run(label: str, coro_factory):
+            try:
+                await coro_factory()
+            except Exception as e:
+                try:
+                    self._log(f"{label} injector failed: {e}", log)
+                except Exception:
+                    pass
+
+        jobs = [
+            _run(
+                "runtime_url_hooks",
+                lambda: self._inject_runtime_url_hooks(context, log),
+            ),
+            _run(
+                "mutation_observer",
+                lambda: self._inject_mutation_observer(context, log),
+            ),
+            _run(
+                "json_parse_hook",
+                lambda: self._inject_json_parse_hook(context, log),
+            ),
+            _run(
+                "css_url_sniffer",
+                lambda: self._inject_css_url_sniffer(context, log),
+            ),
+        ]
+
+        if profile.get("allow_media", True):
+            jobs.append(
+                _run(
+                    "mediasource",
+                    lambda: self._inject_mediasource_script(context, log),
+                )
+            )
+
+        if profile.get("allow_workers", True):
+            jobs.append(
+                _run(
+                    "worker",
+                    lambda: self._inject_worker_sniffer(context, log),
+                )
+            )
+            jobs.append(
+                _run(
+                    "service_worker",
+                    lambda: self._inject_service_worker_sniffer(context, log),
+                )
+            )
+
+        if profile.get("allow_webrtc", True):
+            jobs.append(
+                _run(
+                    "webrtc",
+                    lambda: self._inject_webrtc_sniffer(context, log),
+                )
+            )
+
+        if not jobs:
+            return
+
+        await asyncio.gather(*jobs, return_exceptions=True)
 
     # ------------------------------------------------------------------
     # Collectors
@@ -8700,17 +11659,30 @@ class ReactSniffer:
         return html or "", hits
 
     # ------------------------------------------------------------------ #
-    # JS Injection: The Advanced Forensic Engine
+    # JS Injection: The Advanced Forensic Engine (Enhanced)
     # ------------------------------------------------------------------ #
-    async def _install_instrumentation(self, page, page_url: str, log: List[str]) -> None:
+    async def _install_instrumentation(
+            self,
+            page: playwright.async_api.Page,
+            page_url: str,
+            log: Optional[List[str]] = None
+    ) -> None:
         """
-        Builds and injects a massive JavaScript payload to hook into Web APIs,
-        State Managers, Webpack Chunks, and React Internals.
-        """
-        script_parts: List[str] = []
+        Builds and injects a massively enhanced JavaScript payload to hook into
+        Web APIs, State Managers, Webpack Chunks, React Internals, and Shadow DOMs.
 
-        # 1. Base Shared Memory Buffer
-        script_parts.append(
+        Enhanced Capabilities:
+            • Deep React Fiber introspection with context & hooks tracing
+            • Advanced State Managers (Zustand, Jotai, Recoil, TanStack Query, etc.)
+            • Dynamic Component Discovery & Route Mapping
+            • Enhanced Shadow DOM + CSS Inlining Extraction
+            • Memory Leak & Performance Impact Analysis
+        """
+        if log is None:
+            log = []
+
+        # --- 1. Base Shared Memory & Event Queue ---
+        script_parts: List[str] = [
             f"""
             (function() {{
                 try {{
@@ -8740,169 +11712,298 @@ class ReactSniffer:
                     }}
 
                     window.__RS_pushEvent = __RS_pushEvent;
-                }} catch (e) {{
-                    console.log("[ReactSniffer] Shared buffer init error:", e);
-                }}
+
+                    // 1A. Event Fingerprint for Deduplication
+                    function __RS_fingerprint(evt) {{
+                        return [evt.kind, evt.url, evt.pathname, (evt.timestamp || 0)].join("|");
+                    }}
+                    window.__RS_fingerprint = __RS_fingerprint;
+
+                }} catch (e) {{ console.error("[ReactSniffer] Shared Buffer Error:", e); }}
             }})();
             """
-        )
+        ]
 
-        # 2. Network Interceptors (XHR & Fetch) - Captures SPA background API calls
+        # --- 2. Network Interceptors (XHR & Fetch with Enhanced Logging) ---
         if self.cfg.enable_fetch_xhr_interception:
             script_parts.append(
                 """
                 (function() {
                     try {
-                        // Fetch Interceptor
-                        const origFetch = window.fetch;
-                        if (origFetch) {
-                            window.fetch = async function(...args) {
-                                try {
-                                    const reqUrl = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : "");
-                                    if (reqUrl) {
-                                        window.__RS_pushEvent({
-                                            kind: "intercept_fetch",
-                                            url: reqUrl,
-                                            pathname: location.pathname,
-                                            timestamp: Date.now()
-                                        });
-                                    }
-                                } catch (_) {}
-                                return origFetch.apply(this, args);
-                            };
-                        }
+                        // 2A. Fetch Interceptor with Enhanced Metadata
+                        const origFetch = window.fetch.bind(window);
+                        if (origFetch) {{
+                            window.fetch = async function(...args) {{
+                                try {{
+                                    const reqUrl = typeof args[0] === 'string' 
+                                        ? args[0] 
+                                        : (args[0] && args[0].url 
+                                            ? args[0].url 
+                                            : "");
 
-                        // XHR Interceptor
+                                    if (reqUrl && reqUrl.length > 1) {{
+                                        // Normalize & record
+                                        var cleanUrl = new URL(reqUrl, location.href).href;
+                                        window.__RS_pushEvent({{
+                                            kind: "intercept_fetch",
+                                            url: cleanUrl,
+                                            pathname: location.pathname,
+                                            timestamp: Date.now(),
+                                            meta: {{
+                                                method: args[0].method || "GET",
+                                                headers: (args[0].headers || {}).toString().slice(0, 200)
+                                            }}
+                                        }});
+                                    }}
+                                }} catch (_) {{}}
+                                return origFetch.apply(this, args);
+                            }};
+                        }}
+
+                        // 2B. XHR Interceptor
                         const origOpen = XMLHttpRequest.prototype.open;
-                        if (origOpen) {
-                            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-                                try {
-                                    if (url) {
-                                        window.__RS_pushEvent({
+                        if (origOpen) {{
+                            XMLHttpRequest.prototype.open = function(method, url, ...rest) {{
+                                try {{
+                                    if (url) {{
+                                        window.__RS_pushEvent({{
                                             kind: "intercept_xhr",
                                             url: String(url),
                                             pathname: location.pathname,
-                                            timestamp: Date.now()
-                                        });
-                                    }
-                                } catch (_) {}
+                                            timestamp: Date.now(),
+                                            meta: {{ method, ...rest.slice(0, 2) }}
+                                        }});
+                                    }}
+                                }} catch (_) {{}}
                                 return origOpen.call(this, method, url, ...rest);
-                            };
-                        }
-                    } catch (e) {
-                        console.log("[ReactSniffer] Network Interceptor Error:", e);
-                    }
+                            }};
+                        }}
+
+                        // 2C. EventSource & WebSocket Interception (Bonus)
+                        const origEventSource = window.EventSource;
+                        if (origEventSource) {{
+                            window.EventSource = function(url) {{
+                                try {{
+                                    window.__RS_pushEvent({{
+                                        kind: "intercept_eventsour",
+                                        url: String(url),
+                                        pathname: location.pathname,
+                                        timestamp: Date.now()
+                                    }});
+                                }} catch (_) {{}}
+                                return origEventSource.apply(this, arguments);
+                            }};
+                        }}
+
+                        const origWebSocket = window.WebSocket;
+                        if (origWebSocket) {{
+                            window.WebSocket = function(url, ...rest) {{
+                                try {{
+                                    window.__RS_pushEvent({{
+                                        kind: "intercept_ws",
+                                        url: String(url),
+                                        pathname: location.pathname,
+                                        timestamp: Date.now()
+                                    }});
+                                }} catch (_) {{}}
+                                return origWebSocket.apply(this, arguments);
+                            }};
+                        }}
+
+                    }} catch (e) {{
+                        console.error("[ReactSniffer] Network Interceptor Error:", e);
+                    }}
                 })();
                 """
             )
 
-        # 3. Webpack Chunk Interceptor
+        # --- 3. Webpack / Rollup / Vite Chunk Interceptor ---
         if self.cfg.enable_webpack_chunk_interception:
             script_parts.append(
                 """
-                (function() {
-                    try {
-                        const originalPush = window.webpackChunk_N_E ? window.webpackChunk_N_E.push.bind(window.webpackChunk_N_E) : null;
-                        if (originalPush) {
-                            window.webpackChunk_N_E.push = function(chunkData) {
-                                try {
-                                    const chunkIds = chunkData[0] || [];
-                                    const modules = chunkData[1] || {};
-                                    for (const key in modules) {
-                                        const modString = modules[key].toString();
-                                        const urls = modString.match(/https?:\\/\\/[^"'\\s<>]+/ig) || [];
-                                        const routes = modString.match(/\\/[A-Za-z0-9_./-]+/g) || [];
+                (function() {{
+                    try {{
+                        // 3A. Webpack Chunk Hook
+                        const wrappers = [[ "webpackChunk_",".push.bind" ], [ "webpackChunk",".push" ]];
+                        wrappers.forEach(([prefix, fn]) => {{
+                            if (window[prefix]) {{
+                                const original = window[prefix][fn] || null;
+                                if (original) {{
+                                    const wrapped = (chunkData) => {{
+                                        try {{
+                                            const chunkIds = chunkData[0] || [];
+                                            const modules = chunkData[1] || {};
 
-                                        [...urls, ...routes].forEach(u => {
-                                            if (u.length > 2) {
-                                                window.__RS_pushEvent({
-                                                    kind: "webpack_chunk_leak",
-                                                    url: u,
-                                                    pathname: location.pathname,
-                                                    meta: { chunkId: chunkIds.join(","), moduleKey: key },
-                                                    timestamp: Date.now()
-                                                });
-                                            }
-                                        });
-                                    }
-                                } catch (_) {}
-                                return originalPush(chunkData);
-                            };
-                        }
-                    } catch (e) {}
+                                            // Enhanced extraction with better regex patterns
+                                            for (const key in modules) {{
+                                                const modString = modules[key].toString();
+                                                const urls = modString.match(/https?:\\\\/\\\\/[^"'\\\\s<>\\\\\\[]+/ig) || [];
+                                                const routes = modString.match(/\\\\/[A-Za-z0-9_./-]+/g) || [];
+
+                                                [...urls, ...routes].forEach(u => {{
+                                                    if (u.length > 2 && !u.includes("webpackChunk")) {{
+                                                        window.__RS_pushEvent({{
+                                                            kind: "webpack_chunk_leak",
+                                                            url: u,
+                                                            pathname: location.pathname,
+                                                            meta: {{ chunkId: chunkIds.join(","), moduleKey: key }},
+                                                            timestamp: Date.now()
+                                                        }});
+                                                    }}
+                                                }});
+                                            }}
+                                        }} catch (_) {{}}
+                                        return original(chunkData);
+                                    }};
+                                    window[prefix][fn] = wrapped;
+                                }}
+                            }}
+                        }};
+
+                        // 3B. Dynamic `import()` / `require()` Interceptor (for Vite/Rollup)
+                        const origImport = window.__REACT__ && window.__REACT__.__esModule
+                            ? window.__REACT__.__esModule
+                            : undefined;
+                        if (origImport) {{
+                            const origApply = origImport.apply.bind(origImport);
+                            const wrapped = function() {{
+                                try {{
+                                    if (arguments[0] && typeof arguments[0] === 'string') {{
+                                        const u = arguments[0];
+                                        window.__RS_pushEvent({{
+                                            kind: "dynamic_import_leak",
+                                            url: u,
+                                            pathname: location.pathname,
+                                            timestamp: Date.now()
+                                        }});
+                                    }}
+                                }} catch (_) {{}}
+                                return origApply.apply(this, arguments);
+                            }};
+                            window.__REACT__.__esModule = wrapped;
+                        }}
+
+                    }} catch (e) {{}}
                 })();
                 """
             )
 
-        # 4. History API & Routing Hooks
+        # --- 4. History API & Routing Hooks (Enhanced) ---
         if self.cfg.hook_history_api or self.cfg.capture_hashchange:
             script_parts.append(
                 """
-                (function() {
-                    try {
-                        function recordReactNav(kind, url) {
-                            window.__RS_pushEvent({
+                (function() {{
+                    try {{
+                        function recordReactNav(kind, url) {{
+                            window.__RS_pushEvent({{
                                 kind: kind,
                                 url: String(url || location.href),
                                 pathname: location.pathname,
                                 timestamp: Date.now()
-                            });
-                        }
+                            }});
+                        }}
 
-                        if (window.history && window.history.pushState) {
+                        if (window.history && window.history.pushState) {{
                             var origPush = history.pushState;
                             var origReplace = history.replaceState;
 
-                            history.pushState = function(state, title, url) {
-                                try { origPush.apply(this, arguments); } catch (_) {}
+                            history.pushState = function(state, title, url) {{
+                                try {{ origPush.apply(this, arguments); }} catch (_) {{}}
                                 recordReactNav("pushState", url);
-                            };
+                            }};
 
-                            history.replaceState = function(state, title, url) {
-                                try { origReplace.apply(this, arguments); } catch (_) {}
+                            history.replaceState = function(state, title, url) {{
+                                try {{ origReplace.apply(this, arguments); }} catch (_) {{}}
                                 recordReactNav("replaceState", url);
-                            };
-                        }
+                            }};
+                        }}
 
-                        window.addEventListener("popstate", function() { recordReactNav("popstate", location.href); });
-                        window.addEventListener("hashchange", function() { recordReactNav("hashchange", location.href); });
+                        window.addEventListener("popstate", function() {{ recordReactNav("popstate", location.href); }});
+                        window.addEventListener("hashchange", function() {{ recordReactNav("hashchange", location.href); }});
 
+                        // Initial Load
                         recordReactNav("initial", location.href);
-                    } catch (e) {}
+
+                        // 4A. Enhanced Router Hooks (React Router, History.js, etc.)
+                        ['react-router-dom', 'react-router', 'history'].forEach(r => {{
+                            if (window[r]) {{
+                                window.__RS_pushEvent({{
+                                    kind: "router_hook_detected",
+                                    url: location.href,
+                                    pathname: location.pathname,
+                                    meta: {{ library: r, version: (r.version || "").slice(0, 20) }},
+                                    timestamp: Date.now()
+                                }});
+                            }}
+                        }});
+
+                    }} catch (e) {{}}
                 })();
                 """
             )
 
-        # 5. Link Clicks
+        # --- 5. Link & Click Events (Shadow-Inclusive) ---
         if self.cfg.hook_link_clicks:
             script_parts.append(
                 """
-                (function() {
-                    try {
-                        document.addEventListener("click", function(ev) {
+                (function() {{
+                    try {{
+                        function findClosestAnchor(el) {{
+                            while (el && el !== document && !el.href) {{
+                                el = el.parentElement || el.closest;
+                                if (el && el.closest) el = el.closest('a');
+                                if (!el) break;
+                            }}
+                            return el;
+                        }}
+
+                        document.addEventListener("click", function(ev) {{
                             var t = ev.target;
-                            while (t && t !== document && !t.href) t = t.parentElement;
+                            t = findClosestAnchor(t);
                             if (!t || !t.href) return;
 
-                            window.__RS_pushEvent({
+                            window.__RS_pushEvent({{
                                 kind: "click",
                                 url: String(t.href),
                                 pathname: location.pathname,
                                 text: (t.innerText || "").trim(),
                                 timestamp: Date.now()
-                            });
+                            }});
                         }, true);
-                    } catch (e) {}
+
+                        // 5B. Shadow DOM Click Traversal
+                        document.addEventListener("click", function(ev) {{
+                             var t = ev.target;
+                             if (t.shadowRoot) {{
+                                 function scanShadow(e) {{
+                                     if (!e || e.nodeType !== 11) return;
+                                     [...e.children].forEach(c => {{
+                                         if (c.shadowRoot) scanShadow(c.shadowRoot);
+                                         if (c.href) {{
+                                             window.__RS_pushEvent({{
+                                                 kind: "shadow_click",
+                                                 url: e.href,
+                                                 pathname: location.pathname,
+                                                 text: (e.innerText || "").trim(),
+                                                 timestamp: Date.now()
+                                             }});
+                                         }}
+                                     }});
+                                 }}(t.shadowRoot);
+                             }}
+                        }, true);
+
+                    }} catch (e) {{}}
                 })();
                 """
             )
 
-        # 6. Deep State Management Extraction Engine (Redux, Apollo, Next, Nuxt)
-        url_rx_js = json.dumps(self.cfg.url_like_regex or r"(https?://[^\s\"']+|/[A-Za-z0-9_./-]+)")
+        # --- 6. Deep State Management Extraction Engine (All Frameworks) ---
+        url_rx_js = json.dumps(self.cfg.url_like_regex or r"(https?://[^\s\\\"']+(?:[^\s\\\"']*)?|/[A-Za-z0-9_./-]+)")
 
         script_parts.append(
             f"""
-            window.__RS_DEEP_STATE_EXTRACTOR = function() {{
+            window.__RS_STATE_EXTRACTOR = function() {{
                 try {{
                     const MAX_DEPTH = {int(self.cfg.max_state_object_depth)};
                     const URL_RX = new RegExp({url_rx_js}, "i");
@@ -8971,12 +12072,35 @@ class ReactSniffer:
                         }}
                     }}
 
-                }} catch (e) {{ console.log("[ReactSniffer] Deep State Extraction Error", e); }}
+                    // 6E. Zustand & Jotai State (Modern State Libraries)
+                    if (window.useStore && typeof window.useStore !== "function") {{
+                        try {{ extractFromObject("ZustandStore", window.useStore.getState()); }} catch (_) {{}}
+                    }}
+                    if (window.getStore && typeof window.getStore === "function") {{
+                        try {{ extractFromObject("JotaiStore", window.getStore.getState()); }} catch (_) {{}}
+                    }}
+
+                    // 6F. TanStack Query / SWR
+                    if (window.__SWR__ || window.__SWR__KEY) {{
+                        extractFromObject("SWR", window.__SWR__);
+                    }}
+                    if (window.__TANSTACK_QUERY__) {{
+                        extractFromObject("TanStackQuery", window.__TANSTACK_QUERY__);
+                    }}
+
+                    // 6G. Global Heuristic Search (Secret Config)
+                    Object.keys(window).forEach(key => {{
+                        if (key.match(/(CONFIG|APP|STATE|STORE)/i) && typeof window[key] === "object") {{
+                            try {{ extractFromObject("GlobalKey_" + key, window[key]); }} catch (_) {{}}
+                        }}
+                    }});
+
+                }} catch (e) {{ console.error("[ReactSniffer] State Extraction Error", e); }}
             }};
             """
         )
 
-        # 7. Deep Fiber Traversal Engine
+        # --- 7. Deep Fiber Traversal Engine (Enhanced) ---
         script_parts.append(
             f"""
             window.__RS_FIBER_EXTRACTOR = function() {{
@@ -9069,8 +12193,91 @@ class ReactSniffer:
                     const roots = getFiberRoots();
                     for (let i = 0; i < roots.length; i++) traverseFiber(roots[i]);
 
-                }} catch (e) {{ console.log("[ReactSniffer] Fiber Traversal Error", e); }}
+                }} catch (e) {{ console.error("[ReactSniffer] Fiber Traversal Error", e); }}
             }};
+            """
+        )
+
+        # --- 8. Shadow DOM Extraction (Bonus Feature) ---
+        script_parts.append(
+            r"""
+            (function() {
+                try {
+                    const shadowSelectors = 'shadow, :scope > shadow-root, [slot]';
+
+                    function extractShadowContent(root) {
+                        if (!root) return;
+
+                        const text = root.textContent || "";
+
+                        if (text.length > 100) {
+                            const urls = text.match(/https?:\/\/[^"'`\s<>]+/g) || [];
+
+                            urls.forEach(u => {
+                                if (u.length > 5) {
+                                    window.__RS_pushEvent({
+                                        kind: "shadow_content_leak",
+                                        url: u,
+                                        pathname: location.pathname,
+                                        meta: { source: "ShadowDOM" },
+                                        timestamp: Date.now()
+                                    });
+                                }
+                            });
+                        }
+                    }
+
+                    function findShadowRoots() {
+                        const roots = [];
+
+                        document.querySelectorAll("*").forEach(n => {
+                            if (n.shadowRoot) {
+                                roots.push(n.shadowRoot);
+                            }
+                        });
+
+                        return roots;
+                    }
+
+                    if (location.pathname === "/") {
+                        const shadows = findShadowRoots();
+                        shadows.forEach(e => extractShadowContent(e));
+                    }
+                } catch (e) {}
+            })();
+            """
+        )
+
+        # --- 9. Memory & Performance Impact Check ---
+        script_parts.append(
+            f"""
+            (function() {{
+                try {{
+                    // 9A. Capture Heap Before Hook
+                    window.__RS_HEAP_BEFORE = performance.getEntriesByType("navigation").find(e => e.name === "navigate")
+                        ? "found"
+                        : "missed";
+                    window.__RS_HEAP_SIZE_BEFORE = window.performance.memory?.usedJSHeapSize || "not_supported";
+
+                    // 9B. Async Execution Timeout to Avoid Stalls
+                    setTimeout(() => {{
+                        window.__RS_ASYNC_CHECK = true;
+                        try {{
+                            if (window.__RS_HEAP_SIZE_AFTER !== "not_supported") {{
+                                const delta = window.__RS_HEAP_SIZE_AFTER - window.__RS_HEAP_SIZE_BEFORE;
+                                if (delta > {self.cfg.max_memory_impact_bytes}000) {{
+                                    window.__RS_pushEvent({{
+                                        kind: "memory_warning",
+                                        url: location.href,
+                                        meta: {{ delta_bytes: delta, kind: "post_hook" }},
+                                        timestamp: Date.now()
+                                    }});
+                                }}
+                            }}
+                        }} catch (e) {{}}
+                    }}, {int(self.cfg.async_execution_delay)}000);
+                }} catch (e) {{}}
+            }}());
             """
         )
 
@@ -9079,9 +12286,9 @@ class ReactSniffer:
         try:
             await page.add_init_script(final_script)
             await page.evaluate(final_script)
-            self._log(f"Deep Instrumentation installed on {page_url}", log)
+            await self._log(f"🚀 Enhanced Deep Instrumentation installed on {page_url}", log)
         except Exception as e:
-            self._log(f"Failed to install instrumentation: {e}", log)
+            await self._log(f"❌ Failed to install instrumentation: {e}", log)
 
     async def _execute_post_load_scans(self, page, log: List[str]) -> None:
         """
