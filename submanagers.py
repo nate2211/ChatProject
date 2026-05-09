@@ -6562,7 +6562,345 @@ class RuntimeSniffer:
     # ------------------------------------------------------------------
     # Init scripts
     # ------------------------------------------------------------------
+    async def _inject_service_worker_sniffer(self, context, log: Optional[List[str]]) -> None:
+        """
+        Injects page-side Service Worker instrumentation.
 
+        Captures:
+        - navigator.serviceWorker.register(scriptURL, options)
+        - registration scope/updatefound/installing/waiting/active workers
+        - serviceWorker.ready
+        - serviceWorker.controller
+        - controllerchange/message events
+        - ServiceWorker.postMessage payload URL leaks
+        - CacheStorage.open / Cache.add / Cache.addAll / Cache.put / Cache.match URL usage
+
+        Safe behavior:
+        - Does not force unregister or block service workers.
+        - Does not recurse register().
+        - Stores events in window.__serviceWorkerEvents.
+        """
+        if not getattr(self.cfg, "enable_service_worker_sniff", True):
+            return
+
+        max_events = int(getattr(self.cfg, "max_sw_events", 100))
+        max_msg = int(getattr(self.cfg, "worker_message_max_bytes", 2048))
+
+        script = f"""
+        (() => {{
+          try {{
+            const STORE = "__serviceWorkerEvents";
+            const MAX = {max_events};
+            const MAX_MSG = {max_msg};
+
+            window[STORE] = window[STORE] || [];
+
+            if (window.__runtimeSnifferServiceWorkerInstalled) return;
+            window.__runtimeSnifferServiceWorkerInstalled = true;
+
+            const seen = new Set();
+
+            function abs(u) {{
+              try {{ return new URL(String(u), location.href).href; }}
+              catch {{ return String(u || ""); }}
+            }}
+
+            function safeText(v, maxLen) {{
+              try {{
+                if (v == null) return "";
+                if (typeof v === "string") return v.slice(0, maxLen);
+                if (typeof v === "number" || typeof v === "boolean") return String(v);
+                return JSON.stringify(v).slice(0, maxLen);
+              }} catch {{
+                try {{ return String(v).slice(0, maxLen); }}
+                catch {{ return ""; }}
+              }}
+            }}
+
+            function extractUrls(v) {{
+              try {{
+                const s = safeText(v, MAX_MSG);
+                if (!s) return [];
+                const m = s.match(/\\b(?:https?|wss?):\\/\\/[^\\s"'<>]+/ig) || [];
+                return Array.from(new Set(m)).slice(0, 50);
+              }} catch {{
+                return [];
+              }}
+            }}
+
+            function cleanPayload(payload) {{
+              try {{
+                const p = Object.assign({{}}, payload || {{}});
+                if (p.url) p.url = abs(p.url);
+                if (p.scriptURL) p.scriptURL = abs(p.scriptURL);
+                if (p.scope) p.scope = abs(p.scope);
+                if (p.urls && Array.isArray(p.urls)) p.urls = p.urls.map(abs).slice(0, 50);
+                return p;
+              }} catch {{
+                return payload || {{}};
+              }}
+            }}
+
+            function push(kind, payload) {{
+              try {{
+                payload = cleanPayload(payload || {{}});
+                const key = kind + "|" + safeText(payload, 600);
+                if (seen.has(key)) return;
+                seen.add(key);
+
+                window[STORE].push(Object.assign({{
+                  ts: Date.now(),
+                  kind: kind,
+                  page: location.href
+                }}, payload));
+
+                if (window[STORE].length > MAX) window[STORE].shift();
+              }} catch {{}}
+            }}
+
+            function hookServiceWorkerObject(sw, label) {{
+              try {{
+                if (!sw || sw.__snifferHooked) return;
+                try {{ Object.defineProperty(sw, "__snifferHooked", {{ value: true }}); }} catch {{}}
+
+                push("sw:" + label, {{
+                  scriptURL: sw.scriptURL || "",
+                  state: sw.state || ""
+                }});
+
+                try {{
+                  sw.addEventListener("statechange", () => {{
+                    push("sw:statechange", {{
+                      scriptURL: sw.scriptURL || "",
+                      state: sw.state || ""
+                    }});
+                  }});
+                }} catch {{}}
+
+                try {{
+                  const origPostMessage = sw.postMessage;
+                  if (typeof origPostMessage === "function" && !sw.__snifferPostMessageHooked) {{
+                    try {{ Object.defineProperty(sw, "__snifferPostMessageHooked", {{ value: true }}); }} catch {{}}
+
+                    sw.postMessage = function(message, transfer) {{
+                      try {{
+                        push("sw:postMessage", {{
+                          scriptURL: sw.scriptURL || "",
+                          state: sw.state || "",
+                          preview: safeText(message, MAX_MSG),
+                          urls: extractUrls(message)
+                        }});
+                      }} catch {{}}
+                      return origPostMessage.apply(this, arguments);
+                    }};
+                  }}
+                }} catch {{}}
+              }} catch {{}}
+            }}
+
+            function hookRegistration(reg, reason) {{
+              try {{
+                if (!reg) return;
+
+                push("sw:registration", {{
+                  reason: reason || "",
+                  scope: reg.scope || ""
+                }});
+
+                hookServiceWorkerObject(reg.installing, "installing");
+                hookServiceWorkerObject(reg.waiting, "waiting");
+                hookServiceWorkerObject(reg.active, "active");
+
+                try {{
+                  if (!reg.__snifferUpdateFoundHooked) {{
+                    try {{ Object.defineProperty(reg, "__snifferUpdateFoundHooked", {{ value: true }}); }} catch {{}}
+
+                    reg.addEventListener("updatefound", () => {{
+                      try {{
+                        push("sw:updatefound", {{ scope: reg.scope || "" }});
+                        hookServiceWorkerObject(reg.installing, "installing");
+                        hookServiceWorkerObject(reg.waiting, "waiting");
+                        hookServiceWorkerObject(reg.active, "active");
+                      }} catch {{}}
+                    }});
+                  }}
+                }} catch {{}}
+              }} catch {{}}
+            }}
+
+            // navigator.serviceWorker hooks
+            try {{
+              const swc = navigator.serviceWorker;
+              if (swc) {{
+                try {{
+                  const origRegister = swc.register ? swc.register.bind(swc) : null;
+
+                  if (origRegister && !swc.__snifferRegisterHooked) {{
+                    try {{ Object.defineProperty(swc, "__snifferRegisterHooked", {{ value: true }}); }} catch {{}}
+
+                    swc.register = function(scriptURL, options) {{
+                      try {{
+                        push("sw:register", {{
+                          scriptURL: scriptURL || "",
+                          scope: options && options.scope ? options.scope : "",
+                          type: options && options.type ? options.type : "",
+                          updateViaCache: options && options.updateViaCache ? options.updateViaCache : ""
+                        }});
+                      }} catch {{}}
+
+                      return origRegister(scriptURL, options).then((reg) => {{
+                        try {{ hookRegistration(reg, "register:then"); }} catch {{}}
+                        return reg;
+                      }}).catch((err) => {{
+                        try {{
+                          push("sw:register:error", {{
+                            scriptURL: scriptURL || "",
+                            error: String(err && err.message ? err.message : err).slice(0, 500)
+                          }});
+                        }} catch {{}}
+                        throw err;
+                      }});
+                    }};
+                  }}
+                }} catch {{}}
+
+                try {{
+                  if (swc.controller) {{
+                    hookServiceWorkerObject(swc.controller, "controller");
+                    push("sw:controller", {{
+                      scriptURL: swc.controller.scriptURL || "",
+                      state: swc.controller.state || ""
+                    }});
+                  }}
+                }} catch {{}}
+
+                try {{
+                  swc.addEventListener("controllerchange", () => {{
+                    try {{
+                      if (swc.controller) hookServiceWorkerObject(swc.controller, "controller");
+                      push("sw:controllerchange", {{
+                        scriptURL: swc.controller && swc.controller.scriptURL ? swc.controller.scriptURL : "",
+                        state: swc.controller && swc.controller.state ? swc.controller.state : ""
+                      }});
+                    }} catch {{}}
+                  }});
+                }} catch {{}}
+
+                try {{
+                  swc.addEventListener("message", (ev) => {{
+                    try {{
+                      push("sw:message", {{
+                        origin: ev.origin || "",
+                        lastEventId: ev.lastEventId || "",
+                        preview: safeText(ev.data, MAX_MSG),
+                        urls: extractUrls(ev.data)
+                      }});
+                    }} catch {{}}
+                  }});
+                }} catch {{}}
+
+                try {{
+                  if (swc.ready && typeof swc.ready.then === "function") {{
+                    swc.ready.then((reg) => {{
+                      try {{ hookRegistration(reg, "ready"); }} catch {{}}
+                    }}).catch(() => {{}});
+                  }}
+                }} catch {{}}
+
+                try {{
+                  if (typeof swc.getRegistrations === "function") {{
+                    swc.getRegistrations().then((regs) => {{
+                      try {{
+                        for (const reg of regs || []) hookRegistration(reg, "getRegistrations");
+                      }} catch {{}}
+                    }}).catch(() => {{}});
+                  }}
+                }} catch {{}}
+              }}
+            }} catch {{}}
+
+            // CacheStorage / Cache API hooks
+            try {{
+              if (window.caches && typeof window.caches.open === "function" && !window.caches.__snifferOpenHooked) {{
+                const origCachesOpen = window.caches.open.bind(window.caches);
+                try {{ Object.defineProperty(window.caches, "__snifferOpenHooked", {{ value: true }}); }} catch {{}}
+
+                window.caches.open = function(name) {{
+                  try {{ push("cache:open", {{ name: String(name || "") }}); }} catch {{}}
+
+                  return origCachesOpen(name).then((cache) => {{
+                    try {{
+                      if (cache && !cache.__snifferCacheHooked) {{
+                        try {{ Object.defineProperty(cache, "__snifferCacheHooked", {{ value: true }}); }} catch {{}}
+
+                        if (typeof cache.add === "function") {{
+                          const origAdd = cache.add.bind(cache);
+                          cache.add = function(request) {{
+                            try {{
+                              push("cache:add", {{
+                                cache: String(name || ""),
+                                url: request && request.url ? request.url : String(request || "")
+                              }});
+                            }} catch {{}}
+                            return origAdd(request);
+                          }};
+                        }}
+
+                        if (typeof cache.addAll === "function") {{
+                          const origAddAll = cache.addAll.bind(cache);
+                          cache.addAll = function(requests) {{
+                            try {{
+                              const urls = Array.from(requests || []).map((r) => r && r.url ? r.url : String(r || "")).slice(0, 100);
+                              push("cache:addAll", {{
+                                cache: String(name || ""),
+                                urls: urls
+                              }});
+                            }} catch {{}}
+                            return origAddAll(requests);
+                          }};
+                        }}
+
+                        if (typeof cache.put === "function") {{
+                          const origPut = cache.put.bind(cache);
+                          cache.put = function(request, response) {{
+                            try {{
+                              push("cache:put", {{
+                                cache: String(name || ""),
+                                url: request && request.url ? request.url : String(request || "")
+                              }});
+                            }} catch {{}}
+                            return origPut(request, response);
+                          }};
+                        }}
+
+                        if (typeof cache.match === "function") {{
+                          const origMatch = cache.match.bind(cache);
+                          cache.match = function(request, options) {{
+                            try {{
+                              push("cache:match", {{
+                                cache: String(name || ""),
+                                url: request && request.url ? request.url : String(request || "")
+                              }});
+                            }} catch {{}}
+                            return origMatch(request, options);
+                          }};
+                        }}
+                      }}
+                    }} catch {{}}
+                    return cache;
+                  }});
+                }};
+              }}
+            }} catch {{}}
+          }} catch {{}}
+        }})();
+        """
+
+        try:
+            await context.add_init_script(script)
+            self._log("Injected ServiceWorker sniffer.", log)
+        except Exception as e:
+            self._log(f"Failed to inject ServiceWorker sniffer: {e}", log)
     async def _inject_runtime_url_hooks(self, context, log: Optional[List[str]]) -> None:
         if not self.cfg.enable_runtime_url_hooks:
             return

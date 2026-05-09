@@ -8790,7 +8790,7 @@ class LinkTrackerBlock(BaseBlock):
                         except Exception as e:
                             local_log.append(f"Error fetching {page_url}: {e}")
                             if use_database and self.store and _should_persist_page(page_url):
-                                self.store.mark_scan_complete(page_url)
+                                self.store.mark_page_scanned(page_url)
                             return {
                                 "page": page_url,
                                 "assets": local_assets,
@@ -9170,9 +9170,6 @@ class LinkTrackerBlock(BaseBlock):
                     if use_database and store and _should_persist_page(page_url):
                         store.mark_page_scanned(page_url)
 
-                    if use_database and store and _should_persist_page(page_url):
-                        store.mark_page_scanned(page_url)
-
                 except Exception as e:
                     local_log.append(f"Error scanning {page_url}: {e}")
                     if use_database and store and _should_persist_page(page_url):
@@ -9263,9 +9260,19 @@ class LinkTrackerBlock(BaseBlock):
                         continue
 
                     if use_database and self.store and self.store.page_scanned(u):
+                        if not db_allow_rescan:
+                            if not logged_rescan_notice:
+                                DEBUG_LOGGER.log_message(
+                                    "[LinkTracker][db] Skipping already-scanned pages "
+                                    "(db_allow_rescan=False)."
+                                )
+                                logged_rescan_notice = True
+                            continue
+
                         if not logged_rescan_notice:
                             DEBUG_LOGGER.log_message(
-                                "[LinkTracker][db] page_scanned() is True, but processing anyway (DB skip disabled)."
+                                "[LinkTracker][db] Rescanning already-scanned pages "
+                                "(db_allow_rescan=True)."
                             )
                             logged_rescan_notice = True
 
