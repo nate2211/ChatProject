@@ -40646,18 +40646,18 @@ BLOCKS.register("oniontracker", OnionTrackerBlock)
 @dataclass
 class OllamaBlock(BaseBlock):
     """
-    Standalone Ollama generation block for blocks.py.
+    Simple working Ollama block for blocks.py.
 
-    Design goals:
-    - no prior ollama integration required
-    - directly calls local Ollama /api/chat
-    - accepts base `query` + incoming `payload`
-    - resolves context/lexicon/links from:
-        1) direct params
-        2) memory keys
-        3) parsed sections embedded in upstream payload
-    - supports block-style memory exports
-    - supports optional message history and tool schemas
+    Goals:
+    - Send payload/query to local Ollama /api/chat
+    - Always return a usable assistant response when Ollama returns one
+    - Extract native Ollama thinking from message.thinking
+    - Extract Qwen-style thinking from <think>...</think>
+    - Force <think>...</think> tags when requested, so thinking can appear in logs
+    - Log thinking like LinkTracker logs:
+        [Ollama][THINK] ...
+        [Ollama][ANSWER] ...
+        [Ollama][RAW] ...
     """
 
     default_base_url: str = field(
@@ -40666,852 +40666,1047 @@ class OllamaBlock(BaseBlock):
     default_model: str = field(
         default_factory=lambda: os.getenv("GPTPROJECT_MODEL", "qwen3:8b")
     )
-    default_api_key: str = field(
-        default_factory=lambda: os.getenv("GPTPROJECT_API_KEY", "ollama")
-    )
     default_temperature: float = field(
         default_factory=lambda: float(os.getenv("GPTPROJECT_TEMPERATURE", "0.2"))
     )
     default_request_timeout_sec: int = field(
         default_factory=lambda: int(os.getenv("GPTPROJECT_REQUEST_TIMEOUT_SEC", "180"))
     )
-    default_max_history: int = field(
-        default_factory=lambda: int(os.getenv("GPTPROJECT_MAX_HISTORY", "24"))
-    )
 
-    _SECTION_RE = re.compile(
-        r"(?ims)^\[(lexicon|context|links|query|prompt|instructions|system)\]\s*\n(.*?)(?=^\[[a-zA-Z0-9_\-]+\]\s*\n|\Z)"
-    )
+    _THINK_RE = re.compile(r"(?is)<think>\s*(.*?)\s*</think>")
+    _OPEN_THINK_RE = re.compile(r"(?is)<think>\s*(.*)$")
 
     # ----------------------------
-    # HTTP helpers
+    # basic helpers
     # ----------------------------
 
-    def _build_session(self) -> requests.Session:
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=4,
-            pool_maxsize=8,
-            max_retries=0,
-        )
-        session.mount("http://", adapter)
-        session.mount("https://", adapter)
-        session.headers.update({"Content-Type": "application/json"})
-        return session
+    def _text(self, value: Any) -> str:
+        if value is None:
+            return ""
+
+        if isinstance(value, str):
+            return value.strip()
+
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace").strip()
+
+        if isinstance(value, dict):
+            for key in ("final", "answer", "text", "content", "response", "result", "output", "body"):
+                if key in value:
+                    s = self._text(value.get(key))
+                    if s:
+                        return s
+
+            try:
+                return json.dumps(value, ensure_ascii=False, indent=2)
+            except Exception:
+                return str(value).strip()
+
+        if isinstance(value, (list, tuple)):
+            parts = [self._text(x) for x in value]
+            return "\n".join(x for x in parts if x).strip()
+
+        return str(value).strip()
+
+    def _bool(self, value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return default
+
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        s = str(value).strip().lower()
+
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+
+        if s in {"0", "false", "no", "n", "off", "none", "null", ""}:
+            return False
+
+        return default
+
+    def _int(self, value: Any, default: int = 0) -> int:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str) and not value.strip():
+                return default
+            return int(value)
+        except Exception:
+            return default
+
+    def _float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            if value is None:
+                return default
+            if isinstance(value, str) and not value.strip():
+                return default
+            return float(value)
+        except Exception:
+            return default
 
     def _normalize_base_url(self, base_url: str) -> str:
         raw = (base_url or "").strip().rstrip("/")
+
         if not raw:
             raw = "http://127.0.0.1:11434"
 
         if raw.endswith("/v1"):
             raw = raw[:-3]
+
         if raw.endswith("/api"):
             raw = raw[:-4]
 
         return raw.rstrip("/")
 
-    def _api_root(self, base_url: str) -> str:
-        return f"{self._normalize_base_url(base_url)}/api"
+    def _api_chat_url(self, base_url: str) -> str:
+        return f"{self._normalize_base_url(base_url)}/api/chat"
 
-    # ----------------------------
-    # value coercion helpers
-    # ----------------------------
-
-    def _coerce_text(self, value: Any) -> str:
+    def _think_value(self, value: Any) -> Any:
+        """
+        Ollama supports:
+        - true / false
+        - low / medium / high on some models
+        - None means omit the field
+        """
         if value is None:
-            return ""
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, (list, tuple)):
-            parts = [str(x).strip() for x in value if str(x).strip()]
-            return "\n".join(parts).strip()
-        if isinstance(value, dict):
-            for key in ("final", "text", "content", "prompt", "query", "body", "result"):
-                if key in value and str(value[key]).strip():
-                    return str(value[key]).strip()
-            try:
-                return json.dumps(value, ensure_ascii=False, indent=2)
-            except Exception:
-                return str(value).strip()
-        return str(value).strip()
+            return None
 
-    def _coerce_list(self, value: Any) -> List[Any]:
-        if value is None:
-            return []
-        if isinstance(value, list):
+        if isinstance(value, bool):
             return value
-        if isinstance(value, tuple):
-            return list(value)
-        if isinstance(value, str):
-            s = value.strip()
-            if not s:
-                return []
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return parsed
-            except Exception:
-                pass
-            return [x.strip() for x in s.split(",") if x.strip()]
-        return [value]
 
-    def _coerce_messages(self, value: Any) -> List[Dict[str, str]]:
-        raw = self._coerce_list(value)
-        out: List[Dict[str, str]] = []
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role", "user")).strip() or "user"
-            content = self._coerce_text(item.get("content", ""))
-            if content:
-                out.append({"role": role, "content": content})
-        return out
+        if isinstance(value, (int, float)):
+            return bool(value)
 
-    def _coerce_tools(self, value: Any) -> List[Dict[str, Any]]:
-        raw = self._coerce_list(value)
-        return [x for x in raw if isinstance(x, dict)]
+        s = str(value).strip().lower()
 
-    def _normalize_links(self, value: Any) -> List[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            lines = [line.strip() for line in value.splitlines()]
-            out = [line for line in lines if line]
-            if not out and value.strip():
-                out = [value.strip()]
-            return out
-        if isinstance(value, (list, tuple)):
-            out: List[str] = []
-            for item in value:
-                if isinstance(item, dict):
-                    url = str(item.get("url", "")).strip()
-                    if url:
-                        out.append(url)
-                else:
-                    s = str(item).strip()
-                    if s:
-                        out.append(s)
-            return out
-        if isinstance(value, dict):
-            url = str(value.get("url", "")).strip()
-            return [url] if url else []
-        s = str(value).strip()
-        return [s] if s else []
+        if s in {"", "none", "null", "default", "auto", "omit"}:
+            return None
 
-    def _normalize_lexicon(self, value: Any) -> List[str]:
-        if value is None:
-            return []
-        if isinstance(value, str):
-            raw = value.strip()
-            if not raw:
-                return []
-            if "\n" in raw:
-                parts = [x.strip(" -•\t") for x in raw.splitlines() if x.strip()]
-                return self._dedupe_preserve_order(parts)
-            parts = [x.strip() for x in raw.split(",") if x.strip()]
-            return self._dedupe_preserve_order(parts)
-        if isinstance(value, (list, tuple, set)):
-            parts = [str(x).strip() for x in value if str(x).strip()]
-            return self._dedupe_preserve_order(parts)
-        return [str(value).strip()] if str(value).strip() else []
+        if s in {"1", "true", "yes", "y", "on", "think"}:
+            return True
 
-    def _normalize_context(self, value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, (list, tuple)):
-            parts = [str(x).strip() for x in value if str(x).strip()]
-            return "\n".join(parts).strip()
-        if isinstance(value, dict):
-            try:
-                return json.dumps(value, ensure_ascii=False, indent=2)
-            except Exception:
-                return str(value).strip()
-        return str(value).strip()
+        if s in {"0", "false", "no", "n", "off", "no_think", "no-think", "nothink"}:
+            return False
 
-    def _dedupe_preserve_order(self, items: List[str]) -> List[str]:
-        out: List[str] = []
-        seen = set()
-        for item in items:
-            s = str(item).strip()
-            if not s:
-                continue
-            key = s.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(s)
-        return out
+        if s in {"low", "medium", "high"}:
+            return s
+
+        return value
+
+    def _preview(self, text: str, max_chars: int) -> str:
+        s = self._text(text)
+
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + f"\n...[truncated {len(s) - max_chars} chars]"
+
+        return s
+
+    def _query_preview(self, text: str, max_chars: int = 220) -> str:
+        s = self._text(text).replace("\r", " ").replace("\n", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+
+        if max_chars > 0 and len(s) > max_chars:
+            return s[:max_chars] + "..."
+
+        return s
 
     # ----------------------------
-    # Memory helpers
+    # logging helpers
     # ----------------------------
 
-    def _memory_load(self) -> Dict[str, Any]:
-        try:
-            return Memory.load()
-        except Exception:
-            return {}
+    def _find_logger(self, params: Dict[str, Any]) -> Any:
+        direct = params.get("debug_logger") or params.get("logger")
+        if direct is not None:
+            return direct
 
-    def _memory_save(self, store: Dict[str, Any]) -> None:
+        own = getattr(self, "debug_logger", None) or getattr(self, "logger", None)
+        if own is not None:
+            return own
+
+        for name in ("DEBUG_LOGGER", "debug_logger", "LOGGER", "logger"):
+            obj = globals().get(name)
+            if obj is not None:
+                return obj
+
+        return None
+
+    def _log(self, message: str, *, params: Dict[str, Any]) -> None:
+        """
+        Logs exactly like the rest of blocks.py:
+            DEBUG_LOGGER.log_message("[Ollama] ...")
+
+        If logger is missing, optional stdout fallback can be enabled with:
+            ollama.debug_log_to_stdout=true
+        """
+        msg = str(message)
+
+        logger = self._find_logger(params)
+
         try:
-            Memory.save(store)
+            if logger is not None:
+                if hasattr(logger, "log_message"):
+                    try:
+                        logger.log_message(msg)
+                    except TypeError:
+                        logger.log_message("Ollama", msg)
+                    return
+
+                if hasattr(logger, "info"):
+                    logger.info(msg)
+                    return
+
+                if hasattr(logger, "debug"):
+                    logger.debug(msg)
+                    return
+
+                if callable(logger):
+                    logger(msg)
+                    return
         except Exception:
             pass
 
-    def _get_from_memory_keys(
-        self,
-        store: Dict[str, Any],
-        keys: Any,
-        *,
-        mode: str = "first",
-        joiner: str = "\n\n",
-        max_items: int = 0,
-    ) -> Any:
-        key_list = [str(x).strip() for x in self._coerce_list(keys) if str(x).strip()]
-        if not key_list:
-            return None
+        if self._bool(params.get("debug_log_to_stdout", False), False):
+            try:
+                print(msg, flush=True)
+            except Exception:
+                pass
 
-        collected: List[Any] = []
-        for key in key_list:
-            if key in store:
-                collected.append(store.get(key))
-                if mode == "first":
-                    break
-
-        if not collected:
-            return None
-
-        if max_items > 0:
-            collected = collected[:max_items]
-
-        if mode == "first":
-            return collected[0]
-
-        if mode == "list":
-            return collected
-
-        # join/auto default
-        norm_parts: List[str] = []
-        for item in collected:
-            if isinstance(item, list):
-                norm_parts.append("\n".join(str(x) for x in item if str(x).strip()))
-            else:
-                norm_parts.append(self._coerce_text(item))
-        return joiner.join(x for x in norm_parts if x.strip()).strip()
-
-    # ----------------------------
-    # Payload section parsing
-    # ----------------------------
-
-    def _parse_payload_sections(self, text: str) -> Dict[str, str]:
-        out: Dict[str, str] = {}
-        raw = (text or "").strip()
-        if not raw:
-            return out
-
-        for name, body in self._SECTION_RE.findall(raw):
-            key = str(name or "").strip().lower()
-            val = str(body or "").strip()
-            if key and val:
-                out[key] = val
-
-        return out
-
-    def _strip_payload_sections(self, text: str) -> str:
-        raw = (text or "").strip()
-        if not raw:
-            return ""
-        stripped = self._SECTION_RE.sub("", raw).strip()
-        stripped = re.sub(r"\n{3,}", "\n\n", stripped)
-        return stripped.strip()
-
-    # ----------------------------
-    # Composition helpers
-    # ----------------------------
-
-    def _resolve_query(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str]) -> str:
-        direct_query = self._coerce_text(params.get("query", ""))
-        section_query = self._coerce_text(sections.get("query", ""))
-        section_prompt = self._coerce_text(sections.get("prompt", ""))
-
-        for candidate in (direct_query, section_query, section_prompt):
-            if candidate:
-                return candidate
-        return ""
-
-    def _resolve_system(self, params: Dict[str, Any], sections: Dict[str, str]) -> str:
-        for candidate in (
-            params.get("system", ""),
-            params.get("system_prompt", ""),
-            sections.get("system", ""),
-            sections.get("instructions", ""),
-        ):
-            s = self._coerce_text(candidate)
-            if s:
-                return s
-        return ""
-
-    def _resolve_context(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> str:
-        # direct param wins
-        direct = self._normalize_context(params.get("context", None))
-        if direct:
-            return direct
-
-        # memory keys next
-        mem_context = self._get_from_memory_keys(
-            store,
-            params.get("mem_context_keys", params.get("context_key", None)),
-            mode=str(params.get("mem_context_mode", "join")),
-            joiner=str(params.get("mem_context_join", "\n\n")),
-            max_items=int(params.get("mem_context_max_items", 0) or 0),
-        )
-        mem_context_text = self._normalize_context(mem_context)
-        if mem_context_text:
-            return mem_context_text
-
-        # parsed section from payload
-        section_context = self._normalize_context(sections.get("context", ""))
-        if section_context:
-            return section_context
-
-        return ""
-
-    def _resolve_lexicon(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> List[str]:
-        # direct param
-        direct = self._normalize_lexicon(params.get("lexicon", None))
-        if direct:
-            return direct
-
-        # memory keys
-        mem_lex = self._get_from_memory_keys(
-            store,
-            params.get("mem_lexicon_keys", params.get("lexicon_key", None)),
-            mode=str(params.get("mem_lexicon_mode", "list")),
-            joiner=str(params.get("mem_lexicon_join", "\n")),
-            max_items=int(params.get("mem_lexicon_max_items", 0) or 0),
-        )
-        mem_lexicon = self._normalize_lexicon(mem_lex)
-        if mem_lexicon:
-            return mem_lexicon
-
-        # parsed section
-        section_lex = self._normalize_lexicon(sections.get("lexicon", ""))
-        if section_lex:
-            return section_lex
-
-        return []
-
-    def _resolve_links(self, payload_text: str, params: Dict[str, Any], sections: Dict[str, str], store: Dict[str, Any]) -> List[str]:
-        direct = self._normalize_links(params.get("links", None))
-        if direct:
-            return self._dedupe_preserve_order(direct)
-
-        mem_links = self._get_from_memory_keys(
-            store,
-            params.get("mem_links_keys", params.get("links_key", None)),
-            mode=str(params.get("mem_links_mode", "list")),
-            joiner=str(params.get("mem_links_join", "\n")),
-            max_items=int(params.get("mem_links_max_items", 0) or 0),
-        )
-        mem_link_list = self._normalize_links(mem_links)
-        if mem_link_list:
-            return self._dedupe_preserve_order(mem_link_list)
-
-        section_links = self._normalize_links(sections.get("links", ""))
-        return self._dedupe_preserve_order(section_links)
-
-    def _resolve_extra_memory_inputs(self, params: Dict[str, Any], store: Dict[str, Any]) -> str:
-        """
-        General-purpose memory feeder like the larger block ecosystem's mem_in_keys style.
-        """
-        value = self._get_from_memory_keys(
-            store,
-            params.get("mem_in_keys", None),
-            mode=str(params.get("mem_in_mode", "join")),
-            joiner=str(params.get("mem_in_join", "\n\n")),
-            max_items=int(params.get("mem_in_max_items", 0) or 0),
-        )
-        return self._coerce_text(value)
-
-    def _merge_query_and_payload(
+    def _log_text_block(
         self,
         *,
-        query: str,
-        payload_text: str,
-        merge_mode: str,
-        joiner: str,
-    ) -> str:
-        q = (query or "").strip()
-        p = (payload_text or "").strip()
+        prefix: str,
+        text: str,
+        params: Dict[str, Any],
+        max_chars: int,
+    ) -> None:
+        body = self._preview(text, max_chars)
 
-        if merge_mode == "query_only":
-            return q
-        if merge_mode == "payload_only":
-            return p
-        if merge_mode == "payload_then_query":
-            return joiner.join([x for x in (p, q) if x]).strip()
+        if not body:
+            self._log(f"{prefix} <empty>", params=params)
+            return
 
-        return joiner.join([x for x in (q, p) if x]).strip()
+        # Log header
+        self._log(f"{prefix} chars={len(text)}", params=params)
+
+        # Log line-by-line so GUI logs show it like LinkTracker events.
+        for line in body.splitlines():
+            line = line.rstrip()
+            if line:
+                self._log(f"{prefix} {line}", params=params)
+
+    # ----------------------------
+    # prompt helpers
+    # ----------------------------
 
     def _build_user_text(
         self,
         *,
-        merged_query_payload: str,
-        context_text: str,
-        lexicon: List[str],
-        links: List[str],
-        extra_memory_text: str,
-        prefix: str,
-        suffix: str,
-        include_context: bool,
-        include_lexicon: bool,
-        include_links: bool,
-        include_extra_memory: bool,
+        payload_text: str,
+        query: str,
+        merge_mode: str,
         joiner: str,
     ) -> str:
-        parts: List[str] = []
+        payload_text = self._text(payload_text)
+        query = self._text(query)
+        mode = str(merge_mode or "query_then_payload").strip().lower()
 
-        if prefix.strip():
-            parts.append(prefix.strip())
+        if mode == "payload_only":
+            return payload_text
 
-        if merged_query_payload.strip():
-            parts.append(merged_query_payload.strip())
+        if mode == "query_only":
+            return query
 
-        if include_lexicon and lexicon:
-            parts.append("### Key Terms\n" + ", ".join(lexicon))
+        if mode == "payload_then_query":
+            return joiner.join(x for x in (payload_text, query) if x).strip()
 
-        if include_context and context_text.strip():
-            parts.append("### Context\n" + context_text.strip())
-
-        if include_links and links:
-            parts.append("### Links\n" + "\n".join(f"- {u}" for u in links))
-
-        if include_extra_memory and extra_memory_text.strip():
-            parts.append("### Memory Inputs\n" + extra_memory_text.strip())
-
-        if suffix.strip():
-            parts.append(suffix.strip())
-
-        return joiner.join([p for p in parts if p.strip()]).strip()
+        return joiner.join(x for x in (query, payload_text) if x).strip()
 
     def _build_messages(
         self,
         *,
         system_prompt: str,
-        history: List[Dict[str, str]],
-        prepend_messages: List[Dict[str, str]],
-        append_messages: List[Dict[str, str]],
         user_text: str,
-    ) -> List[Dict[str, Any]]:
-        messages: List[Dict[str, Any]] = []
+        force_think_tags: bool,
+    ) -> List[Dict[str, str]]:
+        messages: List[Dict[str, str]] = []
 
-        if system_prompt.strip():
-            messages.append({"role": "system", "content": system_prompt.strip()})
+        system_prompt = self._text(system_prompt)
 
-        messages.extend(prepend_messages)
-        messages.extend(history)
+        if force_think_tags:
+            think_instruction = (
+                "Show your reasoning inside <think> and </think>. "
+                "After </think>, write the final answer. "
+                "Do not leave the final answer empty."
+            )
 
-        if user_text.strip():
-            messages.append({"role": "user", "content": user_text.strip()})
+            if system_prompt:
+                system_prompt = system_prompt.rstrip() + "\n\n" + think_instruction
+            else:
+                system_prompt = think_instruction
 
-        messages.extend(append_messages)
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        if user_text:
+            messages.append({"role": "user", "content": user_text})
+
         return messages
 
     # ----------------------------
-    # Ollama response helpers
+    # response parsing
     # ----------------------------
 
-    def _extract_assistant_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        msg = data.get("message", {})
-        if not isinstance(msg, dict):
-            return {"role": "assistant", "content": "", "tool_calls": []}
+    def _extract_thinking_from_tags(self, content: str) -> Tuple[str, str]:
+        raw = content or ""
 
-        tool_calls = msg.get("tool_calls", [])
-        if not isinstance(tool_calls, list):
-            tool_calls = []
+        matches = self._THINK_RE.findall(raw)
 
-        return {
-            "role": str(msg.get("role", "assistant") or "assistant"),
-            "content": str(msg.get("content", "") or ""),
-            "tool_calls": tool_calls,
+        if matches:
+            thinking = "\n\n".join(x.strip() for x in matches if x.strip()).strip()
+            cleaned = self._THINK_RE.sub("", raw).strip()
+            cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+            return thinking, cleaned
+
+        # Handles unfinished <think> output.
+        if "<think>" in raw.lower():
+            m = self._OPEN_THINK_RE.search(raw)
+            if m:
+                thinking = self._text(m.group(1))
+                cleaned = self._OPEN_THINK_RE.sub("", raw).strip()
+                return thinking, cleaned
+
+        return "", raw.strip()
+
+    def _extract_from_data(self, data: Dict[str, Any]) -> Tuple[str, str, str, List[Any]]:
+        """
+        Returns:
+            answer_text, thinking_text, thinking_source, tool_calls
+        """
+        answer_parts: List[str] = []
+        thinking_parts: List[str] = []
+        tool_calls: List[Any] = []
+
+        msg = data.get("message")
+
+        if isinstance(msg, dict):
+            content = self._text(msg.get("content", ""))
+            native_thinking = self._text(msg.get("thinking", ""))
+
+            if content:
+                answer_parts.append(content)
+
+            if native_thinking:
+                thinking_parts.append(native_thinking)
+
+            calls = msg.get("tool_calls")
+            if isinstance(calls, list):
+                tool_calls.extend(calls)
+
+        elif isinstance(msg, str):
+            answer_parts.append(msg)
+
+        # Fallbacks for non-chat or weird Ollama-compatible shapes.
+        for key in ("response", "content", "text", "answer", "result", "output"):
+            val = self._text(data.get(key))
+            if val:
+                answer_parts.append(val)
+
+        for key in ("thinking", "reasoning", "reasoning_content"):
+            val = self._text(data.get(key))
+            if val:
+                thinking_parts.append(val)
+
+        answer_text = "\n".join(x for x in answer_parts if x).strip()
+        native_thinking = "\n".join(x for x in thinking_parts if x).strip()
+
+        tagged_thinking, cleaned_answer = self._extract_thinking_from_tags(answer_text)
+
+        if cleaned_answer:
+            answer_text = cleaned_answer
+
+        if native_thinking and tagged_thinking:
+            thinking_text = native_thinking + "\n\n" + tagged_thinking
+            thinking_source = "native+think_tags"
+        elif native_thinking:
+            thinking_text = native_thinking
+            thinking_source = "native"
+        elif tagged_thinking:
+            thinking_text = tagged_thinking
+            thinking_source = "think_tags"
+        else:
+            thinking_text = ""
+            thinking_source = "none"
+
+        return answer_text.strip(), thinking_text.strip(), thinking_source, tool_calls
+
+    def _parse_stream_response(
+        self,
+        response: requests.Response,
+        *,
+        params: Dict[str, Any],
+        model: str,
+        query: str,
+        debug_live: bool,
+        live_max_chars: int,
+    ) -> Tuple[Dict[str, Any], str]:
+        answer_parts: List[str] = []
+        thinking_parts: List[str] = []
+        raw_lines: List[str] = []
+        last_data: Dict[str, Any] = {}
+
+        for line in response.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+
+            raw_lines.append(str(line))
+
+            try:
+                data = json.loads(line)
+            except Exception:
+                continue
+
+            if not isinstance(data, dict):
+                continue
+
+            last_data = data
+            msg = data.get("message", {})
+
+            if isinstance(msg, dict):
+                thinking_chunk = self._text(msg.get("thinking", ""))
+                answer_chunk = self._text(msg.get("content", ""))
+
+                if thinking_chunk:
+                    thinking_parts.append(thinking_chunk)
+
+                    if debug_live:
+                        self._log_text_block(
+                            prefix=f"[Ollama][THINK][LIVE] model={model}",
+                            text=thinking_chunk,
+                            params=params,
+                            max_chars=live_max_chars,
+                        )
+
+                if answer_chunk:
+                    answer_parts.append(answer_chunk)
+
+            # Generate endpoint fallback, just in case.
+            response_chunk = self._text(data.get("response", ""))
+            if response_chunk:
+                answer_parts.append(response_chunk)
+
+        last_data["message"] = {
+            "role": "assistant",
+            "content": "".join(answer_parts),
+            "thinking": "".join(thinking_parts),
         }
 
+        return last_data, "\n".join(raw_lines)
+
+    def _parse_response(
+        self,
+        response: requests.Response,
+        *,
+        stream: bool,
+        params: Dict[str, Any],
+        model: str,
+        query: str,
+        debug_live: bool,
+        live_max_chars: int,
+    ) -> Tuple[Dict[str, Any], str]:
+        if stream:
+            return self._parse_stream_response(
+                response,
+                params=params,
+                model=model,
+                query=query,
+                debug_live=debug_live,
+                live_max_chars=live_max_chars,
+            )
+
+        raw_text = response.text or ""
+
+        if not raw_text.strip():
+            return {}, raw_text
+
+        try:
+            data = response.json()
+            if isinstance(data, dict):
+                return data, raw_text
+        except Exception:
+            pass
+
+        # NDJSON fallback.
+        answer_parts: List[str] = []
+        thinking_parts: List[str] = []
+        last_data: Dict[str, Any] = {}
+
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+
+            if not isinstance(item, dict):
+                continue
+
+            last_data = item
+
+            msg = item.get("message", {})
+            if isinstance(msg, dict):
+                answer_parts.append(self._text(msg.get("content", "")))
+                thinking_parts.append(self._text(msg.get("thinking", "")))
+
+            answer_parts.append(self._text(item.get("response", "")))
+
+        if last_data:
+            last_data["message"] = {
+                "role": "assistant",
+                "content": "".join(x for x in answer_parts if x),
+                "thinking": "".join(x for x in thinking_parts if x),
+            }
+            return last_data, raw_text
+
+        # Last fallback: use raw text as answer.
+        return {
+            "message": {
+                "role": "assistant",
+                "content": raw_text,
+                "thinking": "",
+            }
+        }, raw_text
+
     # ----------------------------
-    # Memory output/export helpers
+    # Ollama request
     # ----------------------------
 
-    def _memory_export(
+    def _send_ollama(
         self,
         *,
-        store: Dict[str, Any],
-        ok: bool,
-        assistant_text: str,
-        context_text: str,
-        lexicon: List[str],
-        links: List[str],
+        url: str,
+        body: Dict[str, Any],
+        timeout_sec: int,
+        stream: bool,
         params: Dict[str, Any],
-    ) -> List[str]:
+        model: str,
+        query: str,
+        debug_live: bool,
+        live_max_chars: int,
+    ) -> Tuple[bool, Dict[str, Any], str, str, Optional[int]]:
         """
-        Block-style optional exports back into Memory.
+        Returns:
+            ok, data, raw_text, error, status_code
         """
-        exports: List[str] = []
+        try:
+            with requests.Session() as session:
+                session.headers.update({"Content-Type": "application/json"})
 
-        if not ok and bool(params.get("mem_out_on_ok", True)):
-            return exports
+                response = session.post(
+                    url,
+                    json=body,
+                    timeout=(3.0, float(timeout_sec)),
+                    stream=stream,
+                )
 
-        response_key = str(params.get("mem_out_response_key", "") or "").strip()
-        if response_key:
-            store[response_key] = assistant_text
-            exports.append(response_key)
+                status_code = response.status_code
 
-        out_key = str(params.get("mem_out_key", "") or "").strip()
-        out_prefix = str(params.get("mem_out_prefix", "") or "")
-        if out_key:
-            value = (out_prefix + assistant_text).strip() if out_prefix else assistant_text
-            if bool(params.get("mem_out_merge", False)):
-                existing = store.get(out_key)
-                if isinstance(existing, list):
-                    merged = existing + [value]
-                    max_items = int(params.get("mem_out_max_items", 0) or 0)
-                    if max_items > 0:
-                        merged = merged[-max_items:]
-                    store[out_key] = merged
-                elif isinstance(existing, str) and existing.strip():
-                    store[out_key] = existing.rstrip() + "\n\n" + value
-                else:
-                    store[out_key] = value
-            else:
-                store[out_key] = value
-            exports.append(out_key)
+                if not response.ok:
+                    raw = response.text or ""
+                    return False, {}, raw, f"server_rejected_request:{status_code}", status_code
 
-        export_context_key = str(params.get("export_context_key", "") or "").strip()
-        if export_context_key and context_text.strip():
-            store[export_context_key] = context_text
-            exports.append(export_context_key)
+                data, raw = self._parse_response(
+                    response,
+                    stream=stream,
+                    params=params,
+                    model=model,
+                    query=query,
+                    debug_live=debug_live,
+                    live_max_chars=live_max_chars,
+                )
 
-        export_lexicon_key = str(params.get("export_lexicon_key", "") or "").strip()
-        if export_lexicon_key and lexicon:
-            store[export_lexicon_key] = lexicon
-            exports.append(export_lexicon_key)
+                return True, data, raw, "", status_code
 
-        export_links_key = str(params.get("export_links_key", "") or "").strip()
-        if export_links_key and links:
-            store[export_links_key] = links
-            exports.append(export_links_key)
+        except requests.RequestException as exc:
+            return False, {}, "", f"request_failed:{exc}", None
 
-        return exports
+        except Exception as exc:
+            return False, {}, "", f"parse_failed:{exc}", None
+
+    def _build_body(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, str]],
+        stream: bool,
+        temperature: float,
+        think: Any,
+        num_predict: Any,
+        top_p: Any,
+        top_k: Any,
+        repeat_penalty: Any,
+        seed: Any,
+        stop: Any,
+        keep_alive: Any,
+        format_value: Any,
+    ) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "temperature": temperature,
+        }
+
+        if num_predict not in (None, ""):
+            options["num_predict"] = int(num_predict)
+
+        if top_p not in (None, ""):
+            options["top_p"] = float(top_p)
+
+        if top_k not in (None, ""):
+            options["top_k"] = int(top_k)
+
+        if repeat_penalty not in (None, ""):
+            options["repeat_penalty"] = float(repeat_penalty)
+
+        if seed not in (None, ""):
+            options["seed"] = int(seed)
+
+        if stop not in (None, ""):
+            options["stop"] = stop
+
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "options": options,
+        }
+
+        if think is not None:
+            body["think"] = think
+
+        if keep_alive not in (None, ""):
+            body["keep_alive"] = keep_alive
+
+        if format_value not in (None, ""):
+            body["format"] = format_value
+
+        return body
+
+    def _format_output(
+        self,
+        *,
+        answer: str,
+        thinking: str,
+        show_thinking: bool,
+        thinking_output: str,
+    ) -> Any:
+        answer = self._text(answer)
+        thinking = self._text(thinking)
+        mode = str(thinking_output or "sections").strip().lower()
+
+        if mode == "dict":
+            return {
+                "thinking": thinking if show_thinking else "",
+                "answer": answer,
+            }
+
+        if not show_thinking or not thinking:
+            return answer
+
+        if mode == "append":
+            return (
+                f"{answer}\n\n"
+                "### Thinking\n"
+                f"{thinking}"
+            ).strip()
+
+        # default: sections / prepend
+        return (
+            "### Thinking\n"
+            f"{thinking}\n\n"
+            "### Answer\n"
+            f"{answer}"
+        ).strip()
 
     # ----------------------------
     # public execute
     # ----------------------------
 
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[Any, Dict[str, Any]]:
-        # config-style params
-        base_url = str(params.get("base_url", self.default_base_url) or self.default_base_url).strip()
-        model = str(params.get("model", self.default_model) or self.default_model).strip()
-        api_key = str(params.get("api_key", self.default_api_key) or self.default_api_key).strip()
-        request_timeout_sec = int(params.get("request_timeout_sec", self.default_request_timeout_sec) or self.default_request_timeout_sec)
-        temperature = float(params.get("temperature", self.default_temperature))
-        max_history = int(params.get("max_history", self.default_max_history) or self.default_max_history)
+        params = params or {}
 
-        # prompt-building params
+        base_url = self._text(params.get("base_url", self.default_base_url)) or self.default_base_url
+        url = self._api_chat_url(base_url)
+
+        model = self._text(params.get("model", self.default_model)) or self.default_model
+        temperature = self._float(params.get("temperature", self.default_temperature), self.default_temperature)
+        timeout_sec = self._int(params.get("request_timeout_sec", self.default_request_timeout_sec), self.default_request_timeout_sec)
+
+        query = self._text(params.get("query", ""))
+        payload_text = self._text(payload)
+        merge_mode = self._text(params.get("merge_mode", "query_then_payload")) or "query_then_payload"
         joiner = str(params.get("joiner", "\n\n"))
-        merge_mode = str(params.get("merge_mode", "query_then_payload")).strip().lower()
 
-        prefix = self._coerce_text(params.get("prefix", ""))
-        suffix = self._coerce_text(params.get("suffix", ""))
+        system_prompt = self._text(params.get("system", params.get("system_prompt", "")))
 
-        include_context = bool(params.get("include_context", True))
-        include_lexicon = bool(params.get("include_lexicon", True))
-        include_links = bool(params.get("include_links", True))
-        include_extra_memory = bool(params.get("include_extra_memory", True))
+        stream = self._bool(params.get("stream", False), False)
+        think = self._think_value(params.get("think", None))
 
-        # advanced message params
-        prepend_messages = self._coerce_messages(params.get("prepend_messages", []))
-        append_messages = self._coerce_messages(params.get("append_messages", []))
-        history = self._coerce_messages(params.get("history", []))[-max_history:]
-        tools = self._coerce_tools(params.get("tools", []))
-        stream = bool(params.get("stream", False))
+        show_thinking = self._bool(params.get("show_thinking", True), True)
+        thinking_output = self._text(params.get("thinking_output", "sections")) or "sections"
 
-        # model options
+        debug_log_thinking = self._bool(params.get("debug_log_thinking", True), True)
+        debug_log_answer = self._bool(params.get("debug_log_answer", True), True)
+        debug_log_raw = self._bool(params.get("debug_log_raw", False), False)
+        debug_log_request = self._bool(params.get("debug_log_request", False), False)
+        debug_log_live_thinking = self._bool(params.get("debug_log_live_thinking", False), False)
+
+        log_max_chars = self._int(params.get("debug_log_max_chars", 12000), 12000)
+        live_max_chars = self._int(params.get("debug_log_live_max_chars", 2000), 2000)
+
+        force_think_tags_param = str(params.get("force_think_tags", "auto")).strip().lower()
+
+        if force_think_tags_param in {"auto", ""}:
+            # Auto means: if the user wants thinking visible or logged,
+            # ask the model to emit <think> tags even if native Ollama thinking is unsupported.
+            force_think_tags = bool(show_thinking or debug_log_thinking or debug_log_live_thinking)
+        else:
+            force_think_tags = self._bool(force_think_tags_param, False)
+
+        retry_without_think = self._bool(params.get("retry_without_think", True), True)
+        retry_with_forced_tags = self._bool(params.get("retry_with_forced_tags", True), True)
+
+        num_predict = params.get("num_predict", None)
         top_p = params.get("top_p", None)
         top_k = params.get("top_k", None)
-        num_predict = params.get("num_predict", None)
         repeat_penalty = params.get("repeat_penalty", None)
         seed = params.get("seed", None)
         stop = params.get("stop", None)
-        format_value = params.get("format", None)
         keep_alive = params.get("keep_alive", None)
+        format_value = params.get("format", None)
 
-        store = self._memory_load()
-
-        payload_text_full = self._coerce_text(payload)
-        sections = self._parse_payload_sections(payload_text_full)
-        payload_text = self._strip_payload_sections(payload_text_full)
-
-        query = self._resolve_query(payload_text, params, sections)
-        system_prompt = self._resolve_system(params, sections)
-        context_text = self._resolve_context(payload_text, params, sections, store)
-        lexicon = self._resolve_lexicon(payload_text, params, sections, store)
-        links = self._resolve_links(payload_text, params, sections, store)
-        extra_memory_text = self._resolve_extra_memory_inputs(params, store)
-
-        merged_query_payload = self._merge_query_and_payload(
-            query=query,
+        user_text = self._build_user_text(
             payload_text=payload_text,
+            query=query,
             merge_mode=merge_mode,
             joiner=joiner,
         )
 
-        user_text = self._build_user_text(
-            merged_query_payload=merged_query_payload,
-            context_text=context_text,
-            lexicon=lexicon,
-            links=links,
-            extra_memory_text=extra_memory_text,
-            prefix=prefix,
-            suffix=suffix,
-            include_context=include_context,
-            include_lexicon=include_lexicon,
-            include_links=include_links,
-            include_extra_memory=include_extra_memory,
-            joiner=joiner,
-        )
-
-        messages = self._build_messages(
-            system_prompt=system_prompt,
-            history=history,
-            prepend_messages=prepend_messages,
-            append_messages=append_messages,
-            user_text=user_text,
-        )
-
-        if not messages:
+        if not user_text:
             return "", {
                 "ok": False,
                 "error": "empty_request",
-                "base_url": self._normalize_base_url(base_url),
                 "model": model,
+                "base_url": self._normalize_base_url(base_url),
             }
 
-        body: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-            "options": {
-                "temperature": temperature,
-            },
-        }
+        messages = self._build_messages(
+            system_prompt=system_prompt,
+            user_text=user_text,
+            force_think_tags=force_think_tags,
+        )
 
-        if tools:
-            body["tools"] = tools
-        if top_p is not None:
-            body["options"]["top_p"] = float(top_p)
-        if top_k is not None:
-            body["options"]["top_k"] = int(top_k)
-        if num_predict is not None:
-            body["options"]["num_predict"] = int(num_predict)
-        if repeat_penalty is not None:
-            body["options"]["repeat_penalty"] = float(repeat_penalty)
-        if seed is not None:
-            body["options"]["seed"] = int(seed)
-        if stop is not None:
-            body["options"]["stop"] = stop
-        if format_value is not None:
-            body["format"] = format_value
-        if keep_alive is not None:
-            body["keep_alive"] = keep_alive
+        body = self._build_body(
+            model=model,
+            messages=messages,
+            stream=stream,
+            temperature=temperature,
+            think=think,
+            num_predict=num_predict,
+            top_p=top_p,
+            top_k=top_k,
+            repeat_penalty=repeat_penalty,
+            seed=seed,
+            stop=stop,
+            keep_alive=keep_alive,
+            format_value=format_value,
+        )
 
-        url = f"{self._api_root(base_url)}/chat"
-        session = self._build_session()
-
-        try:
-            response = session.post(
-                url,
-                data=json.dumps(body),
-                timeout=(2.0, float(request_timeout_sec)),
+        if debug_log_request:
+            self._log(
+                f"[Ollama][REQUEST] model={model} url={url} stream={stream} think={think} "
+                f"force_think_tags={force_think_tags} query={self._query_preview(query or user_text)}",
+                params=params,
             )
 
-            if not response.ok:
-                detail = response.text.strip()
-                if len(detail) > 2000:
-                    detail = detail[:2000] + "..."
-                return "", {
-                    "ok": False,
-                    "error": "server_rejected_request",
-                    "base_url": self._normalize_base_url(base_url),
-                    "chat_url": url,
-                    "status_code": response.status_code,
-                    "response_text": detail,
-                    "model": model,
-                    "request_message_count": len(messages),
-                    "query": query,
-                }
+        ok, data, raw_text, error, status_code = self._send_ollama(
+            url=url,
+            body=body,
+            timeout_sec=timeout_sec,
+            stream=stream,
+            params=params,
+            model=model,
+            query=query or user_text,
+            debug_live=debug_log_live_thinking,
+            live_max_chars=live_max_chars,
+        )
 
-            try:
-                data = response.json()
-            except ValueError:
-                return "", {
-                    "ok": False,
-                    "error": "invalid_json_response",
-                    "base_url": self._normalize_base_url(base_url),
-                    "chat_url": url,
-                    "model": model,
-                    "raw_text": response.text[:2000],
-                    "query": query,
-                }
+        used_retry = False
+        used_think = think
+        used_force_think_tags = force_think_tags
 
-        except requests.RequestException as exc:
+        # If old Ollama rejects the native "think" field, retry without it.
+        if not ok and retry_without_think and think is not None:
+            lower_raw = (raw_text or "").lower()
+            lower_err = (error or "").lower()
+
+            if "think" in lower_raw or "think" in lower_err or status_code in {400, 404, 422, 500}:
+                used_retry = True
+                used_think = None
+
+                retry_body = dict(body)
+                retry_body.pop("think", None)
+
+                self._log(
+                    f"[Ollama][RETRY] retrying without native think field model={model} status={status_code}",
+                    params=params,
+                )
+
+                ok, data, raw_text, error, status_code = self._send_ollama(
+                    url=url,
+                    body=retry_body,
+                    timeout_sec=timeout_sec,
+                    stream=stream,
+                    params=params,
+                    model=model,
+                    query=query or user_text,
+                    debug_live=debug_log_live_thinking,
+                    live_max_chars=live_max_chars,
+                )
+
+        answer_text = ""
+        thinking_text = ""
+        thinking_source = "none"
+        tool_calls: List[Any] = []
+
+        if ok:
+            answer_text, thinking_text, thinking_source, tool_calls = self._extract_from_data(data)
+
+        # If response is OK but empty, retry once with forced <think> tags and no native think field.
+        if ok and not answer_text and not thinking_text and retry_with_forced_tags:
+            used_retry = True
+            used_think = None
+            used_force_think_tags = True
+
+            retry_messages = self._build_messages(
+                system_prompt=system_prompt,
+                user_text=user_text,
+                force_think_tags=True,
+            )
+
+            retry_body = self._build_body(
+                model=model,
+                messages=retry_messages,
+                stream=stream,
+                temperature=temperature,
+                think=None,
+                num_predict=num_predict,
+                top_p=top_p,
+                top_k=top_k,
+                repeat_penalty=repeat_penalty,
+                seed=seed,
+                stop=stop,
+                keep_alive=keep_alive,
+                format_value=format_value,
+            )
+
+            self._log(
+                f"[Ollama][RETRY] empty response; retrying with forced <think> tags model={model}",
+                params=params,
+            )
+
+            ok, data, raw_text, error, status_code = self._send_ollama(
+                url=url,
+                body=retry_body,
+                timeout_sec=timeout_sec,
+                stream=stream,
+                params=params,
+                model=model,
+                query=query or user_text,
+                debug_live=debug_log_live_thinking,
+                live_max_chars=live_max_chars,
+            )
+
+            if ok:
+                answer_text, thinking_text, thinking_source, tool_calls = self._extract_from_data(data)
+
+        if not ok:
+            self._log(
+                f"[Ollama][ERROR] model={model} status={status_code} error={error}",
+                params=params,
+            )
+
+            if raw_text:
+                self._log_text_block(
+                    prefix=f"[Ollama][RAW] model={model}",
+                    text=raw_text,
+                    params=params,
+                    max_chars=log_max_chars,
+                )
+
             return "", {
                 "ok": False,
-                "error": "request_failed",
+                "error": error,
+                "status_code": status_code,
+                "model": model,
                 "base_url": self._normalize_base_url(base_url),
                 "chat_url": url,
-                "model": model,
-                "detail": str(exc),
-                "query": query,
+                "raw_text": self._preview(raw_text, 2000),
             }
-        finally:
-            session.close()
 
-        assistant_msg = self._extract_assistant_message(data)
-        assistant_text = str(assistant_msg.get("content", "") or "")
-        tool_calls = assistant_msg.get("tool_calls", []) or []
+        if debug_log_thinking:
+            if thinking_text:
+                self._log_text_block(
+                    prefix=f"[Ollama][THINK] model={model} source={thinking_source}",
+                    text=thinking_text,
+                    params=params,
+                    max_chars=log_max_chars,
+                )
+            else:
+                self._log(
+                    f"[Ollama][THINK] <none> model={model} source={thinking_source} "
+                    f"answer_chars={len(answer_text)}",
+                    params=params,
+                )
 
-        exports = self._memory_export(
-            store=store,
-            ok=True,
-            assistant_text=assistant_text,
-            context_text=context_text,
-            lexicon=lexicon,
-            links=links,
-            params=params,
+        if debug_log_answer:
+            self._log_text_block(
+                prefix=f"[Ollama][ANSWER] model={model}",
+                text=answer_text,
+                params=params,
+                max_chars=log_max_chars,
+            )
+
+        if debug_log_raw:
+            raw_to_log = raw_text
+
+            if not raw_to_log:
+                try:
+                    raw_to_log = json.dumps(data, ensure_ascii=False, indent=2)
+                except Exception:
+                    raw_to_log = str(data)
+
+            self._log_text_block(
+                prefix=f"[Ollama][RAW] model={model}",
+                text=raw_to_log,
+                params=params,
+                max_chars=log_max_chars,
+            )
+
+        if not answer_text and thinking_text:
+            # Some thinking models put everything in thinking and no final answer.
+            answer_text = thinking_text
+
+        if not answer_text:
+            answer_text = "[Ollama returned an empty response. Enable ollama.debug_log_raw=true to inspect the raw response.]"
+
+        final_output = self._format_output(
+            answer=answer_text,
+            thinking=thinking_text,
+            show_thinking=show_thinking,
+            thinking_output=thinking_output,
         )
-        if exports:
-            self._memory_save(store)
 
         meta: Dict[str, Any] = {
             "ok": True,
+            "model": model,
             "base_url": self._normalize_base_url(base_url),
             "chat_url": url,
-            "model": model,
-            "api_key": api_key,
-            "temperature": temperature,
-            "request_timeout_sec": request_timeout_sec,
+            "status_code": status_code,
             "query": query,
             "merge_mode": merge_mode,
 
-            "context_chars": len(context_text),
-            "lexicon_size": len(lexicon),
-            "links_count": len(links),
-            "extra_memory_chars": len(extra_memory_text),
+            "think": think,
+            "used_think": used_think,
+            "force_think_tags": force_think_tags,
+            "used_force_think_tags": used_force_think_tags,
+            "used_retry": used_retry,
 
-            "request_message_count": len(messages),
-            "history_count": len(history),
-            "tools_count": len(tools),
+            "answer_chars": len(answer_text),
+            "thinking_chars": len(thinking_text),
+            "thinking_source": thinking_source,
+            "show_thinking": show_thinking,
+            "thinking_output": thinking_output,
+
+            "debug_log_thinking": debug_log_thinking,
+            "debug_log_answer": debug_log_answer,
+            "debug_log_raw": debug_log_raw,
+
             "tool_calls": tool_calls,
 
-            "done": data.get("done", None),
-            "done_reason": data.get("done_reason", None),
-            "prompt_eval_count": data.get("prompt_eval_count", None),
-            "eval_count": data.get("eval_count", None),
-            "total_duration": data.get("total_duration", None),
-            "load_duration": data.get("load_duration", None),
-            "prompt_eval_duration": data.get("prompt_eval_duration", None),
-            "eval_duration": data.get("eval_duration", None),
+            "done": data.get("done"),
+            "done_reason": data.get("done_reason"),
+            "prompt_eval_count": data.get("prompt_eval_count"),
+            "eval_count": data.get("eval_count"),
+            "total_duration": data.get("total_duration"),
+            "load_duration": data.get("load_duration"),
+            "prompt_eval_duration": data.get("prompt_eval_duration"),
+            "eval_duration": data.get("eval_duration"),
         }
 
-        if exports:
-            meta["memory_exports"] = exports
+        if thinking_text:
+            meta["thinking"] = thinking_text
 
-        return assistant_text, meta
+        return final_output, meta
 
     def get_params_info(self) -> Dict[str, Any]:
         return {
-            # config/provider-style
+            # Ollama connection
             "base_url": "http://127.0.0.1:11434",
             "model": "qwen3:8b",
-            "api_key": "ollama",
             "request_timeout_sec": 180,
-            "temperature": 0.2,
-            "max_history": 24,
 
-            # main prompt inputs
+            # Prompt input
             "query": "",
-            "merge_mode": "query_then_payload",   # query_then_payload | payload_then_query | query_only | payload_only
+            "merge_mode": "query_then_payload",
+            # query_then_payload | payload_then_query | query_only | payload_only
+            "joiner": "\n\n",
             "system": "",
             "system_prompt": "",
-            "prefix": "",
-            "suffix": "",
-            "joiner": "\n\n",
 
-            # direct injected rich inputs
-            "context": None,
-            "lexicon": None,
-            "links": None,
-
-            # parse/include controls
-            "include_context": True,
-            "include_lexicon": True,
-            "include_links": True,
-            "include_extra_memory": True,
-
-            # memory resolution
-            "mem_in_keys": None,
-            "mem_in_mode": "join",
-            "mem_in_join": "\n\n",
-            "mem_in_max_items": 0,
-
-            "context_key": "",
-            "lexicon_key": "",
-            "links_key": "",
-
-            "mem_context_keys": None,
-            "mem_context_mode": "join",
-            "mem_context_join": "\n\n",
-            "mem_context_max_items": 0,
-
-            "mem_lexicon_keys": None,
-            "mem_lexicon_mode": "list",
-            "mem_lexicon_join": "\n",
-            "mem_lexicon_max_items": 0,
-
-            "mem_links_keys": None,
-            "mem_links_mode": "list",
-            "mem_links_join": "\n",
-            "mem_links_max_items": 0,
-
-            # message-level advanced inputs
-            "history": [],
-            "prepend_messages": [],
-            "append_messages": [],
-            "tools": [],
-            "stream": False,
-
-            # model options
+            # Generation
+            "temperature": 0.2,
+            "num_predict": 1800,
             "top_p": None,
             "top_k": None,
-            "num_predict": None,
             "repeat_penalty": None,
             "seed": None,
             "stop": None,
             "format": None,
             "keep_alive": None,
+            "stream": False,
 
-            # exports
-            "mem_out_prefix": "",
-            "mem_out_key": "",
-            "mem_out_response_key": "",
-            "mem_out_on_ok": True,
-            "mem_out_merge": False,
-            "mem_out_max_items": 0,
+            # Thinking
+            "think": True,
+            # True uses Ollama native thinking when supported
+            "force_think_tags": "auto",
+            # auto | true | false
+            # auto forces <think> tags whenever thinking/logging is enabled
+            "show_thinking": True,
+            "thinking_output": "sections",
+            # sections | append | dict
 
-            "export_context_key": "",
-            "export_lexicon_key": "",
-            "export_links_key": "",
+            # Logging
+            "debug_logger": None,
+            "logger": None,
+            "debug_log_to_stdout": False,
+
+            "debug_log_thinking": True,
+            "debug_log_answer": True,
+            "debug_log_raw": False,
+            "debug_log_request": False,
+            "debug_log_live_thinking": False,
+
+            "debug_log_max_chars": 12000,
+            "debug_log_live_max_chars": 2000,
+
+            # Retry behavior
+            "retry_without_think": True,
+            "retry_with_forced_tags": True,
         }
 
 

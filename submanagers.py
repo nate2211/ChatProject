@@ -11233,7 +11233,8 @@ class ReactSniffer:
         max_router_entries: int = 1000
         max_state_object_depth: int = 6
         max_state_string_length: int = 10000
-
+        max_memory_impact_bytes = 1000
+        async_execution_delay = 0.5
         # Heuristic: what looks like a URL / route?
         url_like_regex: str = r"(https?://[^\s\"']+|/[A-Za-z0-9_./-]+)"
 
@@ -11665,646 +11666,947 @@ class ReactSniffer:
     # ------------------------------------------------------------------ #
     async def _install_instrumentation(
             self,
-            page: playwright.async_api.Page,
+            page,
             page_url: str,
             log: Optional[List[str]] = None
     ) -> None:
         """
-        Builds and injects a massively enhanced JavaScript payload to hook into
-        Web APIs, State Managers, Webpack Chunks, React Internals, and Shadow DOMs.
+        Safe ReactSniffer browser instrumentation.
 
-        Enhanced Capabilities:
-            • Deep React Fiber introspection with context & hooks tracing
-            • Advanced State Managers (Zustand, Jotai, Recoil, TanStack Query, etc.)
-            • Dynamic Component Discovery & Route Mapping
-            • Enhanced Shadow DOM + CSS Inlining Extraction
-            • Memory Leak & Performance Impact Analysis
+        Fixes:
+        - no doubled {{ }} braces in raw JS
+        - no await on sync self._log()
+        - defines both __RS_STATE_EXTRACTOR and __RS_DEEP_STATE_EXTRACTOR
+        - hooks fetch/xhr/ws/eventsource/history/clicks/webpack chunks
+        - keeps payload bounded to prevent browser/IPC blowups
         """
         if log is None:
             log = []
 
-        # --- 1. Base Shared Memory & Event Queue ---
-        script_parts: List[str] = [
-            f"""
-            (function() {{
-                try {{
-                    if (!window.__PROMPTCHAT_REACT_SNIFFER_HITS__) {{
-                        window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = [];
-                    }}
+        def js_bool(v: Any) -> str:
+            return "true" if bool(v) else "false"
 
-                    var MAX_EVENTS_PER_KIND = {int(self.cfg.max_events_per_kind)};
+        replacements = {
+            "__MAX_EVENTS_PER_KIND__": str(int(self.cfg.max_events_per_kind)),
+            "__MAX_DEPTH__": str(int(self.cfg.max_state_object_depth)),
+            "__MAX_FIBER_NODES__": str(int(self.cfg.max_fiber_nodes)),
+            "__MAX_ROUTER_ENTRIES__": str(int(self.cfg.max_router_entries)),
+            "__URL_RX_JSON__": json.dumps(
+                self.cfg.url_like_regex or r"(https?://[^\s\"']+|/[A-Za-z0-9_./?&=%#:@-]+)"
+            ),
+            "__ENABLE_NEXT_NUXT__": js_bool(self.cfg.enable_nextjs_nuxt_inspection),
+            "__ENABLE_APOLLO__": js_bool(self.cfg.enable_apollo_graphql_inspection),
+            "__ENABLE_REDUX__": js_bool(self.cfg.enable_redux_inspection),
+            "__ENABLE_FETCH_XHR__": js_bool(self.cfg.enable_fetch_xhr_interception),
+            "__ENABLE_WEBPACK__": js_bool(self.cfg.enable_webpack_chunk_interception),
+            "__ENABLE_HISTORY__": js_bool(self.cfg.hook_history_api),
+            "__ENABLE_HASHCHANGE__": js_bool(self.cfg.capture_hashchange),
+            "__ENABLE_LINK_CLICKS__": js_bool(self.cfg.hook_link_clicks),
+            "__ENABLE_FIBER__": js_bool(self.cfg.enable_fiber_traversal),
+            "__INSPECT_REACT_DEVTOOLS__": js_bool(self.cfg.inspect_react_devtools_hook),
+            "__MAX_MEMORY_IMPACT_BYTES__": str(int(self.cfg.max_memory_impact_bytes)),
+            "__ASYNC_DELAY_MS__": str(max(1, int(float(self.cfg.async_execution_delay) * 1000))),
+        }
 
-                    function __RS_pushEvent(evt) {{
-                        try {{
-                            var arr = window.__PROMPTCHAT_REACT_SNIFFER_HITS__;
-                            if (!Array.isArray(arr)) {{
-                                arr = [];
-                                window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = arr;
-                            }}
-                            var kind = evt && evt.kind || "unknown";
-                            var count = 0;
-                            for (var i = 0; i < arr.length; i++) {{
-                                if (arr[i] && arr[i].kind === kind) {{
-                                    count++;
-                                    if (count >= MAX_EVENTS_PER_KIND) return;
-                                }}
-                            }}
-                            arr.push(evt);
-                        }} catch (_) {{}}
-                    }}
+        final_script = r"""
+(function () {
+    try {
+        if (!window.__PROMPTCHAT_REACT_SNIFFER_HITS__) {
+            window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = [];
+        }
 
-                    window.__RS_pushEvent = __RS_pushEvent;
+        var MAX_EVENTS_PER_KIND = __MAX_EVENTS_PER_KIND__;
 
-                    // 1A. Event Fingerprint for Deduplication
-                    function __RS_fingerprint(evt) {{
-                        return [evt.kind, evt.url, evt.pathname, (evt.timestamp || 0)].join("|");
-                    }}
-                    window.__RS_fingerprint = __RS_fingerprint;
+        function __RS_pushEvent(evt) {
+            try {
+                if (!evt || typeof evt !== "object") return;
 
-                }} catch (e) {{ console.error("[ReactSniffer] Shared Buffer Error:", e); }}
-            }})();
-            """
-        ]
+                var arr = window.__PROMPTCHAT_REACT_SNIFFER_HITS__;
+                if (!Array.isArray(arr)) {
+                    arr = [];
+                    window.__PROMPTCHAT_REACT_SNIFFER_HITS__ = arr;
+                }
 
-        # --- 2. Network Interceptors (XHR & Fetch with Enhanced Logging) ---
-        if self.cfg.enable_fetch_xhr_interception:
-            script_parts.append(
-                """
-                (function() {
+                var kind = evt.kind || "unknown";
+                var count = 0;
+
+                for (var i = 0; i < arr.length; i++) {
+                    if (arr[i] && arr[i].kind === kind) {
+                        count++;
+                        if (count >= MAX_EVENTS_PER_KIND) return;
+                    }
+                }
+
+                arr.push(evt);
+            } catch (_) {}
+        }
+
+        window.__RS_pushEvent = __RS_pushEvent;
+
+        function __RS_isUrlish(value) {
+            try {
+                if (typeof value !== "string") return false;
+                if (!value || value.length < 2 || value.length > 2000) return false;
+
+                var low = value.toLowerCase();
+                if (
+                    low.startsWith("javascript:") ||
+                    low.startsWith("mailto:") ||
+                    low.startsWith("tel:") ||
+                    low.startsWith("data:") ||
+                    low.startsWith("blob:")
+                ) {
+                    return false;
+                }
+
+                var URL_RX = new RegExp(__URL_RX_JSON__, "i");
+                return URL_RX.test(value) || value[0] === "/" || value.startsWith("./") || value.startsWith("../");
+            } catch (_) {
+                return false;
+            }
+        }
+
+        window.__RS_isUrlish = __RS_isUrlish;
+
+        function __RS_abs(value) {
+            try {
+                if (!value) return "";
+                return new URL(String(value), location.href).href;
+            } catch (_) {
+                return String(value || "");
+            }
+        }
+
+        window.__RS_abs = __RS_abs;
+
+        if (__INSPECT_REACT_DEVTOOLS__) {
+            try {
+                var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+                var rendererIds = [];
+
+                if (hook && hook.renderers) {
                     try {
-                        // 2A. Fetch Interceptor with Enhanced Metadata
-                        const origFetch = window.fetch.bind(window);
-                        if (origFetch) {{
-                            window.fetch = async function(...args) {{
-                                try {{
-                                    const reqUrl = typeof args[0] === 'string' 
-                                        ? args[0] 
-                                        : (args[0] && args[0].url 
-                                            ? args[0].url 
-                                            : "");
+                        rendererIds = Object.keys(hook.renderers || {});
+                    } catch (_) {}
+                }
 
-                                    if (reqUrl && reqUrl.length > 1) {{
-                                        // Normalize & record
-                                        var cleanUrl = new URL(reqUrl, location.href).href;
-                                        window.__RS_pushEvent({{
-                                            kind: "intercept_fetch",
-                                            url: cleanUrl,
-                                            pathname: location.pathname,
-                                            timestamp: Date.now(),
-                                            meta: {{
-                                                method: args[0].method || "GET",
-                                                headers: (args[0].headers || {}).toString().slice(0, 200)
-                                            }}
-                                        }});
-                                    }}
-                                }} catch (_) {{}}
-                                return origFetch.apply(this, args);
-                            }};
-                        }}
+                window.__RS_pushEvent({
+                    kind: "react_devtools",
+                    url: location.href,
+                    pathname: location.pathname,
+                    hasReact: !!hook,
+                    rendererIds: rendererIds,
+                    timestamp: Date.now()
+                });
+            } catch (_) {}
+        }
 
-                        // 2B. XHR Interceptor
-                        const origOpen = XMLHttpRequest.prototype.open;
-                        if (origOpen) {{
-                            XMLHttpRequest.prototype.open = function(method, url, ...rest) {{
-                                try {{
-                                    if (url) {{
-                                        window.__RS_pushEvent({{
-                                            kind: "intercept_xhr",
-                                            url: String(url),
-                                            pathname: location.pathname,
-                                            timestamp: Date.now(),
-                                            meta: {{ method, ...rest.slice(0, 2) }}
-                                        }});
-                                    }}
-                                }} catch (_) {{}}
-                                return origOpen.call(this, method, url, ...rest);
-                            }};
-                        }}
+        if (__ENABLE_FETCH_XHR__) {
+            try {
+                var origFetch = window.fetch ? window.fetch.bind(window) : null;
 
-                        // 2C. EventSource & WebSocket Interception (Bonus)
-                        const origEventSource = window.EventSource;
-                        if (origEventSource) {{
-                            window.EventSource = function(url) {{
-                                try {{
-                                    window.__RS_pushEvent({{
-                                        kind: "intercept_eventsour",
-                                        url: String(url),
-                                        pathname: location.pathname,
-                                        timestamp: Date.now()
-                                    }});
-                                }} catch (_) {{}}
-                                return origEventSource.apply(this, arguments);
-                            }};
-                        }}
+                if (origFetch && !window.fetch.__RS_hooked) {
+                    var wrappedFetch = async function () {
+                        try {
+                            var args = Array.prototype.slice.call(arguments);
+                            var raw = "";
 
-                        const origWebSocket = window.WebSocket;
-                        if (origWebSocket) {{
-                            window.WebSocket = function(url, ...rest) {{
-                                try {{
-                                    window.__RS_pushEvent({{
-                                        kind: "intercept_ws",
-                                        url: String(url),
-                                        pathname: location.pathname,
-                                        timestamp: Date.now()
-                                    }});
-                                }} catch (_) {{}}
-                                return origWebSocket.apply(this, arguments);
-                            }};
-                        }}
+                            if (typeof args[0] === "string") {
+                                raw = args[0];
+                            } else if (args[0] && args[0].url) {
+                                raw = args[0].url;
+                            }
 
-                    }} catch (e) {{
-                        console.error("[ReactSniffer] Network Interceptor Error:", e);
-                    }}
-                })();
-                """
-            )
+                            if (raw) {
+                                var method =
+                                    (args[1] && args[1].method) ||
+                                    (args[0] && args[0].method) ||
+                                    "GET";
 
-        # --- 3. Webpack / Rollup / Vite Chunk Interceptor ---
-        if self.cfg.enable_webpack_chunk_interception:
-            script_parts.append(
-                """
-                (function() {{
-                    try {{
-                        // 3A. Webpack Chunk Hook
-                        const wrappers = [[ "webpackChunk_",".push.bind" ], [ "webpackChunk",".push" ]];
-                        wrappers.forEach(([prefix, fn]) => {{
-                            if (window[prefix]) {{
-                                const original = window[prefix][fn] || null;
-                                if (original) {{
-                                    const wrapped = (chunkData) => {{
-                                        try {{
-                                            const chunkIds = chunkData[0] || [];
-                                            const modules = chunkData[1] || {};
-
-                                            // Enhanced extraction with better regex patterns
-                                            for (const key in modules) {{
-                                                const modString = modules[key].toString();
-                                                const urls = modString.match(/https?:\\\\/\\\\/[^"'\\\\s<>\\\\\\[]+/ig) || [];
-                                                const routes = modString.match(/\\\\/[A-Za-z0-9_./-]+/g) || [];
-
-                                                [...urls, ...routes].forEach(u => {{
-                                                    if (u.length > 2 && !u.includes("webpackChunk")) {{
-                                                        window.__RS_pushEvent({{
-                                                            kind: "webpack_chunk_leak",
-                                                            url: u,
-                                                            pathname: location.pathname,
-                                                            meta: {{ chunkId: chunkIds.join(","), moduleKey: key }},
-                                                            timestamp: Date.now()
-                                                        }});
-                                                    }}
-                                                }});
-                                            }}
-                                        }} catch (_) {{}}
-                                        return original(chunkData);
-                                    }};
-                                    window[prefix][fn] = wrapped;
-                                }}
-                            }}
-                        }};
-
-                        // 3B. Dynamic `import()` / `require()` Interceptor (for Vite/Rollup)
-                        const origImport = window.__REACT__ && window.__REACT__.__esModule
-                            ? window.__REACT__.__esModule
-                            : undefined;
-                        if (origImport) {{
-                            const origApply = origImport.apply.bind(origImport);
-                            const wrapped = function() {{
-                                try {{
-                                    if (arguments[0] && typeof arguments[0] === 'string') {{
-                                        const u = arguments[0];
-                                        window.__RS_pushEvent({{
-                                            kind: "dynamic_import_leak",
-                                            url: u,
-                                            pathname: location.pathname,
-                                            timestamp: Date.now()
-                                        }});
-                                    }}
-                                }} catch (_) {{}}
-                                return origApply.apply(this, arguments);
-                            }};
-                            window.__REACT__.__esModule = wrapped;
-                        }}
-
-                    }} catch (e) {{}}
-                })();
-                """
-            )
-
-        # --- 4. History API & Routing Hooks (Enhanced) ---
-        if self.cfg.hook_history_api or self.cfg.capture_hashchange:
-            script_parts.append(
-                """
-                (function() {{
-                    try {{
-                        function recordReactNav(kind, url) {{
-                            window.__RS_pushEvent({{
-                                kind: kind,
-                                url: String(url || location.href),
-                                pathname: location.pathname,
-                                timestamp: Date.now()
-                            }});
-                        }}
-
-                        if (window.history && window.history.pushState) {{
-                            var origPush = history.pushState;
-                            var origReplace = history.replaceState;
-
-                            history.pushState = function(state, title, url) {{
-                                try {{ origPush.apply(this, arguments); }} catch (_) {{}}
-                                recordReactNav("pushState", url);
-                            }};
-
-                            history.replaceState = function(state, title, url) {{
-                                try {{ origReplace.apply(this, arguments); }} catch (_) {{}}
-                                recordReactNav("replaceState", url);
-                            }};
-                        }}
-
-                        window.addEventListener("popstate", function() {{ recordReactNav("popstate", location.href); }});
-                        window.addEventListener("hashchange", function() {{ recordReactNav("hashchange", location.href); }});
-
-                        // Initial Load
-                        recordReactNav("initial", location.href);
-
-                        // 4A. Enhanced Router Hooks (React Router, History.js, etc.)
-                        ['react-router-dom', 'react-router', 'history'].forEach(r => {{
-                            if (window[r]) {{
-                                window.__RS_pushEvent({{
-                                    kind: "router_hook_detected",
-                                    url: location.href,
+                                window.__RS_pushEvent({
+                                    kind: "intercept_fetch",
+                                    url: window.__RS_abs(raw),
                                     pathname: location.pathname,
-                                    meta: {{ library: r, version: (r.version || "").slice(0, 20) }},
-                                    timestamp: Date.now()
-                                }});
-                            }}
-                        }});
+                                    timestamp: Date.now(),
+                                    meta: {
+                                        method: String(method || "GET")
+                                    }
+                                });
+                            }
+                        } catch (_) {}
 
-                    }} catch (e) {{}}
-                })();
-                """
-            )
+                        return origFetch.apply(window, arguments);
+                    };
 
-        # --- 5. Link & Click Events (Shadow-Inclusive) ---
-        if self.cfg.hook_link_clicks:
-            script_parts.append(
-                """
-                (function() {{
-                    try {{
-                        function findClosestAnchor(el) {{
-                            while (el && el !== document && !el.href) {{
-                                el = el.parentElement || el.closest;
-                                if (el && el.closest) el = el.closest('a');
-                                if (!el) break;
-                            }}
-                            return el;
-                        }}
+                    wrappedFetch.__RS_hooked = true;
+                    window.fetch = wrappedFetch;
+                }
+            } catch (_) {}
 
-                        document.addEventListener("click", function(ev) {{
-                            var t = ev.target;
-                            t = findClosestAnchor(t);
-                            if (!t || !t.href) return;
+            try {
+                var origOpen = XMLHttpRequest.prototype.open;
 
-                            window.__RS_pushEvent({{
-                                kind: "click",
-                                url: String(t.href),
+                if (origOpen && !XMLHttpRequest.prototype.open.__RS_hooked) {
+                    var wrappedOpen = function (method, url) {
+                        try {
+                            if (url) {
+                                window.__RS_pushEvent({
+                                    kind: "intercept_xhr",
+                                    url: window.__RS_abs(url),
+                                    pathname: location.pathname,
+                                    timestamp: Date.now(),
+                                    meta: {
+                                        method: String(method || "GET")
+                                    }
+                                });
+                            }
+                        } catch (_) {}
+
+                        return origOpen.apply(this, arguments);
+                    };
+
+                    wrappedOpen.__RS_hooked = true;
+                    XMLHttpRequest.prototype.open = wrappedOpen;
+                }
+            } catch (_) {}
+
+            try {
+                var OrigEventSource = window.EventSource;
+
+                if (OrigEventSource && !OrigEventSource.__RS_hooked) {
+                    var WrappedEventSource = function (url, config) {
+                        try {
+                            window.__RS_pushEvent({
+                                kind: "intercept_eventsource",
+                                url: window.__RS_abs(url),
                                 pathname: location.pathname,
-                                text: (t.innerText || "").trim(),
                                 timestamp: Date.now()
-                            }});
-                        }, true);
+                            });
+                        } catch (_) {}
 
-                        // 5B. Shadow DOM Click Traversal
-                        document.addEventListener("click", function(ev) {{
-                             var t = ev.target;
-                             if (t.shadowRoot) {{
-                                 function scanShadow(e) {{
-                                     if (!e || e.nodeType !== 11) return;
-                                     [...e.children].forEach(c => {{
-                                         if (c.shadowRoot) scanShadow(c.shadowRoot);
-                                         if (c.href) {{
-                                             window.__RS_pushEvent({{
-                                                 kind: "shadow_click",
-                                                 url: e.href,
-                                                 pathname: location.pathname,
-                                                 text: (e.innerText || "").trim(),
-                                                 timestamp: Date.now()
-                                             }});
-                                         }}
-                                     }});
-                                 }}(t.shadowRoot);
-                             }}
-                        }, true);
+                        return new OrigEventSource(url, config);
+                    };
 
-                    }} catch (e) {{}}
-                })();
-                """
-            )
+                    WrappedEventSource.prototype = OrigEventSource.prototype;
+                    WrappedEventSource.__RS_hooked = true;
+                    window.EventSource = WrappedEventSource;
+                }
+            } catch (_) {}
 
-        # --- 6. Deep State Management Extraction Engine (All Frameworks) ---
-        url_rx_js = json.dumps(self.cfg.url_like_regex or r"(https?://[^\s\\\"']+(?:[^\s\\\"']*)?|/[A-Za-z0-9_./-]+)")
+            try {
+                var OrigWebSocket = window.WebSocket;
 
-        script_parts.append(
-            f"""
-            window.__RS_STATE_EXTRACTOR = function() {{
-                try {{
-                    const MAX_DEPTH = {int(self.cfg.max_state_object_depth)};
-                    const URL_RX = new RegExp({url_rx_js}, "i");
+                if (OrigWebSocket && !OrigWebSocket.__RS_hooked) {
+                    var WrappedWebSocket = function (url, protocols) {
+                        try {
+                            window.__RS_pushEvent({
+                                kind: "intercept_ws",
+                                url: window.__RS_abs(url),
+                                pathname: location.pathname,
+                                timestamp: Date.now()
+                            });
+                        } catch (_) {}
 
-                    function isUrlish(str) {{
-                        if (typeof str !== "string" || !str) return false;
-                        return URL_RX.test(str) || (str[0] === "/" && str.length > 2 && str.length <= 256);
-                    }}
+                        if (protocols !== undefined) {
+                            return new OrigWebSocket(url, protocols);
+                        }
 
-                    function extractFromObject(sourceName, obj) {{
+                        return new OrigWebSocket(url);
+                    };
+
+                    WrappedWebSocket.prototype = OrigWebSocket.prototype;
+                    WrappedWebSocket.__RS_hooked = true;
+                    window.WebSocket = WrappedWebSocket;
+                }
+            } catch (_) {}
+        }
+
+        if (__ENABLE_WEBPACK__) {
+            try {
+                function scanTextForUrls(source, meta) {
+                    try {
+                        source = String(source || "");
+                        if (!source) return;
+
+                        var urls = source.match(/https?:\/\/[^"'\s<>\[\]{}]+/ig) || [];
+                        var routes = source.match(/\/[A-Za-z0-9_./?&=%#:@-]+/g) || [];
+                        var all = urls.concat(routes);
+
+                        for (var i = 0; i < all.length; i++) {
+                            var u = all[i];
+
+                            if (!u || u.length < 2 || u.length > 2000) continue;
+                            if (u.indexOf("webpackChunk") !== -1) continue;
+                            if (!window.__RS_isUrlish(u)) continue;
+
+                            window.__RS_pushEvent({
+                                kind: "webpack_chunk_leak",
+                                url: window.__RS_abs(u),
+                                pathname: location.pathname,
+                                meta: meta || {},
+                                timestamp: Date.now()
+                            });
+                        }
+                    } catch (_) {}
+                }
+
+                function scanWebpackChunk(chunkData, arrayName) {
+                    try {
+                        if (!chunkData) return;
+
+                        var chunkIds = [];
+                        var modules = null;
+
+                        if (Array.isArray(chunkData)) {
+                            chunkIds = chunkData[0] || [];
+                            modules = chunkData[1] || null;
+                        }
+
+                        if (!modules || typeof modules !== "object") {
+                            scanTextForUrls(chunkData, {
+                                source: "webpack_chunk_raw",
+                                arrayName: arrayName || ""
+                            });
+                            return;
+                        }
+
+                        Object.keys(modules).forEach(function (key) {
+                            try {
+                                scanTextForUrls(modules[key], {
+                                    source: "webpack_module",
+                                    arrayName: arrayName || "",
+                                    chunkId: Array.isArray(chunkIds) ? chunkIds.join(",") : String(chunkIds || ""),
+                                    moduleKey: key
+                                });
+                            } catch (_) {}
+                        });
+                    } catch (_) {}
+                }
+
+                function hookWebpackArray(name) {
+                    try {
+                        var arr = window[name];
+                        if (!arr || !Array.isArray(arr)) return;
+                        if (arr.__RS_hooked) return;
+
+                        var originalPush = arr.push;
+
+                        Object.defineProperty(arr, "__RS_hooked", {
+                            value: true,
+                            enumerable: false,
+                            configurable: true
+                        });
+
+                        arr.push = function () {
+                            try {
+                                var items = Array.prototype.slice.call(arguments);
+                                for (var i = 0; i < items.length; i++) {
+                                    scanWebpackChunk(items[i], name);
+                                }
+                            } catch (_) {}
+
+                            return originalPush.apply(this, arguments);
+                        };
+
+                        try {
+                            for (var i = 0; i < arr.length; i++) {
+                                scanWebpackChunk(arr[i], name);
+                            }
+                        } catch (_) {}
+                    } catch (_) {}
+                }
+
+                function hookExistingWebpackArrays() {
+                    try {
+                        Object.keys(window).forEach(function (key) {
+                            if (/^webpackChunk/i.test(key)) {
+                                hookWebpackArray(key);
+                            }
+                        });
+                    } catch (_) {}
+                }
+
+                hookExistingWebpackArrays();
+                setInterval(hookExistingWebpackArrays, 1000);
+            } catch (_) {}
+        }
+
+        if (__ENABLE_HISTORY__ || __ENABLE_HASHCHANGE__) {
+            try {
+                function recordReactNav(kind, url) {
+                    try {
+                        window.__RS_pushEvent({
+                            kind: kind,
+                            url: window.__RS_abs(url || location.href),
+                            pathname: location.pathname,
+                            timestamp: Date.now()
+                        });
+                    } catch (_) {}
+                }
+
+                if (__ENABLE_HISTORY__ && window.history && window.history.pushState && !window.history.__RS_hooked) {
+                    var origPush = history.pushState;
+                    var origReplace = history.replaceState;
+
+                    history.pushState = function (state, title, url) {
+                        var ret = origPush.apply(this, arguments);
+                        recordReactNav("pushState", url || location.href);
+                        return ret;
+                    };
+
+                    history.replaceState = function (state, title, url) {
+                        var ret = origReplace.apply(this, arguments);
+                        recordReactNav("replaceState", url || location.href);
+                        return ret;
+                    };
+
+                    window.history.__RS_hooked = true;
+                }
+
+                if (__ENABLE_HISTORY__) {
+                    window.addEventListener("popstate", function () {
+                        recordReactNav("popstate", location.href);
+                    });
+                }
+
+                if (__ENABLE_HASHCHANGE__) {
+                    window.addEventListener("hashchange", function () {
+                        recordReactNav("hashchange", location.href);
+                    });
+                }
+
+                recordReactNav("initial", location.href);
+            } catch (_) {}
+        }
+
+        if (__ENABLE_LINK_CLICKS__) {
+            try {
+                function closestAnchor(el) {
+                    try {
+                        if (!el) return null;
+                        if (el.closest) return el.closest("a[href]");
+                        while (el && el !== document) {
+                            if (el.href) return el;
+                            el = el.parentElement;
+                        }
+                    } catch (_) {}
+
+                    return null;
+                }
+
+                document.addEventListener("click", function (ev) {
+                    try {
+                        var a = closestAnchor(ev.target);
+                        if (!a || !a.href) return;
+
+                        window.__RS_pushEvent({
+                            kind: "click",
+                            url: window.__RS_abs(a.href),
+                            pathname: location.pathname,
+                            text: String(a.innerText || a.textContent || "").trim().slice(0, 500),
+                            timestamp: Date.now()
+                        });
+                    } catch (_) {}
+                }, true);
+            } catch (_) {}
+        }
+
+        window.__RS_STATE_EXTRACTOR = function () {
+            try {
+                var MAX_DEPTH = __MAX_DEPTH__;
+                var URL_RX = new RegExp(__URL_RX_JSON__, "i");
+
+                function isUrlish(str) {
+                    try {
+                        return (
+                            typeof str === "string" &&
+                            str.length > 1 &&
+                            str.length <= 2000 &&
+                            (
+                                URL_RX.test(str) ||
+                                str[0] === "/" ||
+                                str.startsWith("./") ||
+                                str.startsWith("../")
+                            )
+                        );
+                    } catch (_) {
+                        return false;
+                    }
+                }
+
+                function extractFromObject(sourceName, obj) {
+                    try {
                         if (!obj || typeof obj !== "object") return;
-                        const seen = new WeakSet();
 
-                        function walk(o, depth, currentPath) {{
-                            if (depth > MAX_DEPTH || !o || typeof o !== "object") return;
-                            if (seen.has(o)) return;
-                            seen.add(o);
+                        var seen = new WeakSet();
 
-                            const keys = Object.keys(o);
-                            for (let i = 0; i < keys.length; i++) {{
-                                const k = keys[i];
-                                const v = o[k];
+                        function walk(o, depth, currentPath) {
+                            try {
+                                if (depth > MAX_DEPTH) return;
+                                if (!o || typeof o !== "object") return;
+                                if (seen.has(o)) return;
 
-                                if (typeof v === "string") {{
-                                    if (isUrlish(v)) {{
-                                        window.__RS_pushEvent({{
-                                            kind: "state_extraction",
-                                            url: v,
-                                            pathname: location.pathname,
-                                            meta: {{ source: sourceName, keyPath: currentPath + "." + k }},
-                                            timestamp: Date.now()
-                                        }});
-                                    }}
-                                    // Parse stringified JSON inside state
-                                    if (v.startsWith("{{") || v.startsWith("[")) {{
-                                        try {{ walk(JSON.parse(v), depth + 1, currentPath + "." + k + "[Parsed]"); }} catch (_) {{}}
-                                    }}
-                                }} else if (v && typeof v === "object") {{
-                                    walk(v, depth + 1, currentPath + "." + k);
-                                }}
-                            }}
-                        }}
-                        walk(obj, 0, sourceName);
-                    }}
+                                seen.add(o);
 
-                    // 6A. Next.js Hydration Data
-                    if ({str(self.cfg.enable_nextjs_nuxt_inspection).lower()} && window.__NEXT_DATA__) {{
-                        extractFromObject("NextJS__NEXT_DATA__", window.__NEXT_DATA__);
-                    }}
+                                var keys = Object.keys(o).slice(0, 500);
 
-                    // 6B. Nuxt.js Hydration Data
-                    if ({str(self.cfg.enable_nextjs_nuxt_inspection).lower()} && window.__NUXT__) {{
-                        extractFromObject("NuxtJS__NUXT__", window.__NUXT__);
-                    }}
+                                for (var i = 0; i < keys.length; i++) {
+                                    var k = keys[i];
+                                    var v;
 
-                    // 6C. Apollo GraphQL Cache
-                    if ({str(self.cfg.enable_apollo_graphql_inspection).lower()} && window.__APOLLO_STATE__) {{
-                        extractFromObject("ApolloGraphQL", window.__APOLLO_STATE__);
-                    }}
+                                    try {
+                                        v = o[k];
+                                    } catch (_) {
+                                        continue;
+                                    }
 
-                    // 6D. Redux Stores attached to window
-                    if ({str(self.cfg.enable_redux_inspection).lower()}) {{
-                        if (window.__PRELOADED_STATE__) extractFromObject("ReduxPreloaded", window.__PRELOADED_STATE__);
-                        if (window.store && typeof window.store.getState === "function") {{
-                            extractFromObject("ReduxGlobalStore", window.store.getState());
-                        }}
-                    }}
-
-                    // 6E. Zustand & Jotai State (Modern State Libraries)
-                    if (window.useStore && typeof window.useStore !== "function") {{
-                        try {{ extractFromObject("ZustandStore", window.useStore.getState()); }} catch (_) {{}}
-                    }}
-                    if (window.getStore && typeof window.getStore === "function") {{
-                        try {{ extractFromObject("JotaiStore", window.getStore.getState()); }} catch (_) {{}}
-                    }}
-
-                    // 6F. TanStack Query / SWR
-                    if (window.__SWR__ || window.__SWR__KEY) {{
-                        extractFromObject("SWR", window.__SWR__);
-                    }}
-                    if (window.__TANSTACK_QUERY__) {{
-                        extractFromObject("TanStackQuery", window.__TANSTACK_QUERY__);
-                    }}
-
-                    // 6G. Global Heuristic Search (Secret Config)
-                    Object.keys(window).forEach(key => {{
-                        if (key.match(/(CONFIG|APP|STATE|STORE)/i) && typeof window[key] === "object") {{
-                            try {{ extractFromObject("GlobalKey_" + key, window[key]); }} catch (_) {{}}
-                        }}
-                    }});
-
-                }} catch (e) {{ console.error("[ReactSniffer] State Extraction Error", e); }}
-            }};
-            """
-        )
-
-        # --- 7. Deep Fiber Traversal Engine (Enhanced) ---
-        script_parts.append(
-            f"""
-            window.__RS_FIBER_EXTRACTOR = function() {{
-                try {{
-                    const MAX_NODES = {int(self.cfg.max_fiber_nodes)};
-                    const MAX_ROUTES = {int(self.cfg.max_router_entries)};
-                    const URL_RX = new RegExp({url_rx_js}, "i");
-                    let routerRoutes = [];
-
-                    function isUrlish(str) {{
-                        return typeof str === "string" && !!str && (URL_RX.test(str) || (str[0] === "/" && str.length > 2 && str.length <= 256));
-                    }}
-
-                    function getFiberRoots() {{
-                        const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-                        if (!hook || !hook.getFiberRoots) return [];
-                        const roots = [];
-                        try {{
-                            const rendererIds = Object.keys(hook.renderers || {{}});
-                            for (let i = 0; i < rendererIds.length; i++) {{
-                                const rootSet = hook.getFiberRoots(Number(rendererIds[i]));
-                                if (rootSet && typeof rootSet.forEach === "function") {{
-                                    rootSet.forEach(r => roots.push(r.current ? r.current : r));
-                                }}
-                            }}
-                        }} catch (_) {{}}
-                        return roots;
-                    }}
-
-                    function traverseFiber(root) {{
-                        const seen = new WeakSet();
-                        let count = 0;
-
-                        function visit(node) {{
-                            if (!node || typeof node !== "object" || seen.has(node) || count >= MAX_NODES) return;
-                            seen.add(node);
-                            count++;
-
-                            let cName = "Unknown";
-                            try {{
-                                const et = node.elementType || node.type;
-                                if (typeof et === "function" && et.name) cName = et.name;
-                                else if (typeof et === "string") cName = et;
-                                else if (typeof et === "object" && et !== null && et.$$typeof) cName = "Context/Provider";
-                            }} catch (_) {{}}
-
-                            // Introspect Props (Routes, links, API endpoints)
-                            try {{
-                                const props = node.memoizedProps || node.pendingProps;
-                                if (props && typeof props === "object") {{
-                                    ['to', 'href', 'path', 'src', 'endpoint', 'url', 'action'].forEach(key => {{
-                                        if (typeof props[key] === "string" && isUrlish(props[key])) {{
-                                            window.__RS_pushEvent({{
-                                                kind: "fiber_prop_leak",
-                                                url: props[key],
+                                    if (typeof v === "string") {
+                                        if (isUrlish(v)) {
+                                            window.__RS_pushEvent({
+                                                kind: "state_extraction",
+                                                url: window.__RS_abs(v),
                                                 pathname: location.pathname,
-                                                meta: {{ component: cName, propKey: key }},
+                                                meta: {
+                                                    source: sourceName,
+                                                    keyPath: currentPath + "." + k
+                                                },
                                                 timestamp: Date.now()
-                                            }});
-                                        }}
-                                    }});
-                                }}
-                            }} catch (_) {{}}
+                                            });
+                                        }
 
-                            // Introspect Memoized State (Hooks, local component state)
-                            try {{
-                                let st = node.memoizedState;
-                                let depth = 0;
-                                while (st && typeof st === "object" && depth < 5) {{
-                                    if (typeof st.memoizedState === "string" && isUrlish(st.memoizedState)) {{
-                                        window.__RS_pushEvent({{
-                                            kind: "fiber_state_leak",
-                                            url: st.memoizedState,
-                                            pathname: location.pathname,
-                                            meta: {{ component: cName }},
-                                            timestamp: Date.now()
-                                        }});
-                                    }}
-                                    st = st.next; // Traverse hook linked list
-                                    depth++;
-                                }}
-                            }} catch (_) {{}}
+                                        if (
+                                            v.length <= 10000 &&
+                                            (
+                                                v.trim().startsWith("{") ||
+                                                v.trim().startsWith("[")
+                                            )
+                                        ) {
+                                            try {
+                                                walk(JSON.parse(v), depth + 1, currentPath + "." + k + "[parsed]");
+                                            } catch (_) {}
+                                        }
+                                    } else if (v && typeof v === "object") {
+                                        walk(v, depth + 1, currentPath + "." + k);
+                                    }
+                                }
+                            } catch (_) {}
+                        }
 
-                            try {{ visit(node.child); }} catch (_) {{}}
-                            try {{ visit(node.sibling); }} catch (_) {{}}
-                        }}
-                        visit(root);
-                    }}
+                        walk(obj, 0, sourceName);
+                    } catch (_) {}
+                }
 
-                    const roots = getFiberRoots();
-                    for (let i = 0; i < roots.length; i++) traverseFiber(roots[i]);
+                if (__ENABLE_NEXT_NUXT__) {
+                    try {
+                        if (window.__NEXT_DATA__) {
+                            extractFromObject("NextJS__NEXT_DATA__", window.__NEXT_DATA__);
+                        }
+                    } catch (_) {}
 
-                }} catch (e) {{ console.error("[ReactSniffer] Fiber Traversal Error", e); }}
-            }};
-            """
-        )
+                    try {
+                        if (window.__NUXT__) {
+                            extractFromObject("NuxtJS__NUXT__", window.__NUXT__);
+                        }
+                    } catch (_) {}
+                }
 
-        # --- 8. Shadow DOM Extraction (Bonus Feature) ---
-        script_parts.append(
-            r"""
-            (function() {
+                if (__ENABLE_APOLLO__) {
+                    try {
+                        if (window.__APOLLO_STATE__) {
+                            extractFromObject("ApolloGraphQL", window.__APOLLO_STATE__);
+                        }
+                    } catch (_) {}
+                }
+
+                if (__ENABLE_REDUX__) {
+                    try {
+                        if (window.__PRELOADED_STATE__) {
+                            extractFromObject("ReduxPreloaded", window.__PRELOADED_STATE__);
+                        }
+                    } catch (_) {}
+
+                    try {
+                        if (window.store && typeof window.store.getState === "function") {
+                            extractFromObject("ReduxGlobalStore", window.store.getState());
+                        }
+                    } catch (_) {}
+                }
+
                 try {
-                    const shadowSelectors = 'shadow, :scope > shadow-root, [slot]';
+                    if (window.useStore && typeof window.useStore.getState === "function") {
+                        extractFromObject("ZustandStore", window.useStore.getState());
+                    }
+                } catch (_) {}
 
-                    function extractShadowContent(root) {
-                        if (!root) return;
+                try {
+                    if (window.__SWR__) {
+                        extractFromObject("SWR", window.__SWR__);
+                    }
+                } catch (_) {}
 
-                        const text = root.textContent || "";
+                try {
+                    if (window.__TANSTACK_QUERY__) {
+                        extractFromObject("TanStackQuery", window.__TANSTACK_QUERY__);
+                    }
+                } catch (_) {}
 
-                        if (text.length > 100) {
-                            const urls = text.match(/https?:\/\/[^"'`\s<>]+/g) || [];
+                try {
+                    Object.keys(window).slice(0, 2000).forEach(function (key) {
+                        try {
+                            if (!/(CONFIG|APP|STATE|STORE|DATA|QUERY|CACHE)/i.test(key)) return;
 
-                            urls.forEach(u => {
-                                if (u.length > 5) {
+                            var value = window[key];
+
+                            if (value && typeof value === "object") {
+                                extractFromObject("GlobalKey_" + key, value);
+                            }
+                        } catch (_) {}
+                    });
+                } catch (_) {}
+            } catch (_) {}
+        };
+
+        window.__RS_DEEP_STATE_EXTRACTOR = window.__RS_STATE_EXTRACTOR;
+
+        window.__RS_FIBER_EXTRACTOR = function () {
+            try {
+                if (!__ENABLE_FIBER__) return;
+
+                var MAX_NODES = __MAX_FIBER_NODES__;
+                var URL_RX = new RegExp(__URL_RX_JSON__, "i");
+
+                function isUrlish(str) {
+                    try {
+                        return (
+                            typeof str === "string" &&
+                            str.length > 1 &&
+                            str.length <= 2000 &&
+                            (
+                                URL_RX.test(str) ||
+                                str[0] === "/" ||
+                                str.startsWith("./") ||
+                                str.startsWith("../")
+                            )
+                        );
+                    } catch (_) {
+                        return false;
+                    }
+                }
+
+                function getFiberRoots() {
+                    var roots = [];
+
+                    try {
+                        var hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+                        if (!hook || !hook.getFiberRoots) return roots;
+
+                        var rendererIds = Object.keys(hook.renderers || {});
+
+                        for (var i = 0; i < rendererIds.length; i++) {
+                            try {
+                                var rootSet = hook.getFiberRoots(Number(rendererIds[i]));
+                                if (rootSet && typeof rootSet.forEach === "function") {
+                                    rootSet.forEach(function (r) {
+                                        if (r && r.current) {
+                                            roots.push(r.current);
+                                        } else if (r) {
+                                            roots.push(r);
+                                        }
+                                    });
+                                }
+                            } catch (_) {}
+                        }
+                    } catch (_) {}
+
+                    return roots;
+                }
+
+                function inspectProps(componentName, props) {
+                    try {
+                        if (!props || typeof props !== "object") return;
+
+                        var keys = [
+                            "to",
+                            "href",
+                            "path",
+                            "src",
+                            "endpoint",
+                            "url",
+                            "action",
+                            "as",
+                            "route"
+                        ];
+
+                        for (var i = 0; i < keys.length; i++) {
+                            var key = keys[i];
+                            var value = props[key];
+
+                            if (typeof value === "string" && isUrlish(value)) {
+                                window.__RS_pushEvent({
+                                    kind: "fiber_prop_leak",
+                                    url: window.__RS_abs(value),
+                                    pathname: location.pathname,
+                                    meta: {
+                                        component: componentName,
+                                        propKey: key
+                                    },
+                                    timestamp: Date.now()
+                                });
+                            }
+                        }
+                    } catch (_) {}
+                }
+
+                function inspectState(componentName, stateNode) {
+                    try {
+                        var st = stateNode;
+                        var depth = 0;
+
+                        while (st && typeof st === "object" && depth < 8) {
+                            try {
+                                if (typeof st.memoizedState === "string" && isUrlish(st.memoizedState)) {
                                     window.__RS_pushEvent({
-                                        kind: "shadow_content_leak",
-                                        url: u,
+                                        kind: "fiber_state_leak",
+                                        url: window.__RS_abs(st.memoizedState),
                                         pathname: location.pathname,
-                                        meta: { source: "ShadowDOM" },
+                                        meta: {
+                                            component: componentName
+                                        },
                                         timestamp: Date.now()
                                     });
                                 }
+                            } catch (_) {}
+
+                            st = st.next;
+                            depth++;
+                        }
+                    } catch (_) {}
+                }
+
+                function traverseFiber(root) {
+                    var seen = new WeakSet();
+                    var count = 0;
+
+                    function visit(node) {
+                        try {
+                            if (!node || typeof node !== "object") return;
+                            if (seen.has(node)) return;
+                            if (count >= MAX_NODES) return;
+
+                            seen.add(node);
+                            count++;
+
+                            var componentName = "Unknown";
+
+                            try {
+                                var et = node.elementType || node.type;
+
+                                if (typeof et === "function" && et.name) {
+                                    componentName = et.name;
+                                } else if (typeof et === "string") {
+                                    componentName = et;
+                                } else if (et && typeof et === "object") {
+                                    componentName = "ObjectComponent";
+                                }
+                            } catch (_) {}
+
+                            try {
+                                inspectProps(componentName, node.memoizedProps || node.pendingProps);
+                            } catch (_) {}
+
+                            try {
+                                inspectState(componentName, node.memoizedState);
+                            } catch (_) {}
+
+                            try {
+                                visit(node.child);
+                            } catch (_) {}
+
+                            try {
+                                visit(node.sibling);
+                            } catch (_) {}
+                        } catch (_) {}
+                    }
+
+                    visit(root);
+                }
+
+                var roots = getFiberRoots();
+
+                for (var i = 0; i < roots.length; i++) {
+                    traverseFiber(roots[i]);
+                }
+            } catch (_) {}
+        };
+
+        try {
+            function extractShadowContent(root) {
+                try {
+                    if (!root) return;
+
+                    var text = root.textContent || "";
+                    if (!text || text.length < 20) return;
+
+                    var urls = text.match(/https?:\/\/[^"'`\s<>]+/g) || [];
+
+                    for (var i = 0; i < urls.length; i++) {
+                        var u = urls[i];
+
+                        if (u && u.length > 5) {
+                            window.__RS_pushEvent({
+                                kind: "shadow_content_leak",
+                                url: window.__RS_abs(u),
+                                pathname: location.pathname,
+                                meta: {
+                                    source: "ShadowDOM"
+                                },
+                                timestamp: Date.now()
                             });
                         }
                     }
+                } catch (_) {}
+            }
 
-                    function findShadowRoots() {
-                        const roots = [];
+            function findShadowRoots() {
+                var roots = [];
 
-                        document.querySelectorAll("*").forEach(n => {
+                try {
+                    document.querySelectorAll("*").forEach(function (n) {
+                        try {
                             if (n.shadowRoot) {
                                 roots.push(n.shadowRoot);
                             }
-                        });
+                        } catch (_) {}
+                    });
+                } catch (_) {}
 
-                        return roots;
+                return roots;
+            }
+
+            setTimeout(function () {
+                try {
+                    var roots = findShadowRoots();
+                    for (var i = 0; i < roots.length; i++) {
+                        extractShadowContent(roots[i]);
                     }
+                } catch (_) {}
+            }, 1500);
+        } catch (_) {}
 
-                    if (location.pathname === "/") {
-                        const shadows = findShadowRoots();
-                        shadows.forEach(e => extractShadowContent(e));
+        try {
+            window.__RS_HEAP_SIZE_BEFORE =
+                window.performance &&
+                window.performance.memory &&
+                window.performance.memory.usedJSHeapSize
+                    ? window.performance.memory.usedJSHeapSize
+                    : 0;
+
+            setTimeout(function () {
+                try {
+                    var after =
+                        window.performance &&
+                        window.performance.memory &&
+                        window.performance.memory.usedJSHeapSize
+                            ? window.performance.memory.usedJSHeapSize
+                            : 0;
+
+                    if (after && window.__RS_HEAP_SIZE_BEFORE) {
+                        var delta = after - window.__RS_HEAP_SIZE_BEFORE;
+
+                        if (delta > __MAX_MEMORY_IMPACT_BYTES__) {
+                            window.__RS_pushEvent({
+                                kind: "memory_warning",
+                                url: location.href,
+                                pathname: location.pathname,
+                                meta: {
+                                    delta_bytes: delta
+                                },
+                                timestamp: Date.now()
+                            });
+                        }
                     }
-                } catch (e) {}
-            })();
-            """
-        )
+                } catch (_) {}
+            }, __ASYNC_DELAY_MS__);
+        } catch (_) {}
+    } catch (e) {
+        try {
+            console.error("[ReactSniffer] instrumentation top-level error", e);
+        } catch (_) {}
+    }
+})();
+"""
 
-        # --- 9. Memory & Performance Impact Check ---
-        script_parts.append(
-            f"""
-            (function() {{
-                try {{
-                    // 9A. Capture Heap Before Hook
-                    window.__RS_HEAP_BEFORE = performance.getEntriesByType("navigation").find(e => e.name === "navigate")
-                        ? "found"
-                        : "missed";
-                    window.__RS_HEAP_SIZE_BEFORE = window.performance.memory?.usedJSHeapSize || "not_supported";
-
-                    // 9B. Async Execution Timeout to Avoid Stalls
-                    setTimeout(() => {{
-                        window.__RS_ASYNC_CHECK = true;
-                        try {{
-                            if (window.__RS_HEAP_SIZE_AFTER !== "not_supported") {{
-                                const delta = window.__RS_HEAP_SIZE_AFTER - window.__RS_HEAP_SIZE_BEFORE;
-                                if (delta > {self.cfg.max_memory_impact_bytes}000) {{
-                                    window.__RS_pushEvent({{
-                                        kind: "memory_warning",
-                                        url: location.href,
-                                        meta: {{ delta_bytes: delta, kind: "post_hook" }},
-                                        timestamp: Date.now()
-                                    }});
-                                }}
-                            }}
-                        }} catch (e) {{}}
-                    }}, {int(self.cfg.async_execution_delay)}000);
-                }} catch (e) {{}}
-            }}());
-            """
-        )
-
-        final_script = "\n".join(script_parts)
+        for k, v in replacements.items():
+            final_script = final_script.replace(k, v)
 
         try:
             await page.add_init_script(final_script)
+
+            # Also install immediately for pages that already exist.
             await page.evaluate(final_script)
-            await self._log(f"🚀 Enhanced Deep Instrumentation installed on {page_url}", log)
+
+            self._log(f"🚀 Enhanced Deep Instrumentation installed on {page_url}", log)
+
         except Exception as e:
-            await self._log(f"❌ Failed to install instrumentation: {e}", log)
+            # IMPORTANT: no await here. _log is synchronous.
+            self._log(f"❌ Failed to install instrumentation: {e}", log)
 
     async def _execute_post_load_scans(self, page, log: List[str]) -> None:
         """
-        Triggers the heavy forensic extraction scripts after the page has hydrated.
+        Triggers the heavier forensic extraction scripts after the page has hydrated.
+
+        Fixes:
+        - calls __RS_STATE_EXTRACTOR, not only the old wrong name
+        - safely returns a status object for easier debugging
         """
         trigger_script = """
         () => {
-            if (typeof window.__RS_DEEP_STATE_EXTRACTOR === 'function') window.__RS_DEEP_STATE_EXTRACTOR();
-            if (typeof window.__RS_FIBER_EXTRACTOR === 'function') window.__RS_FIBER_EXTRACTOR();
+            const result = {
+                state: false,
+                deepState: false,
+                fiber: false,
+                errors: []
+            };
+
+            try {
+                if (typeof window.__RS_STATE_EXTRACTOR === "function") {
+                    window.__RS_STATE_EXTRACTOR();
+                    result.state = true;
+                }
+            } catch (e) {
+                result.errors.push("state: " + String(e && e.message || e));
+            }
+
+            try {
+                if (typeof window.__RS_DEEP_STATE_EXTRACTOR === "function") {
+                    window.__RS_DEEP_STATE_EXTRACTOR();
+                    result.deepState = true;
+                }
+            } catch (e) {
+                result.errors.push("deepState: " + String(e && e.message || e));
+            }
+
+            try {
+                if (typeof window.__RS_FIBER_EXTRACTOR === "function") {
+                    window.__RS_FIBER_EXTRACTOR();
+                    result.fiber = true;
+                }
+            } catch (e) {
+                result.errors.push("fiber: " + String(e && e.message || e));
+            }
+
+            return result;
         }
         """
+
         try:
-            await page.evaluate(trigger_script)
-            self._log("Executed post-load forensic scans.", log)
+            result = await page.evaluate(trigger_script)
+
+            if isinstance(result, dict) and result.get("errors"):
+                self._log(f"Executed post-load forensic scans with warnings: {result}", log)
+            else:
+                self._log(f"Executed post-load forensic scans: {result}", log)
+
         except Exception as e:
             self._log(f"Failed to execute post-load scans: {e}", log)
 
@@ -12352,9 +12654,20 @@ class ReactSniffer:
 
             elif kind == "click":
                 self._register_click(url, pathname, str(h.get("text") or ""), timestamp)
-
-            elif kind in ("state_extraction", "fiber_prop_leak", "fiber_state_leak", "intercept_fetch", "intercept_xhr",
-                          "webpack_chunk_leak"):
+            elif kind in (
+                "state_extraction",
+                "fiber_prop_leak",
+                "fiber_state_leak",
+                "intercept_fetch",
+                "intercept_xhr",
+                "intercept_ws",
+                "intercept_eventsource",
+                "webpack_chunk_leak",
+                "dynamic_import_leak",
+                "shadow_content_leak",
+                "memory_warning",
+                "router_hook_detected",
+            ):
                 self._state_events.append(
                     ReactSniffer.StateExtractionEvent(
                         source=kind,
