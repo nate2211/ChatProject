@@ -19881,24 +19881,56 @@ class _RelationBudget:
 
 
 class _CDNLinkPrioritizer:
+    """
+    Query-aware CDN asset prioritizer.
+
+    Goal:
+      - Prefer FOUND CDN asset links that match the user's query.
+      - Still reward CDN/media evidence.
+      - Penalize unrelated CDN/static noise when a query is present.
+      - Stay backward compatible with old call sites.
+
+    Use:
+        self._cdn_priority.score(
+            url=url,
+            content_type=...,
+            kind=...,
+            source=...,
+            query=query,
+            text=item.get("text", ""),
+            tag=item.get("tag", ""),
+            evidence=(...)
+        )
+    """
+
     CDN_HOST_HINTS = (
         "cdn", "cloudfront.net", "akamaized.net", "akamai.net", "fastly.net",
         "fastlylb.net", "b-cdn.net", "cdn77", "edgekey.net", "edgesuite.net",
         "cachefly.net", "hwcdn.net", "stackpathcdn.com", "jsdelivr.net",
         "unpkg.com", "bootstrapcdn.com", "cloudflareinsights.com",
+        "googlevideo.com", "ytimg.com", "sndcdn.com", "scdn.co",
+        "mzstatic.com", "media-amazon.com", "twimg.com", "fbcdn.net",
     )
 
     CDN_PATH_HINTS = (
-        "/cdn/", "/media/", "/assets/", "/static/", "/dist/", "/content/",
-        "/image/", "/images/", "/img/", "/video/", "/audio/", "/playback/",
-        "/manifest/", "/segment/", "/chunk/", "/frag/", "/thumb/", "/poster/",
+        "/cdn/", "/media/", "/assets/", "/asset/", "/static/", "/dist/",
+        "/content/", "/image/", "/images/", "/img/", "/video/", "/videos/",
+        "/audio/", "/playback/", "/manifest/", "/segment/", "/segments/",
+        "/chunk/", "/chunks/", "/frag/", "/thumb/", "/thumbnail/",
+        "/poster/", "/stream/", "/streams/", "/download/",
     )
 
     ASSET_EXTS = (
-        ".m3u8", ".mpd", ".m4s", ".ts", ".mp4", ".webm", ".mkv",
+        ".m3u8", ".mpd", ".m4s", ".ts", ".mp4", ".webm", ".mkv", ".mov",
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
-        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav",
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
         ".js", ".mjs", ".css", ".json", ".xml",
+    )
+
+    STRONG_MEDIA_EXTS = (
+        ".m3u8", ".mpd", ".m4s", ".ts", ".mp4", ".webm", ".mkv", ".mov",
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif",
     )
 
     MEDIA_CT_HINTS = (
@@ -19907,9 +19939,255 @@ class _CDNLinkPrioritizer:
         "application/x-mpegurl",
         "application/dash+xml",
         "application/javascript",
+        "text/javascript",
         "text/css",
         "application/json",
+        "application/xml",
+        "text/xml",
     )
+
+    FOUND_SOURCE_HINTS = {
+        "sniffer",
+        "network_sniff",
+        "body_extract",
+        "response_link_header",
+        "response_final",
+        "response_location",
+        "json",
+        "json_url",
+        "mse",
+        "media_source",
+        "runtime",
+        "react_sniffer",
+        "runtime_sniffer",
+        "service_worker",
+        "worker",
+        "manifest",
+        "playlist",
+        "dom",
+        "asset_extract",
+    }
+
+    QUERY_STOPWORDS = {
+        "a", "an", "the", "and", "or", "but", "for", "from", "to", "of",
+        "in", "on", "at", "by", "with", "without", "is", "are", "was",
+        "were", "be", "been", "being", "this", "that", "these", "those",
+        "show", "find", "get", "list", "links", "link", "url", "urls",
+        "asset", "assets", "cdn", "video", "audio", "image", "song",
+        "songs", "track", "tracks", "file", "files", "download",
+    }
+
+    _TOKEN_RE = re.compile(r"[a-z0-9]{2,}", re.I)
+
+    def _s(self, value: object) -> str:
+        try:
+            return str(value or "")
+        except Exception:
+            return ""
+
+    def _lower_unquote(self, value: object) -> str:
+        raw = self._s(value)
+        try:
+            raw = unquote(raw)
+        except Exception:
+            pass
+        return raw.lower()
+
+    def _tokens(self, value: object, *, drop_stopwords: bool = False) -> list:
+        text = self._lower_unquote(value)
+        toks = []
+        seen = set()
+
+        for m in self._TOKEN_RE.finditer(text):
+            t = m.group(0).lower().strip()
+            if not t or len(t) < 2:
+                continue
+            if drop_stopwords and t in self.QUERY_STOPWORDS:
+                continue
+            if t not in seen:
+                seen.add(t)
+                toks.append(t)
+
+        return toks[:96]
+
+    def _url_parts(self, url: str) -> dict:
+        try:
+            p = urlparse(self._s(url))
+            host = self._lower_unquote(p.netloc)
+            path = self._lower_unquote(p.path)
+            query = self._lower_unquote(p.query)
+            filename = path.rsplit("/", 1)[-1] if "/" in path else path
+            stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+            return {
+                "host": host,
+                "path": path,
+                "query": query,
+                "filename": filename,
+                "stem": stem,
+                "full": self._lower_unquote(url),
+            }
+        except Exception:
+            u = self._lower_unquote(url)
+            return {
+                "host": "",
+                "path": u,
+                "query": "",
+                "filename": u.rsplit("/", 1)[-1],
+                "stem": u.rsplit("/", 1)[-1].rsplit(".", 1)[0],
+                "full": u,
+            }
+
+    def _is_cdnish(self, url: str) -> bool:
+        parts = self._url_parts(url)
+        host = parts["host"]
+        path = parts["path"]
+        full = parts["full"]
+
+        return (
+            any(h in host for h in self.CDN_HOST_HINTS)
+            or any(h in path for h in self.CDN_PATH_HINTS)
+            or any(h in full for h in ("cdn", "media", "assets", "static", "playback", "stream"))
+        )
+
+    def _is_assetish(self, url: str, content_type: str = "", kind: str = "unknown") -> bool:
+        parts = self._url_parts(url)
+        full = parts["full"]
+        ct = self._lower_unquote(content_type)
+        k = self._lower_unquote(kind)
+
+        return (
+            any(full.endswith(ext) for ext in self.ASSET_EXTS)
+            or any(h in ct for h in self.MEDIA_CT_HINTS)
+            or k in {"video", "audio", "image", "manifest", "asset", "json", "html"}
+        )
+
+    def _query_score(
+        self,
+        *,
+        url: str,
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        source: str = "",
+        kind: str = "unknown",
+        content_type: str = "",
+        evidence=(),
+    ) -> tuple:
+        """
+        Returns:
+            (score, matched_count, total_query_tokens, reasons)
+        """
+
+        q = self._s(query).strip()
+        if not q:
+            return 0.0, 0, 0, []
+
+        q_low = self._lower_unquote(q)
+        q_tokens = self._tokens(q, drop_stopwords=True)
+
+        if not q_tokens:
+            return 0.0, 0, 0, []
+
+        parts = self._url_parts(url)
+
+        ev_text = " ".join(self._s(x) for x in evidence or ())
+        haystack = " ".join(
+            [
+                parts["host"],
+                parts["path"],
+                parts["query"],
+                parts["filename"],
+                parts["stem"],
+                self._lower_unquote(text),
+                self._lower_unquote(tag),
+                self._lower_unquote(title),
+                self._lower_unquote(source),
+                self._lower_unquote(kind),
+                self._lower_unquote(content_type),
+                self._lower_unquote(ev_text),
+            ]
+        )
+
+        asset_tokens = set(self._tokens(haystack, drop_stopwords=False))
+        filename_tokens = set(self._tokens(parts["filename"], drop_stopwords=False))
+        path_tokens = set(self._tokens(parts["path"], drop_stopwords=False))
+        host_tokens = set(self._tokens(parts["host"], drop_stopwords=False))
+
+        score = 0.0
+        reasons = []
+        matched = set()
+
+        # Exact phrase match is very strong.
+        if len(q_low) >= 4 and q_low in haystack:
+            score += 7.5
+            reasons.append("query_phrase")
+
+        # URL-safe phrase match: "playboi carti" -> playboi-carti / playboi_carti / playboicarti-ish.
+        q_join_dash = "-".join(q_tokens)
+        q_join_under = "_".join(q_tokens)
+        q_join_plain = "".join(q_tokens)
+
+        compact_haystack = haystack.replace("-", "").replace("_", "").replace("%20", "").replace("+", "")
+        if q_join_dash and q_join_dash in haystack:
+            score += 4.0
+            reasons.append("query_dash_phrase")
+        if q_join_under and q_join_under in haystack:
+            score += 4.0
+            reasons.append("query_underscore_phrase")
+        if q_join_plain and len(q_join_plain) >= 5 and q_join_plain in compact_haystack:
+            score += 3.5
+            reasons.append("query_compact_phrase")
+
+        for tok in q_tokens:
+            if tok in asset_tokens:
+                matched.add(tok)
+
+                if tok in filename_tokens:
+                    score += 1.65
+                    reasons.append(f"filename:{tok}")
+                elif tok in path_tokens:
+                    score += 1.15
+                    reasons.append(f"path:{tok}")
+                elif tok in host_tokens:
+                    score += 0.65
+                    reasons.append(f"host:{tok}")
+                else:
+                    score += 0.85
+                    reasons.append(f"meta:{tok}")
+
+            elif tok in haystack:
+                matched.add(tok)
+                score += 0.45
+                reasons.append(f"substring:{tok}")
+
+        total = len(q_tokens)
+        matched_count = len(matched)
+        coverage = matched_count / max(1, total)
+
+        # Coverage matters more than raw CDN evidence.
+        if matched_count:
+            score += 6.0 * coverage
+            reasons.append(f"coverage:{coverage:.2f}")
+
+        if matched_count == total and total >= 2:
+            score += 4.0
+            reasons.append("all_query_terms")
+
+        if matched_count >= 2:
+            score += min(2.5, matched_count * 0.45)
+            reasons.append("multi_term_match")
+
+        # Small bonus if the URL is likely the actual asset and not just an HTML/API helper.
+        if matched_count and self._is_assetish(url, content_type, kind):
+            score += 1.25
+            reasons.append("query_assetish")
+
+        if matched_count and self._is_cdnish(url):
+            score += 1.50
+            reasons.append("query_cdn_asset")
+
+        return score, matched_count, total, reasons
 
     def score(
         self,
@@ -19918,47 +20196,170 @@ class _CDNLinkPrioritizer:
         content_type: str = "",
         kind: str = "unknown",
         source: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        evidence=(),
     ) -> float:
-        u = str(url or "").lower()
-        ct = str(content_type or "").lower()
-        src = str(source or "").lower()
+        u = self._lower_unquote(url)
+        ct = self._lower_unquote(content_type)
+        src = self._lower_unquote(source)
+        k = self._lower_unquote(kind)
+
         score = 0.0
 
+        q_score, q_matched, q_total, _reasons = self._query_score(
+            url=url,
+            query=query,
+            text=text,
+            tag=tag,
+            title=title,
+            source=source,
+            kind=kind,
+            content_type=content_type,
+            evidence=evidence,
+        )
+
+        # Query is the strongest signal.
+        score += q_score
+
+        # CDN evidence.
         if any(h in u for h in self.CDN_HOST_HINTS):
-            score += 2.25
+            score += 1.75
 
         if any(h in u for h in self.CDN_PATH_HINTS):
-            score += 1.10
-
-        if any(u.endswith(ext) for ext in self.ASSET_EXTS):
-            score += 1.35
-
-        if any(h in ct for h in self.MEDIA_CT_HINTS):
-            score += 1.25
-
-        if kind in {"video", "audio", "image", "manifest", "asset", "json"}:
             score += 0.90
 
-        if src in {"sniffer", "body_extract", "response_link_header"}:
-            score += 0.35
+        # Asset evidence.
+        if any(u.endswith(ext) for ext in self.STRONG_MEDIA_EXTS):
+            score += 1.20
+        elif any(u.endswith(ext) for ext in self.ASSET_EXTS):
+            score += 0.65
+
+        if any(h in ct for h in self.MEDIA_CT_HINTS):
+            score += 0.90
+
+        if k in {"video", "audio", "image", "manifest", "asset"}:
+            score += 1.05
+        elif k in {"json", "html"}:
+            score += 0.45
+
+        # Found-by-sniffer evidence.
+        if src in self.FOUND_SOURCE_HINTS:
+            score += 0.75
+
+        if src in {"sniffer", "network_sniff", "mse", "runtime_sniffer", "react_sniffer"}:
+            score += 0.55
+
+        # Query-present penalty:
+        # If a CDN asset does not match the query at all, it should not outrank relevant links.
+        if self._s(query).strip() and q_total > 0 and q_matched == 0:
+            if self._is_cdnish(url) or self._is_assetish(url, content_type, kind):
+                score -= 2.75
+            else:
+                score -= 1.25
+
+        # Generic static framework files should lose unless they match query.
+        if q_matched == 0 and any(
+            bad in u
+            for bad in (
+                "bootstrap", "jquery", "react", "webpack", "runtime.",
+                "chunk-vendors", "polyfill", "analytics", "gtag", "cloudflareinsights",
+            )
+        ):
+            score -= 1.35
 
         return round(score, 4)
 
-    def is_probable_cdn(self, url: str, content_type: str = "", kind: str = "unknown") -> bool:
-        return self.score(url=url, content_type=content_type, kind=kind) >= 2.0
+    def debug_score(
+        self,
+        *,
+        url: str,
+        content_type: str = "",
+        kind: str = "unknown",
+        source: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        evidence=(),
+    ) -> dict:
+        q_score, q_matched, q_total, reasons = self._query_score(
+            url=url,
+            query=query,
+            text=text,
+            tag=tag,
+            title=title,
+            source=source,
+            kind=kind,
+            content_type=content_type,
+            evidence=evidence,
+        )
+
+        final = self.score(
+            url=url,
+            content_type=content_type,
+            kind=kind,
+            source=source,
+            query=query,
+            text=text,
+            tag=tag,
+            title=title,
+            evidence=evidence,
+        )
+
+        return {
+            "url": url,
+            "score": final,
+            "query_score": round(q_score, 4),
+            "query_matched": q_matched,
+            "query_total": q_total,
+            "query_reasons": reasons[:24],
+            "cdnish": self._is_cdnish(url),
+            "assetish": self._is_assetish(url, content_type, kind),
+            "kind": kind,
+            "content_type": content_type,
+            "source": source,
+        }
+
+    def is_probable_cdn(
+        self,
+        url: str,
+        content_type: str = "",
+        kind: str = "unknown",
+        *,
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        source: str = "",
+    ) -> bool:
+        # Backward compatible, but query-aware when supplied.
+        threshold = 2.0 if not self._s(query).strip() else 3.0
+        return self.score(
+            url=url,
+            content_type=content_type,
+            kind=kind,
+            source=source,
+            query=query,
+            text=text,
+            tag=tag,
+        ) >= threshold
 
 
 class HTTPSSubmanager:
     """
-    Shared aiohttp HTTPS engine with:
-      - existing request surface
-      - link intelligence
-      - API/auth/CSRF accessibility pages
-      - SessionClass-backed CSRF/session header replay
-      - DEBUG_LOGGER output for human-findable pages
+    Shared aiohttp HTTPS engine.
 
-    This does not print live token values. Tokens are stored in SessionClass and
-    replayed only for same-host unsafe methods.
+    Fixed goals:
+      - SAME __init__ signature as your existing HTTPSSubmanager.
+      - Does NOT call nonexistent AccessibilityManager.register_linktracker_hits().
+      - Correctly uses AccessibilityManager.prepare_headers().
+      - Correctly records discovered API/page/link candidates through
+        AccessibilityManager.remember_access_page_sync() when available.
+      - Keeps http.register_sniffer_candidates(...) working.
+      - Supports query-aware CDN scoring when your _CDNLinkPrioritizer accepts query=.
+      - Falls back cleanly if older helper classes do not expose optional methods.
     """
 
     _MAGIC_EXE = (b"MZ",)
@@ -19997,9 +20398,12 @@ class HTTPSSubmanager:
     _TOKEN_RE = re.compile(r"[a-z0-9]{2,}", re.I)
 
     _ASSETISH_HINTS = (
-        ".m3u8", ".mpd", ".m4s", ".mp4", ".webm", ".ts", ".mkv", ".jpg", ".jpeg", ".png", ".gif",
-        "manifest", "playlist", "stream", "segment", "chunk", "frag", "download", "media", "video", "audio",
-        "cdn", "playback", "thumb", "poster", "graphql", "api",
+        ".m3u8", ".mpd", ".m4s", ".mp4", ".webm", ".ts", ".mkv",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
+        "manifest", "playlist", "stream", "segment", "chunk", "frag",
+        "download", "media", "video", "audio", "cdn", "playback",
+        "thumb", "poster", "graphql", "api",
     )
 
     _MEDIA_ACCEPTS = {
@@ -20082,32 +20486,39 @@ class HTTPSSubmanager:
         self.proxy_pool = proxy_pool or []
         self.verify = bool(verify)
         self.ca_bundle = ca_bundle
+
         self.max_bytes = int(max_bytes)
         self.max_html_chars = int(max_html_chars)
         self.respect_retry_after = bool(respect_retry_after)
         self.enable_cookies = bool(enable_cookies)
         self.allow_redirects = bool(allow_redirects)
+
         self.max_redirects = int(max_redirects)
         self.total_timeout_s = float(total_timeout_s)
         self.connect_timeout_s = float(connect_timeout_s)
         self.sock_read_timeout_s = float(sock_read_timeout_s)
         self.chunk_timeout_s = float(chunk_timeout_s)
         self.chunk_size = int(chunk_size)
+
         self.heavy_mime_hints = tuple(str(x).lower() for x in heavy_mime_hints)
         self.heavy_snippet_cap = int(heavy_snippet_cap)
+
         self.enable_magic_byte_verification = bool(enable_magic_byte_verification)
         self.magic_pe_kill_mime_allow = tuple(str(x).lower() for x in magic_pe_kill_mime_allow)
         self.magic_pe_kill_ext_block = tuple(str(x).lower() for x in magic_pe_kill_ext_block)
+
         self.enable_entropy_filter = bool(enable_entropy_filter)
         self.entropy_sample_bytes = int(entropy_sample_bytes)
         self.entropy_threshold = float(entropy_threshold)
         self.min_printable_ratio = float(min_printable_ratio)
+
         self.enable_decompression_bomb_guard = bool(enable_decompression_bomb_guard)
         self.decompress_ratio_limit = float(decompress_ratio_limit)
         self.decompress_hard_cap_bytes = int(decompress_hard_cap_bytes)
+
         self.enable_domain_reputation_filter = bool(enable_domain_reputation_filter)
         self.domain_denylist = tuple((domain_denylist or ()))
-        self.parked_domain_hints = tuple(x.lower() for x in parked_domain_hints)
+        self.parked_domain_hints = tuple(str(x).lower() for x in parked_domain_hints)
 
         self.session_class = session_class or SessionClass(
             logger=DEBUG_LOGGER,
@@ -20123,25 +20534,30 @@ class HTTPSSubmanager:
         self._session: Optional[aiohttp.ClientSession] = None
         self._connector: Optional[aiohttp.TCPConnector] = None
         self._ssl_context: Optional[ssl.SSLContext] = None
+
         self._host_sem: Dict[str, asyncio.Semaphore] = {}
         self._host_cooldown_until: Dict[str, float] = {}
         self._host_last_ok_url: Dict[str, str] = {}
         self._cooldown_lock = asyncio.Lock()
 
-        self._intel_by_url: Dict[str, _LinkIntel] = {}
+        self._intel_by_url: Dict[str, Any] = {}
         self._children_by_parent: Dict[str, Set[str]] = {}
         self._seed_to_candidates: Dict[str, Set[str]] = {}
         self._host_accept_bias: Dict[str, str] = {}
         self._host_referers: Dict[str, Dict[str, float]] = {}
         self._intel_lock = asyncio.Lock()
 
-        self._past_link_guard = _PastLinkGuard()
-        self._response_memo = _ResponseMemoStore()
-        self._relation_budget = _RelationBudget()
+        self._past_link_guard = _PastLinkGuard() if "_PastLinkGuard" in globals() else None
+        self._response_memo = _ResponseMemoStore() if "_ResponseMemoStore" in globals() else None
+        self._relation_budget = _RelationBudget() if "_RelationBudget" in globals() else None
 
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
         self._cdn_priority = _CDNLinkPrioritizer()
+
+    # ------------------------------------------------------------------
+    # Context manager
+    # ------------------------------------------------------------------
 
     async def __aenter__(self):
         self._ssl_context = self._build_ssl_context()
@@ -20155,7 +20571,7 @@ class HTTPSSubmanager:
             happy_eyeballs_delay=0.25,
         )
 
-        jar = self.session_class.cookie_jar if self.enable_cookies else None
+        jar = getattr(self.session_class, "cookie_jar", None) if self.enable_cookies else None
 
         self._session = aiohttp.ClientSession(
             connector=self._connector,
@@ -20165,7 +20581,7 @@ class HTTPSSubmanager:
             trust_env=True,
         )
 
-        DEBUG_LOGGER.log_message("[HTTPS][SESSION] HTTPSSubmanager entered with SessionClass + AccessibilityManager")
+        self._log("[HTTPS][SESSION] HTTPSSubmanager entered with AccessibilityManager compatibility")
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -20175,21 +20591,46 @@ class HTTPSSubmanager:
         self._session = None
         self._connector = None
         self._ssl_context = None
+
         self._host_sem.clear()
         self._host_cooldown_until.clear()
         self._host_last_ok_url.clear()
         self._host_accept_bias.clear()
         self._host_referers.clear()
-        self._past_link_guard.clear()
-        self._response_memo.clear()
+
+        if self._past_link_guard and hasattr(self._past_link_guard, "clear"):
+            try:
+                self._past_link_guard.clear()
+            except Exception:
+                pass
+
+        if self._response_memo and hasattr(self._response_memo, "clear"):
+            try:
+                self._response_memo.clear()
+            except Exception:
+                pass
 
         async with self._inflight_lock:
             self._inflight.clear()
 
-        DEBUG_LOGGER.log_message("[HTTPS][SESSION] HTTPSSubmanager closed")
+        self._log("[HTTPS][SESSION] HTTPSSubmanager closed")
 
     # ------------------------------------------------------------------
-    # Public additions for sniffers / trackers
+    # Logging
+    # ------------------------------------------------------------------
+
+    def _log(self, msg: str) -> None:
+        try:
+            logger = DEBUG_LOGGER
+            if logger and hasattr(logger, "log_message"):
+                logger.log_message(str(msg))
+            else:
+                print(str(msg))
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Public sniffer integration
     # ------------------------------------------------------------------
 
     async def register_sniffer_candidates(
@@ -20198,36 +20639,79 @@ class HTTPSSubmanager:
         items: Sequence[Dict[str, Any]],
         *,
         source: str = "sniffer",
+        query: str = "",
     ) -> None:
+        """
+        Correct replacement for the broken register_linktracker_hits path.
+
+        This method:
+          - does NOT call AccessibilityManager.register_linktracker_hits()
+          - records every candidate in HTTPSSubmanager intelligence memory
+          - records page/api/html/json candidates into AccessibilityManager
+          - supports query-aware CDN priority when available
+        """
+
         seed = self._canonicalize_url(page_url)
         if not seed or not items:
             return
 
-        await self.accessibility_manager.register_linktracker_hits(
-            page_url=page_url,
-            items=items,
+        await self._access_remember(
+            url=seed,
+            kind="page",
+            method="GET",
+            status=None,
+            content_type="",
+            parent="",
             source=source,
+            evidence=("sniffer_seed",),
+            required_headers=("User-Agent", "Accept"),
         )
+
+        added = 0
 
         for item in items:
             if not isinstance(item, dict):
                 continue
 
-            url = self._canonicalize_url(str(item.get("url") or ""))
+            raw_url = str(item.get("url") or item.get("href") or "").strip()
+            if not raw_url:
+                continue
+
+            url = self._canonicalize_url(urljoin(seed, raw_url))
             if not url:
                 continue
 
-            kind = self._classify_url_kind(url, str(item.get("content_type") or ""))
+            content_type = str(item.get("content_type") or item.get("mime") or "")
+            item_kind = str(item.get("kind") or "")
+            item_text = str(item.get("text") or item.get("title") or "")
+            item_tag = str(item.get("tag") or source)
+
+            kind = self._classify_url_kind(url, content_type)
+            if kind == "unknown" and item_kind:
+                kind = item_kind
+
+            evidence = (
+                item_tag,
+                item_kind or kind,
+                str(item.get("evidence") or ""),
+                str(item.get("confidence") or ""),
+                item_text[:180],
+            )
+
             score = 2.0 + self._score_url_similarity(seed, url)
 
-            if kind in ("video", "audio", "image", "manifest", "json"):
+            if kind in {"video", "audio", "image", "manifest", "json", "asset"}:
                 score += 1.0
 
-            score += self._cdn_priority.score(
+            score += self._cdn_score(
                 url=url,
-                content_type=str(item.get("content_type") or ""),
+                content_type=content_type,
                 kind=kind,
                 source=source,
+                query=query,
+                text=item_text,
+                tag=item_tag,
+                evidence=evidence,
             )
 
             await self._remember_candidate(
@@ -20236,13 +20720,22 @@ class HTTPSSubmanager:
                 parent=seed,
                 score=score,
                 kind=kind,
-                content_type=str(item.get("content_type") or ""),
-                evidence=(str(item.get("tag") or source), str(item.get("kind") or kind)),
+                content_type=content_type,
+                evidence=evidence,
             )
+
+            added += 1
+
+        self._log(
+            f"[HTTPS][SNIFFER] registered {added} candidate(s) "
+            f"from source={source} seed={seed}"
+        )
+
+
 
     async def get_guidance(self, seed_url: str, *, limit: int = 24) -> Dict[str, Any]:
         bundle = await self._build_guidance_bundle(seed_url, limit=limit)
-        access = await self.accessibility_manager.snapshot()
+        access = await self._access_snapshot()
 
         return {
             "seed_url": bundle.seed_url,
@@ -20254,10 +20747,27 @@ class HTTPSSubmanager:
         }
 
     async def get_accessibility_pages(self) -> Dict[str, Any]:
-        return await self.accessibility_manager.snapshot()
+        return await self._access_snapshot()
 
     async def get_session_snapshot(self, *, include_values: bool = False) -> Dict[str, Any]:
-        return await self.session_class.snapshot(include_values=include_values)
+        fn = getattr(self.session_class, "snapshot", None)
+        if callable(fn):
+            try:
+                out = fn(include_values=include_values)
+                if hasattr(out, "__await__"):
+                    out = await out
+                return dict(out or {})
+            except Exception as e:
+                return {"error": f"session_snapshot_failed:{e}"}
+
+        return {
+            "available": False,
+            "reason": "SessionClass.snapshot not available",
+        }
+
+    # ------------------------------------------------------------------
+    # Public HTTP helpers
+    # ------------------------------------------------------------------
 
     async def head(
         self,
@@ -20266,7 +20776,13 @@ class HTTPSSubmanager:
         allow_redirects: Optional[bool] = None,
         headers: Optional[Dict[str, str]] = None,
     ) -> Tuple[Optional[int], Dict[str, str]]:
-        r = await self._request("HEAD", url, want_body=False, allow_redirects=allow_redirects, headers=headers)
+        r = await self._request(
+            "HEAD",
+            url,
+            want_body=False,
+            allow_redirects=allow_redirects,
+            headers=headers,
+        )
         return r.status, r.headers
 
     async def get_bytes(
@@ -20277,7 +20793,14 @@ class HTTPSSubmanager:
         headers: Optional[Dict[str, str]] = None,
         max_bytes: Optional[int] = None,
     ) -> bytes:
-        r = await self._request("GET", url, want_body=True, allow_redirects=allow_redirects, headers=headers, max_bytes=max_bytes)
+        r = await self._request(
+            "GET",
+            url,
+            want_body=True,
+            allow_redirects=allow_redirects,
+            headers=headers,
+            max_bytes=max_bytes,
+        )
         return bytes(r.body or b"") if r.ok else b""
 
     async def get_text(
@@ -20288,7 +20811,12 @@ class HTTPSSubmanager:
         headers: Optional[Dict[str, str]] = None,
         max_bytes: Optional[int] = None,
     ) -> str:
-        raw = await self.get_bytes(url, allow_redirects=allow_redirects, headers=headers, max_bytes=max_bytes)
+        raw = await self.get_bytes(
+            url,
+            allow_redirects=allow_redirects,
+            headers=headers,
+            max_bytes=max_bytes,
+        )
         if not raw:
             return ""
         return self._decode_body(raw)
@@ -20357,11 +20885,18 @@ class HTTPSSubmanager:
             return b""
 
         h = dict(headers or {})
-        if not any(k.lower() == "range" for k in h):
+        if not any(str(k).lower() == "range" for k in h):
             h["Range"] = f"bytes=0-{max(0, size - 1)}"
 
         async def _do() -> bytes:
-            r = await self._request("GET", url, want_body=True, allow_redirects=allow_redirects, headers=h, max_bytes=size)
+            r = await self._request(
+                "GET",
+                url,
+                want_body=True,
+                allow_redirects=allow_redirects,
+                headers=h,
+                max_bytes=size,
+            )
             if not r.ok or not r.body:
                 return b""
             return bytes(r.body[:size])
@@ -20405,7 +20940,7 @@ class HTTPSSubmanager:
             return out
 
         try:
-            status, hdrs = await self.head(url)
+            status, hdrs = await self.head(url, allow_redirects=allow_redirects, headers=headers)
             out["status"] = status
             out["content_type"] = hdrs.get("Content-Type") or hdrs.get("content-type") or None
             out["content_length"] = hdrs.get("Content-Length") or hdrs.get("content-length") or None
@@ -20472,7 +21007,14 @@ class HTTPSSubmanager:
                     try:
                         return await existing
                     except Exception as e:
-                        return _HTTPResult(False, None, {}, str(url or ""), b"", error=str(e) or "request_failed")
+                        return _HTTPResult(
+                            False,
+                            None,
+                            {},
+                            str(url or ""),
+                            b"",
+                            error=str(e) or "request_failed",
+                        )
 
                 task = asyncio.create_task(
                     self._request_uncached(
@@ -20516,22 +21058,29 @@ class HTTPSSubmanager:
         data: Optional[bytes] = None,
     ) -> _HTTPResult:
         if not self._session:
-            raise RuntimeError("HTTPSSubmanager must be used in an async context: async with HTTPSSubmanager(...) as http:")
+            raise RuntimeError(
+                "HTTPSSubmanager must be used in an async context: "
+                "async with HTTPSSubmanager(...) as http:"
+            )
 
-        host = self._host(url)
+        method = (method or "GET").upper().strip()
+        url = str(url or "").strip()
         canonical_req = self._canonicalize_url(url)
+        host = self._host(canonical_req or url)
+
+        if not canonical_req:
+            return _HTTPResult(False, None, {}, url, b"", error="invalid_url")
 
         if self.enable_domain_reputation_filter and self._is_toxic_domain(host):
-            return _HTTPResult(False, None, {}, str(url or ""), b"", error="domain_reputation_blocked")
+            return _HTTPResult(False, None, {}, url, b"", error="domain_reputation_blocked")
 
-        allowed, reason = self._past_link_guard.allow_request(
-            canonical_req or str(url or ""),
+        allowed, reason = self._past_allow_request(
+            canonical_req,
             method=method,
             want_body=want_body,
         )
-
         if not allowed:
-            return _HTTPResult(False, None, {}, str(url or ""), b"", error=reason)
+            return _HTTPResult(False, None, {}, url, b"", error=reason or "past_link_guard_blocked")
 
         sem = self._get_host_semaphore(host)
         last_exc = ""
@@ -20546,11 +21095,14 @@ class HTTPSSubmanager:
                 req_headers.update(headers)
 
             referer = req_headers.get("Referer") or self._pick_best_referer(url) or ""
-            req_headers = await self.accessibility_manager.prepare_headers(
+
+            req_headers = await self._access_prepare_headers(
                 url=url,
                 method=method,
                 headers=req_headers,
                 referer=referer,
+                source="https_submanager",
+                needs_csrf=(method not in {"GET", "HEAD", "OPTIONS"}),
             )
 
             started = time.perf_counter()
@@ -20566,363 +21118,281 @@ class HTTPSSubmanager:
                     async with self._session.request(
                         method,
                         url,
-                        allow_redirects=allow_redirects,
-                        max_redirects=self.max_redirects,
-                        proxy=proxy,
-                        timeout=timeout,
                         headers=req_headers,
                         data=data,
+                        allow_redirects=allow_redirects,
+                        max_redirects=max(0, self.max_redirects),
+                        timeout=timeout,
+                        proxy=proxy,
                     ) as resp:
-                        final_url = str(resp.url)
-                        final_canonical = self._canonicalize_url(final_url) or canonical_req or str(url or "")
                         status = int(resp.status)
-                        hdrs = dict(resp.headers) if resp.headers else {}
+                        final_url = str(resp.url)
+                        resp_headers = {str(k): str(v) for k, v in resp.headers.items()}
+                        headers_lc = {str(k).lower(): str(v) for k, v in resp.headers.items()}
+                        content_type = headers_lc.get("content-type", "")
+                        content_length = self._safe_int(headers_lc.get("content-length"))
 
-                        if self.respect_retry_after and status in (429, 503):
-                            ra = self._parse_retry_after(hdrs)
-                            if ra:
-                                await self._set_host_cooldown(host, ra)
+                        if status in {429, 503}:
+                            await self._set_host_cooldown_from_retry_after(host, headers_lc, attempt)
 
                         body = b""
-                        err = ""
-
-                        if want_body:
-                            body, err = await self._read_bounded_secure(resp, url=final_url, max_bytes=max_bytes)
-                            if err:
-                                self._past_link_guard.note_failure(
-                                    final_canonical,
-                                    error=err,
-                                    status=status,
-                                    want_body=True,
-                                )
-
-                                await self._learn_from_response(
-                                    requested_url=str(url or ""),
-                                    final_url=final_url,
-                                    status=status,
-                                    headers=hdrs,
-                                    body=b"",
-                                    request_headers=req_headers,
-                                )
-
-                                await self.accessibility_manager.observe_response(
-                                    requested_url=str(url or ""),
-                                    final_url=final_url,
-                                    status=status,
-                                    headers=hdrs,
-                                    body=b"",
-                                    request_headers=req_headers,
-                                    decode_body_func=self._decode_body,
-                                )
-
-                                return _HTTPResult(False, status, hdrs, final_url, b"", error=err)
-
-                        elapsed_ms = max(0.0, (time.perf_counter() - started) * 1000.0)
-
-                        if 200 <= status < 300:
-                            self._host_last_ok_url[host] = final_url
-                            self._past_link_guard.note_success(final_canonical, status=status, elapsed_ms=elapsed_ms)
-                        else:
-                            self._past_link_guard.note_failure(
-                                final_canonical,
-                                error=f"http_status:{status}",
-                                status=status,
-                                want_body=want_body,
+                        if want_body and method != "HEAD":
+                            body = await self._read_limited_body(
+                                resp,
+                                max_bytes=max_bytes,
+                                content_type=content_type,
                             )
 
-                        await self._learn_from_response(
-                            requested_url=str(url or ""),
-                            final_url=final_url,
+                            if body:
+                                safe, why = self._secure_body_ok(
+                                    url=final_url,
+                                    body=body,
+                                    content_type=content_type,
+                                )
+                                if not safe:
+                                    self._past_note_failure(canonical_req, status=status, error=why)
+                                    return _HTTPResult(
+                                        False,
+                                        status,
+                                        resp_headers,
+                                        final_url,
+                                        b"",
+                                        error=why,
+                                    )
+
+                        ok = 200 <= status < 300
+                        elapsed_ms = (time.perf_counter() - started) * 1000.0
+
+                        kind = self._classify_url_kind(final_url, content_type)
+
+                        await self._remember_candidate(
+                            url=final_url,
+                            source="response",
+                            parent=referer,
+                            score=self._score_response_candidate(
+                                final_url,
+                                status=status,
+                                content_type=content_type,
+                                body_size=len(body),
+                                kind=kind,
+                            ),
+                            kind=kind,
                             status=status,
-                            headers=hdrs,
-                            body=body,
-                            request_headers=req_headers,
+                            content_type=content_type,
+                            evidence=(
+                                f"method:{method}",
+                                f"status:{status}",
+                                f"elapsed_ms:{elapsed_ms:.1f}",
+                            ),
                         )
 
-                        await self.accessibility_manager.observe_response(
-                            requested_url=str(url or ""),
-                            final_url=final_url,
-                            status=status,
-                            headers=hdrs,
-                            body=body,
-                            request_headers=req_headers,
-                            decode_body_func=self._decode_body,
-                        )
+                        if ok:
+                            self._host_last_ok_url[host] = final_url
+                            self._past_note_success(
+                                canonical_req,
+                                status=status,
+                                elapsed_ms=elapsed_ms,
+                            )
+                        else:
+                            self._past_note_failure(
+                                canonical_req,
+                                status=status,
+                                error=f"http_{status}",
+                            )
 
-                        if self._is_retryable_status(status) and attempt < self.retries:
-                            server_hint = self._parse_retry_after(hdrs) if self.respect_retry_after else None
-                            await asyncio.sleep(self._retry_delay(attempt, server_hint=server_hint))
-                            continue
+                        if body and self._is_textlike_content_type(content_type):
+                            await self._process_text_response_links(
+                                final_url=final_url,
+                                parent=referer,
+                                content_type=content_type,
+                                status=status,
+                                body=body,
+                            )
 
-                        return _HTTPResult(
-                            ok=(200 <= status < 300),
-                            status=status,
-                            headers=hdrs,
-                            final_url=final_url,
-                            body=body,
-                            error="",
-                        )
+                        if ok:
+                            return _HTTPResult(True, status, resp_headers, final_url, body, error="")
 
-            except asyncio.TimeoutError:
-                last_exc = "timeout"
-                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
+                        if status not in self._RETRYABLE_STATUS or attempt >= self.retries:
+                            return _HTTPResult(
+                                False,
+                                status,
+                                resp_headers,
+                                final_url,
+                                body,
+                                error=f"http_{status}",
+                            )
+
+                        last_exc = f"http_{status}"
+                        await self._sleep_backoff(attempt, headers_lc)
+
+            except asyncio.TimeoutError as e:
+                last_exc = f"timeout:{e}"
+                self._past_note_failure(canonical_req, status=None, error=last_exc)
+                await self._sleep_backoff(attempt, {})
+
             except aiohttp.ClientError as e:
                 last_exc = f"client_error:{e}"
-                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
+                self._past_note_failure(canonical_req, status=None, error=last_exc)
+                await self._sleep_backoff(attempt, {})
+
             except Exception as e:
-                last_exc = str(e)
-                self._past_link_guard.note_failure(canonical_req or str(url or ""), error=last_exc, want_body=want_body)
+                last_exc = f"request_error:{e}"
+                self._past_note_failure(canonical_req, status=None, error=last_exc)
+                await self._sleep_backoff(attempt, {})
 
-            if attempt < self.retries:
-                await asyncio.sleep(self._retry_delay(attempt))
-
-        return _HTTPResult(False, None, {}, str(url or ""), b"", error=last_exc or "request_failed")
+        return _HTTPResult(False, None, {}, url, b"", error=last_exc or "request_failed")
 
     # ------------------------------------------------------------------
-    # Link intelligence / self-guidance
+    # AccessibilityManager compatibility wrappers
     # ------------------------------------------------------------------
 
-    async def _learn_from_response(
+    async def _access_prepare_headers(
         self,
         *,
-        requested_url: str,
-        final_url: str,
-        status: Optional[int],
-        headers: Dict[str, str],
-        body: bytes,
-        request_headers: Dict[str, str],
+        url: str,
+        method: str,
+        headers: Optional[Mapping[str, str]] = None,
+        referer: str = "",
+        source: str = "https_submanager",
+        needs_csrf: Optional[bool] = None,
+    ) -> Dict[str, str]:
+        """
+        Uses AccessibilityManager.prepare_headers when present.
+        That method may return a normal dict or an AwaitableDict.
+        """
+        access = self.accessibility_manager
+
+        try:
+            fn = getattr(access, "prepare_headers", None)
+            if callable(fn):
+                out = fn(
+                    url=url,
+                    method=method,
+                    headers=headers,
+                    referer=referer,
+                    source=source,
+                    needs_csrf=needs_csrf,
+                )
+                if hasattr(out, "__await__"):
+                    out = await out
+                return {str(k): str(v) for k, v in dict(out or {}).items() if k and v is not None}
+        except Exception as e:
+            self._log(f"[HTTPS][ACCESS] prepare_headers failed: {e}")
+
+        return {str(k): str(v) for k, v in dict(headers or {}).items() if k and v is not None}
+
+    async def _access_remember(
+        self,
+        *,
+        url: str,
+        kind: str = "",
+        method: str = "GET",
+        status: Optional[int] = None,
+        content_type: str = "",
+        parent: str = "",
+        source: str = "response",
+        evidence: Iterable[str] = (),
+        requires_auth: bool = False,
+        requires_csrf: bool = False,
+        csrf_names: Iterable[str] = (),
+        required_headers: Iterable[str] = (),
     ) -> None:
-        req_c = self._canonicalize_url(requested_url)
-        fin_c = self._canonicalize_url(final_url)
+        """
+        Correct AccessibilityManager write path.
 
-        if not req_c and not fin_c:
-            return
+        Priority:
+          1. remember_access_page(...) if your project has an async/sync wrapper.
+          2. remember_access_page_sync(...) from your uploaded AccessibilityManager.
+          3. no-op fallback.
+        """
+        access = self.accessibility_manager
 
-        seed = fin_c or req_c
-        ctype = self._header_get(headers, "content-type")
-        kind = self._classify_url_kind(seed, ctype)
+        kwargs = {
+            "url": url,
+            "kind": kind,
+            "method": method,
+            "status": status,
+            "content_type": content_type,
+            "parent": parent,
+            "source": source,
+            "evidence": tuple(str(x) for x in (evidence or ()) if str(x).strip()),
+            "requires_auth": bool(requires_auth),
+            "requires_csrf": bool(requires_csrf),
+            "csrf_names": tuple(str(x) for x in (csrf_names or ()) if str(x).strip()),
+            "required_headers": tuple(str(x) for x in (required_headers or ()) if str(x).strip()),
+        }
 
-        base_score = 1.0
-        if status and 200 <= status < 300:
-            base_score += 1.5
-        if req_c and fin_c and req_c != fin_c:
-            base_score += 0.5
-
-        await self._remember_candidate(
-            url=seed,
-            source="response_final",
-            parent=req_c,
-            score=base_score,
-            kind=kind,
-            status=status,
-            content_type=ctype,
-            evidence=(f"status:{status}",),
-        )
-
-        location = self._header_get(headers, "location")
-        if location:
-            loc_abs = self._canonicalize_url(urljoin(final_url or requested_url, location))
-            if loc_abs:
-                await self._remember_candidate(
-                    url=loc_abs,
-                    source="response_location",
-                    parent=seed,
-                    score=1.5 + self._score_url_similarity(seed, loc_abs),
-                    kind=self._classify_url_kind(loc_abs, ""),
-                    status=status,
-                    evidence=("header:location",),
-                )
-
-        for link_url in self._extract_header_links(headers, base_url=final_url or requested_url):
-            await self._remember_candidate(
-                url=link_url,
-                source="response_link_header",
-                parent=seed,
-                score=1.4 + self._score_url_similarity(seed, link_url),
-                kind=self._classify_url_kind(link_url, ""),
-                status=status,
-                evidence=("header:link",),
-            )
-
-        accept_kind = self._classify_url_kind(seed, ctype)
-        if accept_kind != "unknown":
-            self._host_accept_bias[self._host(seed)] = accept_kind
-
-        if request_headers.get("Referer"):
-            self._note_referer(seed, request_headers["Referer"], weight=1.0)
-
-        if not body:
-            return
-
-        if not self._looks_textlike(ctype) and kind not in {"html", "json"}:
-            return
-
-        fingerprint = self._response_memo.make_fingerprint(
-            final_url=seed,
-            status=status,
-            content_type=ctype,
-            body=body,
-        )
-
-        memo = self._response_memo.get(fingerprint)
-        if memo is not None:
-            self._past_link_guard.note_parse(seed, mode="memo", extracted_urls=memo.extracted_urls)
-            await self._remember_children_from_cache(seed, memo.extracted_urls)
-            return
-
-        mode = self._past_link_guard.select_parse_mode(
-            seed,
-            fingerprint=fingerprint,
-            body_size=len(body),
-            content_type=ctype,
-        )
-
-        if mode == "skip":
-            self._response_memo.remember(
-                fingerprint=fingerprint,
-                final_url=seed,
-                status=status,
-                content_type=ctype,
-                extracted_urls=(),
-                mode=mode,
-            )
-            self._past_link_guard.note_parse(seed, mode="skip", extracted_urls=())
-            return
-
-        extracted_urls = self._mine_body_urls(
-            body=body,
-            content_type=ctype,
-            base_url=final_url or requested_url,
-            kind=kind,
-            mode=mode,
-        )
-
-        self._response_memo.remember(
-            fingerprint=fingerprint,
-            final_url=seed,
-            status=status,
-            content_type=ctype,
-            extracted_urls=extracted_urls,
-            mode=mode,
-        )
-
-        self._past_link_guard.note_parse(seed, mode=mode, extracted_urls=extracted_urls)
-        await self._remember_children_from_cache(seed, extracted_urls)
-
-    async def _remember_children_from_cache(self, seed: str, urls: Iterable[str]) -> None:
-        seed_c = self._canonicalize_url(seed)
-        if not seed_c:
-            return
-
-        for child in list(urls)[:300]:
-            c_child = self._canonicalize_url(child)
-            if not c_child or c_child == seed_c:
+        for name in ("remember_access_page", "remember_access_page_sync"):
+            fn = getattr(access, name, None)
+            if not callable(fn):
                 continue
 
-            score = 0.75 + self._score_url_similarity(seed_c, c_child)
-            child_kind = self._classify_url_kind(c_child, "")
+            try:
+                out = fn(**kwargs)
+                if hasattr(out, "__await__"):
+                    await out
+                return
+            except TypeError:
+                # Some older versions may not accept all kwargs.
+                reduced = {
+                    "url": url,
+                    "kind": kind,
+                    "method": method,
+                    "status": status,
+                    "content_type": content_type,
+                    "parent": parent,
+                    "source": source,
+                    "evidence": kwargs["evidence"],
+                    "required_headers": kwargs["required_headers"],
+                }
+                try:
+                    out = fn(**reduced)
+                    if hasattr(out, "__await__"):
+                        await out
+                    return
+                except Exception as e:
+                    self._log(f"[HTTPS][ACCESS] {name} reduced call failed: {e}")
+            except Exception as e:
+                self._log(f"[HTTPS][ACCESS] {name} failed: {e}")
 
-            if child_kind in {"video", "audio", "image", "manifest", "json"}:
-                score += 0.6
+    async def _access_snapshot(self) -> Dict[str, Any]:
+        access = self.accessibility_manager
 
-            await self._remember_candidate(
-                url=c_child,
-                source="body_extract",
-                parent=seed_c,
-                score=score,
-                kind=child_kind,
-                status=None,
-                evidence=("cached/memo extract",),
-            )
+        fn = getattr(access, "snapshot", None)
+        if callable(fn):
+            try:
+                out = fn()
+                if hasattr(out, "__await__"):
+                    out = await out
+                return dict(out or {})
+            except Exception as e:
+                return {"error": f"access_snapshot_failed:{e}"}
 
-    def _mine_body_urls(
-        self,
-        *,
-        body: bytes,
-        content_type: str,
-        base_url: str,
-        kind: str,
-        mode: str,
-    ) -> List[str]:
-        text = self._decode_body(body)
-        if not text:
-            return []
+        # Fallback directly from the known AccessibilityManager fields.
+        try:
+            pages = []
+            raw_pages = getattr(access, "_pages", {}) or {}
+            for _k, page in list(raw_pages.items())[:512]:
+                if hasattr(page, "__dict__"):
+                    row = dict(page.__dict__)
+                    row["evidence"] = sorted(list(row.get("evidence") or []))[:12]
+                    row["csrf_names"] = sorted(list(row.get("csrf_names") or []))[:12]
+                    row["required_headers"] = sorted(list(row.get("required_headers") or []))[:12]
+                    pages.append(row)
+                else:
+                    pages.append({"value": str(page)})
 
-        text_cap = self.max_html_chars
-        if mode == "light":
-            text_cap = min(text_cap, 180_000)
+            return {
+                "available": True,
+                "pages": pages,
+                "api_cache": sorted(list(getattr(access, "_api_cache", set()) or []))[:512],
+            }
+        except Exception as e:
+            return {"available": False, "error": str(e)}
 
-        text = text[:text_cap]
-
-        urls: Set[str] = set(self._extract_urls_from_text(text))
-        lowered = (content_type or "").lower()
-        htmlish = ("html" in lowered) or ("<html" in text[:256].lower()) or ("href=" in text[:2048].lower())
-        jsonish = (kind == "json") or self._looks_jsonish(text)
-
-        if htmlish:
-            if mode == "full":
-                urls.update(self._extract_asset_urls_from_html(text, base_url, max_assets=300))
-            else:
-                for m in self._HTML_ATTR_RE.finditer(text):
-                    raw = (m.group(1) or "").strip()
-                    if raw and not raw.startswith(("#", "javascript:", "mailto:", "tel:")):
-                        full = self._canonicalize_url(urljoin(base_url, raw))
-                        if full:
-                            urls.add(full)
-                            if len(urls) >= 300:
-                                break
-
-        elif jsonish:
-            urls.update(self._extract_urls_from_jsonish(text, base_url, limit=300))
-
-        return list(sorted(urls))[:300]
-
-    async def _build_guidance_bundle(self, seed_url: str, *, limit: int = 24) -> _GuidanceBundle:
-        seed = self._canonicalize_url(seed_url)
-        host = self._host(seed)
-        referer = self._pick_best_referer(seed)
-        accept_kind = self._host_accept_bias.get(host) or self._classify_url_kind(seed, "")
-        accept = self._MEDIA_ACCEPTS.get(accept_kind, self._MEDIA_ACCEPTS["generic"])
-
-        candidates: List[Tuple[float, Dict[str, Any]]] = []
-
-        for cand_url in self._seed_to_candidates.get(seed, set()):
-            intel = self._intel_by_url.get(cand_url)
-            if not intel:
-                continue
-
-            sim = self._score_url_similarity(seed, cand_url)
-            total = float(intel.score) + sim + min(1.5, 0.2 * intel.hits)
-
-            if intel.kind in {"video", "audio", "manifest", "json", "image"}:
-                total += 0.6
-
-            candidates.append(
-                (
-                    total,
-                    {
-                        "url": intel.canonical_url,
-                        "score": round(total, 3),
-                        "kind": intel.kind,
-                        "source": intel.source,
-                        "hits": intel.hits,
-                        "content_type": intel.content_type or "",
-                        "status": intel.status,
-                        "parent": intel.parent,
-                        "evidence": list(intel.evidence[:8]),
-                    },
-                )
-            )
-
-        candidates.sort(key=lambda x: (x[0], x[1]["hits"]), reverse=True)
-
-        return _GuidanceBundle(
-            seed_url=seed_url,
-            canonical_seed=seed,
-            referer=referer,
-            accept=accept,
-            candidates=[row for _, row in candidates[: max(1, int(limit))]],
-        )
+    # ------------------------------------------------------------------
+    # Candidate memory / guidance
+    # ------------------------------------------------------------------
 
     async def _remember_candidate(
         self,
@@ -20944,9 +21414,16 @@ class HTTPSSubmanager:
         if parent_c and parent_c == cu:
             parent_c = ""
 
-        if kind in {"json", "html"}:
-            access_kind = "api" if kind == "json" and ("/api/" in cu.lower() or "graphql" in cu.lower()) else ("page" if kind == "html" else kind)
-            await self.accessibility_manager.remember_access_page(
+        ev = tuple(str(x).strip() for x in (evidence or ()) if str(x).strip())
+
+        if kind in {"json", "html", "api", "page"}:
+            access_kind = kind
+            if kind == "json":
+                access_kind = "api" if ("/api/" in cu.lower() or "graphql" in cu.lower()) else "json"
+            elif kind == "html":
+                access_kind = "page"
+
+            await self._access_remember(
                 url=cu,
                 kind=access_kind,
                 method="GET",
@@ -20954,125 +21431,759 @@ class HTTPSSubmanager:
                 content_type=content_type,
                 parent=parent_c,
                 source=source,
-                evidence=evidence,
-                required_headers=("User-Agent", "Accept", "Referer"),
-            )
-
-        if "/api/" in cu.lower() or "graphql" in cu.lower() or "auth" in cu.lower() or "login" in cu.lower():
-            await self.accessibility_manager.remember_access_page(
-                url=cu,
-                kind=self.accessibility_manager._classify(cu, content_type, source),
-                method="GET",
-                status=status,
-                content_type=content_type,
-                parent=parent_c,
-                source=source,
-                evidence=evidence,
+                evidence=ev,
                 required_headers=("User-Agent", "Accept", "Referer"),
             )
 
         async with self._intel_lock:
-            now = time.time()
-            host = self._host(cu)
-            path = urlparse(cu).path or "/"
-            tokens = tuple(self._url_tokens(cu))
-            ev = tuple(str(x) for x in evidence if str(x).strip())[:12]
             existing = self._intel_by_url.get(cu)
 
             if existing is None:
-                self._intel_by_url[cu] = _LinkIntel(
-                    url=url,
+                existing = self._new_link_intel(
                     canonical_url=cu,
-                    host=host,
-                    path=path,
                     source=source,
-                    parent=parent_c,
-                    score=float(score),
-                    hits=1,
-                    first_seen=now,
-                    last_seen=now,
-                    content_type=content_type,
+                    score=float(score or 0.0),
+                    kind=kind or "unknown",
                     status=status,
-                    kind=kind,
-                    tokens=tokens,
+                    content_type=content_type or "",
+                    parent=parent_c,
                     evidence=ev,
                 )
+                self._intel_by_url[cu] = existing
             else:
-                existing.last_seen = now
-                existing.hits += 1
-                existing.score = max(float(existing.score), float(score))
-                if content_type and not existing.content_type:
-                    existing.content_type = content_type
-                if status is not None:
-                    existing.status = status
-                if kind and existing.kind == "unknown":
-                    existing.kind = kind
-                if parent_c and not existing.parent:
-                    existing.parent = parent_c
-                if ev:
-                    merged = list(existing.evidence)
-                    for one in ev:
-                        if one not in merged:
-                            merged.append(one)
-                    existing.evidence = tuple(merged[:12])
+                existing.hits = int(getattr(existing, "hits", 0)) + 1
+                existing.last_seen = time.time()
+                existing.score = max(float(getattr(existing, "score", 0.0)), float(score or 0.0))
+                existing.kind = self._better_kind(getattr(existing, "kind", "unknown"), kind)
+                existing.status = status if status is not None else getattr(existing, "status", None)
+                existing.content_type = content_type or getattr(existing, "content_type", "")
+                existing.parent = parent_c or getattr(existing, "parent", "")
+                merged_ev = list(getattr(existing, "evidence", ()) or ())
+                for x in ev:
+                    if x not in merged_ev:
+                        merged_ev.append(x)
+                existing.evidence = tuple(merged_ev[:24])
 
             if parent_c:
-                self._relation_budget.add_child(self._children_by_parent, parent_c, cu, intel=self._intel_by_url)
-                self._relation_budget.add_child(self._seed_to_candidates, parent_c, cu, intel=self._intel_by_url)
-                self._note_referer(cu, parent_c, weight=max(0.5, score))
+                self._children_by_parent.setdefault(parent_c, set()).add(cu)
+                self._seed_to_candidates.setdefault(parent_c, set()).add(cu)
 
-            self._prune_intel_if_needed()
+            if len(self._intel_by_url) > self._MAX_INTEL_URLS:
+                overflow = len(self._intel_by_url) - self._MAX_INTEL_URLS
+                oldest = sorted(
+                    self._intel_by_url.items(),
+                    key=lambda kv: getattr(kv[1], "last_seen", 0.0),
+                )[: max(1, overflow)]
 
-    def _prune_intel_if_needed(self) -> None:
-        if len(self._intel_by_url) <= self._MAX_INTEL_URLS:
-            return
+                for old_url, _old in oldest:
+                    self._intel_by_url.pop(old_url, None)
+                    for s in self._seed_to_candidates.values():
+                        s.discard(old_url)
+                    for s in self._children_by_parent.values():
+                        s.discard(old_url)
 
-        drop_n = max(64, len(self._intel_by_url) - self._MAX_INTEL_URLS)
-        oldest = sorted(
-            self._intel_by_url.items(),
-            key=lambda kv: (kv[1].last_seen, kv[1].hits, kv[1].score),
-        )[:drop_n]
+    def _new_link_intel(
+        self,
+        *,
+        canonical_url: str,
+        source: str,
+        score: float,
+        kind: str,
+        status: Optional[int],
+        content_type: str,
+        parent: str,
+        evidence: Iterable[str],
+    ):
+        if "_LinkIntel" in globals():
+            try:
+                return _LinkIntel(
+                    canonical_url=canonical_url,
+                    source=source,
+                    score=score,
+                    kind=kind,
+                    status=status,
+                    content_type=content_type,
+                    parent=parent,
+                    evidence=tuple(evidence or ()),
+                    hits=1,
+                )
+            except TypeError:
+                pass
 
-        dead = {k for k, _ in oldest}
+        obj = type("LinkIntelCompat", (), {})()
+        obj.canonical_url = canonical_url
+        obj.source = source
+        obj.score = float(score or 0.0)
+        obj.kind = kind or "unknown"
+        obj.status = status
+        obj.content_type = content_type or ""
+        obj.parent = parent or ""
+        obj.evidence = tuple(evidence or ())
+        obj.hits = 1
+        obj.first_seen = time.time()
+        obj.last_seen = time.time()
+        return obj
 
-        for k in dead:
-            self._intel_by_url.pop(k, None)
+    async def _build_guidance_bundle(self, seed_url: str, *, limit: int = 24):
+        seed = self._canonicalize_url(seed_url)
+        host = self._host(seed)
+        referer = self._pick_best_referer(seed)
+        accept_kind = self._host_accept_bias.get(host) or self._classify_url_kind(seed, "")
+        accept = self._MEDIA_ACCEPTS.get(accept_kind, self._MEDIA_ACCEPTS["generic"])
 
-        for mapping in (self._children_by_parent, self._seed_to_candidates):
-            for parent in list(mapping.keys()):
-                mapping[parent].difference_update(dead)
-                if not mapping[parent]:
-                    mapping.pop(parent, None)
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
 
-    def _note_referer(self, url: str, referer: str, *, weight: float) -> None:
-        u = self._canonicalize_url(url)
-        r = self._canonicalize_url(referer)
+        for cand_url in self._seed_to_candidates.get(seed, set()):
+            intel = self._intel_by_url.get(cand_url)
+            if not intel:
+                continue
 
-        if not u or not r or u == r:
-            return
+            sim = self._score_url_similarity(seed, cand_url)
+            total = float(getattr(intel, "score", 0.0)) + sim + min(1.5, 0.2 * int(getattr(intel, "hits", 1)))
 
-        host = self._host(u)
-        self._relation_budget.add_referer(self._host_referers, host, r, max(0.1, weight))
+            if getattr(intel, "kind", "") in {"video", "audio", "manifest", "json", "image", "asset"}:
+                total += 0.6
 
-    def _pick_best_referer(self, url: str) -> Optional[str]:
-        cu = self._canonicalize_url(url)
-        if not cu:
-            return None
+            candidates.append(
+                (
+                    total,
+                    {
+                        "url": getattr(intel, "canonical_url", cand_url),
+                        "score": round(total, 3),
+                        "kind": getattr(intel, "kind", "unknown"),
+                        "source": getattr(intel, "source", ""),
+                        "hits": getattr(intel, "hits", 1),
+                        "content_type": getattr(intel, "content_type", "") or "",
+                        "status": getattr(intel, "status", None),
+                        "parent": getattr(intel, "parent", ""),
+                        "evidence": list((getattr(intel, "evidence", ()) or ())[:8]),
+                    },
+                )
+            )
 
-        intel = self._intel_by_url.get(cu)
-        if intel and intel.parent:
-            return intel.parent
+        candidates.sort(key=lambda x: (x[0], x[1]["hits"]), reverse=True)
 
-        host = self._host(cu)
-        bucket = self._host_referers.get(host) or {}
+        if "_GuidanceBundle" in globals():
+            return _GuidanceBundle(
+                seed_url=seed_url,
+                canonical_seed=seed,
+                referer=referer,
+                accept=accept,
+                candidates=[row for _, row in candidates[: max(1, int(limit))]],
+            )
 
-        if bucket:
-            return max(bucket.items(), key=lambda kv: kv[1])[0]
-
-        return self._host_last_ok_url.get(host)
+        obj = type("GuidanceBundleCompat", (), {})()
+        obj.seed_url = seed_url
+        obj.canonical_seed = seed
+        obj.referer = referer
+        obj.accept = accept
+        obj.candidates = [row for _, row in candidates[: max(1, int(limit))]]
+        return obj
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Response link extraction
+    # ------------------------------------------------------------------
+
+    async def _process_text_response_links(
+        self,
+        *,
+        final_url: str,
+        parent: str,
+        content_type: str,
+        status: int,
+        body: bytes,
+    ) -> None:
+        text = self._decode_body(body)
+        if not text:
+            return
+
+        urls = self._extract_urls_from_response_text(
+            text,
+            base_url=final_url,
+            content_type=content_type,
+        )
+
+        mode = "full" if len(body) < self.max_html_chars else "light"
+        self._past_note_parse(final_url, mode=mode, extracted_urls=urls)
+
+        for u in urls[:300]:
+            kind = self._classify_url_kind(u, "")
+            await self._remember_candidate(
+                url=u,
+                source="body_extract",
+                parent=final_url or parent,
+                score=1.0 + self._score_url_similarity(final_url, u),
+                kind=kind,
+                status=None,
+                content_type="",
+                evidence=(f"parent_status:{status}", "text_response_link"),
+            )
+
+    def _extract_urls_from_response_text(
+        self,
+        text: str,
+        *,
+        base_url: str,
+        content_type: str = "",
+    ) -> List[str]:
+        text = str(text or "")
+        if not text:
+            return []
+
+        out: Set[str] = set()
+
+        for m in self._URL_RE.finditer(text):
+            u = self._canonicalize_url(m.group(0))
+            if u:
+                out.add(u)
+                if len(out) >= 300:
+                    return sorted(out)
+
+        ct = (content_type or "").lower()
+
+        if "html" in ct or "xml" in ct or "<html" in text[:2048].lower():
+            for m in self._HTML_ATTR_RE.finditer(text):
+                raw = (m.group(1) or "").strip()
+                full = self._safe_abs_url(raw, base_url)
+                if full:
+                    out.add(full)
+                    if len(out) >= 300:
+                        return sorted(out)
+
+        if "json" in ct or text[:1] in {"{", "["}:
+            out.update(self._extract_urls_from_jsonish(text, base_url, limit=300))
+
+        return sorted(out)[:300]
+
+    def _extract_urls_from_jsonish(self, text: str, base_url: str, *, limit: int = 300) -> List[str]:
+        out: Set[str] = set()
+
+        def push(value: str) -> None:
+            if len(out) >= limit:
+                return
+            u = self._safe_abs_url(value, base_url)
+            if u:
+                out.add(u)
+
+        try:
+            obj = json.loads(text)
+            stack = [obj]
+            seen = 0
+
+            while stack and seen < 5000 and len(out) < limit:
+                cur = stack.pop()
+                seen += 1
+
+                if isinstance(cur, str):
+                    if "http://" in cur or "https://" in cur or cur.startswith("/"):
+                        push(cur)
+                elif isinstance(cur, dict):
+                    for v in cur.values():
+                        stack.append(v)
+                elif isinstance(cur, (list, tuple)):
+                    stack.extend(cur)
+        except Exception:
+            pass
+
+        for m in self._URL_RE.finditer(text):
+            push(m.group(0))
+            if len(out) >= limit:
+                break
+
+        return sorted(out)[:limit]
+
+    # ------------------------------------------------------------------
+    # URL / scoring helpers
+    # ------------------------------------------------------------------
+
+    def _host(self, url: str) -> str:
+        try:
+            p = urlparse(str(url or ""))
+            return (p.hostname or "").lower()
+        except Exception:
+            return ""
+
+    def _canonicalize_url(self, u: str) -> str:
+        try:
+            p = urlparse(str(u or "").strip())
+            if p.scheme not in {"http", "https"} or not p.netloc:
+                return ""
+
+            host = p.netloc.lower()
+            path = p.path or "/"
+
+            qs = [
+                (k, v)
+                for (k, v) in parse_qsl(p.query, keep_blank_values=False)
+                if str(k).lower() not in self._TRACKING_QS
+            ]
+
+            query = urlencode(qs, doseq=True)
+            return urlunparse((p.scheme.lower(), host, path, "", query, ""))
+        except Exception:
+            return ""
+
+    def _safe_abs_url(self, raw: str, base_url: str) -> str:
+        raw = html.unescape(str(raw or "").strip())
+        if not raw:
+            return ""
+
+        low = raw.lower()
+        if low.startswith(("#", "javascript:", "data:", "blob:", "mailto:", "tel:", "sms:")):
+            return ""
+
+        try:
+            full = urljoin(base_url, raw)
+            return self._canonicalize_url(full)
+        except Exception:
+            return ""
+
+    def _classify_url_kind(self, url: str, content_type: str = "") -> str:
+        u = str(url or "").lower()
+        ct = str(content_type or "").lower().split(";", 1)[0].strip()
+
+        if ct.startswith("video/"):
+            return "video"
+        if ct.startswith("audio/"):
+            return "audio"
+        if ct.startswith("image/"):
+            return "image"
+        if ct in {"application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml"}:
+            return "manifest"
+        if "json" in ct:
+            return "json"
+        if "html" in ct or "xml" in ct:
+            return "html"
+
+        if any(u.endswith(x) for x in (".m3u8", ".mpd")):
+            return "manifest"
+        if any(u.endswith(x) for x in (".mp4", ".webm", ".mkv", ".mov", ".m4s", ".ts")):
+            return "video"
+        if any(u.endswith(x) for x in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac")):
+            return "audio"
+        if any(u.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
+            return "image"
+        if u.endswith(".json") or "/graphql" in u or "/api/" in u:
+            return "json"
+        if u.endswith((".html", ".htm")):
+            return "html"
+
+        if any(h in u for h in self._ASSETISH_HINTS):
+            return "asset"
+
+        return "unknown"
+
+    def _better_kind(self, old: str, new: str) -> str:
+        old = old or "unknown"
+        new = new or "unknown"
+
+        rank = {
+            "unknown": 0,
+            "asset": 1,
+            "html": 2,
+            "json": 3,
+            "manifest": 4,
+            "image": 5,
+            "audio": 6,
+            "video": 7,
+        }
+
+        return new if rank.get(new, 0) > rank.get(old, 0) else old
+
+    def _tokens(self, s: str) -> Set[str]:
+        return {m.group(0).lower() for m in self._TOKEN_RE.finditer(str(s or "").lower())}
+
+    def _score_url_similarity(self, a: str, b: str) -> float:
+        try:
+            pa = urlparse(str(a or ""))
+            pb = urlparse(str(b or ""))
+
+            score = 0.0
+
+            if pa.hostname and pb.hostname and pa.hostname == pb.hostname:
+                score += 1.0
+            elif pa.hostname and pb.hostname:
+                da = ".".join(pa.hostname.split(".")[-2:])
+                db = ".".join(pb.hostname.split(".")[-2:])
+                if da and da == db:
+                    score += 0.45
+
+            ta = self._tokens(pa.path)
+            tb = self._tokens(pb.path)
+            if ta and tb:
+                inter = len(ta & tb)
+                union = max(1, len(ta | tb))
+                score += min(1.5, 2.0 * (inter / union))
+
+            if any(h in str(b).lower() for h in self._ASSETISH_HINTS):
+                score += 0.35
+
+            return round(score, 4)
+        except Exception:
+            return 0.0
+
+    def _score_response_candidate(
+        self,
+        url: str,
+        *,
+        status: int,
+        content_type: str,
+        body_size: int,
+        kind: str,
+    ) -> float:
+        score = 0.0
+
+        if 200 <= int(status) < 300:
+            score += 1.0
+
+        if kind in {"video", "audio", "image", "manifest"}:
+            score += 1.5
+        elif kind in {"json", "html"}:
+            score += 0.6
+        elif kind == "asset":
+            score += 0.8
+
+        if body_size > 0:
+            score += 0.2
+
+        score += self._cdn_score(
+            url=url,
+            content_type=content_type,
+            kind=kind,
+            source="response",
+        )
+
+        return round(score, 4)
+
+    def _cdn_score(
+        self,
+        *,
+        url: str,
+        content_type: str = "",
+        kind: str = "unknown",
+        source: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        evidence: Iterable[str] = (),
+    ) -> float:
+        try:
+            return float(
+                self._cdn_priority.score(
+                    url=url,
+                    content_type=content_type,
+                    kind=kind,
+                    source=source,
+                    query=query,
+                    text=text,
+                    tag=tag,
+                    evidence=evidence,
+                )
+            )
+        except TypeError:
+            # Old _CDNLinkPrioritizer signature.
+            try:
+                return float(
+                    self._cdn_priority.score(
+                        url=url,
+                        content_type=content_type,
+                        kind=kind,
+                        source=source,
+                    )
+                )
+            except Exception:
+                return 0.0
+        except Exception:
+            return 0.0
+
+    # ------------------------------------------------------------------
+    # Headers / SSL / proxy
+    # ------------------------------------------------------------------
+
+    def _base_browser_headers(self) -> Dict[str, str]:
+        return {
+            "User-Agent": self.ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+    def _per_request_headers(self, url: str) -> Dict[str, str]:
+        kind = self._classify_url_kind(url, "")
+        accept = self._MEDIA_ACCEPTS.get(kind, self._MEDIA_ACCEPTS["generic"])
+
+        return {
+            "User-Agent": self.ua,
+            "Accept": accept,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
+        if not self.verify:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            return ctx
+
+        if self.ca_bundle:
+            return ssl.create_default_context(cafile=self.ca_bundle)
+
+        return ssl.create_default_context()
+
+    def _choose_proxy(self) -> Optional[str]:
+        if self.proxy_pool:
+            try:
+                return random.choice(self.proxy_pool)
+            except Exception:
+                pass
+        return self.proxy
+
+    # ------------------------------------------------------------------
+    # Body / security
+    # ------------------------------------------------------------------
+
+    async def _read_limited_body(self, resp, *, max_bytes: int, content_type: str) -> bytes:
+        chunks = []
+        total = 0
+        cap = int(max_bytes)
+
+        if self._is_heavy_mime(content_type):
+            cap = min(cap, self.heavy_snippet_cap)
+
+        async for chunk in resp.content.iter_chunked(max(1024, self.chunk_size)):
+            if not chunk:
+                continue
+
+            total += len(chunk)
+
+            if total > cap:
+                remaining = max(0, cap - sum(len(c) for c in chunks))
+                if remaining > 0:
+                    chunks.append(bytes(chunk[:remaining]))
+                break
+
+            chunks.append(bytes(chunk))
+
+        return b"".join(chunks)
+
+    def _is_heavy_mime(self, content_type: str) -> bool:
+        ct = str(content_type or "").lower()
+        return any(h in ct for h in self.heavy_mime_hints)
+
+    def _is_textlike_content_type(self, content_type: str) -> bool:
+        ct = str(content_type or "").lower()
+        return any(h in ct for h in self._TEXTLIKE_MIME_HINTS)
+
+    def _secure_body_ok(self, *, url: str, body: bytes, content_type: str) -> Tuple[bool, str]:
+        if not body:
+            return True, ""
+
+        if self.enable_magic_byte_verification:
+            ok, why = self._magic_body_ok(url=url, body=body, content_type=content_type)
+            if not ok:
+                return False, why
+
+        if self.enable_entropy_filter and self._is_textlike_content_type(content_type):
+            ok, why = self._entropy_text_ok(body)
+            if not ok:
+                return False, why
+
+        return True, ""
+
+    def _magic_body_ok(self, *, url: str, body: bytes, content_type: str) -> Tuple[bool, str]:
+        b = bytes(body[:16])
+        ct = str(content_type or "").lower()
+        path = urlparse(str(url or "")).path.lower()
+
+        is_exe = any(b.startswith(m) for m in self._MAGIC_EXE)
+        if is_exe:
+            if any(ct.startswith(x) for x in self.magic_pe_kill_mime_allow) or any(
+                path.endswith(x) for x in self.magic_pe_kill_ext_block
+            ):
+                return False, "blocked_magic_executable"
+
+        return True, ""
+
+    def _entropy_text_ok(self, body: bytes) -> Tuple[bool, str]:
+        sample = bytes(body[: max(1024, self.entropy_sample_bytes)])
+        if not sample:
+            return True, ""
+
+        printable = sum(1 for x in sample if 32 <= x <= 126 or x in (9, 10, 13))
+        printable_ratio = printable / max(1, len(sample))
+
+        if printable_ratio < self.min_printable_ratio:
+            entropy = self._byte_entropy(sample)
+            if entropy >= self.entropy_threshold:
+                return False, f"blocked_high_entropy_text entropy={entropy:.2f} printable={printable_ratio:.2f}"
+
+        return True, ""
+
+    def _byte_entropy(self, data: bytes) -> float:
+        if not data:
+            return 0.0
+
+        counts = collections.Counter(data)
+        total = float(len(data))
+        ent = 0.0
+
+        for n in counts.values():
+            p = n / total
+            ent -= p * math.log2(p)
+
+        return ent
+
+    def _decode_body(self, raw: bytes) -> str:
+        if not raw:
+            return ""
+
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return raw.decode(enc, errors="ignore")
+            except Exception:
+                pass
+
+        try:
+            return str(raw)
+        except Exception:
+            return ""
+
+    # ------------------------------------------------------------------
+    # Cooldown / retry
+    # ------------------------------------------------------------------
+
+    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
+        host = host or "_default"
+        sem = self._host_sem.get(host)
+        if sem is None:
+            sem = asyncio.Semaphore(max(1, self.max_conn_per_host))
+            self._host_sem[host] = sem
+        return sem
+
+    async def _respect_host_cooldown(self, host: str) -> None:
+        if not host:
+            return
+
+        async with self._cooldown_lock:
+            until = float(self._host_cooldown_until.get(host, 0.0) or 0.0)
+
+        now = time.time()
+        if until > now:
+            await asyncio.sleep(min(8.0, until - now))
+
+    async def _set_host_cooldown_from_retry_after(
+        self,
+        host: str,
+        headers_lc: Dict[str, str],
+        attempt: int,
+    ) -> None:
+        if not host:
+            return
+
+        delay = 0.0
+        retry_after = str(headers_lc.get("retry-after") or "").strip()
+
+        if self.respect_retry_after and retry_after:
+            try:
+                delay = float(retry_after)
+            except Exception:
+                delay = 0.0
+
+        if delay <= 0:
+            delay = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
+
+        async with self._cooldown_lock:
+            self._host_cooldown_until[host] = max(
+                self._host_cooldown_until.get(host, 0.0),
+                time.time() + max(0.0, delay),
+            )
+
+    async def _sleep_backoff(self, attempt: int, headers_lc: Dict[str, str]) -> None:
+        delay = 0.0
+
+        retry_after = str((headers_lc or {}).get("retry-after") or "").strip()
+        if self.respect_retry_after and retry_after:
+            try:
+                delay = float(retry_after)
+            except Exception:
+                delay = 0.0
+
+        if delay <= 0:
+            delay = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
+
+        delay += random.uniform(0.0, min(0.25, delay * 0.20))
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    # ------------------------------------------------------------------
+    # Past-link guard compatibility
+    # ------------------------------------------------------------------
+
+    def _past_allow_request(self, canonical_url: str, *, method: str, want_body: bool) -> Tuple[bool, str]:
+        guard = self._past_link_guard
+        if guard and hasattr(guard, "allow_request"):
+            try:
+                return guard.allow_request(
+                    canonical_url,
+                    method=method,
+                    want_body=want_body,
+                )
+            except Exception:
+                return True, ""
+        return True, ""
+
+    def _past_note_success(self, canonical_url: str, *, status: Optional[int], elapsed_ms: float) -> None:
+        guard = self._past_link_guard
+        for name in ("note_success", "success", "record_success"):
+            fn = getattr(guard, name, None) if guard else None
+            if callable(fn):
+                try:
+                    fn(canonical_url, status=status, elapsed_ms=elapsed_ms)
+                    return
+                except TypeError:
+                    try:
+                        fn(canonical_url)
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+    def _past_note_failure(self, canonical_url: str, *, status: Optional[int], error: str) -> None:
+        guard = self._past_link_guard
+        for name in ("note_failure", "failure", "record_failure"):
+            fn = getattr(guard, name, None) if guard else None
+            if callable(fn):
+                try:
+                    fn(canonical_url, status=status, error=error)
+                    return
+                except TypeError:
+                    try:
+                        fn(canonical_url)
+                        return
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+    def _past_note_parse(
+        self,
+        canonical_url: str,
+        *,
+        mode: str,
+        extracted_urls: Optional[Iterable[str]] = None,
+    ) -> None:
+        guard = self._past_link_guard
+        fn = getattr(guard, "note_parse", None) if guard else None
+        if callable(fn):
+            try:
+                fn(canonical_url, mode=mode, extracted_urls=extracted_urls)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Misc helpers
     # ------------------------------------------------------------------
 
     def _request_coalesce_key(
@@ -21084,511 +22195,75 @@ class HTTPSSubmanager:
         allow_redirects: bool,
         headers: Optional[Dict[str, str]],
         max_bytes: int,
-        data: Optional[bytes] = None,
+        data: Optional[bytes],
     ) -> str:
-        canon = self._canonicalize_url(url) or str(url or "")
-        h = []
+        hbits = []
+        for k, v in sorted((headers or {}).items()):
+            lk = str(k).lower()
+            if lk in {"range", "accept", "referer"}:
+                hbits.append((lk, str(v)))
 
-        for k, v in sorted((headers or {}).items(), key=lambda kv: str(kv[0]).lower()):
-            kl = str(k).lower()
-            if kl in {"range", "accept", "referer", "content-type"}:
-                h.append(f"{kl}={v}")
-
-        data_hash = ""
-        if data:
-            data_hash = hashlib.sha1(data[:65536]).hexdigest()
-
-        return "|".join(
-            [
-                method.upper().strip(),
-                "1" if want_body else "0",
-                "1" if allow_redirects else "0",
-                str(int(max_bytes)),
-                canon,
-                "&".join(h),
-                data_hash,
-            ]
+        raw = json.dumps(
+            {
+                "m": method,
+                "u": self._canonicalize_url(url) or str(url or ""),
+                "body": bool(want_body),
+                "redir": bool(allow_redirects),
+                "max": int(max_bytes),
+                "h": hbits,
+                "d": hashlib.sha1(data or b"").hexdigest() if data else "",
+            },
+            sort_keys=True,
         )
 
-    def _build_ssl_context(self) -> ssl.SSLContext:
-        if self.verify:
-            ctx = ssl.create_default_context(cafile=self.ca_bundle or None)
-            ctx.check_hostname = True
-            ctx.verify_mode = ssl.CERT_REQUIRED
-            return ctx
+        return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
-
-    def _base_browser_headers(self) -> Dict[str, str]:
-        return {
-            "User-Agent": self.ua,
-            "Accept": self._MEDIA_ACCEPTS["html"],
-            "Accept-Language": "en-US,en;q=0.9",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
-        }
-
-    def _per_request_headers(self, url: str) -> Dict[str, str]:
-        out: Dict[str, str] = {"User-Agent": self.ua}
-        kind = self._host_accept_bias.get(self._host(url)) or self._classify_url_kind(url, "")
-        out["Accept"] = self._MEDIA_ACCEPTS.get(kind, self._MEDIA_ACCEPTS["generic"])
-
-        referer = self._pick_best_referer(url)
-        if referer and referer != self._canonicalize_url(url):
-            out["Referer"] = referer
-
-        return out
-
-    def _host(self, url: str) -> str:
-        try:
-            return urlparse(str(url or "")).netloc.lower().split(":")[0]
-        except Exception:
+    def _pick_best_referer(self, url: str) -> str:
+        host = self._host(url)
+        if not host:
             return ""
 
-    def _choose_proxy(self) -> Optional[str]:
-        if self.proxy_pool:
+        rows = self._host_referers.get(host) or {}
+        if rows:
             try:
-                return random.choice(self.proxy_pool)
+                return sorted(rows.items(), key=lambda kv: kv[1], reverse=True)[0][0]
             except Exception:
-                return self.proxy
-        return self.proxy
+                pass
 
-    def _get_host_semaphore(self, host: str) -> asyncio.Semaphore:
-        sem = self._host_sem.get(host)
-        if sem is None:
-            sem = asyncio.Semaphore(max(1, self.max_conn_per_host))
-            self._host_sem[host] = sem
-        return sem
+        return self._host_last_ok_url.get(host, "")
 
-    async def _respect_host_cooldown(self, host: str) -> None:
-        while True:
-            until = self._host_cooldown_until.get(host, 0.0)
-            remaining = until - time.time()
-            if remaining <= 0:
-                return
-            await asyncio.sleep(min(remaining, 0.5))
+    def _note_referer(self, url: str, referer: str) -> None:
+        host = self._host(url)
+        referer = self._canonicalize_url(referer)
 
-    async def _set_host_cooldown(self, host: str, seconds: float) -> None:
-        async with self._cooldown_lock:
-            self._host_cooldown_until[host] = max(
-                self._host_cooldown_until.get(host, 0.0),
-                time.time() + max(0.0, seconds),
-            )
+        if not host or not referer:
+            return
 
-    def _parse_retry_after(self, headers: Dict[str, str]) -> Optional[float]:
-        raw = self._header_get(headers, "retry-after")
-        if not raw:
-            return None
+        bucket = self._host_referers.setdefault(host, {})
+        bucket[referer] = time.time()
 
-        raw = raw.strip()
-        if raw.isdigit():
-            return float(int(raw))
-
-        return None
-
-    def _retry_delay(self, attempt: int, *, server_hint: Optional[float] = None) -> float:
-        if server_hint is not None:
-            return max(0.0, float(server_hint))
-
-        base = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
-        return base + random.random() * min(0.25, base / 3.0)
-
-    def _is_retryable_status(self, status: Optional[int]) -> bool:
-        return bool(status in self._RETRYABLE_STATUS)
+        if len(bucket) > 24:
+            old = sorted(bucket.items(), key=lambda kv: kv[1])[: len(bucket) - 24]
+            for k, _v in old:
+                bucket.pop(k, None)
 
     def _is_toxic_domain(self, host: str) -> bool:
-        host = (host or "").lower()
-        if not host:
+        h = str(host or "").lower()
+        if not h:
             return False
 
-        if any(d and (host == d.lower() or host.endswith("." + d.lower())) for d in self.domain_denylist):
+        if any(d and (h == d or h.endswith("." + d)) for d in self.domain_denylist):
             return True
 
-        return any(h in host for h in self.parked_domain_hints)
-
-    def _header_get(self, headers: Dict[str, str], key: str) -> str:
-        key_l = key.lower()
-        for k, v in (headers or {}).items():
-            if str(k).lower() == key_l:
-                return str(v)
-        return ""
-
-    def _looks_textlike(self, ctype: str) -> bool:
-        ct = (ctype or "").lower()
-        return any(ct.startswith(p) or p in ct for p in self._TEXTLIKE_MIME_HINTS)
-
-    def _looks_jsonish(self, text: str) -> bool:
-        s = (text or "").lstrip()
-        return s.startswith("{") or s.startswith("[")
-
-    def _decode_body(self, body: bytes) -> str:
-        try:
-            return body.decode("utf-8", errors="ignore")[: self.max_html_chars]
-        except Exception:
-            try:
-                return body.decode("latin-1", errors="ignore")[: self.max_html_chars]
-            except Exception:
-                return ""
-
-    def _magic_byte_violation(self, url: str, ctype: str, probe: bytes) -> bool:
-        ct = (ctype or "").lower()
-        path = (urlparse(url).path or "").lower()
-
-        if probe.startswith(self._MAGIC_EXE):
-            if any(ct.startswith(ok) for ok in self.magic_pe_kill_mime_allow):
-                return False
-            if any(path.endswith(ext) for ext in self.magic_pe_kill_ext_block):
-                return True
+        if any(x in h for x in self.parked_domain_hints):
+            return True
 
         return False
 
-    def _shannon_entropy(self, data: bytes) -> float:
-        if not data:
-            return 0.0
-
-        counts = [0] * 256
-        for b in data:
-            counts[b] += 1
-
-        total = float(len(data))
-        ent = 0.0
-
-        for c in counts:
-            if c:
-                p = c / total
-                ent -= p * math.log2(p)
-
-        return ent
-
-    def _printable_ratio(self, data: bytes) -> float:
-        if not data:
-            return 1.0
-
-        printable = sum(1 for b in data if b in (9, 10, 13) or 32 <= b <= 126)
-        return printable / max(1, len(data))
-
-    async def _read_bounded_secure(self, resp, *, url: str, max_bytes: int) -> Tuple[bytes, str]:
-        headers = dict(resp.headers or {})
-        ctype = self._header_get(headers, "content-type")
-        encoding = self._header_get(headers, "content-encoding").lower().strip()
-
-        content_length_raw = self._header_get(headers, "content-length")
+    def _safe_int(self, value: Any) -> Optional[int]:
         try:
-            content_length = int(content_length_raw) if content_length_raw else 0
+            if value is None:
+                return None
+            return int(str(value).strip())
         except Exception:
-            content_length = 0
-
-        if any(h in (ctype or "").lower() for h in self.heavy_mime_hints) and max_bytes > self.heavy_snippet_cap:
-            max_bytes = min(max_bytes, self.heavy_snippet_cap)
-
-        if content_length > 0 and self.enable_decompression_bomb_guard:
-            if content_length > max(self.decompress_hard_cap_bytes, max_bytes * 4):
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                return b"", "content_length_hard_cap_blocked"
-
-        decompressor = None
-        if self.enable_decompression_bomb_guard:
-            try:
-                if encoding == "gzip":
-                    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
-                elif encoding == "deflate":
-                    decompressor = zlib.decompressobj()
-            except Exception:
-                decompressor = None
-
-        out = bytearray()
-        entropy_probe = bytearray()
-        first_probe_done = False
-        compressed_read = 0
-
-        while True:
-            try:
-                chunk = await asyncio.wait_for(resp.content.read(self.chunk_size), timeout=self.chunk_timeout_s)
-            except asyncio.TimeoutError:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                return bytes(out), "chunk_timeout"
-            except Exception as e:
-                return bytes(out), f"read_error:{e}"
-
-            if not chunk:
-                break
-
-            compressed_read += len(chunk)
-            produced = chunk
-
-            if decompressor is not None:
-                try:
-                    produced = decompressor.decompress(chunk)
-                except Exception:
-                    return bytes(out), "decompression_failed"
-
-                if self.enable_decompression_bomb_guard and compressed_read > 0:
-                    ratio = (len(out) + len(produced)) / max(1, compressed_read)
-                    if ratio > self.decompress_ratio_limit:
-                        return bytes(out), "decompression_ratio_blocked"
-                    if (len(out) + len(produced)) > self.decompress_hard_cap_bytes:
-                        return bytes(out), "decompression_hard_cap_blocked"
-
-            if self.enable_magic_byte_verification and not first_probe_done:
-                first_probe_done = True
-                if self._magic_byte_violation(url, ctype, produced[:16]):
-                    try:
-                        resp.close()
-                    except Exception:
-                        pass
-                    return b"", "magic_byte_blocked"
-
-            out.extend(produced)
-
-            if self.enable_entropy_filter and self._looks_textlike(ctype) and len(entropy_probe) < self.entropy_sample_bytes:
-                entropy_probe.extend(produced[: max(0, self.entropy_sample_bytes - len(entropy_probe))])
-
-            if len(out) >= max_bytes:
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-                del out[max_bytes:]
-                break
-
-        if decompressor is not None:
-            try:
-                tail = decompressor.flush()
-                if tail:
-                    if self.enable_decompression_bomb_guard and compressed_read > 0:
-                        ratio = (len(out) + len(tail)) / max(1, compressed_read)
-                        if ratio > self.decompress_ratio_limit:
-                            return bytes(out), "decompression_ratio_blocked"
-                        if (len(out) + len(tail)) > self.decompress_hard_cap_bytes:
-                            return bytes(out), "decompression_hard_cap_blocked"
-
-                    out.extend(tail)
-                    if len(out) > max_bytes:
-                        del out[max_bytes:]
-            except Exception:
-                pass
-
-        if self.enable_entropy_filter and self._looks_textlike(ctype) and entropy_probe:
-            ent = self._shannon_entropy(bytes(entropy_probe))
-            pr = self._printable_ratio(bytes(entropy_probe))
-            if ent >= self.entropy_threshold and pr < self.min_printable_ratio:
-                return bytes(out), "entropy_blocked"
-
-        return bytes(out), ""
-
-    def _canonicalize_url(self, u: str) -> str:
-        try:
-            p = urlparse(str(u or "").strip())
-            if p.scheme not in ("http", "https") or not p.netloc:
-                return ""
-
-            host = p.netloc.lower().split(":")[0]
-            path = p.path or "/"
-
-            if not path.startswith("/"):
-                path = "/" + path
-
-            qs = [
-                (k, v)
-                for (k, v) in parse_qsl(p.query, keep_blank_values=False)
-                if k.lower() not in self._TRACKING_QS
-            ]
-
-            query = urlencode(qs, doseq=True)
-            return urlunparse((p.scheme.lower(), host, path, p.params, query, ""))
-        except Exception:
-            return ""
-
-    def _url_tokens(self, url: str) -> List[str]:
-        parsed = urlparse(str(url or ""))
-        base = f"{parsed.netloc} {parsed.path} {parsed.query}".lower().replace("-", " ").replace("_", " ")
-        toks = [m.group(0).lower() for m in self._TOKEN_RE.finditer(base)]
-        out: List[str] = []
-        seen: Set[str] = set()
-
-        for t in toks:
-            if len(t) < 2:
-                continue
-            if t not in seen:
-                seen.add(t)
-                out.append(t)
-
-        return out[:64]
-
-    def _score_url_similarity(self, seed_url: str, cand_url: str) -> float:
-        seed = self._canonicalize_url(seed_url)
-        cand = self._canonicalize_url(cand_url)
-
-        if not seed or not cand:
-            return 0.0
-
-        if seed == cand:
-            return 4.0
-
-        ps = urlparse(seed)
-        pc = urlparse(cand)
-        score = 0.0
-
-        if ps.netloc == pc.netloc:
-            score += 1.4
-        else:
-            hs = ps.netloc.split(".")
-            hc = pc.netloc.split(".")
-            if len(hs) >= 2 and len(hc) >= 2 and hs[-2:] == hc[-2:]:
-                score += 0.7
-
-        if ps.path and pc.path:
-            if pc.path.startswith(ps.path.rsplit("/", 1)[0]):
-                score += 0.8
-            if ps.path.split("/")[-1] and ps.path.split("/")[-1] in pc.path:
-                score += 0.35
-
-        ts = set(self._url_tokens(seed))
-        tc = set(self._url_tokens(cand))
-
-        if ts and tc:
-            inter = len(ts & tc)
-            union = len(ts | tc)
-            if union:
-                score += 2.4 * (inter / union)
-                if any(tok in tc for tok in ("manifest", "playlist", "segment", "stream", "cdn", "video", "audio", "download")):
-                    score += 1.2
-
-                cand_host = pc.netloc.lower()
-                cand_path = pc.path.lower()
-
-                if any(h in cand_host for h in ("cdn", "cloudfront.net", "akamaized.net", "fastly.net", "b-cdn.net", "jsdelivr.net")):
-                    score += 1.6
-
-                if any(p in cand_path for p in ("/cdn/", "/media/", "/assets/", "/static/", "/video/", "/audio/", "/playback/", "/segment/", "/chunk/")):
-                    score += 0.8
-
-        return round(score, 4)
-
-    def _classify_url_kind(self, url: str, content_type: str) -> str:
-        ul = (url or "").lower()
-        ct = (content_type or "").lower()
-
-        if "text/html" in ct:
-            return "html"
-        if "application/json" in ct:
-            return "json"
-        if any(x in ct for x in ("application/vnd.apple.mpegurl", "application/x-mpegurl", "application/dash+xml")):
-            return "manifest"
-        if any(x in ul for x in (".m3u8", ".mpd")):
-            return "manifest"
-        if ct.startswith("video/") or any(x in ul for x in (".mp4", ".webm", ".mkv", ".ts", ".m4s")):
-            return "video"
-        if ct.startswith("audio/") or any(x in ul for x in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav")):
-            return "audio"
-        if ct.startswith("image/") or any(x in ul for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
-            return "image"
-        if "graphql" in ul:
-            return "json"
-        if "json" in ct or "/api/" in ul:
-            return "json"
-        if any(x in ul for x in self._ASSETISH_HINTS):
-            return "asset"
-
-        return "unknown"
-
-    def _extract_urls_from_text(self, text: str) -> List[str]:
-        out: List[str] = []
-        seen: Set[str] = set()
-
-        for m in self._URL_RE.finditer(text or ""):
-            raw = m.group(0).strip().rstrip(")],.;:'\"")
-            u = self._canonicalize_url(unescape(raw))
-            if u and u not in seen:
-                seen.add(u)
-                out.append(u)
-
-        return out
-
-    def _extract_urls_from_jsonish(self, text: str, base_url: str, *, limit: int) -> List[str]:
-        out: List[str] = []
-        seen: Set[str] = set()
-
-        for u in self._extract_urls_from_text(text):
-            if u not in seen:
-                seen.add(u)
-                out.append(u)
-                if len(out) >= limit:
-                    return out
-
-        for m in re.finditer(r'"(?:url|src|href|manifest|playlist|download|file|endpoint|api)"\s*:\s*"([^"]+)"', text or "", re.I):
-            raw = m.group(1)
-            cand = self._canonicalize_url(urljoin(base_url, raw.replace("\\/", "/")))
-            if cand and cand not in seen:
-                seen.add(cand)
-                out.append(cand)
-                if len(out) >= limit:
-                    break
-
-        return out
-
-    def _extract_asset_urls_from_html(self, html_text: str, base_url: str, *, max_assets: int) -> List[str]:
-        out: List[str] = []
-        seen: Set[str] = set()
-
-        if not html_text:
-            return out
-
-        def _add(raw: str) -> None:
-            if len(out) >= max_assets:
-                return
-
-            raw = (raw or "").strip()
-            if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
-                return
-
-            full = self._canonicalize_url(urljoin(base_url, raw))
-            if full and full not in seen:
-                seen.add(full)
-                out.append(full)
-
-        parse_cap = min(self.max_html_chars, 250_000)
-        html_slice = html_text[:parse_cap]
-
-        if BeautifulSoup is not None and len(html_slice) <= 250_000:
-            try:
-                soup = BeautifulSoup(html_slice, "html.parser")
-                for tag in soup.find_all(["a", "img", "video", "audio", "source", "link", "meta", "iframe", "script", "form"]):
-                    for attr in ("href", "src", "data-src", "data-href", "poster", "content", "action"):
-                        val = tag.get(attr)
-                        if isinstance(val, str):
-                            _add(val)
-                        if len(out) >= max_assets:
-                            return out
-            except Exception:
-                pass
-
-        for m in self._HTML_ATTR_RE.finditer(html_slice):
-            _add(m.group(1))
-            if len(out) >= max_assets:
-                break
-
-        return out
-
-    def _extract_header_links(self, headers: Dict[str, str], *, base_url: str) -> List[str]:
-        out: List[str] = []
-        raw = self._header_get(headers, "link")
-
-        if not raw:
-            return out
-
-        for m in re.finditer(r"<([^>]+)>", raw):
-            u = self._canonicalize_url(urljoin(base_url, m.group(1)))
-            if u and u not in out:
-                out.append(u)
-
-        return out[:128]
+            return None
