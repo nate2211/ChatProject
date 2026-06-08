@@ -30,9 +30,34 @@ from aiohttp import ClientTimeout
 
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable, Mapping
+from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable, Mapping, Deque
 import asyncio, json, re, hashlib, time
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin, urldefrag, unquote
+import numpy as _np
+try:
+    from scipy.special import expit as _scipy_expit
+except Exception:  # pragma: no cover
+    _scipy_expit = None
+
+try:
+    from scipy.special import softmax as _scipy_softmax
+except Exception:  # pragma: no cover
+    _scipy_softmax = None
+
+try:
+    from scipy.stats import rankdata as _scipy_rankdata
+except Exception:  # pragma: no cover
+    _scipy_rankdata = None
+
+try:
+    from scipy.stats import median_abs_deviation as _scipy_mad
+except Exception:  # pragma: no cover
+    _scipy_mad = None
+
+try:
+    from scipy.signal import savgol_filter as _scipy_savgol_filter
+except Exception:  # pragma: no cover
+    _scipy_savgol_filter = None
 
 from loggers import DEBUG_LOGGER
 import libpcap_backend
@@ -20346,6 +20371,1055 @@ class _CDNLinkPrioritizer:
             tag=tag,
         ) >= threshold
 
+@dataclass
+class _HTTPSMathDecision:
+    action: str
+    score: float
+    reasons: List[str] = field(default_factory=list)
+    features: Dict[str, float] = field(default_factory=dict)
+    ts: float = field(default_factory=time.time)
+
+
+class HTTPSMathematicalModelLayer:
+    """
+    Optional mathematical/model layer for HTTPSSubmanager.
+
+    Purpose:
+      - Score discovered links/candidates.
+      - Rank candidates.
+      - Adjust parse depth.
+      - Adjust retry delay and cooldowns.
+      - Choose normal Accept / Referer preferences.
+      - Track lightweight host history.
+
+    Safety:
+      - Does not perform network requests.
+      - Does not bypass auth, CAPTCHA, WAF, 401, 403, 407, 429, or 451.
+      - Never reduces cooldowns for blocked / forbidden / rate-limited responses.
+      - Falls back to pure Python if NumPy/SciPy are not installed.
+    """
+
+    PROTECTED_STATUSES = {401, 403, 407, 429, 451}
+
+    ASSET_EXTS = (
+        ".m3u8", ".mpd", ".m4s", ".ts", ".mp4", ".webm", ".mkv", ".mov",
+        ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
+        ".js", ".mjs", ".css", ".json", ".xml",
+    )
+
+    CDN_HINTS = (
+        "cdn", "cloudfront", "akamai", "fastly", "edgekey", "edgesuite",
+        "media", "asset", "assets", "static", "playback", "stream",
+        "manifest", "segment", "segments", "chunk", "chunks",
+    )
+
+    DEFAULT_ACCEPT = (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "application/json;q=0.8,*/*;q=0.7"
+    )
+
+    JSON_ACCEPT = "application/json,text/plain,*/*"
+    ASSET_ACCEPT = "*/*"
+    HTML_ACCEPT = DEFAULT_ACCEPT
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        logger: Any = None,
+        history_size: int = 512,
+        random_seed: Optional[int] = None,
+        min_score: float = -100.0,
+        max_score: float = 100.0,
+    ):
+        self.enabled = bool(enabled)
+        self.logger = logger
+        self.history_size = max(32, int(history_size or 512))
+        self.min_score = float(min_score)
+        self.max_score = float(max_score)
+
+        self.numpy_available = _np is not None
+        self.scipy_available = any(
+            x is not None
+            for x in (
+                _scipy_expit,
+                _scipy_softmax,
+                _scipy_rankdata,
+                _scipy_mad,
+                _scipy_savgol_filter,
+            )
+        )
+
+        self._mu = threading.RLock()
+        self._host_history: Dict[str, Deque[Dict[str, Any]]] = collections.defaultdict(
+            lambda: collections.deque(maxlen=self.history_size)
+        )
+        self._last_decisions: Deque[_HTTPSMathDecision] = collections.deque(maxlen=256)
+
+        if self.numpy_available:
+            try:
+                self._rng = _np.random.default_rng(random_seed)
+            except Exception:
+                self._rng = None
+        else:
+            self._rng = None
+
+        self.weights: Dict[str, float] = {
+            "base": 1.00,
+            "query": 5.50,
+            "cdn": 1.25,
+            "asset": 1.50,
+            "status": 1.25,
+            "host_success": 2.00,
+            "latency": 1.15,
+            "hits": 0.65,
+            "evidence": 0.85,
+            "freshness": 0.45,
+            "penalty": -3.00,
+        }
+
+    # ------------------------------------------------------------------
+    # Public status / logging
+    # ------------------------------------------------------------------
+
+    def available(self) -> bool:
+        """
+        True when the layer is enabled.
+
+        It can still run without NumPy/SciPy using pure Python fallback math.
+        """
+        return bool(self.enabled)
+
+    def debug_decision(self) -> Dict[str, Any]:
+        with self._mu:
+            last = self._last_decisions[-1] if self._last_decisions else None
+
+        return {
+            "enabled": self.enabled,
+            "numpy_available": self.numpy_available,
+            "scipy_available": self.scipy_available,
+            "history_size": self.history_size,
+            "last_decision": None
+            if last is None
+            else {
+                "action": last.action,
+                "score": last.score,
+                "reasons": list(last.reasons),
+                "features": dict(last.features),
+                "ts": last.ts,
+            },
+        }
+
+    def _log(self, msg: str) -> None:
+        try:
+            if self.logger and hasattr(self.logger, "log_message"):
+                self.logger.log_message(msg)
+            elif self.logger and hasattr(self.logger, "info"):
+                self.logger.info(msg)
+        except Exception:
+            pass
+
+    def _remember_decision(
+        self,
+        action: str,
+        score: float,
+        reasons: Iterable[str],
+        features: Mapping[str, float],
+    ) -> None:
+        with self._mu:
+            self._last_decisions.append(
+                _HTTPSMathDecision(
+                    action=str(action),
+                    score=float(score),
+                    reasons=list(reasons),
+                    features={str(k): float(v) for k, v in dict(features).items()},
+                )
+            )
+
+    # ------------------------------------------------------------------
+    # Safe numeric helpers
+    # ------------------------------------------------------------------
+
+    def _f(self, value: Any, default: float = 0.0) -> float:
+        try:
+            x = float(value)
+            if not math.isfinite(x):
+                return float(default)
+            return x
+        except Exception:
+            return float(default)
+
+    def _clip(self, value: Any, lo: float, hi: float) -> float:
+        x = self._f(value)
+        if self.numpy_available:
+            try:
+                return float(_np.clip(x, lo, hi))
+            except Exception:
+                pass
+        return max(float(lo), min(float(hi), x))
+
+    def _log1p(self, value: Any) -> float:
+        x = max(0.0, self._f(value))
+        if self.numpy_available:
+            try:
+                return float(_np.log1p(x))
+            except Exception:
+                pass
+        return math.log1p(x)
+
+    def _sigmoid(self, value: Any) -> float:
+        x = self._clip(value, -60.0, 60.0)
+
+        if _scipy_expit is not None:
+            try:
+                return float(_scipy_expit(x))
+            except Exception:
+                pass
+
+        return 1.0 / (1.0 + math.exp(-x))
+
+    def _softmax(self, values: Sequence[float]) -> List[float]:
+        vals = [self._f(v) for v in values]
+
+        if not vals:
+            return []
+
+        if _scipy_softmax is not None:
+            try:
+                out = _scipy_softmax(vals)
+                return [float(x) for x in out]
+            except Exception:
+                pass
+
+        m = max(vals)
+        exps = [math.exp(self._clip(v - m, -60.0, 60.0)) for v in vals]
+        total = sum(exps) or 1.0
+        return [x / total for x in exps]
+
+    def robust_zscore(self, values: Sequence[float]) -> List[float]:
+        vals = [self._f(v) for v in values]
+
+        if not vals:
+            return []
+
+        if self.numpy_available:
+            try:
+                arr = _np.asarray(vals, dtype=float)
+                arr = _np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+                med = float(_np.median(arr))
+
+                if _scipy_mad is not None:
+                    mad = float(_scipy_mad(arr, scale="normal"))
+                else:
+                    mad = float(_np.median(_np.abs(arr - med))) * 1.4826
+
+                if mad <= 1e-12:
+                    std = float(_np.std(arr))
+                    if std <= 1e-12:
+                        return [0.0 for _ in vals]
+                    return [float((x - med) / std) for x in arr]
+
+                return [float((x - med) / mad) for x in arr]
+            except Exception:
+                pass
+
+        vals_sorted = sorted(vals)
+        mid = len(vals_sorted) // 2
+        med = vals_sorted[mid] if len(vals_sorted) % 2 else (vals_sorted[mid - 1] + vals_sorted[mid]) / 2.0
+        devs = sorted(abs(v - med) for v in vals)
+        dmid = len(devs) // 2
+        mad = devs[dmid] if len(devs) % 2 else (devs[dmid - 1] + devs[dmid]) / 2.0
+        mad = mad * 1.4826
+
+        if mad <= 1e-12:
+            mean = sum(vals) / max(1, len(vals))
+            var = sum((v - mean) ** 2 for v in vals) / max(1, len(vals))
+            std = math.sqrt(var)
+            if std <= 1e-12:
+                return [0.0 for _ in vals]
+            return [(v - mean) / std for v in vals]
+
+        return [(v - med) / mad for v in vals]
+
+    def normalize_features(self, features: Mapping[str, Any]) -> Dict[str, float]:
+        """
+        Clamp features into stable model-safe ranges.
+        """
+        out = {
+            "base": self._clip(self._f(features.get("base", 0.0)) / 25.0, -4.0, 4.0),
+            "query": self._clip(features.get("query", 0.0), 0.0, 1.0),
+            "cdn": self._clip(features.get("cdn", 0.0), 0.0, 1.0),
+            "asset": self._clip(features.get("asset", 0.0), 0.0, 1.0),
+            "status": self._clip(features.get("status", 0.0), -1.0, 1.0),
+            "host_success": self._clip(features.get("host_success", 0.5), 0.0, 1.0),
+            "latency": self._clip(features.get("latency", 0.5), 0.0, 1.0),
+            "hits": self._clip(self._log1p(features.get("hits", 0.0)) / 5.0, 0.0, 1.0),
+            "evidence": self._clip(self._log1p(features.get("evidence", 0.0)) / 4.0, 0.0, 1.0),
+            "freshness": self._clip(features.get("freshness", 0.5), 0.0, 1.0),
+            "penalty": self._clip(features.get("penalty", 0.0), 0.0, 1.0),
+        }
+        return out
+
+    def weighted_score(self, features: Mapping[str, Any]) -> float:
+        nf = self.normalize_features(features)
+
+        score = 0.0
+        for name, value in nf.items():
+            score += self.weights.get(name, 0.0) * value
+
+        return self._clip(score, self.min_score, self.max_score)
+
+    # ------------------------------------------------------------------
+    # URL / text helpers
+    # ------------------------------------------------------------------
+
+    def _host(self, url: str) -> str:
+        try:
+            return (urlparse(str(url or "")).hostname or "").lower()
+        except Exception:
+            return ""
+
+    def _lower(self, value: Any) -> str:
+        try:
+            return unquote(str(value or "")).lower()
+        except Exception:
+            return str(value or "").lower()
+
+    def _tokenize(self, value: Any) -> List[str]:
+        text = self._lower(value)
+        toks: List[str] = []
+        cur: List[str] = []
+
+        for ch in text:
+            if ch.isalnum():
+                cur.append(ch)
+            else:
+                if len(cur) >= 2:
+                    toks.append("".join(cur))
+                cur = []
+
+        if len(cur) >= 2:
+            toks.append("".join(cur))
+
+        seen = set()
+        out = []
+
+        for t in toks:
+            if t not in seen:
+                seen.add(t)
+                out.append(t)
+
+        return out[:128]
+
+    def _query_coverage(
+        self,
+        *,
+        query: str = "",
+        url: str = "",
+        text: str = "",
+        title: str = "",
+        tag: str = "",
+        evidence: Iterable[Any] = (),
+    ) -> float:
+        q_tokens = [
+            t for t in self._tokenize(query)
+            if t not in {
+                "the", "and", "for", "from", "with", "link", "links",
+                "url", "urls", "asset", "assets", "cdn", "file", "files",
+                "find", "get", "show", "list",
+            }
+        ]
+
+        if not q_tokens:
+            return 0.0
+
+        hay = " ".join(
+            [
+                self._lower(url),
+                self._lower(text),
+                self._lower(title),
+                self._lower(tag),
+                " ".join(self._lower(x) for x in evidence or ()),
+            ]
+        )
+
+        matched = sum(1 for t in q_tokens if t in hay)
+        return self._clip(matched / max(1, len(q_tokens)), 0.0, 1.0)
+
+    def _is_assetish(self, url: str, content_type: str = "", kind: str = "") -> bool:
+        u = self._lower(url)
+        ct = self._lower(content_type)
+        k = self._lower(kind)
+
+        return (
+            any(u.endswith(ext) for ext in self.ASSET_EXTS)
+            or any(x in ct for x in ("video/", "audio/", "image/", "javascript", "css", "json", "xml"))
+            or k in {"video", "audio", "image", "asset", "manifest", "playlist", "json"}
+        )
+
+    def _is_cdnish(self, url: str) -> bool:
+        u = self._lower(url)
+        return any(h in u for h in self.CDN_HINTS)
+
+    def _status_feature(self, status: Optional[int]) -> float:
+        if status is None:
+            return 0.0
+
+        try:
+            s = int(status)
+        except Exception:
+            return 0.0
+
+        if 200 <= s < 300:
+            return 1.0
+        if 300 <= s < 400:
+            return 0.65
+        if s in self.PROTECTED_STATUSES:
+            return -1.0
+        if 400 <= s < 500:
+            return -0.65
+        if 500 <= s < 600:
+            return -0.35
+        return 0.0
+
+    # ------------------------------------------------------------------
+    # History model
+    # ------------------------------------------------------------------
+
+    def observe_request_result(
+        self,
+        *,
+        url: str,
+        host: str = "",
+        ok: bool = False,
+        status: Optional[int] = None,
+        error: str = "",
+        elapsed_ms: float = 0.0,
+        body_size: int = 0,
+        extracted_count: int = 0,
+        **_: Any,
+    ) -> None:
+        if not self.enabled:
+            return
+
+        h = (host or self._host(url)).lower()
+
+        if not h:
+            return
+
+        row = {
+            "url": str(url or ""),
+            "ok": bool(ok),
+            "status": status,
+            "error": str(error or ""),
+            "elapsed_ms": max(0.0, self._f(elapsed_ms)),
+            "body_size": max(0, int(body_size or 0)),
+            "extracted_count": max(0, int(extracted_count or 0)),
+            "ts": time.time(),
+        }
+
+        with self._mu:
+            self._host_history[h].append(row)
+
+    def history_summary(self, host: str = "", url: str = "") -> Dict[str, float]:
+        h = (host or self._host(url)).lower()
+
+        if not h:
+            return {
+                "count": 0.0,
+                "success_rate": 0.5,
+                "failure_rate": 0.0,
+                "timeout_rate": 0.0,
+                "latency_ms": 0.0,
+                "extract_rate": 0.0,
+            }
+
+        with self._mu:
+            rows = list(self._host_history.get(h, ()))
+
+        if not rows:
+            return {
+                "count": 0.0,
+                "success_rate": 0.5,
+                "failure_rate": 0.0,
+                "timeout_rate": 0.0,
+                "latency_ms": 0.0,
+                "extract_rate": 0.0,
+            }
+
+        count = len(rows)
+        ok_count = sum(1 for r in rows if r.get("ok"))
+        fail_count = count - ok_count
+        timeout_count = sum(1 for r in rows if "timeout" in str(r.get("error", "")).lower())
+
+        latencies = [self._f(r.get("elapsed_ms", 0.0)) for r in rows if self._f(r.get("elapsed_ms", 0.0)) > 0]
+        extracted = [self._f(r.get("extracted_count", 0.0)) for r in rows]
+
+        if self.numpy_available and latencies:
+            try:
+                latency_ms = float(_np.median(_np.asarray(latencies, dtype=float)))
+            except Exception:
+                latency_ms = sorted(latencies)[len(latencies) // 2]
+        else:
+            latency_ms = sorted(latencies)[len(latencies) // 2] if latencies else 0.0
+
+        extract_rate = sum(1 for x in extracted if x > 0) / max(1, len(extracted))
+
+        return {
+            "count": float(count),
+            "success_rate": ok_count / max(1, count),
+            "failure_rate": fail_count / max(1, count),
+            "timeout_rate": timeout_count / max(1, count),
+            "latency_ms": latency_ms,
+            "extract_rate": extract_rate,
+        }
+
+    # ------------------------------------------------------------------
+    # Candidate scoring / ranking
+    # ------------------------------------------------------------------
+
+    def feature_vector(
+        self,
+        *,
+        base_score: float = 0.0,
+        url: str = "",
+        kind: str = "unknown",
+        source: str = "",
+        content_type: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        hits: int = 0,
+        status: Optional[int] = None,
+        latency_ms: float = 0.0,
+        evidence: Iterable[Any] = (),
+        first_seen: float = 0.0,
+        last_seen: float = 0.0,
+        **_: Any,
+    ) -> Dict[str, float]:
+        host_summary = self.history_summary(url=url)
+
+        observed_latency = self._f(latency_ms)
+        hist_latency = self._f(host_summary.get("latency_ms", 0.0))
+        latency = observed_latency or hist_latency
+
+        # 1.0 is fast/good, 0.0 is slow/bad.
+        latency_feature = 1.0 / (1.0 + max(0.0, latency) / 1500.0)
+
+        now = time.time()
+        seen = self._f(last_seen or first_seen or now)
+        age = max(0.0, now - seen)
+        freshness = 1.0 / (1.0 + age / 3600.0)
+
+        ev_count = 0
+        try:
+            ev_count = len(list(evidence or ()))
+        except Exception:
+            ev_count = 0
+
+        features = {
+            "base": self._f(base_score),
+            "query": self._query_coverage(
+                query=query,
+                url=url,
+                text=text,
+                title=title,
+                tag=tag,
+                evidence=evidence,
+            ),
+            "cdn": 1.0 if self._is_cdnish(url) else 0.0,
+            "asset": 1.0 if self._is_assetish(url, content_type, kind) else 0.0,
+            "status": self._status_feature(status),
+            "host_success": self._f(host_summary.get("success_rate", 0.5), 0.5),
+            "latency": latency_feature,
+            "hits": float(max(0, int(hits or 0))),
+            "evidence": float(ev_count),
+            "freshness": freshness,
+            "penalty": 1.0 if status in self.PROTECTED_STATUSES else 0.0,
+        }
+
+        return features
+
+    def score_candidate(
+        self,
+        *,
+        base_score: float = 0.0,
+        url: str = "",
+        kind: str = "unknown",
+        source: str = "",
+        content_type: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        hits: int = 0,
+        status: Optional[int] = None,
+        latency_ms: float = 0.0,
+        evidence: Iterable[Any] = (),
+        first_seen: float = 0.0,
+        last_seen: float = 0.0,
+        **kwargs: Any,
+    ) -> float:
+        """
+        Return a final safe score.
+
+        Existing heuristic score should be passed as base_score.
+        """
+        if not self.enabled:
+            return self._f(base_score)
+
+        features = self.feature_vector(
+            base_score=base_score,
+            url=url,
+            kind=kind,
+            source=source,
+            content_type=content_type,
+            query=query,
+            text=text,
+            tag=tag,
+            title=title,
+            hits=hits,
+            status=status,
+            latency_ms=latency_ms,
+            evidence=evidence,
+            first_seen=first_seen,
+            last_seen=last_seen,
+            **kwargs,
+        )
+
+        score = self.weighted_score(features)
+
+        # Convert model score into a smooth adjustment.
+        confidence = self._sigmoid(score / 4.0)
+        adjusted = self._f(base_score) + ((confidence - 0.5) * 20.0)
+
+        # Do not accidentally promote protected/blocked endpoints.
+        if status in self.PROTECTED_STATUSES:
+            adjusted = min(adjusted, self._f(base_score))
+
+        adjusted = self._clip(adjusted, self.min_score, self.max_score)
+
+        reasons = []
+        if features["query"] > 0:
+            reasons.append(f"query:{features['query']:.2f}")
+        if features["cdn"] > 0:
+            reasons.append("cdnish")
+        if features["asset"] > 0:
+            reasons.append("assetish")
+        if features["host_success"] >= 0.75:
+            reasons.append("host_success")
+        if features["penalty"] > 0:
+            reasons.append("protected_status_penalty")
+
+        self._remember_decision("score_candidate", adjusted, reasons, features)
+        return float(adjusted)
+
+    def _candidate_get(self, obj: Any, name: str, default: Any = None) -> Any:
+        if isinstance(obj, Mapping):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    def _candidate_with_score(self, obj: Any, score: float) -> Any:
+        if isinstance(obj, dict):
+            new_obj = dict(obj)
+            new_obj["_math_score"] = float(score)
+            return new_obj
+        return obj
+
+    def rank_candidates(self, candidates: Sequence[Any], *, query: str = "") -> List[Any]:
+        """
+        Rank list/dict/object candidates.
+
+        Dict candidates receive an added `_math_score` field.
+        Object candidates are returned unchanged, but sorted.
+        """
+        if not candidates:
+            return []
+
+        scored: List[Tuple[float, int, Any]] = []
+
+        for idx, item in enumerate(candidates):
+            base = self._candidate_get(item, "score", 0.0)
+            score = self.score_candidate(
+                base_score=base,
+                url=self._candidate_get(item, "url", ""),
+                kind=self._candidate_get(item, "kind", "unknown"),
+                source=self._candidate_get(item, "source", ""),
+                content_type=self._candidate_get(item, "content_type", ""),
+                query=query,
+                text=self._candidate_get(item, "text", ""),
+                tag=self._candidate_get(item, "tag", ""),
+                title=self._candidate_get(item, "title", ""),
+                hits=self._candidate_get(item, "hits", 0),
+                status=self._candidate_get(item, "status", None),
+                latency_ms=self._candidate_get(item, "latency_ms", 0.0),
+                evidence=self._candidate_get(item, "evidence", ()),
+                first_seen=self._candidate_get(item, "first_seen", 0.0),
+                last_seen=self._candidate_get(item, "last_seen", 0.0),
+            )
+            scored.append((score, idx, item))
+
+        # Optional SciPy rank tie handling.
+        if _scipy_rankdata is not None and len(scored) > 1:
+            try:
+                raw_scores = [s[0] for s in scored]
+                ranks = _scipy_rankdata([-x for x in raw_scores], method="ordinal")
+                scored = [
+                    (float(-ranks[i]), scored[i][1], scored[i][2])
+                    for i in range(len(scored))
+                ]
+            except Exception:
+                pass
+
+        scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+        return [self._candidate_with_score(item, score) for score, _idx, item in scored]
+
+    # ------------------------------------------------------------------
+    # Parse mode decision
+    # ------------------------------------------------------------------
+
+    def decide_parse_mode(
+        self,
+        *,
+        existing_mode: str = "full",
+        body_size: int = 0,
+        content_type: str = "",
+        latency_ema_ms: float = 0.0,
+        same_fingerprint_hits: int = 0,
+        same_child_digest_hits: int = 0,
+        zero_child_parses: int = 0,
+        extracted_count: int = 0,
+        **_: Any,
+    ) -> str:
+        """
+        Decide full/light/skip.
+
+        Rule:
+          - Never upgrades existing skip to full.
+          - Can downgrade full -> light or skip when repetition/size/latency is high.
+        """
+        if not self.enabled:
+            return existing_mode or "full"
+
+        mode = (existing_mode or "full").lower().strip()
+
+        if mode == "skip":
+            return "skip"
+
+        size = max(0, int(body_size or 0))
+        latency = max(0.0, self._f(latency_ema_ms))
+        fp_hits = max(0, int(same_fingerprint_hits or 0))
+        child_hits = max(0, int(same_child_digest_hits or 0))
+        zero_hits = max(0, int(zero_child_parses or 0))
+
+        ct = self._lower(content_type)
+        htmlish = ("html" in ct) or ("xml" in ct) or not ct
+
+        size_pressure = self._clip(size / 1_500_000.0, 0.0, 1.0)
+        latency_pressure = self._clip(latency / 5000.0, 0.0, 1.0)
+        repeat_pressure = self._clip((fp_hits + child_hits + zero_hits) / 10.0, 0.0, 1.0)
+        no_extract_pressure = 1.0 if zero_hits >= 2 and extracted_count <= 0 else 0.0
+
+        pressure = (
+            size_pressure * 0.35
+            + latency_pressure * 0.25
+            + repeat_pressure * 0.30
+            + no_extract_pressure * 0.10
+        )
+
+        reasons = []
+        if size_pressure > 0.5:
+            reasons.append("large_body")
+        if latency_pressure > 0.5:
+            reasons.append("slow_latency")
+        if repeat_pressure > 0.5:
+            reasons.append("repeated_content")
+        if no_extract_pressure > 0:
+            reasons.append("zero_child_parses")
+
+        if size >= 2_500_000 and fp_hits >= 2:
+            out = "skip"
+        elif pressure >= 0.72 and htmlish:
+            out = "skip"
+        elif pressure >= 0.42:
+            out = "light"
+        else:
+            out = mode if mode in {"full", "light"} else "full"
+
+        # Do not upgrade from light to full here.
+        if mode == "light" and out == "full":
+            out = "light"
+
+        self._remember_decision(
+            "decide_parse_mode",
+            pressure,
+            reasons,
+            {
+                "size_pressure": size_pressure,
+                "latency_pressure": latency_pressure,
+                "repeat_pressure": repeat_pressure,
+                "no_extract_pressure": no_extract_pressure,
+            },
+        )
+        return out
+
+    # ------------------------------------------------------------------
+    # Retry / cooldown decisions
+    # ------------------------------------------------------------------
+
+    def decide_retry_delay(
+        self,
+        *,
+        base_delay: float = 0.0,
+        status: Optional[int] = None,
+        error: str = "",
+        attempt: int = 0,
+        latency_ms: float = 0.0,
+        host_failure_rate: float = 0.0,
+        timeout_hits: int = 0,
+        url: str = "",
+        host: str = "",
+        **_: Any,
+    ) -> float:
+        """
+        Adjust retry delay.
+
+        Protected statuses are never made more aggressive.
+        """
+        base = max(0.0, self._f(base_delay))
+        attempt_i = max(0, int(attempt or 0))
+        err = str(error or "").lower()
+
+        hist = self.history_summary(host=host, url=url)
+        failure_rate = max(self._f(host_failure_rate), self._f(hist.get("failure_rate", 0.0)))
+        timeout_rate = self._f(hist.get("timeout_rate", 0.0))
+
+        if status in self.PROTECTED_STATUSES:
+            return max(base, 60.0)
+
+        pressure = 1.0
+        pressure += min(3.0, attempt_i * 0.5)
+        pressure += min(2.0, failure_rate * 2.0)
+        pressure += min(2.0, timeout_rate * 2.0)
+        pressure += min(2.0, max(0, int(timeout_hits or 0)) * 0.25)
+
+        if "timeout" in err:
+            pressure += 0.75
+        if status and 500 <= int(status) <= 599:
+            pressure += 0.50
+
+        delay = base * pressure if base > 0 else pressure
+        delay = self._clip(delay, 0.0, 300.0)
+
+        self._remember_decision(
+            "decide_retry_delay",
+            delay,
+            ["retry_pressure"],
+            {
+                "base": base,
+                "pressure": pressure,
+                "failure_rate": failure_rate,
+                "timeout_rate": timeout_rate,
+            },
+        )
+        return delay
+
+    def decide_cooldown(
+        self,
+        *,
+        base_cooldown: float = 0.0,
+        status: Optional[int] = None,
+        error: str = "",
+        consecutive_failures: int = 0,
+        timeout_hits: int = 0,
+        latency_ema_ms: float = 0.0,
+        url: str = "",
+        host: str = "",
+        **_: Any,
+    ) -> float:
+        """
+        Adjust cooldown.
+
+        Protected statuses are never reduced.
+        """
+        base = max(0.0, self._f(base_cooldown))
+        err = str(error or "").lower()
+        failures = max(0, int(consecutive_failures or 0))
+        timeouts = max(0, int(timeout_hits or 0))
+
+        hist = self.history_summary(host=host, url=url)
+        failure_rate = self._f(hist.get("failure_rate", 0.0))
+        latency = max(self._f(latency_ema_ms), self._f(hist.get("latency_ms", 0.0)))
+
+        if status in self.PROTECTED_STATUSES:
+            if status == 429:
+                return max(base, 120.0)
+            return max(base, 60.0)
+
+        pressure = 0.0
+        pressure += min(180.0, failures * 15.0)
+        pressure += min(180.0, timeouts * 25.0)
+        pressure += min(120.0, failure_rate * 120.0)
+
+        if latency >= 5000:
+            pressure += 45.0
+        elif latency >= 2500:
+            pressure += 20.0
+
+        if "timeout" in err:
+            pressure += 30.0
+
+        if status and 500 <= int(status) <= 599:
+            pressure += 20.0
+
+        cooldown = max(base, pressure)
+        cooldown = self._clip(cooldown, 0.0, 600.0)
+
+        self._remember_decision(
+            "decide_cooldown",
+            cooldown,
+            ["cooldown_pressure"],
+            {
+                "base": base,
+                "failures": float(failures),
+                "timeouts": float(timeouts),
+                "failure_rate": failure_rate,
+                "latency": latency,
+            },
+        )
+        return cooldown
+
+    # ------------------------------------------------------------------
+    # Header preference decisions
+    # ------------------------------------------------------------------
+
+    def choose_accept_header(
+        self,
+        *,
+        host: str = "",
+        candidates: Sequence[Any] = (),
+        previous_accept: str = "",
+        **_: Any,
+    ) -> str:
+        """
+        Pick normal Accept header based on candidate mix.
+
+        This does not rotate fingerprints or bypass protections.
+        """
+        if previous_accept:
+            return str(previous_accept)
+
+        if not candidates:
+            return self.DEFAULT_ACCEPT
+
+        kinds: List[str] = []
+        content_types: List[str] = []
+        urls: List[str] = []
+
+        for c in candidates:
+            kinds.append(self._lower(self._candidate_get(c, "kind", "")))
+            content_types.append(self._lower(self._candidate_get(c, "content_type", "")))
+            urls.append(str(self._candidate_get(c, "url", "")))
+
+        joined = " ".join(kinds + content_types + urls).lower()
+
+        if "json" in joined or "/api/" in joined or "graphql" in joined:
+            return self.JSON_ACCEPT
+
+        if any(self._is_assetish(u) for u in urls):
+            return self.ASSET_ACCEPT
+
+        return self.HTML_ACCEPT
+
+    def choose_referer(
+        self,
+        *,
+        host: str = "",
+        referers: Mapping[str, float] | Sequence[str] = (),
+        url: str = "",
+        **_: Any,
+    ) -> str:
+        """
+        Choose best known same-host referer.
+        """
+        target_host = (host or self._host(url)).lower()
+
+        if not target_host:
+            return ""
+
+        pairs: List[Tuple[str, float]] = []
+
+        if isinstance(referers, Mapping):
+            pairs = [(str(k), self._f(v)) for k, v in referers.items()]
+        else:
+            pairs = [(str(r), 1.0) for r in referers or ()]
+
+        safe_pairs = [
+            (ref, weight)
+            for ref, weight in pairs
+            if self._host(ref) == target_host
+        ]
+
+        if not safe_pairs:
+            return ""
+
+        safe_pairs.sort(key=lambda x: x[1], reverse=True)
+        chosen = safe_pairs[0][0]
+
+        self._remember_decision(
+            "choose_referer",
+            safe_pairs[0][1],
+            ["same_host_referer"],
+            {"weight": safe_pairs[0][1]},
+        )
+        return chosen
+
+    # ------------------------------------------------------------------
+    # Optional exploration and penalties
+    # ------------------------------------------------------------------
+
+    def outlier_penalty(self, value: float, population: Sequence[float], *, threshold: float = 3.5) -> float:
+        """
+        Return 0..1 penalty for a value that is far away from population.
+        """
+        vals = list(population or [])
+
+        if len(vals) < 4:
+            return 0.0
+
+        zscores = self.robust_zscore(vals + [value])
+        z = abs(zscores[-1]) if zscores else 0.0
+
+        if z <= threshold:
+            return 0.0
+
+        return self._clip((z - threshold) / threshold, 0.0, 1.0)
+
+    def exploration_bonus(
+        self,
+        *,
+        url: str = "",
+        host: str = "",
+        seen_count: int = 0,
+        max_bonus: float = 2.0,
+        **_: Any,
+    ) -> float:
+        """
+        Small bonus for unseen/under-tested candidates.
+
+        This only affects ranking. It does not force a request.
+        """
+        h = (host or self._host(url)).lower()
+        hist = self.history_summary(host=h)
+        count = max(float(seen_count or 0), self._f(hist.get("count", 0.0)))
+
+        bonus = max_bonus / (1.0 + count)
+        return self._clip(bonus, 0.0, max_bonus)
+
+
 
 class HTTPSSubmanager:
     """
@@ -20554,6 +21628,338 @@ class HTTPSSubmanager:
         self._inflight: Dict[str, asyncio.Task] = {}
         self._inflight_lock = asyncio.Lock()
         self._cdn_priority = _CDNLinkPrioritizer()
+        self._math_model = self._make_math_model()
+
+    # ------------------------------------------------------------------
+    # HTTPSMathematicalModelLayer compatibility
+    # ------------------------------------------------------------------
+
+    def _make_math_model(self):
+        """
+        Create the optional mathematical decision layer without changing the
+        HTTPSSubmanager constructor signature. If the class is not present, or
+        NumPy/SciPy are missing inside that class, the rest of the manager keeps
+        using the original heuristics.
+        """
+        math_cls = globals().get("HTTPSMathematicalModelLayer") or globals().get("HTTPSMathDecisionLayer")
+        if math_cls is None:
+            return None
+
+        try:
+            logger = globals().get("DEBUG_LOGGER", None)
+            model = math_cls(logger=logger)
+            if hasattr(model, "available") and not model.available():
+                return model
+            return model
+        except TypeError:
+            try:
+                return math_cls()
+            except Exception as e:
+                try:
+                    self._log(f"[HTTPS][MATH] disabled: {e}")
+                except Exception:
+                    pass
+                return None
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] disabled: {e}")
+            except Exception:
+                pass
+            return None
+
+    def _math_available(self) -> bool:
+        model = getattr(self, "_math_model", None)
+        if model is None:
+            return False
+        try:
+            return bool(model.available()) if hasattr(model, "available") else True
+        except Exception:
+            return False
+
+    def _math_score_candidate(
+        self,
+        *,
+        base_score: float,
+        url: str,
+        kind: str = "unknown",
+        source: str = "",
+        content_type: str = "",
+        query: str = "",
+        text: str = "",
+        tag: str = "",
+        title: str = "",
+        hits: int = 0,
+        status: Optional[int] = None,
+        latency_ms: float = 0.0,
+        evidence: Iterable[str] = (),
+        first_seen: float = 0.0,
+        last_seen: float = 0.0,
+    ) -> float:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return float(base_score or 0.0)
+
+        fn = getattr(model, "score_candidate", None)
+        if not callable(fn):
+            return float(base_score or 0.0)
+
+        try:
+            return float(
+                fn(
+                    base_score=float(base_score or 0.0),
+                    url=url,
+                    kind=kind,
+                    source=source,
+                    content_type=content_type,
+                    query=query,
+                    text=text,
+                    tag=tag,
+                    title=title,
+                    hits=int(hits or 0),
+                    status=status,
+                    latency_ms=float(latency_ms or 0.0),
+                    evidence=tuple(evidence or ()),
+                    first_seen=float(first_seen or 0.0),
+                    last_seen=float(last_seen or 0.0),
+                )
+            )
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] score_candidate failed: {e}")
+            except Exception:
+                pass
+            return float(base_score or 0.0)
+
+    def _math_rank_candidate_rows(self, rows: List[Dict[str, Any]], *, query: str = "") -> List[Dict[str, Any]]:
+        model = getattr(self, "_math_model", None)
+        if not model or not rows:
+            return rows
+
+        fn = getattr(model, "rank_candidates", None)
+        if not callable(fn):
+            return rows
+
+        try:
+            ranked = fn(rows, query=query)
+            if isinstance(ranked, list):
+                return ranked
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] rank_candidates failed: {e}")
+            except Exception:
+                pass
+
+        return rows
+
+    def _math_decide_parse_mode(
+        self,
+        *,
+        existing_mode: str,
+        body_size: int,
+        content_type: str,
+        latency_ema_ms: float = 0.0,
+        same_fingerprint_hits: int = 0,
+        same_child_digest_hits: int = 0,
+        zero_child_parses: int = 0,
+        extracted_count: int = 0,
+    ) -> str:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return existing_mode or "full"
+
+        fn = getattr(model, "decide_parse_mode", None)
+        if not callable(fn):
+            return existing_mode or "full"
+
+        try:
+            out = fn(
+                existing_mode=existing_mode or "full",
+                body_size=int(body_size or 0),
+                content_type=content_type or "",
+                latency_ema_ms=float(latency_ema_ms or 0.0),
+                same_fingerprint_hits=int(same_fingerprint_hits or 0),
+                same_child_digest_hits=int(same_child_digest_hits or 0),
+                zero_child_parses=int(zero_child_parses or 0),
+                extracted_count=int(extracted_count or 0),
+            )
+            out = str(out or existing_mode or "full").lower().strip()
+            return out if out in {"full", "light", "skip", "memo"} else (existing_mode or "full")
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] decide_parse_mode failed: {e}")
+            except Exception:
+                pass
+            return existing_mode or "full"
+
+    def _math_decide_retry_delay(
+        self,
+        *,
+        base_delay: float,
+        status: Optional[int] = None,
+        error: str = "",
+        attempt: int = 0,
+        latency_ms: float = 0.0,
+        host_failure_rate: float = 0.0,
+        timeout_hits: int = 0,
+        url: str = "",
+        host: str = "",
+    ) -> float:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return float(base_delay or 0.0)
+
+        fn = getattr(model, "decide_retry_delay", None)
+        if not callable(fn):
+            return float(base_delay or 0.0)
+
+        try:
+            return float(
+                fn(
+                    base_delay=float(base_delay or 0.0),
+                    status=status,
+                    error=error or "",
+                    attempt=int(attempt or 0),
+                    latency_ms=float(latency_ms or 0.0),
+                    host_failure_rate=float(host_failure_rate or 0.0),
+                    timeout_hits=int(timeout_hits or 0),
+                    url=url or "",
+                    host=host or "",
+                )
+            )
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] decide_retry_delay failed: {e}")
+            except Exception:
+                pass
+            return float(base_delay or 0.0)
+
+    def _math_decide_cooldown(
+        self,
+        *,
+        base_cooldown: float,
+        status: Optional[int] = None,
+        error: str = "",
+        consecutive_failures: int = 0,
+        timeout_hits: int = 0,
+        latency_ema_ms: float = 0.0,
+        url: str = "",
+        host: str = "",
+    ) -> float:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return float(base_cooldown or 0.0)
+
+        fn = getattr(model, "decide_cooldown", None)
+        if not callable(fn):
+            return float(base_cooldown or 0.0)
+
+        try:
+            return float(
+                fn(
+                    base_cooldown=float(base_cooldown or 0.0),
+                    status=status,
+                    error=error or "",
+                    consecutive_failures=int(consecutive_failures or 0),
+                    timeout_hits=int(timeout_hits or 0),
+                    latency_ema_ms=float(latency_ema_ms or 0.0),
+                    url=url or "",
+                    host=host or "",
+                )
+            )
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] decide_cooldown failed: {e}")
+            except Exception:
+                pass
+            return float(base_cooldown or 0.0)
+
+    def _math_choose_accept_header(
+        self,
+        *,
+        host: str = "",
+        candidates: Sequence[Any] = (),
+        previous_accept: str = "",
+    ) -> str:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return previous_accept or ""
+
+        fn = getattr(model, "choose_accept_header", None)
+        if not callable(fn):
+            return previous_accept or ""
+
+        try:
+            return str(fn(host=host, candidates=candidates, previous_accept=previous_accept or "") or previous_accept or "")
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] choose_accept_header failed: {e}")
+            except Exception:
+                pass
+            return previous_accept or ""
+
+    def _math_choose_referer(
+        self,
+        *,
+        host: str = "",
+        referers: Any = (),
+        url: str = "",
+        fallback: str = "",
+    ) -> str:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return fallback or ""
+
+        fn = getattr(model, "choose_referer", None)
+        if not callable(fn):
+            return fallback or ""
+
+        try:
+            chosen = str(fn(host=host, referers=referers, url=url) or "")
+            return chosen or fallback or ""
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] choose_referer failed: {e}")
+            except Exception:
+                pass
+            return fallback or ""
+
+    def _math_observe_request_result(
+        self,
+        *,
+        url: str,
+        host: str = "",
+        ok: bool = False,
+        status: Optional[int] = None,
+        error: str = "",
+        elapsed_ms: float = 0.0,
+        body_size: int = 0,
+        extracted_count: int = 0,
+    ) -> None:
+        model = getattr(self, "_math_model", None)
+        if not model:
+            return
+
+        fn = getattr(model, "observe_request_result", None)
+        if not callable(fn):
+            return
+
+        try:
+            fn(
+                url=url or "",
+                host=host or self._host(url),
+                ok=bool(ok),
+                status=status,
+                error=error or "",
+                elapsed_ms=float(elapsed_ms or 0.0),
+                body_size=int(body_size or 0),
+                extracted_count=int(extracted_count or 0),
+            )
+        except Exception as e:
+            try:
+                self._log(f"[HTTPS][MATH] observe_request_result failed: {e}")
+            except Exception:
+                pass
+
 
     # ------------------------------------------------------------------
     # Context manager
@@ -20697,6 +22103,9 @@ class HTTPSSubmanager:
                 str(item.get("confidence") or ""),
                 item_text[:180],
             )
+
+            if query:
+                evidence = evidence + (f"query:{query}",)
 
             score = 2.0 + self._score_url_similarity(seed, url)
 
@@ -21150,7 +22559,17 @@ class HTTPSSubmanager:
                                     content_type=content_type,
                                 )
                                 if not safe:
+                                    elapsed_ms = (time.perf_counter() - started) * 1000.0
                                     self._past_note_failure(canonical_req, status=status, error=why)
+                                    self._math_observe_request_result(
+                                        url=final_url,
+                                        host=host,
+                                        ok=False,
+                                        status=status,
+                                        error=why,
+                                        elapsed_ms=elapsed_ms,
+                                        body_size=len(body or b""),
+                                    )
                                     return _HTTPResult(
                                         False,
                                         status,
@@ -21200,6 +22619,16 @@ class HTTPSSubmanager:
                                 error=f"http_{status}",
                             )
 
+                        self._math_observe_request_result(
+                            url=final_url,
+                            host=host,
+                            ok=ok,
+                            status=status,
+                            error="" if ok else f"http_{status}",
+                            elapsed_ms=elapsed_ms,
+                            body_size=len(body or b""),
+                        )
+
                         if body and self._is_textlike_content_type(content_type):
                             await self._process_text_response_links(
                                 final_url=final_url,
@@ -21228,16 +22657,43 @@ class HTTPSSubmanager:
             except asyncio.TimeoutError as e:
                 last_exc = f"timeout:{e}"
                 self._past_note_failure(canonical_req, status=None, error=last_exc)
+                self._math_observe_request_result(
+                    url=canonical_req or url,
+                    host=host,
+                    ok=False,
+                    status=None,
+                    error=last_exc,
+                    elapsed_ms=0.0,
+                    body_size=0,
+                )
                 await self._sleep_backoff(attempt, {})
 
             except aiohttp.ClientError as e:
                 last_exc = f"client_error:{e}"
                 self._past_note_failure(canonical_req, status=None, error=last_exc)
+                self._math_observe_request_result(
+                    url=canonical_req or url,
+                    host=host,
+                    ok=False,
+                    status=None,
+                    error=last_exc,
+                    elapsed_ms=0.0,
+                    body_size=0,
+                )
                 await self._sleep_backoff(attempt, {})
 
             except Exception as e:
                 last_exc = f"request_error:{e}"
                 self._past_note_failure(canonical_req, status=None, error=last_exc)
+                self._math_observe_request_result(
+                    url=canonical_req or url,
+                    host=host,
+                    ok=False,
+                    status=None,
+                    error=last_exc,
+                    elapsed_ms=0.0,
+                    body_size=0,
+                )
                 await self._sleep_backoff(attempt, {})
 
         return _HTTPResult(False, None, {}, url, b"", error=last_exc or "request_failed")
@@ -21416,6 +22872,16 @@ class HTTPSSubmanager:
 
         ev = tuple(str(x).strip() for x in (evidence or ()) if str(x).strip())
 
+        score = self._math_score_candidate(
+            base_score=float(score or 0.0),
+            url=cu,
+            kind=kind or "unknown",
+            source=source or "",
+            content_type=content_type or "",
+            status=status,
+            evidence=ev,
+        )
+
         if kind in {"json", "html", "api", "page"}:
             access_kind = kind
             if kind == "json":
@@ -21563,13 +23029,18 @@ class HTTPSSubmanager:
 
         candidates.sort(key=lambda x: (x[0], x[1]["hits"]), reverse=True)
 
+        rows = [row for _, row in candidates[: max(1, int(limit)) * 3]]
+        rows = self._math_rank_candidate_rows(rows, query=seed_url)
+        rows = rows[: max(1, int(limit))]
+        accept = self._math_choose_accept_header(host=host, candidates=rows, previous_accept=accept) or accept
+
         if "_GuidanceBundle" in globals():
             return _GuidanceBundle(
                 seed_url=seed_url,
                 canonical_seed=seed,
                 referer=referer,
                 accept=accept,
-                candidates=[row for _, row in candidates[: max(1, int(limit))]],
+                candidates=rows,
             )
 
         obj = type("GuidanceBundleCompat", (), {})()
@@ -21577,7 +23048,7 @@ class HTTPSSubmanager:
         obj.canonical_seed = seed
         obj.referer = referer
         obj.accept = accept
-        obj.candidates = [row for _, row in candidates[: max(1, int(limit))]]
+        obj.candidates = rows
         return obj
 
     # ------------------------------------------------------------------
@@ -21604,9 +23075,19 @@ class HTTPSSubmanager:
         )
 
         mode = "full" if len(body) < self.max_html_chars else "light"
+        mode = self._math_decide_parse_mode(
+            existing_mode=mode,
+            body_size=len(body or b""),
+            content_type=content_type,
+            extracted_count=len(urls),
+        )
         self._past_note_parse(final_url, mode=mode, extracted_urls=urls)
 
-        for u in urls[:300]:
+        if mode == "skip":
+            return
+
+        max_links = 300 if mode == "full" else 80
+        for u in urls[:max_links]:
             kind = self._classify_url_kind(u, "")
             await self._remember_candidate(
                 url=u,
@@ -22093,6 +23574,12 @@ class HTTPSSubmanager:
         if delay <= 0:
             delay = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
 
+        delay = self._math_decide_cooldown(
+            base_cooldown=delay,
+            host=host,
+        )
+        delay = max(0.0, float(delay or 0.0))
+
         async with self._cooldown_lock:
             self._host_cooldown_until[host] = max(
                 self._host_cooldown_until.get(host, 0.0),
@@ -22111,6 +23598,12 @@ class HTTPSSubmanager:
 
         if delay <= 0:
             delay = min(self.backoff_cap, self.backoff_base * (2 ** max(0, attempt)))
+
+        delay = self._math_decide_retry_delay(
+            base_delay=delay,
+            attempt=attempt,
+        )
+        delay = min(self.backoff_cap, max(0.0, float(delay or 0.0)))
 
         delay += random.uniform(0.0, min(0.25, delay * 0.20))
         if delay > 0:
@@ -22224,13 +23717,15 @@ class HTTPSSubmanager:
             return ""
 
         rows = self._host_referers.get(host) or {}
+        fallback = ""
         if rows:
             try:
-                return sorted(rows.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+                fallback = sorted(rows.items(), key=lambda kv: kv[1], reverse=True)[0][0]
             except Exception:
-                pass
+                fallback = ""
 
-        return self._host_last_ok_url.get(host, "")
+        fallback = fallback or self._host_last_ok_url.get(host, "")
+        return self._math_choose_referer(host=host, referers=rows, url=url, fallback=fallback)
 
     def _note_referer(self, url: str, referer: str) -> None:
         host = self._host(url)
@@ -22267,3 +23762,4 @@ class HTTPSSubmanager:
             return int(str(value).strip())
         except Exception:
             return None
+
