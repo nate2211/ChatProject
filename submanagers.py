@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections  # For collections.Counter
+import datetime
 import hashlib
 import html
 import ipaddress
@@ -16,6 +17,7 @@ import time
 import traceback
 import zlib
 from dataclasses import dataclass, field, fields
+from datetime import timezone
 from html import unescape
 from html.parser import HTMLParser
 from http.cookies import SimpleCookie
@@ -32,7 +34,7 @@ from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Sequence, Iterable, Mapping, Deque
 import asyncio, json, re, hashlib, time
-from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin, urldefrag, unquote
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl, urljoin, urldefrag, unquote, quote
 import numpy as _np
 try:
     from scipy.special import expit as _scipy_expit
@@ -411,7 +413,7 @@ class NetworkSniffer:
         mse_capture_fetch: bool = True
         mse_capture_xhr: bool = True
         mse_capture_media_src_assign: bool = True
-        mse_emit_each_event_json: bool = False
+        mse_emit_each_event_json: bool = True
         mse_mediaish_url_hints: "NetworkSniffer.Set[str]" = field(default_factory=lambda: {
             ".m4s", ".mp4", ".ts", ".aac", ".m3u8", ".mpd", "dash", "hls", "segment", "seg", "chunk", "frag", "bytestream"
         })
@@ -441,7 +443,7 @@ class NetworkSniffer:
         param_max_url_len: int = 2048
         param_max_key_len: int = 128
         param_max_val_len: int = 256
-        param_capture_values: bool = False   # default FALSE (privacy)
+        param_capture_values: bool = True   # default FALSE (privacy)
         param_sample_rate: float = 1.0
 
         # ---------------- NEW: Bundle static scan (optional) ----------------
@@ -3761,7 +3763,7 @@ class JSSniffer:
         max_json_parse_chars: int = 55_000
 
         # Optional click simulation.
-        enable_click_simulation: bool = False
+        enable_click_simulation: bool = True
         max_click_targets: int = 4
         click_timeout_ms: int = 4500
         click_target_selectors: List[str] = field(default_factory=lambda: [
@@ -3774,7 +3776,7 @@ class JSSniffer:
         ])
 
         # Webpack scan stays off by default; useful but expensive.
-        enable_webpack_scan: bool = False
+        enable_webpack_scan: bool = True
         webpack_module_soft_limit: int = 80
         max_webpack_fn_chars: int = 45_000
         webpack_url_regex: str = r"(https?:\/\/[^\s'\"`]+|\/api\/[a-zA-Z0-9_\/\-\?\=&%.]+)"
@@ -3792,7 +3794,7 @@ class JSSniffer:
         enable_srcset_scan: bool = True
 
         enable_css_url_scan: bool = True
-        enable_computed_style_bg_scan: bool = False
+        enable_computed_style_bg_scan: bool = True
         computed_style_bg_budget: int = 220
         max_style_chars: int = 45_000
 
@@ -3965,7 +3967,7 @@ class JSSniffer:
 
         # Fast direct-asset behavior.
         direct_asset_fast_path: bool = True
-        direct_asset_fetch_head: bool = False
+        direct_asset_fetch_head: bool = True
 
         # Profile logging.
         log_profile_decisions: bool = True
@@ -13259,10 +13261,13 @@ class DatabaseSniffer:
 
         # --- Backend Config & Caps ---
         known_globals: Set[str] = field(default_factory=lambda: {
-            "firebase", "_firebaseApp", "Supabase", "supabaseClient",
-            "__FIREBASE_DEFAULTS__", "mongo", "Realm", "couchdb",
-            "__NEXT_DATA__", "__NUXT__", "state", "store"
+            "firebase", "_firebaseApp", "__FIREBASE_DEFAULTS__",
+            "Supabase", "supabaseClient", "mongo", "Realm", "couchdb",
+            "__NEXT_DATA__", "__NUXT__", "state", "store","_nextData_",
+            "react-server-components-state", "@supabase/supabase-js",
+            "__SUPABASE_CLIENT__","firebaseApp", "initializeFirebaseSDK"
         })
+
         backend_serialize_depth: int = 4
         backend_scan_max_urls: int = 200
         backend_scan_max_keys_per_obj: int = 50
@@ -21421,6 +21426,1198 @@ class HTTPSMathematicalModelLayer:
 
 
 
+@dataclass
+class LinkResolveResult:
+    ok: bool = False
+    original_url: str = ""
+    final_url: str = ""
+    source_page: str = ""
+    kind: str = "unknown"
+    expected_ext: str = ""
+    status: Optional[int] = None
+    content_type: str = ""
+    content_length: str = ""
+    size: str = "?"
+    reason: str = ""
+    evidence: List[str] = field(default_factory=list)
+    candidates_tested: int = 0
+    chain: List[str] = field(default_factory=list)
+    hash_prefix: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": bool(self.ok),
+            "original_url": self.original_url,
+            "final_url": self.final_url,
+            "url": self.final_url or self.original_url,
+            "source_page": self.source_page,
+            "kind": self.kind,
+            "expected_ext": self.expected_ext,
+            "status": self.status,
+            "status_code": self.status,
+            "content_type": self.content_type,
+            "content_length": self.content_length,
+            "size": self.size,
+            "reason": self.reason,
+            "evidence": list(self.evidence or []),
+            "candidates_tested": int(self.candidates_tested or 0),
+            "chain": list(self.chain or []),
+            "hash_prefix": self.hash_prefix,
+        }
+
+
+class LinkResolver:
+    """
+    Fast direct asset resolver.
+
+    This rewrite is intentionally stricter than the older heavy crawler-style
+    resolver. It does not process plain search queries, generated query strings,
+    or broad site-search URLs. It only resolves URL-shaped candidates and uses
+    bounded direct tactics:
+      1. direct Range GET confirmation
+      2. viewer/query-param extraction from that same URL
+      3. direct wrapper body mining
+      4. already-sniffed same-site candidate memory
+      5. source/parent/current directory clue pages
+      6. small robots/sitemap pass, bounded
+      7. conservative same-directory filename variants
+
+    It never bypasses auth, CAPTCHA, WAF, paywalls, or protected statuses.
+    """
+
+    PROTECTED_STATUSES = {401, 403, 407, 429, 451}
+    NOT_FOUND_STATUSES = {404, 410}
+    SOFT_FAIL_STATUSES = {202, 408, 409, 425, 500, 502, 503, 504}
+
+    DEFAULT_EXTENSIONS: Tuple[str, ...] = (
+        ".pdf", ".epub", ".mobi", ".doc", ".docx", ".xls", ".xlsx",
+        ".ppt", ".pptx", ".txt", ".csv", ".json", ".xml",
+        ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus",
+        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".wmv",
+        ".m3u8", ".mpd", ".ts", ".m4s",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp",
+        ".svg", ".tif", ".tiff", ".heic", ".heif",
+        ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz",
+    )
+
+    MIME_BY_EXT: Dict[str, Tuple[str, ...]] = {
+        ".pdf": ("application/pdf", "application/x-pdf"),
+        ".epub": ("application/epub+zip",),
+        ".mobi": ("application/x-mobipocket-ebook",),
+        ".doc": ("application/msword",),
+        ".docx": ("application/vnd.openxmlformats-officedocument.wordprocessingml.document",),
+        ".xls": ("application/vnd.ms-excel",),
+        ".xlsx": ("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",),
+        ".ppt": ("application/vnd.ms-powerpoint",),
+        ".pptx": ("application/vnd.openxmlformats-officedocument.presentationml.presentation",),
+        ".txt": ("text/plain",),
+        ".csv": ("text/csv",),
+        ".json": ("application/json", "text/json"),
+        ".xml": ("application/xml", "text/xml"),
+        ".mp3": ("audio/mpeg", "audio/mp3"),
+        ".wav": ("audio/wav", "audio/x-wav", "audio/wave"),
+        ".flac": ("audio/flac",),
+        ".m4a": ("audio/mp4", "audio/x-m4a"),
+        ".aac": ("audio/aac",),
+        ".ogg": ("audio/ogg", "application/ogg"),
+        ".oga": ("audio/ogg",),
+        ".opus": ("audio/opus", "audio/ogg"),
+        ".mp4": ("video/mp4",),
+        ".m4v": ("video/x-m4v", "video/mp4"),
+        ".webm": ("video/webm",),
+        ".mkv": ("video/x-matroska",),
+        ".mov": ("video/quicktime",),
+        ".avi": ("video/x-msvideo",),
+        ".wmv": ("video/x-ms-wmv",),
+        ".m3u8": ("application/vnd.apple.mpegurl", "application/x-mpegurl", "audio/mpegurl"),
+        ".mpd": ("application/dash+xml",),
+        ".ts": ("video/mp2t",),
+        ".m4s": ("video/iso.segment", "video/mp4", "application/octet-stream"),
+        ".jpg": ("image/jpeg",),
+        ".jpeg": ("image/jpeg",),
+        ".png": ("image/png",),
+        ".gif": ("image/gif",),
+        ".webp": ("image/webp",),
+        ".avif": ("image/avif",),
+        ".bmp": ("image/bmp",),
+        ".svg": ("image/svg+xml",),
+        ".tif": ("image/tiff",),
+        ".tiff": ("image/tiff",),
+        ".zip": ("application/zip", "application/x-zip-compressed"),
+        ".rar": ("application/vnd.rar", "application/x-rar-compressed"),
+        ".7z": ("application/x-7z-compressed",),
+        ".tar": ("application/x-tar",),
+        ".gz": ("application/gzip", "application/x-gzip"),
+        ".bz2": ("application/x-bzip2",),
+        ".xz": ("application/x-xz",),
+    }
+
+    MAGIC_BY_EXT: Dict[str, Tuple[bytes, ...]] = {
+        ".pdf": (b"%PDF",),
+        ".mp3": (b"ID3", b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"),
+        ".wav": (b"RIFF",),
+        ".flac": (b"fLaC",),
+        ".ogg": (b"OggS",),
+        ".oga": (b"OggS",),
+        ".opus": (b"OggS",),
+        ".webm": (b"\x1a\x45\xdf\xa3",),
+        ".mkv": (b"\x1a\x45\xdf\xa3",),
+        ".png": (b"\x89PNG\r\n\x1a\n",),
+        ".jpg": (b"\xff\xd8\xff",),
+        ".jpeg": (b"\xff\xd8\xff",),
+        ".gif": (b"GIF87a", b"GIF89a"),
+        ".zip": (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"),
+        ".epub": (b"PK\x03\x04",),
+        ".docx": (b"PK\x03\x04",),
+        ".xlsx": (b"PK\x03\x04",),
+        ".pptx": (b"PK\x03\x04",),
+        ".gz": (b"\x1f\x8b",),
+        ".7z": (b"7z\xbc\xaf\x27\x1c",),
+        ".rar": (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00"),
+    }
+
+    HTMLISH_MIME_HINTS: Tuple[str, ...] = (
+        "text/html", "application/xhtml+xml", "application/xml", "text/xml",
+        "application/json", "text/json", "text/plain", "application/javascript",
+        "application/x-javascript", "application/rss+xml", "application/atom+xml",
+    )
+
+    VIEWER_PARAM_KEYS: Set[str] = {
+        "file", "url", "uri", "src", "href", "media", "audio", "video",
+        "pdf", "doc", "document", "asset", "download", "download_url",
+        "downloadurl", "downloadUrl", "target", "redirect", "redirect_uri",
+        "u", "link", "path", "resource",
+    }
+
+    SEARCH_PATH_HINTS: Tuple[str, ...] = (
+        "/search", "/find", "/results", "/query", "/lookup", "/site-search",
+        "/search/node", "/search.json", "/api/search",
+    )
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.I)
+    _ATTR_RE = re.compile(
+        r"""(?is)\b(?:href|src|data-src|data-href|data|poster|content|file|url|uri|media|audio|video|downloadUrl|pdfUrl|documentUrl|assetUrl|sourceUrl)\s*[:=]\s*[\"']([^\"']+)[\"']"""
+    )
+    _XML_LOC_RE = re.compile(r"(?is)<loc>\s*([^<]+?)\s*</loc>")
+    _ROBOTS_SITEMAP_RE = re.compile(r"(?im)^\s*sitemap\s*:\s*(https?://[^\s#]+)")
+    _TOKEN_RE = re.compile(r"[a-z0-9]{3,}", re.I)
+
+    def __init__(
+        self,
+        http: Any,
+        *,
+        extensions: Optional[Iterable[str]] = None,
+        max_candidates: int = 24,
+        max_depth: int = 1,
+        range_bytes: int = 65536,
+        html_bytes: int = 220_000,
+        concurrency: int = 3,
+        logger: Any = None,
+        enable_sitemaps: bool = False,
+        enable_robots: bool = False,
+        enable_parent_pages: bool = False,
+        enable_filename_variants: bool = True,
+        enable_cms_endpoints: bool = False,
+        enable_search_pages: bool = False,
+        same_site_only: bool = True,
+        direct_only: bool = True,
+        sitemap_limit: int = 0,
+        sitemap_locs_limit: int = 80,
+        clue_page_limit: int = 0,
+        recovery_candidate_limit: int = 24,
+        min_recovery_token_score: int = 0,
+        penalize_future_years: bool = True,
+        max_resolve_seconds: float = 5.0,
+        max_probe_seconds: float = 2.0,
+        max_clue_seconds: float = 1.25,
+        self_variant_limit: int = 24,
+        mine_error_body_candidates: bool = True,
+    ):
+        self.http = http
+        self.extensions = self._normalize_extensions(extensions or self.DEFAULT_EXTENSIONS)
+        self.max_candidates = max(1, int(max_candidates))
+        self.max_depth = max(0, int(max_depth))
+        self.range_bytes = max(4096, int(range_bytes))
+        self.html_bytes = max(32_000, int(html_bytes))
+        self.concurrency = max(1, int(concurrency))
+        self.logger = logger or globals().get("DEBUG_LOGGER", None)
+        self.enable_sitemaps = bool(enable_sitemaps)
+        self.enable_robots = bool(enable_robots)
+        self.enable_parent_pages = bool(enable_parent_pages)
+        self.enable_filename_variants = bool(enable_filename_variants)
+        self.enable_cms_endpoints = bool(enable_cms_endpoints)
+        self.enable_search_pages = bool(enable_search_pages)
+        self.same_site_only = bool(same_site_only)
+        self.direct_only = bool(direct_only)
+        self.sitemap_limit = max(0, int(sitemap_limit))
+        self.sitemap_locs_limit = max(20, int(sitemap_locs_limit))
+        self.clue_page_limit = max(0, int(clue_page_limit))
+        self.recovery_candidate_limit = max(1, int(recovery_candidate_limit))
+        self.min_recovery_token_score = max(0, int(min_recovery_token_score))
+        self.penalize_future_years = bool(penalize_future_years)
+        self.max_resolve_seconds = max(1.0, float(max_resolve_seconds))
+        self.max_probe_seconds = max(0.5, float(max_probe_seconds))
+        self.max_clue_seconds = max(0.5, float(max_clue_seconds))
+        self.self_variant_limit = max(4, int(self_variant_limit))
+        self.mine_error_body_candidates = bool(mine_error_body_candidates)
+
+    def _log(self, msg: str) -> None:
+        try:
+            if self.logger and hasattr(self.logger, "log_message"):
+                self.logger.log_message(str(msg))
+            else:
+                print(str(msg))
+        except Exception:
+            pass
+
+    def _normalize_extensions(self, extensions: Iterable[str]) -> Tuple[str, ...]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for raw in extensions or ():
+            e = str(raw or "").strip().lower()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            if e not in seen:
+                seen.add(e)
+                out.append(e)
+        return tuple(out or self.DEFAULT_EXTENSIONS)
+
+    def _is_http_url(self, url: str) -> bool:
+        if not isinstance(url, str):
+            return False
+        s = url.strip()
+        if not s or any(ch.isspace() for ch in s):
+            return False
+        try:
+            p = urlparse(s)
+            return p.scheme in {"http", "https"} and bool(p.netloc)
+        except Exception:
+            return False
+
+    def _canonicalize(self, url: str) -> str:
+        if not self._is_http_url(str(url or "")):
+            return ""
+        try:
+            fn = getattr(self.http, "_canonicalize_url", None)
+            if callable(fn):
+                out = fn(url)
+                if self._is_http_url(str(out or "")):
+                    return str(out)
+        except Exception:
+            pass
+        try:
+            p = urlparse(str(url or "").strip())
+            return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path or "/", "", p.query, ""))
+        except Exception:
+            return ""
+
+    def _host(self, url: str) -> str:
+        try:
+            return (urlparse(str(url or "")).hostname or "").lower()
+        except Exception:
+            return ""
+
+    def _site_key(self, url: str) -> str:
+        host = self._host(url)
+        parts = host.split(".")
+        return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+    def _same_site_allowed(self, seed_url: str, candidate_url: str) -> bool:
+        if not self.same_site_only:
+            return True
+        a = self._host(seed_url)
+        b = self._host(candidate_url)
+        return bool(a and b and (a == b or self._site_key(seed_url) == self._site_key(candidate_url)))
+
+    def _is_search_page_url(self, url: str) -> bool:
+        try:
+            p = urlparse(str(url or ""))
+            path = (p.path or "/").lower().rstrip("/")
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            if any(path == hint.rstrip("/") or path.startswith(hint.rstrip("/") + "/") for hint in self.SEARCH_PATH_HINTS):
+                return True
+            if any(k.lower() in {"q", "query", "search", "searchword", "keys", "keyword", "s"} for k in q):
+                return not self._ext_from_url(url, self.extensions)
+        except Exception:
+            pass
+        return False
+
+    def _decode_body(self, raw: bytes) -> str:
+        try:
+            fn = getattr(self.http, "_decode_body", None)
+            if callable(fn):
+                return fn(raw)
+        except Exception:
+            pass
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return bytes(raw or b"").decode(enc, "ignore")
+            except Exception:
+                pass
+        return ""
+
+    def _safe_abs_url(self, raw: str, base_url: str) -> str:
+        raw = html.unescape(str(raw or "").strip()).replace("\\/", "/")
+        if not raw:
+            return ""
+        low = raw.lower()
+        if low.startswith(("#", "javascript:", "data:", "blob:", "mailto:", "tel:", "sms:")):
+            return ""
+        try:
+            return self._canonicalize(urljoin(base_url, unquote(raw)))
+        except Exception:
+            return ""
+
+    def _ext_from_url(self, url: str, allowed: Optional[Iterable[str]] = None) -> str:
+        allowed_exts = self._normalize_extensions(allowed or self.extensions)
+        try:
+            path = unquote(urlparse(str(url or "")).path).lower()
+            for e in sorted(allowed_exts, key=len, reverse=True):
+                if path.endswith(e):
+                    return e
+        except Exception:
+            pass
+        return ""
+
+    def _kind_for_ext(self, ext: str) -> str:
+        e = str(ext or "").lower()
+        if e in {".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".m3u8", ".mpd", ".ts", ".m4s"}:
+            return "video"
+        if e in {".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".oga", ".opus"}:
+            return "audio"
+        if e in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp", ".svg", ".tif", ".tiff", ".heic", ".heif"}:
+            return "image"
+        if e in {".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz"}:
+            return "archive"
+        if e in {".json", ".xml"}:
+            return "json"
+        if e:
+            return "document"
+        return "unknown"
+
+    def _accept_for_ext(self, ext: str) -> str:
+        kind = self._kind_for_ext(ext)
+        if kind == "video":
+            return "video/*,application/vnd.apple.mpegurl,application/dash+xml,application/octet-stream;q=0.8,*/*;q=0.5"
+        if kind == "audio":
+            return "audio/*,application/octet-stream;q=0.8,*/*;q=0.5"
+        if kind == "image":
+            return "image/avif,image/webp,image/apng,image/*,*/*;q=0.5"
+        if ext == ".pdf":
+            return "application/pdf,application/x-pdf,application/octet-stream;q=0.8,text/html;q=0.5,*/*;q=0.4"
+        if kind == "archive":
+            return "application/zip,application/octet-stream,*/*;q=0.5"
+        if kind == "json":
+            return "application/json,application/xml,text/plain,*/*;q=0.5"
+        return "application/octet-stream,*/*;q=0.5"
+
+    def _content_type_matches_ext(self, content_type: str, ext: str) -> bool:
+        ct = str(content_type or "").lower().split(";", 1)[0].strip()
+        if not ct or not ext:
+            return False
+        if any(ct == m for m in self.MIME_BY_EXT.get(ext, ())) :
+            return True
+        kind = self._kind_for_ext(ext)
+        return (
+            (kind == "video" and ct.startswith("video/"))
+            or (kind == "audio" and ct.startswith("audio/"))
+            or (kind == "image" and ct.startswith("image/"))
+            or (kind == "document" and ("pdf" in ct or "msword" in ct or "officedocument" in ct))
+            or (kind == "archive" and ("zip" in ct or "rar" in ct or "7z" in ct or "gzip" in ct))
+        )
+
+    def _content_disposition_matches_ext(self, headers: Mapping[str, str], ext: str) -> bool:
+        cd = (headers.get("Content-Disposition") or headers.get("content-disposition") or "").lower()
+        return bool(ext and "filename" in cd and ext in cd)
+
+    def _magic_matches_ext(self, body: bytes, ext: str) -> bool:
+        b = bytes(body or b"")
+        if not b or not ext:
+            return False
+        if ext in {".mp4", ".m4v", ".m4a", ".mov", ".avif"}:
+            return b"ftyp" in b[:32]
+        if ext == ".webp":
+            return b.startswith(b"RIFF") and b"WEBP" in b[:16]
+        if ext == ".wav":
+            return b.startswith(b"RIFF") and b"WAVE" in b[:16]
+        return any(b.startswith(sig) for sig in self.MAGIC_BY_EXT.get(ext, ()))
+
+    def _htmlish(self, content_type: str, body: bytes = b"") -> bool:
+        ct = str(content_type or "").lower()
+        if any(x in ct for x in self.HTMLISH_MIME_HINTS):
+            return True
+        prefix = bytes(body or b"")[:4096].lower().strip()
+        return prefix.startswith((b"<!doctype html", b"<html", b"{", b"[", b"<?xml")) or b"<html" in prefix
+
+    def _size_label(self, headers: Mapping[str, str]) -> str:
+        cl = headers.get("Content-Length") or headers.get("content-length") or ""
+        try:
+            if cl:
+                n = int(str(cl).strip())
+                if n >= 1024 * 1024:
+                    return f"{n / (1024 * 1024):.2f} MB"
+                return f"{max(1, n // 1024)} KB"
+        except Exception:
+            pass
+        return "?"
+
+    def _allowed_exts_for_url(self, url: str, expected_exts: Optional[Iterable[str]]) -> Tuple[str, ...]:
+        return self._normalize_extensions(expected_exts or self.extensions)
+
+    def _guess_ext(self, url: str, content_type: str = "", expected_exts: Optional[Iterable[str]] = None) -> str:
+        allowed = self._allowed_exts_for_url(url, expected_exts)
+        by_url = self._ext_from_url(url, allowed)
+        if by_url:
+            return by_url
+        for ext in allowed:
+            if self._content_type_matches_ext(content_type, ext):
+                return ext
+        return ""
+
+    def _looks_targetish(self, url: str, text: str = "", expected_exts: Optional[Iterable[str]] = None) -> bool:
+        if not self._is_http_url(url):
+            return False
+        if self._is_search_page_url(url):
+            return False
+        allowed = self._allowed_exts_for_url(url, expected_exts)
+        joined = f"{url} {text}".lower()
+        if self._ext_from_url(url, allowed):
+            return True
+        return any(h in joined for h in ("download", "viewer", "preview", "media", "audio", "video", "document", "asset", "file=", "resource"))
+
+    def _extract_query_param_urls(self, url: str, expected_exts: Optional[Iterable[str]]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        try:
+            p = urlparse(url)
+            for key, value in parse_qsl(p.query, keep_blank_values=False):
+                key_l = str(key or "").lower()
+                val = unquote(str(value or "")).strip()
+                if not val:
+                    continue
+                high_value = key_l in self.VIEWER_PARAM_KEYS or any(ext.strip(".") in key_l for ext in self._allowed_exts_for_url(url, expected_exts))
+                if not high_value:
+                    continue
+                u = self._safe_abs_url(val, url)
+                if u and not self._is_search_page_url(u) and u not in seen:
+                    seen.add(u)
+                    out.append(u)
+        except Exception:
+            pass
+        return out[: self.max_candidates]
+
+    def _extract_candidates_from_text(self, body_text: str, base_url: str, expected_exts: Optional[Iterable[str]]) -> List[str]:
+        text = html.unescape(str(body_text or "")).replace("\\/", "/")
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        def push(raw: str, *, require_targetish: bool = True) -> None:
+            if len(out) >= self.max_candidates:
+                return
+            u = self._safe_abs_url(raw, base_url)
+            if not u or u in seen or not self._same_site_allowed(base_url, u):
+                return
+            if self._is_search_page_url(u):
+                return
+            if require_targetish and not self._looks_targetish(u, "", expected_exts):
+                return
+            seen.add(u)
+            out.append(u)
+
+        for u in self._extract_query_param_urls(base_url, expected_exts):
+            push(u, require_targetish=False)
+        for m in self._XML_LOC_RE.finditer(text):
+            push(m.group(1), require_targetish=False)
+        for m in self._URL_RE.finditer(text):
+            push(m.group(0), require_targetish=True)
+        for m in self._ATTR_RE.finditer(text):
+            push(m.group(1), require_targetish=True)
+
+        try:
+            obj = json.loads(text)
+            stack = [obj]
+            seen_nodes = 0
+            while stack and len(out) < self.max_candidates and seen_nodes < 1500:
+                cur = stack.pop()
+                seen_nodes += 1
+                if isinstance(cur, str):
+                    if "http://" in cur or "https://" in cur or cur.startswith("/"):
+                        push(cur, require_targetish=True)
+                elif isinstance(cur, Mapping):
+                    for k, v in cur.items():
+                        kl = str(k or "").lower()
+                        if isinstance(v, str) and (kl in self.VIEWER_PARAM_KEYS or kl.endswith(("url", "uri", "src", "href", "file", "path", "link"))):
+                            push(v, require_targetish=False)
+                        elif isinstance(v, (dict, list, tuple)):
+                            stack.append(v)
+                elif isinstance(cur, (list, tuple)):
+                    stack.extend(cur)
+        except Exception:
+            pass
+
+        try:
+            bs = globals().get("BeautifulSoup", None)
+            if bs is not None and len(out) < self.max_candidates:
+                soup = bs(text, "html.parser")
+                for tag in soup.find_all(["a", "iframe", "embed", "object", "source", "video", "audio", "link", "meta"]):
+                    attrs = getattr(tag, "attrs", {}) or {}
+                    high_value = "pdf" in str(attrs.get("type") or "").lower()
+                    for attr in ("href", "src", "data-src", "data-href", "data", "poster", "content"):
+                        if attr in attrs:
+                            push(str(attrs.get(attr) or ""), require_targetish=not high_value)
+                            if len(out) >= self.max_candidates:
+                                break
+                    if len(out) >= self.max_candidates:
+                        break
+        except Exception:
+            pass
+        return out[: self.max_candidates]
+
+    def _variant_urls(self, url: str, expected_exts: Optional[Iterable[str]]) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        def add(u: str) -> None:
+            cu = self._canonicalize(u)
+            if cu and cu not in seen and not self._is_search_page_url(cu):
+                seen.add(cu)
+                out.append(cu)
+
+        for u in self._extract_query_param_urls(url, expected_exts):
+            add(u)
+        try:
+            p = urlparse(url)
+            host = (p.hostname or "").lower()
+            path = p.path or "/"
+            qs = dict(parse_qsl(p.query, keep_blank_values=True))
+            if "drive.google.com" in host:
+                m = re.search(r"/file/d/([^/]+)", path)
+                if m:
+                    add(f"https://drive.google.com/uc?export=download&id={m.group(1)}")
+            if "docs.google.com" in host:
+                m = re.search(r"/(?:document|presentation|spreadsheets)/d/([^/]+)", path)
+                if m:
+                    file_id = m.group(1)
+                    kind = path.strip("/").split("/")[0]
+                    add(f"https://docs.google.com/{kind}/d/{file_id}/export?format=pdf")
+            if "dropbox.com" in host:
+                q = dict(qs); q["dl"] = "1"
+                add(urlunparse((p.scheme, p.netloc, p.path, "", urlencode(q), "")))
+                q = dict(qs); q["raw"] = "1"
+                add(urlunparse((p.scheme, p.netloc, p.path, "", urlencode(q), "")))
+            if host == "github.com" and "/blob/" in path:
+                parts = path.strip("/").split("/")
+                if len(parts) >= 5:
+                    owner, repo, _, branch = parts[:4]
+                    rest = "/".join(parts[4:])
+                    add(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{rest}")
+            # Toggle only when original path itself is asset-like/viewer-like.
+            if self._ext_from_url(url, expected_exts) or any(k in path.lower() for k in ("download", "file", "asset", "document")):
+                for key, value in (("download", "1"), ("dl", "1"), ("raw", "1"), ("format", "pdf"), ("output", "1"), ("export", "download")):
+                    q = dict(qs); q[key] = value
+                    add(urlunparse((p.scheme, p.netloc, p.path, "", urlencode(q), "")))
+        except Exception:
+            pass
+        return out[: self.max_candidates]
+
+    def _recovery_tokens(self, url: str, query: str = "", title: str = "") -> Set[str]:
+        toks: Set[str] = set()
+        try:
+            p = urlparse(str(url or ""))
+            path = unquote(p.path or "").lower()
+            name = path.rsplit("/", 1)[-1]
+        except Exception:
+            path = str(url or "").lower(); name = path
+        hay = f"{name} {path} {title or ''}".lower()
+        # The query argument is intentionally ignored unless it looks like a short title,
+        # to prevent feeding search prompts into URL recovery.
+        q = str(query or "").strip()
+        if q and len(q) <= 120 and not any(ch.isspace() for ch in q[:12]):
+            hay += " " + q.lower()
+        noisy = {"pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "file", "files", "resource", "resources", "document", "documents", "download", "draft", "final", "clean", "version", "uploads", "sites", "default", "system", "content", "wp", "www", "https", "http", "com", "org", "net", "html", "index", "page"}
+        for raw in self._TOKEN_RE.findall(hay):
+            t = raw.strip().lower()
+            if len(t) < 3 or t.isdigit() or re.fullmatch(r"20[0-9]{2}", t) or re.fullmatch(r"v[0-9]+", t) or t in noisy:
+                continue
+            toks.add(t)
+        return toks
+
+    def _token_score(self, candidate_url: str, tokens: Set[str], extra_text: str = "") -> int:
+        low = f"{unquote(str(candidate_url or '')).lower()} {extra_text.lower()}"
+        return sum(1 for t in tokens or set() if t and t in low)
+
+    def _bad_future_year_penalty(self, candidate_url: str) -> int:
+        if not self.penalize_future_years:
+            return 0
+        try:
+            now_year = datetime.now(timezone.utc).year
+        except Exception:
+            now_year = 2026
+        penalty = 0
+        for raw in re.findall(r"\b20[0-9]{2}\b", str(candidate_url or "")):
+            try:
+                y = int(raw)
+            except Exception:
+                continue
+            if y > now_year:
+                penalty += 8
+            if y > now_year + 1:
+                penalty += 20
+        return penalty
+
+    def _score_recovery_candidate(self, candidate_url: str, *, seed_url: str, tokens: Set[str], source: str, extra_text: str = "", expected_exts: Optional[Iterable[str]] = None) -> int:
+        score = self._token_score(candidate_url, tokens, extra_text)
+        ext = self._ext_from_url(candidate_url, expected_exts)
+        if ext:
+            score += 5
+            if ext == ".pdf":
+                score += 5
+        src = str(source or "").lower()
+        if "parent" in src or "source" in src:
+            score += 5
+        if "sitemap" in src:
+            score += 5
+        if "intel" in src:
+            score += 5
+        if "variant" in src:
+            score += 1
+        if self._host(candidate_url) == self._host(seed_url):
+            score += 3
+        score -= self._bad_future_year_penalty(candidate_url)
+        return score
+
+    def _parent_clue_pages(self, dead_url: str, *, parent_url: str = "") -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        def add(u: str) -> None:
+            cu = self._canonicalize(u)
+            if cu and cu not in seen and self._same_site_allowed(dead_url, cu) and not self._is_search_page_url(cu):
+                seen.add(cu); out.append(cu)
+        try:
+            p = urlparse(dead_url)
+            parts = [x for x in (p.path or "/").split("/") if x]
+            if parts:
+                add(urlunparse((p.scheme, p.netloc, "/" + "/".join(parts[:-1]) + "/", "", "", "")))
+            for up in range(2, min(5, len(parts)) + 1):
+                add(urlunparse((p.scheme, p.netloc, "/" + "/".join(parts[:-up]) + "/", "", "", "")))
+            add(urlunparse((p.scheme, p.netloc, "/", "", "", "")))
+        except Exception:
+            pass
+        if parent_url:
+            add(parent_url)
+        return out[: self.clue_page_limit]
+
+    def _robots_sitemap_seeds(self, url: str) -> List[str]:
+        if not (self.enable_robots or self.enable_sitemaps):
+            return []
+        out: List[str] = []
+        try:
+            p = urlparse(url)
+            if self.enable_robots:
+                out.append(urlunparse((p.scheme, p.netloc, "/robots.txt", "", "", "")))
+            if self.enable_sitemaps:
+                for path in ("/sitemap.xml", "/sitemap_index.xml", "/wp-sitemap.xml"):
+                    out.append(urlunparse((p.scheme, p.netloc, path, "", "", "")))
+        except Exception:
+            pass
+        return out[: max(1, self.sitemap_limit)]
+
+    def _safe_404_filename_variants(self, dead_url: str, expected_exts: Optional[Iterable[str]]) -> List[str]:
+        """
+        Self-contained missing-file recovery.
+
+        This method never crawls search pages or broad site links. It only makes
+        conservative variants of the missing URL itself in the same directory:
+          - strip query/fragment
+          - normalize URL encoding
+          - fix generated future years
+          - fix 8-digit MMDDYYYY suffixes
+          - remove draft/final/clean/build suffix noise
+          - swap underscores/hyphens/spaces
+          - keep the same extension and same host
+        """
+        if not self.enable_filename_variants:
+            return []
+
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        def add(u: str) -> None:
+            if len(out) >= self.self_variant_limit:
+                return
+            cu = self._canonicalize(u)
+            if cu and cu not in seen and not self._is_search_page_url(cu):
+                # Self recovery must stay on the same host and in the same directory.
+                try:
+                    src = urlparse(dead_url)
+                    dst = urlparse(cu)
+                    if (src.hostname or "").lower() != (dst.hostname or "").lower():
+                        return
+                    src_dir = (src.path or "/").rsplit("/", 1)[0]
+                    dst_dir = (dst.path or "/").rsplit("/", 1)[0]
+                    if src_dir != dst_dir:
+                        return
+                except Exception:
+                    return
+                seen.add(cu)
+                out.append(cu)
+
+        try:
+            p = urlparse(dead_url)
+            path = unquote(p.path or "")
+            if "/" not in path:
+                return []
+
+            directory, name = path.rsplit("/", 1)
+            stem, dot, raw_ext = name.rpartition(".")
+            ext = "." + raw_ext.lower() if dot else ""
+            allowed = self._allowed_exts_for_url(dead_url, expected_exts)
+            if not ext or ext not in allowed:
+                return []
+
+            # Always try the exact decoded/no-query version first.
+            add(urlunparse((p.scheme, p.netloc, f"{directory}/{name}", "", "", "")))
+
+            try:
+                now_year = datetime.now(timezone.utc).year
+            except Exception:
+                now_year = 2026
+
+            stems: Set[str] = set()
+
+            def add_stem(s: str) -> None:
+                s = str(s or "").strip("_-. ")
+                if s and s != stem:
+                    stems.add(s)
+
+            # Future-year generated aliases like 2027/2028/2029 -> real current/prior docs.
+            year_targets = [now_year, now_year - 1, now_year - 2, now_year - 3]
+            for y in year_targets:
+                add_stem(re.sub(r"20[0-9]{2}", str(y), stem))
+
+            # If the URL has MMDDYYYY, keep MMDD and correct only the year.
+            for y in year_targets:
+                add_stem(re.sub(r"(?<!\d)(\d{4})(20[0-9]{2})(?!\d)", lambda m: f"{m.group(1)}{y}", stem))
+
+            # Common CMS filename suffix cleanup.
+            suffix_patterns = [
+                r"[_-]v?\d+(?:\.\d+)*(?:[_-](?:clean|draft|final))?[_-]?\d{6,8}$",
+                r"[_-]\d{6,8}$",
+                r"[_-](?:draft|final|clean|copy|revised|updated)$",
+                r"[_-]v?\d+(?:\.\d+)*$",
+            ]
+            for pat in suffix_patterns:
+                add_stem(re.sub(pat, "", stem, flags=re.I))
+
+            # Remove only noisy words while preserving useful title tokens.
+            noisy_word_forms = set()
+            for word in ("draft", "clean", "final", "copy", "revised", "updated"):
+                noisy_word_forms.add(re.sub(rf"(?:^|[_\-\s]){word}(?:[_\-\s]|$)", "_", stem, flags=re.I))
+            for s2 in noisy_word_forms:
+                add_stem(re.sub(r"[_\-\s]+", "_", s2))
+
+            # Separator variations for each candidate stem.
+            for s2 in list(stems):
+                add_stem(s2.replace("_", "-"))
+                add_stem(s2.replace("-", "_"))
+                add_stem(s2.replace(" ", "_"))
+                add_stem(s2.replace(" ", "-"))
+
+            # Preserve ranking: current/prior years and cleaned same-directory names first.
+            ordered = sorted(stems, key=lambda x: (self._bad_future_year_penalty(x), len(x)))
+            for s2 in ordered:
+                add(urlunparse((p.scheme, p.netloc, f"{directory}/{quote(s2, safe='-_ .')}{ext}", "", "", "")))
+                if len(out) >= self.self_variant_limit:
+                    break
+
+            # A few servers use uppercase PDF/file extension variants.
+            if len(out) < self.self_variant_limit and ext.lower() == ".pdf":
+                add(urlunparse((p.scheme, p.netloc, f"{directory}/{stem}.PDF", "", "", "")))
+
+        except Exception:
+            pass
+
+        return out[: self.self_variant_limit]
+
+    def _self_recovery_candidates(
+        self,
+        dead_url: str,
+        *,
+        expected_exts: Optional[Iterable[str]],
+        query: str = "",
+        title: str = "",
+    ) -> List[Tuple[int, str, str]]:
+        """Return direct same-URL/same-directory candidates only."""
+        tokens = self._recovery_tokens(dead_url, query=query, title=title)
+        rows: List[Tuple[int, str, str]] = []
+        seen: Set[str] = set()
+
+        def add(u: str, source: str) -> None:
+            cu = self._canonicalize(u)
+            if not cu or cu in seen or self._is_search_page_url(cu):
+                return
+            if not self._same_site_allowed(dead_url, cu):
+                return
+            if not self._looks_targetish(cu, "", expected_exts):
+                return
+            seen.add(cu)
+            score = self._score_recovery_candidate(
+                cu,
+                seed_url=dead_url,
+                tokens=tokens,
+                source=source,
+                expected_exts=expected_exts,
+            )
+            rows.append((score, cu, source))
+
+        for u in self._variant_urls(dead_url, expected_exts):
+            add(u, "self_variant")
+        for u in self._safe_404_filename_variants(dead_url, expected_exts):
+            add(u, "self_missing_file_variant")
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        return rows[: self.self_variant_limit]
+
+    async def _fetch_text_for_clues(self, url: str, *, referer: str = "", max_bytes: Optional[int] = None) -> Tuple[Optional[int], str, str, str]:
+        req = getattr(self.http, "_request", None)
+        if not callable(req):
+            return None, url, "", ""
+        h = {"Accept": "text/html,application/xhtml+xml,application/xml,application/rss+xml,application/json,text/plain,*/*;q=0.5", "Cache-Control": "no-cache", "Pragma": "no-cache"}
+        if referer:
+            h["Referer"] = referer
+        async def _do():
+            res = await req("GET", url, want_body=True, allow_redirects=True, headers=h, max_bytes=int(max_bytes or self.html_bytes))
+            status = getattr(res, "status", None)
+            if status in self.PROTECTED_STATUSES:
+                return status, url, "", ""
+            body = bytes(getattr(res, "body", b"") or b"")
+            final_url = self._canonicalize(getattr(res, "final_url", "") or url) or url
+            headers = dict(getattr(res, "headers", {}) or {})
+            ct = headers.get("Content-Type") or headers.get("content-type") or ""
+            return status, final_url, ct, self._decode_body(body)
+        try:
+            return await asyncio.wait_for(_do(), timeout=self.max_clue_seconds)
+        except Exception:
+            return None, url, "", ""
+
+    async def _session_intel_candidates(self, dead_url: str, *, expected_exts: Optional[Iterable[str]], query: str = "", title: str = "") -> List[Tuple[int, str, str]]:
+        tokens = self._recovery_tokens(dead_url, query=query, title=title)
+        ranked: List[Tuple[int, str, str]] = []
+        try:
+            intel = getattr(self.http, "_intel_by_url", {}) or {}
+            for cand_url, row in list(intel.items())[:2500]:
+                u = str(cand_url or "")
+                if not self._is_http_url(u) or not self._same_site_allowed(dead_url, u) or self._is_search_page_url(u):
+                    continue
+                if not self._looks_targetish(u, "", expected_exts):
+                    continue
+                ev = ""
+                try:
+                    ev = " ".join(str(x) for x in getattr(row, "evidence", ()) or ())
+                except Exception:
+                    pass
+                score = self._score_recovery_candidate(u, seed_url=dead_url, tokens=tokens, source="session_intel", extra_text=ev, expected_exts=expected_exts)
+                if score >= self.min_recovery_token_score:
+                    ranked.append((score, u, "session_intel"))
+        except Exception:
+            pass
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return ranked[: self.recovery_candidate_limit]
+
+    async def _clue_page_candidates(self, dead_url: str, *, parent_url: str = "", expected_exts: Optional[Iterable[str]], query: str = "", title: str = "") -> List[Tuple[int, str, str]]:
+        if not self.enable_parent_pages:
+            return []
+        tokens = self._recovery_tokens(dead_url, query=query, title=title)
+        ranked: List[Tuple[int, str, str]] = []
+        seen: Set[str] = set()
+        for page_url in self._parent_clue_pages(dead_url, parent_url=parent_url):
+            status, final_page, ct, text = await self._fetch_text_for_clues(page_url, referer=parent_url or dead_url, max_bytes=self.html_bytes)
+            if status in self.PROTECTED_STATUSES or not text:
+                continue
+            source = "source_page" if parent_url and self._canonicalize(parent_url) == self._canonicalize(page_url) else "parent_page"
+            for cand in self._extract_candidates_from_text(text, final_page, expected_exts):
+                if not cand or cand in seen or self._is_search_page_url(cand) or not self._same_site_allowed(dead_url, cand):
+                    continue
+                score = self._score_recovery_candidate(cand, seed_url=dead_url, tokens=tokens, source=source, extra_text=text[:3000], expected_exts=expected_exts)
+                if score >= self.min_recovery_token_score:
+                    seen.add(cand); ranked.append((score, cand, source))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return ranked[: self.recovery_candidate_limit]
+
+    async def _sitemap_candidates(self, dead_url: str, *, expected_exts: Optional[Iterable[str]], query: str = "", title: str = "") -> List[Tuple[int, str, str]]:
+        if not self.enable_sitemaps:
+            return []
+        tokens = self._recovery_tokens(dead_url, query=query, title=title)
+        ranked: List[Tuple[int, str, str]] = []
+        seen: Set[str] = set()
+        queue = self._robots_sitemap_seeds(dead_url)
+        consumed = 0
+        while queue and consumed < self.sitemap_limit:
+            sm = queue.pop(0)
+            consumed += 1
+            status, final, ct, text = await self._fetch_text_for_clues(sm, referer=dead_url, max_bytes=min(self.html_bytes, 800_000))
+            if status in self.PROTECTED_STATUSES or not text:
+                continue
+            if final.endswith("/robots.txt") or final.endswith("robots.txt"):
+                for m in self._ROBOTS_SITEMAP_RE.finditer(text):
+                    u = self._canonicalize(m.group(1))
+                    if u and self._same_site_allowed(dead_url, u) and len(queue) < self.sitemap_limit:
+                        queue.append(u)
+                continue
+            locs: List[str] = []
+            for m in self._XML_LOC_RE.finditer(text):
+                u = self._safe_abs_url(m.group(1), final)
+                if u:
+                    locs.append(u)
+                if len(locs) >= self.sitemap_locs_limit:
+                    break
+            for loc in locs:
+                if not loc or loc in seen or not self._same_site_allowed(dead_url, loc) or self._is_search_page_url(loc):
+                    continue
+                seen.add(loc)
+                path_l = urlparse(loc).path.lower()
+                if "sitemap" in path_l and path_l.endswith(".xml") and len(queue) < self.sitemap_limit:
+                    queue.append(loc)
+                    continue
+                if not self._looks_targetish(loc, "", expected_exts):
+                    continue
+                score = self._score_recovery_candidate(loc, seed_url=dead_url, tokens=tokens, source="sitemap", extra_text="", expected_exts=expected_exts)
+                if score >= self.min_recovery_token_score:
+                    ranked.append((score, loc, "sitemap"))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return ranked[: self.recovery_candidate_limit]
+
+    async def _not_found_recovery_candidates(self, dead_url: str, *, parent_url: str = "", expected_exts: Optional[Iterable[str]], query: str = "", title: str = "") -> List[Tuple[int, str, str]]:
+        """
+        Fast recovery for a missing asset URL.
+
+        In direct_only mode this never walks search/CMS/sitemap/parent pages.
+        It resolves the missing file itself by testing same-directory variants,
+        plus already-sniffed same-host intel if available. Broad clue-page
+        recovery only runs when direct_only=False and the caller enables it.
+        """
+        ranked: List[Tuple[int, str, str]] = []
+        seen: Set[str] = set()
+
+        def add_rows(rows: Iterable[Tuple[int, str, str]]) -> None:
+            for score, raw, source in rows or ():
+                if len(ranked) >= self.recovery_candidate_limit:
+                    return
+                u = self._canonicalize(raw)
+                if not u or u in seen or not self._same_site_allowed(dead_url, u) or self._is_search_page_url(u):
+                    continue
+                if not self._looks_targetish(u, "", expected_exts):
+                    continue
+                seen.add(u)
+                ranked.append((int(score), u, source))
+
+        # 1. Missing-file self repair first. This is the main recovery path.
+        add_rows(self._self_recovery_candidates(dead_url, expected_exts=expected_exts, query=query, title=title))
+
+        # 2. Already-sniffed same-host asset candidates are cheap; no new crawling.
+        if len(ranked) < self.recovery_candidate_limit:
+            add_rows(await self._session_intel_candidates(dead_url, expected_exts=expected_exts, query="", title=title))
+
+        # 3. Direct-only stops here: no parent/search/CMS/sitemap page processing.
+        if self.direct_only:
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            return ranked[: self.recovery_candidate_limit]
+
+        # Optional slower one-hop discovery, disabled by default.
+        if len(ranked) < self.recovery_candidate_limit and self.enable_parent_pages:
+            add_rows(await self._clue_page_candidates(dead_url, parent_url=parent_url, expected_exts=expected_exts, query="", title=title))
+        if len(ranked) < self.recovery_candidate_limit and self.enable_sitemaps:
+            add_rows(await self._sitemap_candidates(dead_url, expected_exts=expected_exts, query="", title=title))
+
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return ranked[: self.recovery_candidate_limit]
+
+    async def _probe(self, url: str, *, parent_url: str = "", expected_exts: Optional[Iterable[str]] = None, evidence: Optional[List[str]] = None, max_bytes: Optional[int] = None) -> Tuple[LinkResolveResult, bytes]:
+        url = self._canonicalize(url)
+        if not url:
+            return LinkResolveResult(ok=False, original_url=str(url or ""), reason="invalid_or_query_not_url"), b""
+        expected_exts = self._allowed_exts_for_url(url, expected_exts)
+        initial_ext = self._ext_from_url(url, expected_exts)
+        accept = self._accept_for_ext(initial_ext) if initial_ext else "application/octet-stream,text/html;q=0.7,*/*;q=0.5"
+        h = {"Accept": accept, "Range": f"bytes=0-{max(0, self.range_bytes - 1)}", "Cache-Control": "no-cache", "Pragma": "no-cache"}
+        if parent_url:
+            h["Referer"] = parent_url
+        async def _do_probe():
+            req = getattr(self.http, "_request", None)
+            if not callable(req):
+                return LinkResolveResult(ok=False, original_url=url, final_url=url, reason="http_missing_request_method"), b""
+            res = await req("GET", url, want_body=True, allow_redirects=True, headers=h, max_bytes=int(max_bytes or self.range_bytes))
+            status = getattr(res, "status", None)
+            headers = dict(getattr(res, "headers", {}) or {})
+            body = bytes(getattr(res, "body", b"") or b"")
+            final_url = self._canonicalize(getattr(res, "final_url", "") or url) or url
+            ct = headers.get("Content-Type") or headers.get("content-type") or ""
+            ext = self._guess_ext(final_url, ct, expected_exts) or initial_ext
+            rr = LinkResolveResult(ok=False, original_url=url, final_url=final_url, source_page=parent_url, kind=self._kind_for_ext(ext), expected_ext=ext, status=status, content_type=ct, content_length=headers.get("Content-Length") or headers.get("content-length") or "", size=self._size_label(headers), evidence=list(evidence or []), chain=[url] if url == final_url else [url, final_url])
+            if status in self.PROTECTED_STATUSES:
+                rr.reason = f"protected_status_{status}"; return rr, body
+            if status is None:
+                rr.reason = getattr(res, "error", "") or "request_failed"; return rr, body
+            if not (200 <= int(status) < 300 or int(status) == 206):
+                rr.reason = f"http_{status}"; return rr, body
+            if not ext:
+                ext = self._guess_ext(final_url, ct, expected_exts); rr.expected_ext = ext; rr.kind = self._kind_for_ext(ext)
+            confirmed = False
+            if ext and self._content_type_matches_ext(ct, ext):
+                rr.evidence.append(f"content_type:{ct}"); confirmed = True
+            if ext and self._content_disposition_matches_ext(headers, ext):
+                rr.evidence.append("content_disposition_filename"); confirmed = True
+            if ext and self._magic_matches_ext(body, ext):
+                rr.evidence.append(f"magic:{ext}"); confirmed = True
+            if ext and self._ext_from_url(final_url, expected_exts) == ext and not self._htmlish(ct, body):
+                rr.evidence.append(f"final_url_ext:{ext}"); confirmed = True
+            if ext in {".m3u8", ".mpd"} and body:
+                p = body[:2048].lower()
+                if ext == ".m3u8" and b"#extm3u" in p:
+                    rr.evidence.append("manifest_body:m3u8"); confirmed = True
+                if ext == ".mpd" and (b"<mpd" in p or b"urn:mpeg:dash" in p):
+                    rr.evidence.append("manifest_body:mpd"); confirmed = True
+            if confirmed:
+                rr.ok = True; rr.reason = "asset_confirmed"
+                try:
+                    rr.hash_prefix = hashlib.sha256(body[: min(len(body), self.range_bytes)]).hexdigest() if body else ""
+                except Exception:
+                    pass
+                return rr, body
+            rr.reason = "not_target_asset_response"
+            if self._htmlish(ct, body):
+                rr.evidence.append(f"htmlish:{ct or 'body'}")
+            return rr, body
+        try:
+            return await asyncio.wait_for(_do_probe(), timeout=self.max_probe_seconds)
+        except asyncio.TimeoutError:
+            return LinkResolveResult(ok=False, original_url=url, final_url=url, source_page=parent_url, reason="probe_timeout", evidence=list(evidence or [])), b""
+        except Exception as e:
+            return LinkResolveResult(ok=False, original_url=url, final_url=url, source_page=parent_url, reason=f"probe_error:{e}", evidence=list(evidence or [])), b""
+
+    async def _resolve_impl(self, url: str, *, parent_url: str = "", expected_exts: Optional[Iterable[str]] = None, title: str = "", query: str = "", force: bool = False) -> LinkResolveResult:
+        original = self._canonicalize(url)
+        if not original:
+            return LinkResolveResult(ok=False, original_url=str(url or ""), reason="invalid_or_query_not_url")
+        if self._is_search_page_url(original):
+            return LinkResolveResult(ok=False, original_url=original, final_url=original, source_page=parent_url, reason="search_page_skipped")
+        if not force and not self._looks_targetish(original, f"{title}", expected_exts):
+            return LinkResolveResult(ok=False, original_url=original, final_url=original, source_page=parent_url, reason="not_targetish_candidate")
+        self._log(f"[LinkResolver] probing {original}")
+        first, body = await self._probe(original, parent_url=parent_url, expected_exts=expected_exts, evidence=["direct_range_get"], max_bytes=self.range_bytes)
+        if first.ok:
+            await self._remember(first); return first
+        if first.status in self.PROTECTED_STATUSES:
+            return first
+        candidates: List[Tuple[int, str, str]] = []
+        seen: Set[str] = {original}
+        tokens = self._recovery_tokens(original, query=query, title=title)
+        def add_candidate(u: str, *, source: str, score: int = 0) -> None:
+            cu = self._canonicalize(u)
+            if not cu or cu in seen or self._is_search_page_url(cu) or len(candidates) >= self.recovery_candidate_limit:
+                return
+            seen.add(cu); candidates.append((int(score), cu, source))
+        # Direct variants first; this is cheap and fixes generated/stale missing files.
+        for score, u, source in self._self_recovery_candidates(first.final_url or original, expected_exts=expected_exts, query="", title=title):
+            add_candidate(u, source=source, score=score)
+
+        # Only mine the returned 404/JSON/html body when enabled. This is bounded
+        # and never turns plain search text into resolver input.
+        if self.mine_error_body_candidates and body and self._htmlish(first.content_type, body):
+            text = self._decode_body(body)
+            for u in self._extract_candidates_from_text(text, first.final_url or original, expected_exts):
+                score = self._score_recovery_candidate(u, seed_url=original, tokens=tokens, source="initial_body", extra_text=text[:1200], expected_exts=expected_exts)
+                add_candidate(u, source="initial_body", score=score)
+        if first.status in (self.NOT_FOUND_STATUSES | self.SOFT_FAIL_STATUSES):
+            try:
+                rows = await self._not_found_recovery_candidates(first.final_url or original, parent_url=parent_url, expected_exts=expected_exts, query=query, title=title)
+                for score, u, source in rows:
+                    add_candidate(u, source=source, score=score)
+            except Exception as e:
+                self._log(f"[LinkResolver][RECOVERY] failed for {original}: {e}")
+        candidates.sort(key=lambda row: row[0], reverse=True)
+        if not candidates:
+            if first.status in self.NOT_FOUND_STATUSES:
+                first.reason = "404_no_direct_recovery_candidates"; first.evidence.append("direct_recovery_exhausted")
+            elif first.status in self.SOFT_FAIL_STATUSES:
+                first.reason = "soft_fail_no_direct_recovery_candidates"; first.evidence.append("direct_recovery_exhausted")
+            else:
+                first.reason = first.reason or "no_candidates_found"
+            return first
+        sem = asyncio.Semaphore(self.concurrency)
+        results: List[LinkResolveResult] = []
+        async def worker(score: int, candidate: str, source: str) -> None:
+            async with sem:
+                rr, _ = await self._probe(candidate, parent_url=parent_url or original, expected_exts=expected_exts, evidence=["resolved_candidate", f"from:{original}", f"source:{source}", f"recovery_score:{score}"], max_bytes=self.range_bytes)
+                results.append(rr)
+        await asyncio.gather(*(worker(score, candidate, source) for score, candidate, source in candidates[: self.max_candidates]), return_exceptions=True)
+        for rr in results:
+            if rr.ok:
+                rr.original_url = original; rr.source_page = parent_url; rr.candidates_tested = len(results); rr.evidence.append("resolver:real_asset_link")
+                if first.status in self.NOT_FOUND_STATUSES:
+                    rr.evidence.append("resolved_from_404")
+                elif first.status in self.SOFT_FAIL_STATUSES:
+                    rr.evidence.append("resolved_from_soft_fail")
+                await self._remember(rr)
+                self._log(f"[LinkResolver] resolved {original} -> {rr.final_url}")
+                return rr
+        best = sorted(results, key=lambda r: (bool(r.status and (200 <= int(r.status) < 300 or int(r.status) == 206)), bool(r.expected_ext), len(r.evidence or [])), reverse=True)[0] if results else first
+        best.original_url = original; best.source_page = parent_url; best.candidates_tested = len(results)
+        if not best.reason:
+            best.reason = "no_candidate_confirmed_asset"
+        return best
+
+    async def resolve(self, url: str, *, parent_url: str = "", expected_exts: Optional[Iterable[str]] = None, title: str = "", query: str = "", force: bool = False) -> LinkResolveResult:
+        if not self._is_http_url(str(url or "")):
+            return LinkResolveResult(ok=False, original_url=str(url or ""), reason="query_or_non_url_skipped")
+        try:
+            return await asyncio.wait_for(self._resolve_impl(url, parent_url=parent_url, expected_exts=expected_exts, title=title, query=query, force=force), timeout=self.max_resolve_seconds)
+        except asyncio.TimeoutError:
+            cu = self._canonicalize(str(url or "")) or str(url or "")
+            return LinkResolveResult(ok=False, original_url=cu, final_url=cu, source_page=parent_url, reason="resolve_timeout", evidence=[f"timeout:{self.max_resolve_seconds}s"])
+        except Exception as e:
+            cu = self._canonicalize(str(url or "")) or str(url or "")
+            return LinkResolveResult(ok=False, original_url=cu, final_url=cu, source_page=parent_url, reason=f"resolve_error:{e}")
+
+    async def resolve_many(self, urls: Iterable[str], *, parent_url: str = "", expected_exts: Optional[Iterable[str]] = None, query: str = "", limit: int = 50) -> List[LinkResolveResult]:
+        clean: List[str] = []
+        seen: Set[str] = set()
+        for raw in urls or ():
+            u = self._canonicalize(str(raw or ""))
+            if not u or u in seen or self._is_search_page_url(u):
+                continue
+            seen.add(u); clean.append(u)
+            if len(clean) >= max(1, int(limit)):
+                break
+        sem = asyncio.Semaphore(self.concurrency)
+        out: List[LinkResolveResult] = []
+        async def worker(u: str) -> None:
+            async with sem:
+                out.append(await self.resolve(u, parent_url=parent_url, expected_exts=expected_exts, query=query))
+        await asyncio.gather(*(worker(u) for u in clean), return_exceptions=True)
+        return out
+
+    async def _remember(self, rr: LinkResolveResult) -> None:
+        if not rr or not rr.final_url:
+            return
+        try:
+            fn = getattr(self.http, "_remember_candidate", None)
+            if callable(fn):
+                await fn(url=rr.final_url, source="link_resolver", parent=rr.source_page or rr.original_url, score=9.0 if "resolved_from_404" in (rr.evidence or []) else 7.0, kind=rr.kind or "asset", status=rr.status, content_type=rr.content_type, evidence=tuple(rr.evidence or ()))
+        except Exception:
+            pass
+        try:
+            fn = getattr(self.http, "_access_remember", None)
+            if callable(fn):
+                await fn(url=rr.final_url, kind=rr.kind or "asset", method="GET", status=rr.status, content_type=rr.content_type, parent=rr.source_page or rr.original_url, source="link_resolver", evidence=tuple(rr.evidence or ()), required_headers=("User-Agent", "Accept", "Referer"))
+        except Exception:
+            pass
+
+
+
+
 class HTTPSSubmanager:
     """
     Shared aiohttp HTTPS engine.
@@ -21475,6 +22672,8 @@ class HTTPSSubmanager:
         ".m3u8", ".mpd", ".m4s", ".mp4", ".webm", ".ts", ".mkv",
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg",
         ".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac",
+        ".pdf", ".epub", ".mobi", ".doc", ".docx", ".xls", ".xlsx",
+        ".ppt", ".pptx", ".zip", ".rar", ".7z", ".tar", ".gz",
         "manifest", "playlist", "stream", "segment", "chunk", "frag",
         "download", "media", "video", "audio", "cdn", "playback",
         "thumb", "poster", "graphql", "api",
@@ -21484,6 +22683,8 @@ class HTTPSSubmanager:
         "video": "video/*,application/vnd.apple.mpegurl,application/dash+xml;q=0.9,*/*;q=0.5",
         "audio": "audio/*,application/octet-stream;q=0.8,*/*;q=0.5",
         "image": "image/avif,image/webp,image/apng,image/*,*/*;q=0.5",
+        "document": "application/pdf,application/epub+zip,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/octet-stream;q=0.8,*/*;q=0.5",
+        "archive": "application/zip,application/x-7z-compressed,application/gzip,application/octet-stream,*/*;q=0.5",
         "json": "application/json,text/plain,*/*",
         "html": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "generic": "*/*",
@@ -21548,6 +22749,9 @@ class HTTPSSubmanager:
         # ------------------ Accessibility/session additions ------------------
         session_class: Optional[SessionClass] = None,
         accessibility_manager: Optional[AccessibilityManager] = None,
+
+        # ------------------ Link resolving additions ------------------
+        link_resolver: Optional[LinkResolver] = None,
     ):
         self.ua = user_agent
         self.timeout = float(timeout)
@@ -21629,6 +22833,53 @@ class HTTPSSubmanager:
         self._inflight_lock = asyncio.Lock()
         self._cdn_priority = _CDNLinkPrioritizer()
         self._math_model = self._make_math_model()
+
+        # LinkResolver is a plug-in: existing callers do not have to pass it.
+        # Fast/direct defaults prevent sitemap/search recovery from freezing the crawl.
+        self.link_resolver: LinkResolver = link_resolver or LinkResolver(
+            self,
+            extensions=LinkResolver.DEFAULT_EXTENSIONS,
+            logger=DEBUG_LOGGER,
+            max_candidates=24,
+            max_depth=1,
+            html_bytes=220_000,
+            concurrency=3,
+            max_resolve_seconds=5.0,
+            max_probe_seconds=2.0,
+            max_clue_seconds=1.25,
+            direct_only=True,
+            enable_search_pages=False,
+            enable_cms_endpoints=False,
+            enable_sitemaps=False,
+            enable_robots=False,
+            enable_parent_pages=False,
+            sitemap_limit=0,
+            sitemap_locs_limit=80,
+            clue_page_limit=0,
+            recovery_candidate_limit=24,
+            self_variant_limit=24,
+            mine_error_body_candidates=True,
+        )
+
+        # Non-blocking auto-resolve queue. _access_remember() schedules bounded
+        # resolver work and returns immediately so the crawler never gets stuck.
+        self.link_resolver_auto_enabled = True
+        self.link_resolver_auto_nonblocking = True
+        self._resolver_auto_inflight: Set[str] = set()
+        self._resolver_tasks: Set[asyncio.Task] = set()
+        self._resolver_auto_lock = asyncio.Lock()
+        self._resolver_auto_sem = asyncio.Semaphore(3)
+        self._resolver_auto_max_pending = 96
+        self._resolver_auto_timeout_s = 6.0
+
+        try:
+            self._log(
+                "[LinkResolver][INIT] enabled self-resolving/direct "
+                "max_candidates=24 self_variant_limit=24 sitemap=false parent=false "
+                "recovery_candidate_limit=24 auto_nonblocking=true"
+            )
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # HTTPSMathematicalModelLayer compatibility
@@ -21991,6 +23242,18 @@ class HTTPSSubmanager:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        # Let short auto-resolver tasks finish briefly, then cancel so session close never hangs.
+        try:
+            tasks = list(getattr(self, "_resolver_tasks", set()) or set())
+            if tasks:
+                done, pending = await asyncio.wait(tasks, timeout=1.0)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                self._resolver_tasks.clear()
+        except Exception:
+            pass
         if self._session:
             await self._session.close()
 
@@ -22109,7 +23372,7 @@ class HTTPSSubmanager:
 
             score = 2.0 + self._score_url_similarity(seed, url)
 
-            if kind in {"video", "audio", "image", "manifest", "json", "asset"}:
+            if kind in {"video", "audio", "image", "manifest", "json", "document", "archive", "asset"}:
                 score += 1.0
 
             score += self._cdn_score(
@@ -22132,6 +23395,20 @@ class HTTPSSubmanager:
                 content_type=content_type,
                 evidence=evidence,
             )
+
+            # Lightweight resolver hook: do not force a network resolve here;
+            # just promote extension-looking candidates so get_guidance() can
+            # rank them higher and explicit resolve_link() can verify them.
+            if self._is_resolvable_asset_url(url):
+                await self._remember_candidate(
+                    url=url,
+                    source=f"{source}:resolver_candidate",
+                    parent=seed,
+                    score=score + 1.25,
+                    kind=self._classify_url_kind(url, content_type),
+                    content_type=content_type,
+                    evidence=tuple(evidence) + ("link_resolver_candidate",),
+                )
 
             added += 1
 
@@ -22173,6 +23450,160 @@ class HTTPSSubmanager:
             "available": False,
             "reason": "SessionClass.snapshot not available",
         }
+
+    # ------------------------------------------------------------------
+    # Public LinkResolver helpers
+    # ------------------------------------------------------------------
+
+    def _linkresolver_new(self) -> LinkResolver:
+        return LinkResolver(
+            self,
+            extensions=LinkResolver.DEFAULT_EXTENSIONS,
+            logger=DEBUG_LOGGER,
+            max_candidates=24,
+            max_depth=1,
+            html_bytes=220_000,
+            concurrency=3,
+            max_resolve_seconds=5.0,
+            max_probe_seconds=2.0,
+            max_clue_seconds=1.25,
+            direct_only=True,
+            enable_search_pages=False,
+            enable_cms_endpoints=False,
+            enable_sitemaps=False,
+            enable_robots=False,
+            enable_parent_pages=False,
+            sitemap_limit=0,
+            sitemap_locs_limit=80,
+            clue_page_limit=0,
+            recovery_candidate_limit=24,
+            self_variant_limit=24,
+            mine_error_body_candidates=True,
+        )
+
+    async def resolve_link(
+        self,
+        url: str,
+        *,
+        parent_url: str = "",
+        expected_exts: Optional[Iterable[str]] = None,
+        title: str = "",
+        query: str = "",
+        force: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Resolve a discovered URL into a confirmed public/reachable asset URL.
+        Plain search queries and broad search pages are skipped immediately.
+        """
+        u = str(url or "").strip()
+        if not u.startswith(("http://", "https://")) or any(ch.isspace() for ch in u):
+            return {
+                "ok": False,
+                "original_url": u,
+                "final_url": u,
+                "url": u,
+                "reason": "query_or_non_url_skipped",
+            }
+
+        resolver = getattr(self, "link_resolver", None)
+        if resolver is None:
+            resolver = self._linkresolver_new()
+            self.link_resolver = resolver
+            self._log("[LinkResolver][INIT-LATE] created fast/direct resolver")
+
+        self._log(
+            "[LinkResolver][CALL] resolve_link "
+            f"url={u} parent={parent_url or '-'} "
+            f"expected_exts={list(expected_exts or []) or 'default'} force={force}"
+        )
+
+        try:
+            rr = await asyncio.wait_for(
+                resolver.resolve(
+                    u,
+                    parent_url=parent_url,
+                    expected_exts=expected_exts,
+                    title=title,
+                    query=query,
+                    force=force,
+                ),
+                timeout=float(getattr(resolver, "max_resolve_seconds", 8.0)) + 0.5,
+            )
+        except asyncio.TimeoutError:
+            rr = LinkResolveResult(
+                ok=False,
+                original_url=u,
+                final_url=u,
+                source_page=parent_url,
+                reason="resolve_link_timeout",
+                evidence=["https_submanager_timeout"],
+            )
+        except Exception as e:
+            rr = LinkResolveResult(
+                ok=False,
+                original_url=u,
+                final_url=u,
+                source_page=parent_url,
+                reason=f"resolve_link_error:{e}",
+            )
+
+        out = rr.as_dict()
+        self._log(
+            "[LinkResolver][DONE] "
+            f"ok={out.get('ok')} status={out.get('status')} "
+            f"reason={out.get('reason')} final={out.get('final_url') or out.get('url')}"
+        )
+        return out
+
+    async def resolve_links(
+        self,
+        urls: Iterable[str],
+        *,
+        parent_url: str = "",
+        expected_exts: Optional[Iterable[str]] = None,
+        query: str = "",
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Resolve many discovered URLs concurrently through LinkResolver.
+        Query strings/plain prompts are filtered before the resolver sees them.
+        """
+        resolver = getattr(self, "link_resolver", None)
+        if resolver is None:
+            resolver = self._linkresolver_new()
+            self.link_resolver = resolver
+            self._log("[LinkResolver][INIT-LATE] created fast/direct resolver")
+
+        clean: List[str] = []
+        seen: Set[str] = set()
+        for raw in urls or []:
+            u = str(raw or "").strip()
+            if not u.startswith(("http://", "https://")) or any(ch.isspace() for ch in u):
+                continue
+            if u in seen:
+                continue
+            seen.add(u)
+            clean.append(u)
+            if len(clean) >= max(1, int(limit)):
+                break
+
+        self._log(
+            "[LinkResolver][CALL] resolve_links "
+            f"count={len(clean)} parent={parent_url or '-'} "
+            f"expected_exts={list(expected_exts or []) or 'default'}"
+        )
+
+        rows = await resolver.resolve_many(
+            clean,
+            parent_url=parent_url,
+            expected_exts=expected_exts,
+            query=query,
+            limit=limit,
+        )
+        out = [r.as_dict() for r in rows]
+        ok_count = sum(1 for r in out if r.get("ok"))
+        self._log(f"[LinkResolver][DONE] resolve_links ok={ok_count}/{len(out)}")
+        return out
 
     # ------------------------------------------------------------------
     # Public HTTP helpers
@@ -22737,6 +24168,281 @@ class HTTPSSubmanager:
 
         return {str(k): str(v) for k, v in dict(headers or {}).items() if k and v is not None}
 
+    # ------------------------------------------------------------------
+    # LinkResolver auto-bridge from ACCESS discoveries
+    # ------------------------------------------------------------------
+
+    def _resolver_url_ext_from_path(self, url: str) -> str:
+        try:
+            p = urlparse(str(url or ""))
+            path = unquote(p.path or "").lower()
+            for ext in sorted(LinkResolver.DEFAULT_EXTENSIONS, key=len, reverse=True):
+                if path.endswith(ext):
+                    return ext
+        except Exception:
+            pass
+        return ""
+
+    def _resolver_is_url_not_query(self, url: str) -> bool:
+        u = str(url or "").strip()
+        if not u.startswith(("http://", "https://")):
+            return False
+        if any(ch.isspace() for ch in u):
+            return False
+        try:
+            p = urlparse(u)
+            return p.scheme in {"http", "https"} and bool(p.netloc)
+        except Exception:
+            return False
+
+    def _resolver_is_search_page(self, url: str) -> bool:
+        try:
+            p = urlparse(str(url or ""))
+            path = (p.path or "/").lower().rstrip("/")
+            q = dict(parse_qsl(p.query, keep_blank_values=True))
+            search_paths = ("/search", "/find", "/results", "/query", "/lookup", "/site-search", "/search/node", "/api/search")
+            if any(path == sp or path.startswith(sp + "/") for sp in search_paths):
+                return True
+            if any(str(k).lower() in {"q", "query", "search", "searchword", "keys", "keyword", "s"} for k in q):
+                return not bool(self._resolver_url_ext_from_path(url))
+        except Exception:
+            pass
+        return False
+
+    def _auto_resolve_skip_reason(
+        self,
+        url: str,
+        *,
+        kind: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        source: str = "",
+        evidence: Iterable[str] = (),
+    ) -> str:
+        u = str(url or "").strip()
+        low = u.lower()
+        k = str(kind or "").lower()
+        ct = str(content_type or "").lower()
+        src = str(source or "").lower()
+        ev = " ".join(str(x) for x in (evidence or ())).lower()
+
+        if not getattr(self, "link_resolver_auto_enabled", True):
+            return "auto_disabled"
+        if not self._resolver_is_url_not_query(u):
+            return "not_http_url_or_plain_query"
+        if self._resolver_is_search_page(u):
+            return "search_page_not_asset"
+        if src == "link_resolver" or "link_resolver" in ev or "resolver:real_asset_link" in ev:
+            return "resolver_recursion_guard"
+
+        try:
+            s = int(status) if status is not None else None
+        except Exception:
+            s = None
+        if s in {401, 403, 407, 429, 451}:
+            return f"protected_status_{s}"
+
+        ext = self._resolver_url_ext_from_path(u)
+        mime_hints = (
+            "pdf", "epub", "msword", "officedocument", "text/csv",
+            "audio/", "video/", "mpegurl", "dash+xml", "zip", "rar", "gzip",
+        )
+        assetish = bool(ext) or any(x in ct for x in mime_hints) or k in {"document", "archive", "audio", "video", "asset", "manifest"}
+        if not assetish:
+            return "not_assetish"
+
+        if s is None:
+            return "" if bool(ext) else "no_status_no_path_extension"
+
+        if (200 <= s < 300) or s in {202, 404, 410, 500, 502, 503, 504}:
+            return ""
+        return f"status_not_resolvable_{s}"
+
+    def _should_auto_resolve_access_url(
+        self,
+        url: str,
+        *,
+        kind: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        source: str = "",
+        evidence: Iterable[str] = (),
+    ) -> bool:
+        """
+        Conservative ACCESS -> LinkResolver bridge.
+
+        Allows direct asset-looking missing files through, but blocks plain
+        search queries and broad search/result pages. Use _auto_resolve_skip_reason
+        for debug logs when a candidate is not scheduled.
+        """
+        return not bool(self._auto_resolve_skip_reason(url, kind=kind, status=status, content_type=content_type, source=source, evidence=evidence))
+
+    def _expected_exts_for_resolver_url(
+        self,
+        url: str,
+        *,
+        kind: str = "",
+        content_type: str = "",
+    ) -> Optional[List[str]]:
+        ext = self._resolver_url_ext_from_path(url)
+        low = str(url or "").lower()
+        k = str(kind or "").lower()
+        ct = str(content_type or "").lower()
+
+        if ext:
+            if ext in {".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".epub", ".mobi"}:
+                return [".pdf", ".epub", ".mobi", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"]
+            return [ext]
+        if "pdf" in ct:
+            return [".pdf"]
+        if k == "audio" or ct.startswith("audio/"):
+            return [".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus"]
+        if k == "video" or ct.startswith("video/"):
+            return [".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".wmv", ".m3u8", ".mpd"]
+        if k == "archive":
+            return [".zip", ".rar", ".7z", ".tar", ".gz"]
+        return None
+
+    async def auto_resolve_access_url(
+        self,
+        url: str,
+        *,
+        parent_url: str = "",
+        kind: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        query: str = "",
+        title: str = "",
+        source: str = "",
+        evidence: Iterable[str] = (),
+    ) -> Optional[Dict[str, Any]]:
+        skip_reason = self._auto_resolve_skip_reason(url, kind=kind, status=status, content_type=content_type, source=source, evidence=evidence)
+        if skip_reason:
+            self._log(f"[LinkResolver][AUTO-SKIP] reason={skip_reason} url={url}")
+            return None
+
+        cu = self._canonicalize_url(url) if hasattr(self, "_canonicalize_url") else str(url or "")
+        if not cu:
+            return None
+
+        async with self._resolver_auto_lock:
+            if cu in self._resolver_auto_inflight:
+                return None
+            self._resolver_auto_inflight.add(cu)
+
+        try:
+            expected_exts = self._expected_exts_for_resolver_url(cu, kind=kind, content_type=content_type)
+            self._log(f"[LinkResolver][AUTO] queued status={status} kind={kind or '-'} source={source or '-'} url={cu}")
+            result = await self.resolve_link(
+                cu,
+                parent_url=parent_url or "",
+                expected_exts=expected_exts,
+                title=title or "",
+                query="",  # Do not pass search/prompt text into resolver recovery.
+                force=True,
+            )
+            if result and result.get("ok"):
+                self._log(f"[LinkResolver][AUTO-FOUND] {cu} -> {result.get('url')}")
+            else:
+                self._log(f"[LinkResolver][AUTO-MISS] reason={(result or {}).get('reason')} url={cu}")
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._log(f"[LinkResolver][AUTO-ERROR] {cu}: {e}")
+            return None
+        finally:
+            try:
+                async with self._resolver_auto_lock:
+                    self._resolver_auto_inflight.discard(cu)
+            except Exception:
+                pass
+
+    async def _resolver_auto_task(self, kwargs: Dict[str, Any]) -> None:
+        async with self._resolver_auto_sem:
+            try:
+                await asyncio.wait_for(self.auto_resolve_access_url(**kwargs), timeout=float(getattr(self, "_resolver_auto_timeout_s", 8.0)))
+            except asyncio.TimeoutError:
+                try:
+                    self._log(f"[LinkResolver][AUTO-TIMEOUT] url={kwargs.get('url')}")
+                except Exception:
+                    pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                try:
+                    self._log(f"[LinkResolver][AUTO-TASK-ERROR] url={kwargs.get('url')}: {e}")
+                except Exception:
+                    pass
+
+    def _schedule_auto_resolve_after_access_remember(
+        self,
+        *,
+        url: str,
+        kind: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        parent: str = "",
+        source: str = "response",
+        evidence: Iterable[str] = (),
+    ) -> None:
+        try:
+            skip_reason = self._auto_resolve_skip_reason(url, kind=kind, status=status, content_type=content_type, source=source, evidence=evidence)
+            if skip_reason:
+                # Only log likely assets so normal page crawl logs do not get noisy.
+                try:
+                    if self._resolver_url_ext_from_path(url) or str(content_type or "").lower().startswith(("application/", "audio/", "video/")):
+                        self._log(f"[LinkResolver][AUTO-SKIP] reason={skip_reason} url={url}")
+                except Exception:
+                    pass
+                return
+            tasks: Set[asyncio.Task] = getattr(self, "_resolver_tasks", set())
+            if len(tasks) >= int(getattr(self, "_resolver_auto_max_pending", 32)):
+                self._log(f"[LinkResolver][AUTO-SKIP] queue_full url={url}")
+                return
+            kwargs = {
+                "url": url,
+                "parent_url": parent or "",
+                "kind": kind,
+                "status": status,
+                "content_type": content_type,
+                "query": "",
+                "title": "",
+                "source": source,
+                "evidence": tuple(evidence or ()),
+            }
+            task = asyncio.create_task(self._resolver_auto_task(kwargs))
+            self._resolver_tasks.add(task)
+            task.add_done_callback(lambda t: self._resolver_tasks.discard(t))
+            self._log(f"[LinkResolver][AUTO-SCHEDULED] status={status} kind={kind or '-'} url={url}")
+        except RuntimeError:
+            # No running event loop; skip rather than blocking/surprising sync callers.
+            return
+        except Exception as e:
+            self._log(f"[LinkResolver][AUTO-SCHEDULE-ERROR] {url}: {e}")
+
+    async def _auto_resolve_after_access_remember(
+        self,
+        *,
+        url: str,
+        kind: str = "",
+        status: Optional[int] = None,
+        content_type: str = "",
+        parent: str = "",
+        source: str = "response",
+        evidence: Iterable[str] = (),
+    ) -> None:
+        # Backward-compatible async wrapper, now non-blocking.
+        self._schedule_auto_resolve_after_access_remember(
+            url=url,
+            kind=kind,
+            status=status,
+            content_type=content_type,
+            parent=parent,
+            source=source,
+            evidence=evidence,
+        )
+
     async def _access_remember(
         self,
         *,
@@ -22754,12 +24460,15 @@ class HTTPSSubmanager:
         required_headers: Iterable[str] = (),
     ) -> None:
         """
-        Correct AccessibilityManager write path.
+        Correct AccessibilityManager write path, plus LinkResolver bridge.
 
         Priority:
           1. remember_access_page(...) if your project has an async/sync wrapper.
           2. remember_access_page_sync(...) from your uploaded AccessibilityManager.
-          3. no-op fallback.
+          3. fallback bridge into LinkResolver even if AccessibilityManager fails.
+
+        Important: ACCESS remembering only records a URL. The bridge below is what
+        actually calls LinkResolver for 404/410/500/202/direct asset-looking URLs.
         """
         access = self.accessibility_manager
 
@@ -22778,6 +24487,17 @@ class HTTPSSubmanager:
             "required_headers": tuple(str(x) for x in (required_headers or ()) if str(x).strip()),
         }
 
+        def _bridge() -> None:
+            self._schedule_auto_resolve_after_access_remember(
+                url=url,
+                kind=kind,
+                status=status,
+                content_type=content_type,
+                parent=parent,
+                source=source,
+                evidence=kwargs["evidence"],
+            )
+
         for name in ("remember_access_page", "remember_access_page_sync"):
             fn = getattr(access, name, None)
             if not callable(fn):
@@ -22787,6 +24507,7 @@ class HTTPSSubmanager:
                 out = fn(**kwargs)
                 if hasattr(out, "__await__"):
                     await out
+                _bridge()
                 return
             except TypeError:
                 # Some older versions may not accept all kwargs.
@@ -22805,11 +24526,16 @@ class HTTPSSubmanager:
                     out = fn(**reduced)
                     if hasattr(out, "__await__"):
                         await out
+                    _bridge()
                     return
                 except Exception as e:
                     self._log(f"[HTTPS][ACCESS] {name} reduced call failed: {e}")
             except Exception as e:
                 self._log(f"[HTTPS][ACCESS] {name} failed: {e}")
+
+        # Fallback: if no AccessibilityManager method existed or all calls failed,
+        # still bridge asset-like ACCESS discoveries into LinkResolver.
+        _bridge()
 
     async def _access_snapshot(self) -> Dict[str, Any]:
         access = self.accessibility_manager
@@ -23007,7 +24733,7 @@ class HTTPSSubmanager:
             sim = self._score_url_similarity(seed, cand_url)
             total = float(getattr(intel, "score", 0.0)) + sim + min(1.5, 0.2 * int(getattr(intel, "hits", 1)))
 
-            if getattr(intel, "kind", "") in {"video", "audio", "manifest", "json", "image", "asset"}:
+            if getattr(intel, "kind", "") in {"video", "audio", "manifest", "json", "image", "document", "archive", "asset"}:
                 total += 0.6
 
             candidates.append(
@@ -23235,15 +24961,23 @@ class HTTPSSubmanager:
             return "json"
         if "html" in ct or "xml" in ct:
             return "html"
+        if "pdf" in ct or "msword" in ct or "officedocument" in ct or "epub" in ct:
+            return "document"
+        if "zip" in ct or "rar" in ct or "7z" in ct or "gzip" in ct or "x-tar" in ct:
+            return "archive"
 
         if any(u.endswith(x) for x in (".m3u8", ".mpd")):
             return "manifest"
-        if any(u.endswith(x) for x in (".mp4", ".webm", ".mkv", ".mov", ".m4s", ".ts")):
+        if any(u.endswith(x) for x in (".mp4", ".webm", ".mkv", ".mov", ".m4v", ".m4s", ".ts", ".avi", ".wmv")):
             return "video"
-        if any(u.endswith(x) for x in (".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac")):
+        if any(u.endswith(x) for x in (".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".wav", ".flac")):
             return "audio"
-        if any(u.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg")):
+        if any(u.endswith(x) for x in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".bmp", ".tif", ".tiff", ".heic", ".heif")):
             return "image"
+        if any(u.endswith(x) for x in (".pdf", ".epub", ".mobi", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv")):
+            return "document"
+        if any(u.endswith(x) for x in (".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz")):
+            return "archive"
         if u.endswith(".json") or "/graphql" in u or "/api/" in u:
             return "json"
         if u.endswith((".html", ".htm")):
@@ -23254,6 +24988,27 @@ class HTTPSSubmanager:
 
         return "unknown"
 
+    def _is_resolvable_asset_url(self, url: str) -> bool:
+        """
+        True for URLs worth sending to LinkResolver. This is intentionally
+        broad but still extension/hint based, so registration stays lightweight.
+        """
+        u = str(url or "").lower()
+        if not u:
+            return False
+
+        if any(u.endswith(ext) for ext in LinkResolver.DEFAULT_EXTENSIONS):
+            return True
+
+        return any(
+            h in u
+            for h in (
+                "file=", "download", "viewer", "preview", "document", "asset",
+                "media", "audio", "video", ".pdf", ".mp3", ".wav", ".mp4",
+                ".m3u8", ".mpd",
+            )
+        )
+
     def _better_kind(self, old: str, new: str) -> str:
         old = old or "unknown"
         new = new or "unknown"
@@ -23263,10 +25018,12 @@ class HTTPSSubmanager:
             "asset": 1,
             "html": 2,
             "json": 3,
-            "manifest": 4,
-            "image": 5,
-            "audio": 6,
-            "video": 7,
+            "archive": 4,
+            "document": 5,
+            "manifest": 6,
+            "image": 7,
+            "audio": 8,
+            "video": 9,
         }
 
         return new if rank.get(new, 0) > rank.get(old, 0) else old
@@ -23317,7 +25074,7 @@ class HTTPSSubmanager:
         if 200 <= int(status) < 300:
             score += 1.0
 
-        if kind in {"video", "audio", "image", "manifest"}:
+        if kind in {"video", "audio", "image", "manifest", "document", "archive"}:
             score += 1.5
         elif kind in {"json", "html"}:
             score += 0.6
@@ -23762,4 +25519,5 @@ class HTTPSSubmanager:
             return int(str(value).strip())
         except Exception:
             return None
+
 

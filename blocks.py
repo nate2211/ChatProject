@@ -38884,6 +38884,8 @@ BLOCKS.register("packet_noise", PacketNoiseBlock)
 
 # ======================= OnionTrackerBlock ==================================
 
+
+
 @dataclass
 class OnionTrackerBlock(BaseBlock):
     """
@@ -38905,8 +38907,19 @@ class OnionTrackerBlock(BaseBlock):
     - Can persist discovered pages through PageTrackerStore when available.
     - Can emit lexicon + links into Memory like other tracker-style blocks.
     - Uses Tor SOCKS proxy when possible.
+    - Supports a query-focused crawl: params["query"] (or payload fallback) is
+      used to rank/filter pages after the interactive browser session closes.
+    - Interactive mode starts tor.exe from DEFAULT_ONIONTRACKER_TOR_EXE_PATH
+      by default, but params["tor_exe_path"] can override it.
+    - Interactive mode then opens a visible persistent browser through that
+      Tor SOCKS proxy, lets the user browse until the browser is closed, and
+      starts tracking from the same browser profile/session.
+    - The tracker reuses the same tor.exe SOCKS process and the same persistent
+      interactive profile, so cookies/localStorage/session state are available
+      to the crawl instead of starting from a fresh session.
     """
-
+    DEFAULT_ONIONTRACKER_TOR_EXE_PATH = r"C:\Users\natem\OneDrive\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
+    DEFAULT_ONIONTRACKER_TOR_PROXY = "socks5://127.0.0.1:9150"
     JUNK_FILENAME_KEYWORDS = {
         "sprite", "icon", "favicon", "logo", "tracking", "pixel", "blank",
         "placeholder", "avatar", "thumb", "thumbnail", "analytics"
@@ -38969,6 +38982,1221 @@ class OnionTrackerBlock(BaseBlock):
                 self.interaction_sniffer = submanagers.InteractionSniffer()
         except Exception:
             self.interaction_sniffer = None
+
+    # ------------------------------------------------------------------ #
+    # Interactive authenticated session helpers
+    # ------------------------------------------------------------------ #
+    def _interactive_profile_dir(self, session_file: str) -> str:
+        """
+        Resolve the persistent Playwright profile directory used by interactive mode.
+
+        The old version tried to save BrowserContext.storage_state() after the
+        visible browser was closed. That is fragile because the Playwright
+        context may already be gone. This version keeps the same public params
+        but stores the real browser session in a persistent profile directory.
+
+        If the user passes:
+            oniontracker_session.json
+
+        the persistent browser profile becomes:
+            oniontracker_session.json.profile
+
+        The JSON file may still be written in ENTER mode as a convenience, but
+        the crawler reuses the profile directory because it survives normal
+        browser close.
+        """
+        raw = str(session_file or "oniontracker_session.json").strip() or "oniontracker_session.json"
+        if raw.lower().endswith(".json"):
+            return raw + ".profile"
+        return raw
+
+    def _playwright_proxy(self, proxy_url: str) -> Optional[Dict[str, str]]:
+        launch_proxy = None
+        if proxy_url:
+            try:
+                pu = urlparse(proxy_url)
+                if pu.scheme and pu.hostname and pu.port:
+                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
+            except Exception:
+                launch_proxy = None
+        return launch_proxy
+
+
+    def _parse_proxy_endpoint(self, proxy_url: str) -> Tuple[str, int, str]:
+        """
+        Return (host, port, scheme) for a SOCKS/HTTP proxy URL.
+
+        This helper is intentionally dependency-free so interactive mode can
+        fail early with a clear error instead of opening Chromium into
+        ERR_PROXY_CONNECTION_FAILED.
+        """
+        try:
+            pu = urlparse(str(proxy_url or "").strip())
+            host = pu.hostname or "127.0.0.1"
+            port = int(pu.port or (9150 if "9150" in str(proxy_url) else 9050))
+            scheme = (pu.scheme or "socks5").lower()
+            return host, port, scheme
+        except Exception:
+            return "127.0.0.1", 9050, "socks5"
+
+    def _tcp_port_open(self, host: str, port: int, *, timeout: float = 0.35) -> bool:
+        try:
+            import socket
+            with socket.create_connection((host, int(port)), timeout=float(timeout or 0.35)):
+                return True
+        except Exception:
+            return False
+
+    def _format_proxy_url(self, host: str, port: int, scheme: str = "socks5") -> str:
+        scheme = (scheme or "socks5").strip().lower()
+        if scheme not in {"socks5", "socks4", "http", "https"}:
+            scheme = "socks5"
+        return f"{scheme}://{host}:{int(port)}"
+
+    def _socks_remote_dns_proxy_url(self, proxy_url: str) -> str:
+        """
+        Return a SOCKS URL accepted by aiohttp_socks/python_socks.
+
+        Important fix:
+        - aiohttp_socks accepts socks5:// and socks4://.
+        - It does NOT accept PySocks/requests-style socks5h:// or socks4a://.
+        - Remote DNS is enabled by passing rdns=True to ProxyConnector.from_url().
+
+        So this helper strips socks5h/socks4a back to a valid aiohttp_socks
+        scheme while keeping the connection onion-safe through rdns=True.
+        """
+        raw = str(proxy_url or "").strip()
+        if not raw:
+            return raw
+        low = raw.lower()
+        if low.startswith("socks5h://"):
+            return "socks5://" + raw[len("socks5h://"):]
+        if low.startswith("socks4a://"):
+            return "socks4://" + raw[len("socks4a://"):]
+        return raw
+
+    def _looks_like_browser_error_page(self, *, title: str, text: str, html_text: str) -> bool:
+        """
+        Detect Playwright/Chromium/Tor Browser generated error pages so they do
+        not count as valid crawled pages. A page titled "Error" with proxy or
+        DNS wording means the tracker still did not reach the onion service.
+        """
+        blob = " ".join([str(title or ""), str(text or "")[:2000], str(html_text or "")[:2000]]).lower()
+        if not blob:
+            return False
+        title_l = str(title or "").strip().lower()
+        if title_l in {"error", "problem loading page", "server not found"}:
+            if any(x in blob for x in (
+                "getaddrinfo failed",
+                "proxy",
+                "err_proxy",
+                "server not found",
+                "unable to connect",
+                "can't connect",
+                "could not connect",
+                "dns",
+                "onion",
+                "connection failed",
+            )):
+                return True
+        return False
+
+    def _build_plain_cookie_header_from_playwright_profile(self, profile_dir: str, url: str) -> str:
+        """
+        Best-effort Chromium cookie extraction for the persistent interactive
+        Playwright profile. Modern Chromium often encrypts values on Windows;
+        this only returns plaintext values if available. It never raises.
+        """
+        try:
+            import sqlite3, shutil, tempfile
+            profile_dir = os.path.expandvars(os.path.expanduser(str(profile_dir or "").strip().strip('"')))
+            if not profile_dir or not os.path.isdir(profile_dir):
+                return ""
+            cookie_db_candidates = [
+                os.path.join(profile_dir, "Default", "Network", "Cookies"),
+                os.path.join(profile_dir, "Default", "Cookies"),
+                os.path.join(profile_dir, "Network", "Cookies"),
+                os.path.join(profile_dir, "Cookies"),
+            ]
+            db_path = next((x for x in cookie_db_candidates if os.path.isfile(x)), "")
+            if not db_path:
+                return ""
+            fd, tmp = tempfile.mkstemp(prefix="oniontracker_chromium_cookies_", suffix=".sqlite")
+            os.close(fd)
+            try:
+                shutil.copy2(db_path, tmp)
+                conn = sqlite3.connect(tmp)
+                try:
+                    host = (urlparse(url).hostname or "").lower()
+                    if not host:
+                        return ""
+                    cur = conn.cursor()
+                    cur.execute("SELECT host_key, name, value, path, is_secure FROM cookies")
+                    parts, seen = [], set()
+                    for host_key, name, value, _path, is_secure in cur.fetchall():
+                        hk = str(host_key or "").lower().lstrip(".")
+                        if not hk or not (host == hk or host.endswith("." + hk)):
+                            continue
+                        if bool(is_secure) and not str(url).lower().startswith("https://"):
+                            continue
+                        name = str(name or "").strip()
+                        value = str(value or "")
+                        if not name or not value or name in seen:
+                            continue
+                        seen.add(name)
+                        parts.append(f"{name}={value}")
+                    return "; ".join(parts)
+                finally:
+                    try: conn.close()
+                    except Exception: pass
+            finally:
+                try:
+                    if os.path.isfile(tmp): os.remove(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            return ""
+
+
+    def _read_chromium_history_urls_from_profile(
+        self,
+        profile_dir: str,
+        *,
+        root_url: str,
+        limit: int = 64,
+    ) -> List[str]:
+        """
+        Best-effort read of the persistent Playwright/Chromium profile history.
+
+        This lets the tracker start from the last page the user actually reached
+        in interactive mode instead of falling back to the original onion root.
+        The database is copied first so a recently closed Chromium profile does
+        not crash the tracker if the History file is still locked.
+        """
+        out: List[str] = []
+        seen: Set[str] = set()
+        try:
+            import sqlite3, shutil, tempfile
+            profile_dir = os.path.expandvars(os.path.expanduser(str(profile_dir or "").strip().strip('"')))
+            if not profile_dir or not os.path.isdir(profile_dir):
+                return []
+
+            history_candidates = [
+                os.path.join(profile_dir, "Default", "History"),
+                os.path.join(profile_dir, "History"),
+            ]
+            db_path = next((x for x in history_candidates if os.path.isfile(x)), "")
+            if not db_path:
+                return []
+
+            fd, tmp = tempfile.mkstemp(prefix="oniontracker_chromium_history_", suffix=".sqlite")
+            os.close(fd)
+            try:
+                shutil.copy2(db_path, tmp)
+                conn = sqlite3.connect(tmp)
+                try:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT url FROM urls "
+                        "WHERE url LIKE 'http%' "
+                        "ORDER BY last_visit_time DESC LIMIT ?",
+                        (max(1, int(limit or 64)),),
+                    )
+                    for (url,) in cur.fetchall():
+                        cu = self._canonicalize_url(str(url or ""))
+                        if not cu or cu in seen:
+                            continue
+                        if self._allowed_url(cu, root_url=root_url, same_host_only=True, allow_non_onion=False):
+                            seen.add(cu)
+                            out.append(cu)
+                finally:
+                    try: conn.close()
+                    except Exception: pass
+            finally:
+                try:
+                    if os.path.isfile(tmp): os.remove(tmp)
+                except Exception:
+                    pass
+        except Exception:
+            return out
+        return out
+
+    def _last_interactive_url_from_profile(
+        self,
+        profile_dir: str,
+        *,
+        root_url: str,
+    ) -> str:
+        """Return the newest valid URL from the interactive profile history."""
+        try:
+            urls = self._read_chromium_history_urls_from_profile(profile_dir, root_url=root_url, limit=1)
+            return urls[0] if urls else ""
+        except Exception:
+            return ""
+
+    def _force_tracker_tor_proxy_after_interactive(
+        self,
+        *,
+        tor_exe_path: str,
+        tracker_host: str,
+        tracker_port: int,
+        tracker_data_dir: str,
+        startup_timeout: float,
+        tor_extra_args: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Start or validate a tracker-owned tor.exe SOCKS listener after the
+        interactive browser closes. This intentionally does NOT trust an
+        auto-detected 9150 listener, because that may have belonged to the
+        interactive Tor Browser and may disappear when the window closes.
+        """
+        info: Dict[str, Any] = {
+            "ok": False,
+            "source": "tracker_torexe_after_interactive",
+            "proxy_url": self._format_proxy_url(tracker_host, int(tracker_port), "socks5"),
+            "host": tracker_host,
+            "port": int(tracker_port),
+            "started_tor": None,
+            "error": None,
+        }
+        try:
+            if self._tcp_port_open(tracker_host, int(tracker_port), timeout=0.35):
+                info["ok"] = True
+                info["source"] = "existing_tracker_torexe_proxy"
+                return info
+
+            started = self._start_tor_process(
+                tor_exe_path=tor_exe_path,
+                socks_host=tracker_host,
+                socks_port=int(tracker_port),
+                data_dir=tracker_data_dir,
+                startup_timeout=startup_timeout,
+                extra_args=tor_extra_args,
+            )
+            info["started_tor"] = started
+            if started.get("ok"):
+                info["ok"] = True
+                info["proxy_url"] = str(started.get("proxy_url") or info["proxy_url"])
+                return info
+            info["error"] = str(started.get("error") or "tracker_tor_start_failed")
+            return info
+        except Exception as e:
+            info["error"] = str(e)
+            return info
+
+    def _candidate_tor_proxy_urls(self, requested_proxy: str, fallback_ports: str = "9150") -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+
+        def add(u: str) -> None:
+            u = str(u or "").strip()
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+
+        add(requested_proxy)
+        host, _port, scheme = self._parse_proxy_endpoint(requested_proxy or "socks5://127.0.0.1:9150")
+        for raw in str(fallback_ports or "9150").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                add(self._format_proxy_url(host or "127.0.0.1", int(raw), scheme or "socks5"))
+            except Exception:
+                pass
+        add("socks5://127.0.0.1:9150")  # Tor Browser default SOCKS port when Tor Browser is already running.
+        return out
+
+    def _common_tor_exe_candidates(self, tor_exe_path: str = "") -> List[str]:
+        """
+        Common Windows Tor executable locations.
+
+        The key fix for ERR_PROXY_CONNECTION_FAILED is not the browser itself;
+        it is having a live Tor SOCKS process. Playwright Chromium can browse
+        .onion hosts when it has a working SOCKS proxy. This finds tor.exe from
+        Tor Browser / expert bundle without requiring global installation.
+        """
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def add(path: str) -> None:
+            path = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"')))
+            if path and path not in seen:
+                seen.add(path)
+                candidates.append(path)
+
+        add(tor_exe_path)
+        add(self.DEFAULT_ONIONTRACKER_TOR_EXE_PATH)
+        home = os.path.expanduser("~")
+        envs = [
+            os.environ.get("ProgramFiles", ""),
+            os.environ.get("ProgramFiles(x86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+            os.environ.get("APPDATA", ""),
+            home,
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Downloads"),
+            os.getcwd(),
+        ]
+        suffixes = [
+            os.path.join("Tor Browser", "Browser", "TorBrowser", "Tor", "tor.exe"),
+            os.path.join("Tor Browser", "Browser", "Tor", "tor.exe"),
+            os.path.join("Browser", "TorBrowser", "Tor", "tor.exe"),
+            os.path.join("Browser", "Tor", "tor.exe"),
+            os.path.join("Tor", "tor.exe"),
+            "tor.exe",
+        ]
+        for base in envs:
+            if not base:
+                continue
+            for suffix in suffixes:
+                add(os.path.join(base, suffix))
+        return candidates
+
+    def _find_tor_executable(self, tor_exe_path: str = "") -> str:
+        for candidate in self._common_tor_exe_candidates(tor_exe_path):
+            try:
+                if candidate and os.path.isfile(candidate):
+                    return candidate
+            except Exception:
+                pass
+        try:
+            import shutil
+            found = shutil.which("tor") or shutil.which("tor.exe")
+            if found:
+                return found
+        except Exception:
+            pass
+        return ""
+
+    def _start_tor_process(
+        self,
+        *,
+        tor_exe_path: str,
+        socks_host: str,
+        socks_port: int,
+        data_dir: str,
+        startup_timeout: float,
+        extra_args: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Start a local Tor SOCKS process and wait until the SOCKS port accepts
+        TCP connections. The process is intentionally left running for the
+        duration of the block so the post-interactive crawler can reuse it.
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "proxy_url": self._format_proxy_url(socks_host, socks_port, "socks5"),
+            "tor_exe": "",
+            "pid": None,
+            "error": None,
+        }
+        try:
+            import subprocess
+            import time as _time
+            import tempfile
+            import shlex
+
+            tor_exe = self._find_tor_executable(tor_exe_path)
+            if not tor_exe:
+                result["error"] = (
+                    "tor_exe_not_found: set oniontracker.tor_exe_path to Tor Browser's "
+                    "Browser\\TorBrowser\\Tor\\tor.exe, or start Tor Browser and use port 9150"
+                )
+                return result
+
+            data_dir = str(data_dir or "").strip()
+            if not data_dir:
+                data_dir = os.path.join(tempfile.gettempdir(), "oniontracker_tor_data")
+            data_dir = os.path.expandvars(os.path.expanduser(data_dir))
+            os.makedirs(data_dir, exist_ok=True)
+
+            cmd = [
+                tor_exe,
+                "--SocksPort", f"{socks_host}:{int(socks_port)}",
+                "--DataDirectory", data_dir,
+                "--AvoidDiskWrites", "1",
+            ]
+            if extra_args:
+                try:
+                    cmd.extend(shlex.split(str(extra_args)))
+                except Exception:
+                    cmd.extend(str(extra_args).split())
+
+            creationflags = 0
+            try:
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+            except Exception:
+                creationflags = 0
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            result["tor_exe"] = tor_exe
+            result["pid"] = getattr(proc, "pid", None)
+
+            deadline = _time.time() + max(5.0, float(startup_timeout or 45.0))
+            while _time.time() < deadline:
+                if self._tcp_port_open(socks_host, int(socks_port), timeout=0.5):
+                    result["ok"] = True
+                    return result
+                if proc.poll() is not None:
+                    result["error"] = f"tor_exited_early: rc={proc.returncode}"
+                    return result
+                _time.sleep(0.5)
+
+            result["error"] = f"tor_start_timeout_waiting_for_{socks_host}:{socks_port}"
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+    def _ensure_tor_proxy(
+        self,
+        *,
+        proxy_url: str,
+        auto_detect: bool,
+        auto_start: bool,
+        fallback_ports: str,
+        tor_exe_path: str,
+        tor_socks_host: str,
+        tor_socks_port: int,
+        tor_data_dir: str,
+        tor_startup_timeout: float,
+        tor_extra_args: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Make interactive mode onion-compatible before opening the browser.
+
+        Order:
+        1. Use the requested proxy if it is already listening.
+        2. Try common local Tor ports, especially 9150 for Tor Browser.
+        3. Start tor.exe from Tor Browser / expert bundle and wait for SOCKS.
+        """
+        info: Dict[str, Any] = {
+            "ok": False,
+            "proxy_url": proxy_url,
+            "source": "none",
+            "host": None,
+            "port": None,
+            "error": None,
+            "started_tor": None,
+        }
+
+        if auto_detect:
+            for candidate in self._candidate_tor_proxy_urls(proxy_url, fallback_ports=fallback_ports):
+                host, port, scheme = self._parse_proxy_endpoint(candidate)
+                if self._tcp_port_open(host, int(port), timeout=0.35):
+                    info.update({
+                        "ok": True,
+                        "proxy_url": self._format_proxy_url(host, int(port), scheme),
+                        "source": "existing_proxy" if candidate == proxy_url else "auto_detected_proxy",
+                        "host": host,
+                        "port": int(port),
+                        "error": None,
+                    })
+                    return info
+
+        if auto_start:
+            host = str(tor_socks_host or "127.0.0.1").strip() or "127.0.0.1"
+            port = int(tor_socks_port or 9050)
+            started = self._start_tor_process(
+                tor_exe_path=tor_exe_path,
+                socks_host=host,
+                socks_port=port,
+                data_dir=tor_data_dir,
+                startup_timeout=tor_startup_timeout,
+                extra_args=tor_extra_args,
+            )
+            info["started_tor"] = started
+            if started.get("ok"):
+                info.update({
+                    "ok": True,
+                    "proxy_url": started.get("proxy_url") or self._format_proxy_url(host, port, "socks5"),
+                    "source": "started_tor_process",
+                    "host": host,
+                    "port": port,
+                    "error": None,
+                })
+                return info
+            info["error"] = started.get("error") or "tor_auto_start_failed"
+            return info
+
+        host, port, scheme = self._parse_proxy_endpoint(proxy_url)
+        info.update({
+            "proxy_url": self._format_proxy_url(host, port, scheme),
+            "host": host,
+            "port": port,
+            "error": f"proxy_not_listening_at_{host}:{port}",
+        })
+        return info
+
+
+    def _common_tor_browser_candidates(self, tor_browser_path: str = "") -> List[str]:
+        """
+        Common Tor Browser executable locations. This is the *browser* launcher
+        path, not tor.exe. Starting Browser\firefox.exe lets Tor Browser bring
+        up its own natural SOCKS proxy on 127.0.0.1:9150.
+        """
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def add(path: str) -> None:
+            path = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"')))
+            if path and path not in seen:
+                seen.add(path)
+                candidates.append(path)
+
+        add(tor_browser_path)
+        home = os.path.expanduser("~")
+        envs = [
+            os.environ.get("ProgramFiles", ""),
+            os.environ.get("ProgramFiles(x86)", ""),
+            os.environ.get("LOCALAPPDATA", ""),
+            os.environ.get("APPDATA", ""),
+            home,
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Downloads"),
+            os.getcwd(),
+        ]
+        suffixes = [
+            os.path.join("Tor Browser", "Browser", "firefox.exe"),
+            os.path.join("Tor Browser", "Browser", "start-tor-browser.exe"),
+            os.path.join("Browser", "firefox.exe"),
+            os.path.join("Browser", "start-tor-browser.exe"),
+            "firefox.exe",
+            "start-tor-browser.exe",
+        ]
+        for base in envs:
+            if not base:
+                continue
+            for suffix in suffixes:
+                add(os.path.join(base, suffix))
+        return candidates
+
+    def _find_tor_browser_executable(self, tor_browser_path: str = "") -> str:
+        for candidate in self._common_tor_browser_candidates(tor_browser_path):
+            try:
+                if candidate and os.path.isfile(candidate):
+                    return candidate
+            except Exception:
+                pass
+        return ""
+
+    def _open_tor_browser_native_proxy(
+            self,
+            *,
+            start_url: str,
+            tor_browser_path: str,
+            socks_host: str,
+            socks_port: int,
+            startup_timeout: float,
+            open_url: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Start Tor Browser the normal way, disable JavaScript in the Tor Browser
+        profile, and wait for its natural SOCKS proxy.
+
+        Important:
+        - tor.exe cannot disable JavaScript. It only provides the Tor network/SOCKS proxy.
+        - JavaScript must be disabled in the Tor Browser/Firefox profile.
+        - This writes user.js before launch so the interactive onion browser opens
+          with JS disabled.
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "proxy_url": self._format_proxy_url(socks_host, socks_port, "socks5"),
+            "browser_exe": "",
+            "profile_dir": "",
+            "user_js": "",
+            "javascript_disabled": False,
+            "pid": None,
+            "source": "tor_browser_native_proxy",
+            "already_open": False,
+            "warning": None,
+            "error": None,
+        }
+
+        def _derive_browser_from_tor_exe(path: str) -> str:
+            """
+            Accept either:
+              ...\\Tor Browser\\Browser\\firefox.exe
+            or:
+              ...\\Tor Browser\\Browser\\TorBrowser\\Tor\\tor.exe
+
+            If tor.exe is passed, derive Browser\\firefox.exe.
+            """
+            try:
+                p = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"')))
+                if not p:
+                    return ""
+
+                if os.path.basename(p).lower() == "tor.exe":
+                    # tor.exe:
+                    # C:\...\Tor Browser\Browser\TorBrowser\Tor\tor.exe
+                    tor_dir = os.path.dirname(p)  # ...\TorBrowser\Tor
+                    torbrowser_dir = os.path.dirname(tor_dir)  # ...\TorBrowser
+                    browser_dir = os.path.dirname(torbrowser_dir)  # ...\Browser
+                    firefox_exe = os.path.join(browser_dir, "firefox.exe")
+                    if os.path.isfile(firefox_exe):
+                        return firefox_exe
+
+                if os.path.isfile(p):
+                    return p
+
+                return ""
+            except Exception:
+                return ""
+
+        def _derive_profile_dir(browser_exe: str, original_path: str) -> str:
+            """
+            Resolve Tor Browser's profile.default directory.
+            """
+            candidates: List[str] = []
+            seen: Set[str] = set()
+
+            def add(x: str) -> None:
+                try:
+                    x = os.path.expandvars(os.path.expanduser(str(x or "").strip().strip('"')))
+                    if x and x not in seen:
+                        seen.add(x)
+                        candidates.append(x)
+                except Exception:
+                    pass
+
+            try:
+                # firefox.exe normal case:
+                # ...\Tor Browser\Browser\firefox.exe
+                if browser_exe:
+                    browser_dir = os.path.dirname(browser_exe)
+                    add(os.path.join(browser_dir, "TorBrowser", "Data", "Browser", "profile.default"))
+
+                # tor.exe case:
+                # ...\Tor Browser\Browser\TorBrowser\Tor\tor.exe
+                raw = os.path.expandvars(os.path.expanduser(str(original_path or "").strip().strip('"')))
+                if raw and os.path.basename(raw).lower() == "tor.exe":
+                    tor_dir = os.path.dirname(raw)
+                    torbrowser_dir = os.path.dirname(tor_dir)
+                    add(os.path.join(torbrowser_dir, "Data", "Browser", "profile.default"))
+
+                # fallback common path near current user
+                home = os.path.expanduser("~")
+                add(os.path.join(home, "OneDrive", "Desktop", "Tor Browser", "Browser", "TorBrowser", "Data", "Browser",
+                                 "profile.default"))
+                add(os.path.join(home, "Desktop", "Tor Browser", "Browser", "TorBrowser", "Data", "Browser",
+                                 "profile.default"))
+
+                for c in candidates:
+                    if os.path.isdir(c):
+                        return c
+
+                # If the normal path does not exist yet, return the first candidate
+                # so user.js can be created when possible.
+                return candidates[0] if candidates else ""
+            except Exception:
+                return ""
+
+        def _disable_javascript_userjs(profile_dir: str) -> Dict[str, Any]:
+            """
+            Write/merge managed Tor Browser prefs into user.js.
+            This disables JavaScript and sets Tor Browser security level to Safest.
+            """
+            out: Dict[str, Any] = {
+                "ok": False,
+                "profile_dir": profile_dir,
+                "user_js": "",
+                "error": None,
+            }
+
+            try:
+                profile_dir = os.path.expandvars(os.path.expanduser(str(profile_dir or "").strip().strip('"')))
+                if not profile_dir:
+                    out["error"] = "missing_profile_dir"
+                    return out
+
+                os.makedirs(profile_dir, exist_ok=True)
+                user_js_path = os.path.join(profile_dir, "user.js")
+
+                begin = "// === OnionTracker managed prefs begin ==="
+                end = "// === OnionTracker managed prefs end ==="
+
+                managed_block = "\n".join([
+                    begin,
+                    "// Disable JavaScript for onion-compatible interactive mode.",
+                    'user_pref("javascript.enabled", false);',
+                    'user_pref("javascript.options.wasm", false);',
+                    'user_pref("dom.serviceWorkers.enabled", false);',
+                    'user_pref("dom.workers.enabled", false);',
+                    'user_pref("dom.indexedDB.enabled", false);',
+                    "",
+                    "// Tor Browser security slider: 1=Standard, 2=Safer, 3=Safest.",
+                    'user_pref("browser.security_level.security_slider", 3);',
+                    end,
+                    "",
+                ])
+
+                existing = ""
+                if os.path.isfile(user_js_path):
+                    try:
+                        with open(user_js_path, "r", encoding="utf-8", errors="ignore") as f:
+                            existing = f.read()
+                    except Exception:
+                        existing = ""
+
+                # Remove older managed block if present.
+                pattern = re.compile(
+                    re.escape(begin) + r".*?" + re.escape(end) + r"\s*",
+                    re.IGNORECASE | re.DOTALL,
+                )
+                cleaned = pattern.sub("", existing).rstrip()
+
+                with open(user_js_path, "w", encoding="utf-8") as f:
+                    if cleaned:
+                        f.write(cleaned + "\n\n")
+                    f.write(managed_block)
+
+                out["ok"] = True
+                out["user_js"] = user_js_path
+                return out
+
+            except Exception as e:
+                out["error"] = str(e)
+                return out
+
+        try:
+            import subprocess
+            import time as _time
+
+            # Allow either firefox.exe or tor.exe to be passed in.
+            browser_exe = self._find_tor_browser_executable(tor_browser_path)
+            if not browser_exe:
+                browser_exe = _derive_browser_from_tor_exe(tor_browser_path)
+
+            profile_dir = _derive_profile_dir(browser_exe, tor_browser_path)
+            result["profile_dir"] = profile_dir
+
+            js_result = _disable_javascript_userjs(profile_dir)
+            result["user_js"] = js_result.get("user_js") or ""
+            result["javascript_disabled"] = bool(js_result.get("ok"))
+
+            if not js_result.get("ok"):
+                result["warning"] = f"javascript_disable_failed: {js_result.get('error')}"
+
+            # If Tor Browser is already open, the proxy is usable, but user.js may
+            # not apply until Tor Browser is restarted.
+            if self._tcp_port_open(socks_host, int(socks_port), timeout=0.35):
+                result["ok"] = True
+                result["already_open"] = True
+                if result["javascript_disabled"]:
+                    result["warning"] = (
+                        "Tor Browser was already open. user.js was written, but "
+                        "JavaScript prefs may not apply until Tor Browser is restarted."
+                    )
+                return result
+
+            if not browser_exe:
+                result["error"] = (
+                    "tor_browser_not_found: set oniontracker.tor_browser_path to "
+                    "Tor Browser\\Browser\\firefox.exe, or pass your tor.exe path so "
+                    "Browser\\firefox.exe can be derived"
+                )
+                return result
+
+            cmd = [browser_exe]
+            if open_url and start_url:
+                cmd.extend(["-new-tab", start_url])
+
+            creationflags = 0
+            try:
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            except Exception:
+                creationflags = 0
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+            result["browser_exe"] = browser_exe
+            result["pid"] = getattr(proc, "pid", None)
+
+            deadline = _time.time() + max(5.0, float(startup_timeout or 60.0))
+            while _time.time() < deadline:
+                if self._tcp_port_open(socks_host, int(socks_port), timeout=0.5):
+                    result["ok"] = True
+                    return result
+
+                if proc.poll() is not None:
+                    # Some Tor Browser launchers exit after handing off to firefox.
+                    # Continue waiting for the proxy instead of failing immediately.
+                    pass
+
+                _time.sleep(0.5)
+
+            result["error"] = f"tor_browser_started_but_proxy_not_ready_at_{socks_host}:{socks_port}"
+            return result
+
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+
+    # ------------------------------------------------------------------ #
+    # Native Tor Browser interactive session helpers
+    # ------------------------------------------------------------------ #
+    def _open_url_in_tor_browser(self, *, start_url: str, tor_browser_path: str) -> Dict[str, Any]:
+        """
+        Open an onion URL in the real Tor Browser process.
+
+        This is used for interactive mode because Chromium/Playwright may fail
+        to resolve/navigate .onion URLs depending on proxy/DNS behavior. Tor
+        Browser is the onion-compatible browser; the crawler then reuses Tor
+        Browser's natural SOCKS proxy and profile cookies.
+        """
+        result: Dict[str, Any] = {"ok": False, "browser_exe": "", "pid": None, "error": None}
+        try:
+            import subprocess
+            browser_exe = self._find_tor_browser_executable(tor_browser_path)
+            if not browser_exe:
+                result["error"] = (
+                    "tor_browser_not_found: set oniontracker.tor_browser_path to "
+                    "Tor Browser\\Browser\\firefox.exe"
+                )
+                return result
+
+            cmd = [browser_exe]
+            if start_url:
+                cmd.extend(["-new-tab", start_url])
+
+            creationflags = 0
+            try:
+                if os.name == "nt":
+                    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+            except Exception:
+                creationflags = 0
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+            result.update({"ok": True, "browser_exe": browser_exe, "pid": getattr(proc, "pid", None)})
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+    def _resolve_tor_browser_profile_dir(self, *, tor_browser_path: str, tor_browser_profile_dir: str = "") -> str:
+        """
+        Resolve Tor Browser's Firefox profile directory.
+
+        Default Tor Browser profile shape on Windows:
+            Tor Browser\\Browser\\TorBrowser\\Data\\Browser\\profile.default
+        """
+        raw = os.path.expandvars(os.path.expanduser(str(tor_browser_profile_dir or "").strip().strip('"')))
+        if raw and os.path.isdir(raw):
+            return raw
+
+        candidates: List[str] = []
+        seen: Set[str] = set()
+
+        def add(path: str) -> None:
+            path = os.path.expandvars(os.path.expanduser(str(path or "").strip().strip('"')))
+            if path and path not in seen:
+                seen.add(path)
+                candidates.append(path)
+
+        browser_exe = self._find_tor_browser_executable(tor_browser_path)
+        if browser_exe:
+            browser_dir = os.path.dirname(browser_exe)
+            add(os.path.join(browser_dir, "TorBrowser", "Data", "Browser", "profile.default"))
+            add(os.path.join(browser_dir, "Data", "Browser", "profile.default"))
+            # If browser_exe is ...\Tor Browser\Browser\firefox.exe, this is the normal case.
+            add(os.path.join(os.path.dirname(browser_dir), "Browser", "TorBrowser", "Data", "Browser", "profile.default"))
+
+        home = os.path.expanduser("~")
+        bases = [
+            os.getcwd(),
+            home,
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Downloads"),
+            os.environ.get("LOCALAPPDATA", ""),
+            os.environ.get("APPDATA", ""),
+        ]
+        suffixes = [
+            os.path.join("Tor Browser", "Browser", "TorBrowser", "Data", "Browser", "profile.default"),
+            os.path.join("Browser", "TorBrowser", "Data", "Browser", "profile.default"),
+            os.path.join("TorBrowser", "Data", "Browser", "profile.default"),
+            "profile.default",
+        ]
+        for base in bases:
+            if not base:
+                continue
+            for suffix in suffixes:
+                add(os.path.join(base, suffix))
+
+        for path in candidates:
+            try:
+                if os.path.isdir(path):
+                    return path
+            except Exception:
+                pass
+        return raw or ""
+
+    def _read_firefox_cookies_from_profile(self, profile_dir: str) -> List[Dict[str, Any]]:
+        """
+        Read Tor Browser/Firefox cookies from cookies.sqlite.
+
+        The DB is copied first so this works even when the browser has recently
+        used it. If it is still locked, this simply returns an empty list and
+        the crawl continues unauthenticated instead of crashing.
+        """
+        if not profile_dir:
+            return []
+        db_path = os.path.join(profile_dir, "cookies.sqlite")
+        if not os.path.isfile(db_path):
+            return []
+        tmp_path = ""
+        rows: List[Dict[str, Any]] = []
+        try:
+            import shutil
+            import sqlite3
+            import tempfile
+            import time as _time
+
+            fd, tmp_path = tempfile.mkstemp(prefix="oniontracker_cookies_", suffix=".sqlite")
+            os.close(fd)
+            try:
+                shutil.copy2(db_path, tmp_path)
+            except Exception:
+                tmp_path = db_path
+
+            conn = sqlite3.connect(tmp_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT host, name, value, path, expiry, isSecure, isHttpOnly "
+                    "FROM moz_cookies"
+                )
+                now = int(_time.time())
+                for host, name, value, path, expiry, is_secure, is_http_only in cur.fetchall():
+                    try:
+                        if expiry and int(expiry) < now:
+                            continue
+                    except Exception:
+                        pass
+                    rows.append({
+                        "host": str(host or ""),
+                        "name": str(name or ""),
+                        "value": str(value or ""),
+                        "path": str(path or "/"),
+                        "expiry": expiry,
+                        "secure": bool(is_secure),
+                        "http_only": bool(is_http_only),
+                    })
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return []
+        finally:
+            try:
+                if tmp_path and tmp_path != db_path and os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+        return rows
+
+    def _cookie_matches_url(self, cookie: Dict[str, Any], url: str) -> bool:
+        try:
+            p = urlparse(url)
+            host = (p.hostname or "").lower()
+            scheme = (p.scheme or "http").lower()
+            chost = str(cookie.get("host") or "").lower().lstrip(".")
+            if not host or not chost:
+                return False
+            if bool(cookie.get("secure")) and scheme != "https":
+                return False
+            return host == chost or host.endswith("." + chost)
+        except Exception:
+            return False
+
+    def _cookie_header_from_profile(self, profile_dir: str, url: str) -> str:
+        cookies = self._read_firefox_cookies_from_profile(profile_dir)
+        if not cookies:
+            return ""
+        parts: List[str] = []
+        seen: Set[str] = set()
+        for c in cookies:
+            if not self._cookie_matches_url(c, url):
+                continue
+            name = str(c.get("name") or "").strip()
+            value = str(c.get("value") or "")
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            parts.append(f"{name}={value}")
+        return "; ".join(parts)
+
+    def _last_url_from_tor_profile(self, profile_dir: str) -> str:
+        """
+        Best-effort final URL discovery from Tor Browser's places.sqlite.
+        This is only used to choose a starting point after manual browsing.
+        """
+        if not profile_dir:
+            return ""
+        db_path = os.path.join(profile_dir, "places.sqlite")
+        if not os.path.isfile(db_path):
+            return ""
+        tmp_path = ""
+        try:
+            import shutil
+            import sqlite3
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(prefix="oniontracker_places_", suffix=".sqlite")
+            os.close(fd)
+            try:
+                shutil.copy2(db_path, tmp_path)
+            except Exception:
+                tmp_path = db_path
+            conn = sqlite3.connect(tmp_path)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT url FROM moz_places "
+                    "WHERE url LIKE 'http%' "
+                    "ORDER BY last_visit_date DESC LIMIT 1"
+                )
+                row = cur.fetchone()
+                return str(row[0] or "") if row else ""
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return ""
+        finally:
+            try:
+                if tmp_path and tmp_path != db_path and os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
+    async def _interactive_tor_browser_session(
+        self,
+        start_url: str,
+        *,
+        tor_browser_path: str,
+        tor_browser_profile_dir: str,
+        socks_host: str,
+        socks_port: int,
+        startup_timeout: float,
+        close_mode: str = "enter",
+        wait_poll_ms: int = 750,
+        open_url: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Onion-compatible interactive mode.
+
+        This opens the real Tor Browser, not Playwright Chromium. When the user
+        finishes interacting, the tracker reads Tor Browser's profile cookies and
+        crawls through Tor Browser's natural SOCKS proxy on 127.0.0.1:9150.
+
+        Recommended close_mode is "enter": leave Tor Browser open, press ENTER,
+        and the crawler runs while Tor Browser keeps the 9150 proxy alive.
+        """
+        result: Dict[str, Any] = {
+            "ok": False,
+            "engine": "torbrowser",
+            "final_url": start_url,
+            "title": "",
+            "profile_dir": "",
+            "storage_state_path": "",
+            "storage_mode": "tor_browser_profile_cookies",
+            "cookie_count": 0,
+            "proxy_url": self._format_proxy_url(socks_host, socks_port, "socks5"),
+            "browser": {},
+            "error": None,
+        }
+        try:
+            open_info = self._open_tor_browser_native_proxy(
+                start_url=start_url,
+                tor_browser_path=tor_browser_path,
+                socks_host=socks_host,
+                socks_port=int(socks_port),
+                startup_timeout=startup_timeout,
+                open_url=open_url,
+            )
+            result["browser"] = open_info
+            if not open_info.get("ok"):
+                # Try opening a tab directly if the proxy was already up but no URL was launched.
+                direct_open = self._open_url_in_tor_browser(start_url=start_url, tor_browser_path=tor_browser_path)
+                result["browser_direct_open"] = direct_open
+
+            # Wait for Tor Browser's natural SOCKS proxy.
+            import time as _time
+            deadline = _time.time() + max(5.0, float(startup_timeout or 60.0))
+            while _time.time() < deadline:
+                if self._tcp_port_open(socks_host, int(socks_port), timeout=0.5):
+                    break
+                await asyncio.sleep(0.5)
+            if not self._tcp_port_open(socks_host, int(socks_port), timeout=0.5):
+                result["error"] = f"tor_browser_proxy_not_ready_at_{socks_host}:{socks_port}"
+                return result
+
+            profile_dir = self._resolve_tor_browser_profile_dir(
+                tor_browser_path=tor_browser_path,
+                tor_browser_profile_dir=tor_browser_profile_dir,
+            )
+            result["profile_dir"] = profile_dir
+            result["storage_state_path"] = profile_dir
+
+            mode = (close_mode or "enter").strip().lower()
+            if mode in {"enter", "press_enter", "manual_enter", "keep_open"}:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: input(
+                        "\n[OnionTracker] Tor Browser is open. Browse/login/click normally. "
+                        "Leave Tor Browser open, then press ENTER here to start tracking with this Tor Browser session...\n"
+                    ),
+                )
+            else:
+                # Close-browser mode is supported, but if Tor Browser closes its
+                # 9150 proxy the crawler may lose network. The block will try to
+                # continue using cookies; proxy validation later catches failures.
+                while self._tcp_port_open(socks_host, int(socks_port), timeout=0.35):
+                    await asyncio.sleep(max(0.25, float(wait_poll_ms or 750) / 1000.0))
+
+            last_url = self._last_url_from_tor_profile(profile_dir)
+            if last_url:
+                result["final_url"] = self._canonicalize_url(last_url)
+
+            try:
+                result["cookie_count"] = len(self._read_firefox_cookies_from_profile(profile_dir))
+            except Exception:
+                result["cookie_count"] = 0
+
+            result["ok"] = True
+            return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
     # ------------------------------------------------------------------ #
     # Interactive authenticated session helpers
     # ------------------------------------------------------------------ #
@@ -38983,117 +40211,183 @@ class OnionTrackerBlock(BaseBlock):
         wait_poll_ms: int = 750,
     ) -> Dict[str, Any]:
         """
-        Open a visible browser so the user can log in manually.
-        After the window is closed, persist Playwright storage state so
-        subsequent sniff/fetch steps reuse the authenticated session.
+        Open a visible persistent Chromium profile so the user can browse,
+        log in, solve normal site flows, move to the page they want, and then
+        close the browser.
+
+        Important fix:
+        - Do NOT depend on storage_state() after close_browser mode.
+        - Use launch_persistent_context(user_data_dir=...) so cookies/local
+          storage/session data are already on disk when the user closes the
+          window.
+        - After the visible browser closes, crawler fetches reuse this same
+          profile directory in headless/non-headless mode.
 
         Returns:
             {
                 "ok": bool,
                 "final_url": str,
                 "title": str,
-                "storage_state_path": str,
+                "storage_state_path": str,   # profile directory, not just JSON
+                "storage_state_file": str,   # optional JSON state file
+                "storage_mode": "persistent_profile",
                 "error": Optional[str],
             }
         """
+        profile_dir = self._interactive_profile_dir(session_file)
         result: Dict[str, Any] = {
             "ok": False,
             "final_url": start_url,
             "title": "",
-            "storage_state_path": session_file,
+            "storage_state_path": profile_dir,
+            "storage_state_file": session_file,
+            "storage_mode": "persistent_profile",
             "error": None,
         }
 
-        launch_proxy = None
-        if proxy_url:
-            try:
-                pu = urlparse(proxy_url)
-                if pu.scheme and pu.hostname and pu.port:
-                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
-            except Exception:
-                launch_proxy = None
+        try:
+            parent = os.path.dirname(os.path.abspath(profile_dir))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            os.makedirs(profile_dir, exist_ok=True)
+        except Exception as e:
+            result["error"] = f"failed_to_create_profile_dir: {e}"
+            return result
 
-        browser = None
+        launch_proxy = self._playwright_proxy(proxy_url)
         context = None
         page = None
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
+                context = await p.chromium.launch_persistent_context(
+                    user_data_dir=profile_dir,
                     headless=False,
                     proxy=launch_proxy,
-                )
-                context = await browser.new_context(
                     ignore_https_errors=True,
-                    java_script_enabled=False,
+                    java_script_enabled=True,
                 )
-                page = await context.new_page()
-                await page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+                if context.pages:
+                    page = context.pages[0]
+                else:
+                    page = await context.new_page()
+
+                try:
+                    await page.goto(start_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as nav_error:
+                    # Keep the browser open even if initial navigation times out;
+                    # the user can still browse manually.
+                    result["error"] = f"initial_navigation_warning: {nav_error}"
 
                 close_mode = (close_mode or "close_browser").strip().lower()
 
-                if close_mode == "enter":
+                if close_mode in {"enter", "press_enter", "manual_enter"}:
                     loop = asyncio.get_running_loop()
                     await loop.run_in_executor(
                         None,
                         lambda: input(
-                            "\n[OnionTracker] Log in / interact with the site, then press ENTER here to continue...\n"
+                            "\n[OnionTracker] Browse/login in the opened browser, then press ENTER here to start tracking with this session...\n"
                         ),
                     )
-                else:
-                    # Wait until browser/page/context is closed by the user
-                    while True:
-                        try:
-                            if page.is_closed():
-                                break
-                            await asyncio.sleep(max(0.1, float(wait_poll_ms) / 1000.0))
-                        except Exception:
-                            break
 
-                # Try to save state if browser/context is still alive
+                    try:
+                        if page is not None and not page.is_closed():
+                            result["final_url"] = page.url
+                            result["title"] = await page.title()
+                    except Exception:
+                        pass
+
+                    # Optional compatibility artifact for older state users.
+                    try:
+                        if session_file:
+                            sf_parent = os.path.dirname(os.path.abspath(session_file))
+                            if sf_parent:
+                                os.makedirs(sf_parent, exist_ok=True)
+                            await context.storage_state(path=session_file)
+                    except Exception:
+                        pass
+
+                    result["ok"] = True
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    return result
+
+                # Default mode: user closes the visible browser window.
+                # Track last known URL/title while it is open. Once it is closed,
+                # the persistent profile directory contains the current session.
+                loop = asyncio.get_running_loop()
+                closed_future = loop.create_future()
+
+                def _mark_closed(*_args: Any) -> None:
+                    try:
+                        if not closed_future.done():
+                            closed_future.set_result(True)
+                    except Exception:
+                        pass
+
+                try:
+                    context.on("close", _mark_closed)
+                except Exception:
+                    pass
+
+                while True:
+                    if closed_future.done():
+                        break
+
+                    try:
+                        live_pages = [pg for pg in list(context.pages or []) if not pg.is_closed()]
+                    except Exception:
+                        break
+
+                    if not live_pages:
+                        break
+
+                    page = live_pages[-1]
+                    try:
+                        result["final_url"] = page.url or result["final_url"]
+                    except Exception:
+                        pass
+                    try:
+                        result["title"] = await page.title()
+                    except Exception:
+                        pass
+
+                    await asyncio.sleep(max(0.1, float(wait_poll_ms or 750) / 1000.0))
+
+                # The user closing the browser is success; profile data persists.
+                result["ok"] = True
+
+                # If the context is still technically open because only the last
+                # tab was closed, close it cleanly.
                 try:
                     if context is not None:
-                        if page is not None and not page.is_closed():
-                            try:
-                                result["final_url"] = page.url
-                            except Exception:
-                                pass
-                            try:
-                                result["title"] = await page.title()
-                            except Exception:
-                                pass
-
-                        await context.storage_state(path=session_file)
-                        result["ok"] = True
-                except Exception as e:
-                    result["error"] = f"failed_to_save_storage_state: {e}"
-                finally:
-                    try:
-                        if context is not None:
-                            await context.close()
-                    except Exception:
-                        pass
-                    try:
-                        if browser is not None:
-                            await browser.close()
-                    except Exception:
-                        pass
+                        await context.close()
+                except Exception:
+                    pass
 
                 return result
 
         except Exception as e:
+            # If the visible browser was closed hard, Playwright may throw here.
+            # Treat it as success if the persistent profile directory exists,
+            # because that is the state source used for the crawler.
+            if os.path.isdir(profile_dir):
+                result["ok"] = True
+                if not result.get("error"):
+                    result["error"] = f"browser_closed_or_disconnected: {e}"
+                return result
+
             result["error"] = str(e)
             try:
                 if context is not None:
                     await context.close()
             except Exception:
                 pass
-            try:
-                if browser is not None:
-                    await browser.close()
-            except Exception:
-                pass
             return result
+
     async def _fetch_playwright_with_state(
         self,
         url: str,
@@ -39133,31 +40427,54 @@ class OnionTrackerBlock(BaseBlock):
             "error": None,
         }
 
-        launch_proxy = None
-        if proxy_url:
-            try:
-                pu = urlparse(proxy_url)
-                if pu.scheme and pu.hostname and pu.port:
-                    launch_proxy = {"server": f"{pu.scheme}://{pu.hostname}:{pu.port}"}
-            except Exception:
-                launch_proxy = None
+        launch_proxy = self._playwright_proxy(proxy_url)
+
+        browser = None
+        context = None
+        page = None
+
+        # If storage_state_path is a directory, it is the interactive persistent
+        # profile created by _interactive_auth_session(). Reopen that profile so
+        # cookies/localStorage/session data are reused after the visible browser
+        # has been closed.
+        state_path = str(storage_state_path or "").strip()
+        use_persistent_profile = bool(
+            state_path and (
+                os.path.isdir(state_path) or not state_path.lower().endswith(".json")
+            )
+        )
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=headless,
-                    proxy=launch_proxy,
-                )
+                if use_persistent_profile:
+                    try:
+                        os.makedirs(state_path, exist_ok=True)
+                    except Exception:
+                        pass
 
-                context_kwargs: Dict[str, Any] = {
-                    "ignore_https_errors": True,
-                    "java_script_enabled": False,
-                }
-                if storage_state_path and os.path.exists(storage_state_path):
-                    context_kwargs["storage_state"] = storage_state_path
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=state_path,
+                        headless=headless,
+                        proxy=launch_proxy,
+                        ignore_https_errors=True,
+                        java_script_enabled=True,
+                    )
+                    page = context.pages[0] if context.pages else await context.new_page()
+                else:
+                    browser = await p.chromium.launch(
+                        headless=headless,
+                        proxy=launch_proxy,
+                    )
 
-                context = await browser.new_context(**context_kwargs)
-                page = await context.new_page()
+                    context_kwargs: Dict[str, Any] = {
+                        "ignore_https_errors": True,
+                        "java_script_enabled": True,
+                    }
+                    if state_path and os.path.isfile(state_path):
+                        context_kwargs["storage_state"] = state_path
+
+                    context = await browser.new_context(**context_kwargs)
+                    page = await context.new_page()
 
                 network_links: Set[str] = set()
 
@@ -39256,16 +40573,33 @@ class OnionTrackerBlock(BaseBlock):
                 if return_network_sniff_links:
                     result["network_links"] = sorted(network_links)[:max_links_per_page]
 
-                await context.close()
-                await browser.close()
+                try:
+                    if context is not None:
+                        await context.close()
+                except Exception:
+                    pass
+                try:
+                    if browser is not None:
+                        await browser.close()
+                except Exception:
+                    pass
+
                 return result
 
         except Exception as e:
             result["error"] = str(e)
+            try:
+                if context is not None:
+                    await context.close()
+            except Exception:
+                pass
+            try:
+                if browser is not None:
+                    await browser.close()
+            except Exception:
+                pass
             return result
-    # ------------------------------------------------------------------ #
-    # Sync wrapper
-    # ------------------------------------------------------------------ #
+
     def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         return asyncio.run(self._execute_async(payload, params=params))
 
@@ -39527,6 +40861,71 @@ class OnionTrackerBlock(BaseBlock):
 
         return base + overlap
 
+    def _build_query_terms(self, query: str, *, max_terms: int = 32) -> List[str]:
+        """
+        Convert the user's search query into stable ranking/filter terms.
+
+        This keeps the public block signatures unchanged while adding a real
+        query target for OnionTracker. The full query phrase is kept first,
+        then comma/pipe/semicolon chunks, then normalized tokens.
+        """
+        raw = str(query or "").strip()
+        if not raw:
+            return []
+
+        terms: List[str] = []
+
+        def add_term(x: str) -> None:
+            t = re.sub(r"\s+", " ", str(x or "").strip().lower())
+            if len(t) < 3:
+                return
+            if t not in terms:
+                terms.append(t)
+
+        add_term(raw)
+        for chunk in re.split(r"[,;|]+", raw):
+            add_term(chunk)
+        for token in self._TEXT_TOKEN_RE.findall(raw.lower()):
+            add_term(token)
+
+        return terms[:max(1, int(max_terms or 32))]
+
+    def _merge_terms_unique(self, *groups: Iterable[str], max_terms: int = 96) -> List[str]:
+        out: List[str] = []
+        seen: Set[str] = set()
+        for group in groups:
+            for item in group or []:
+                t = str(item or "").strip().lower()
+                if len(t) < 3 or t in seen:
+                    continue
+                seen.add(t)
+                out.append(t)
+                if len(out) >= max_terms:
+                    return out
+        return out
+
+    def _query_overlap_score(
+        self,
+        *,
+        url: str,
+        title: str,
+        text: str,
+        query_terms: List[str],
+        search_url: bool = True,
+        search_title: bool = True,
+        search_body: bool = True,
+    ) -> int:
+        if not query_terms:
+            return 0
+        parts: List[str] = []
+        if search_url:
+            parts.append(url or "")
+        if search_title:
+            parts.append(title or "")
+        if search_body:
+            parts.append(text or "")
+        return self._term_overlap(" ".join(parts), query_terms)
+
     # ------------------------------------------------------------------ #
     # Memory helpers
     # ------------------------------------------------------------------ #
@@ -39612,21 +41011,29 @@ class OnionTrackerBlock(BaseBlock):
             ssl_ctx = False
 
         connector = None
+        proxy_url = str(proxy_url or "").strip()
 
-        # SOCKS support if available.
+        # Critical onion fix: never fall back to a normal TCPConnector for
+        # SOCKS/.onion traffic. That fallback causes local Windows DNS
+        # getaddrinfo() and produces: onion:80 ssl:default [getaddrinfo failed].
         if proxy_url and proxy_url.lower().startswith("socks"):
             try:
                 from aiohttp_socks import ProxyConnector  # type: ignore
-                connector = ProxyConnector.from_url(
-                    proxy_url,
-                    ssl=ssl_ctx,
-                    limit_per_host=max(1, int(http_max_conn_per_host or 8)),
-                )
-            except Exception:
-                connector = aiohttp.TCPConnector(
-                    ssl=ssl_ctx,
-                    limit_per_host=max(1, int(http_max_conn_per_host or 8)),
-                )
+            except Exception as e:
+                raise RuntimeError(
+                    "aiohttp_socks is required for .onion tracking through Tor. "
+                    "Install it with: pip install aiohttp_socks PySocks"
+                ) from e
+
+            # Keep URL scheme as socks5:// because aiohttp_socks rejects
+            # socks5h://. Remote onion DNS is controlled by rdns=True below.
+            proxy_url = self._socks_remote_dns_proxy_url(proxy_url)
+            connector = ProxyConnector.from_url(
+                proxy_url,
+                ssl=ssl_ctx,
+                rdns=True,
+                limit_per_host=max(1, int(http_max_conn_per_host or 8)),
+            )
         else:
             connector = aiohttp.TCPConnector(
                 ssl=ssl_ctx,
@@ -40109,12 +41516,29 @@ class OnionTrackerBlock(BaseBlock):
                 {"ok": False, "error": "invalid_onion_link", "onion_link": onion_link},
             )
 
+        raw_payload_query = "" if payload is None else str(payload).strip()
+        query = str(params.get("query", raw_payload_query)).strip()
+        query_terms = self._build_query_terms(
+            query,
+            max_terms=int(params.get("query_max_terms", 32)),
+        )
+        query_required = bool(params.get("query_required", bool(query_terms)))
+        query_min_overlap = int(params.get("query_min_overlap", 1 if query_terms else 0))
+        query_boost = float(params.get("query_boost", 5.0))
+        query_search_url = bool(params.get("query_search_url", True))
+        query_search_title = bool(params.get("query_search_title", True))
+        query_search_body = bool(params.get("query_search_body", True))
+
         timeout = float(params.get("timeout", 15))
         timeout_ms = int(timeout * 1000)
         verify = bool(params.get("verify", False))
         scan_limit = int(params.get("scan_limit", 32))
         extensions = [s.strip().lower() for s in str(params.get("extensions", "")).split(",") if s.strip()]
         url_keywords = [s.strip().lower() for s in str(params.get("url_keywords", "")).split(",") if s.strip()]
+        if query_terms:
+            # Let the query influence URL/title ranking even when url_keywords
+            # is left blank in the GUI preset.
+            url_keywords = self._merge_terms_unique(url_keywords, query_terms, max_terms=96)
         site_require = str(params.get("site_require", "")).strip().lower()
         use_js = bool(params.get("use_js", False))
         return_all_js_links = bool(params.get("return_all_js_links", False))
@@ -40154,20 +41578,88 @@ class OnionTrackerBlock(BaseBlock):
         use_body = bool(params.get("use_body", True))
         use_camoufox = bool(params.get("use_camoufox", False))
         camoufox_options = params.get("camoufox_options", {}) or {}
-        tor_proxy = str(params.get("tor_proxy", "socks5://127.0.0.1:9050")).strip()
+        tor_proxy = str(params.get("tor_proxy", self.DEFAULT_ONIONTRACKER_TOR_PROXY)).strip()
+        tor_auto_detect = bool(params.get("tor_auto_detect", True))
+        tor_auto_start = bool(params.get("tor_auto_start", True))
+        tor_require_proxy = bool(params.get("tor_require_proxy", True))
+        tor_fallback_ports = str(params.get("tor_fallback_ports", "9150")).strip()
+        tor_exe_path = str(params.get("tor_exe_path", self.DEFAULT_ONIONTRACKER_TOR_EXE_PATH)).strip()
+        tor_socks_host = str(params.get("tor_socks_host", "127.0.0.1")).strip() or "127.0.0.1"
+        tor_socks_port = int(params.get("tor_socks_port", 9150))
+        tor_data_dir = str(params.get("tor_data_dir", "oniontracker_tor_data")).strip()
+        tor_startup_timeout = float(params.get("tor_startup_timeout", 45))
+        tor_extra_args = str(params.get("tor_extra_args", "")).strip()
+        tor_force_torexe_after_interactive = bool(params.get("tor_force_torexe_after_interactive", True))
+        tor_tracker_socks_host = str(params.get("tor_tracker_socks_host", "127.0.0.1")).strip() or "127.0.0.1"
+        tor_tracker_socks_port = int(params.get("tor_tracker_socks_port", 9150))
+        tor_tracker_data_dir = str(params.get("tor_tracker_data_dir", "oniontracker_tracker_tor_data")).strip()
+        tor_tracker_startup_timeout = float(params.get("tor_tracker_startup_timeout", tor_startup_timeout))
+        tor_rebuild_session_after_interactive = bool(params.get("tor_rebuild_session_after_interactive", True))
+        tracker_use_js_after_interactive = bool(params.get("tracker_use_js_after_interactive", True))
+        tracker_attach_interactive_cookies = bool(params.get("tracker_attach_interactive_cookies", True))
+        tracker_probe_after_interactive = bool(params.get("tracker_probe_after_interactive", True))
+        tor_browser_native_proxy = bool(params.get("tor_browser_native_proxy", False))
+        tor_browser_auto_open = bool(params.get("tor_browser_auto_open", True))
+        tor_browser_path = str(params.get("tor_browser_path", "")).strip()
+        tor_browser_socks_host = str(params.get("tor_browser_socks_host", "127.0.0.1")).strip() or "127.0.0.1"
+        tor_browser_socks_port = int(params.get("tor_browser_socks_port", 9150))
+        tor_browser_startup_timeout = float(params.get("tor_browser_startup_timeout", tor_startup_timeout))
+        tor_browser_open_url = bool(params.get("tor_browser_open_url", True))
+        tor_browser_profile_dir = str(params.get("tor_browser_profile_dir", "")).strip()
+        tor_browser_session_cookies = bool(params.get("tor_browser_session_cookies", True))
+        torbrowser_disable_playwright_crawl = bool(params.get("torbrowser_disable_playwright_crawl", True))
         same_host_only = bool(params.get("same_host_only", True))
         allow_non_onion = bool(params.get("allow_non_onion", False))
         user_agent = str(params.get("user_agent", "Mozilla/5.0 OnionTrackerBlock/1.0"))
         return_format = str(params.get("mode", "pages")).strip().lower()
 
         interactive_mode = bool(params.get("interactive_mode", True))
+        interactive_browser = str(params.get("interactive_browser", "playwright")).strip().lower()
+        if interactive_browser in {"tor", "tor_browser", "native", "firefox"}:
+            interactive_browser = "torbrowser"
+        if interactive_browser in {"torproxy", "tor_proxy", "tor-exe", "torexe"}:
+            interactive_browser = "playwright"
+        if interactive_browser not in {"torbrowser", "playwright"}:
+            interactive_browser = "playwright"
         interactive_start_url = str(params.get("interactive_start_url", "")).strip()
-        interactive_close_mode = str(params.get("interactive_close_mode", "close_browser")).strip().lower()
+        interactive_close_mode = str(params.get("interactive_close_mode", "enter" if interactive_browser == "torbrowser" else "close_browser")).strip().lower()
         interactive_session_file = str(params.get("interactive_session_file", "oniontracker_session.json")).strip()
         interactive_wait_poll_ms = int(params.get("interactive_wait_poll_ms", 750))
         interactive_headless_after_login = bool(params.get("interactive_headless_after_login", True))
+        interactive_track_final_url = bool(params.get("interactive_track_final_url", True))
+        interactive_open_onion_site = bool(params.get("interactive_open_onion_site", True))
+        interactive_history_as_seeds = bool(params.get("interactive_history_as_seeds", True))
+        interactive_history_seed_limit = int(params.get("interactive_history_seed_limit", 64))
+        interactive_start_from_last_url = bool(params.get("interactive_start_from_last_url", True))
+        tracker_force_playwright_after_interactive = bool(params.get("tracker_force_playwright_after_interactive", True))
+
+        # Hard 9150 policy: this block is meant to run all interactive and
+        # tracker traffic through the same base Tor SOCKS endpoint. Do not let
+        # old presets drift to 9050/9152 unless the caller explicitly changes
+        # every related field.
+        tor_proxy = self._format_proxy_url("127.0.0.1", 9150, "socks5") if not tor_proxy else self._socks_remote_dns_proxy_url(tor_proxy)
+        if ":9050" in tor_proxy or ":9152" in tor_proxy:
+            tor_proxy = self._format_proxy_url("127.0.0.1", 9150, "socks5")
+        tor_socks_host = "127.0.0.1"
+        tor_socks_port = 9150
+        tor_browser_socks_host = "127.0.0.1"
+        tor_browser_socks_port = 9150
+        tor_tracker_socks_host = "127.0.0.1"
+        tor_tracker_socks_port = 9150
+        tor_fallback_ports = "9150"
+
+        # Onion-compatible interactive mode uses real Tor Browser, not
+        # Playwright Chromium. Playwright is kept only as an explicit fallback.
+        if interactive_mode and interactive_browser == "playwright":
+            use_js = True
+        elif interactive_mode and interactive_browser == "torbrowser" and torbrowser_disable_playwright_crawl:
+            use_js = False
 
         interactive_storage_state_path = ""
+        interactive_auth_result: Dict[str, Any] = {}
+        interactive_history_urls: List[str] = []
+        tor_proxy_info: Dict[str, Any] = {}
+        tor_browser_cookie_header = ""
 
         if site_require:
             root_host = (urlparse(onion_link).hostname or "").lower()
@@ -40183,6 +41675,77 @@ class OnionTrackerBlock(BaseBlock):
         if use_database:
             self._init_db(db_path)
 
+        # Native Tor Browser proxy mode: prefer the SOCKS endpoint Tor Browser
+        # opens naturally on 127.0.0.1:9150. This avoids the old failure where
+        # Chromium was pointed at 9050 while no Tor service existed.
+        seed = self._canonicalize_url(onion_link)
+        tor_browser_info: Dict[str, Any] = {}
+        if tor_browser_native_proxy:
+            tor_proxy = self._format_proxy_url(tor_browser_socks_host, tor_browser_socks_port, "socks5")
+            tor_socks_host = tor_browser_socks_host
+            tor_socks_port = tor_browser_socks_port
+            # In torbrowser interactive mode, the real Tor Browser session
+            # helper opens the onion site and waits for user interaction. Do
+            # not open a second Playwright/Chromium window here.
+            if interactive_mode and interactive_browser != "torbrowser" and tor_browser_auto_open:
+                native_start_url = self._canonicalize_url(interactive_start_url or (onion_link if interactive_open_onion_site else seed))
+                tor_browser_info = self._open_tor_browser_native_proxy(
+                    start_url=native_start_url,
+                    tor_browser_path=tor_browser_path,
+                    socks_host=tor_browser_socks_host,
+                    socks_port=tor_browser_socks_port,
+                    startup_timeout=tor_browser_startup_timeout,
+                    open_url=tor_browser_open_url,
+                )
+
+        # Critical onion-browser fix: before opening Playwright, make sure a
+        # real Tor SOCKS endpoint exists. Otherwise Chromium opens into
+        # ERR_PROXY_CONNECTION_FAILED. In native mode we prefer Tor Browser's
+        # natural 9150 proxy; in legacy mode we can still fall back to tor.exe.
+        if interactive_mode or self._is_onion_url(onion_link):
+            tor_proxy_info = self._ensure_tor_proxy(
+                proxy_url=tor_proxy,
+                auto_detect=tor_auto_detect,
+                auto_start=tor_auto_start,
+                fallback_ports=tor_fallback_ports,
+                tor_exe_path=tor_exe_path,
+                tor_socks_host=tor_socks_host,
+                tor_socks_port=tor_socks_port,
+                tor_data_dir=tor_data_dir,
+                tor_startup_timeout=tor_startup_timeout,
+                tor_extra_args=tor_extra_args,
+            )
+            if tor_proxy_info.get("ok"):
+                tor_proxy = str(tor_proxy_info.get("proxy_url") or tor_proxy)
+            elif tor_require_proxy:
+                native_detail = ""
+                try:
+                    if tor_browser_info and tor_browser_info.get("error"):
+                        native_detail = str(tor_browser_info.get("error") or "")
+                except Exception:
+                    native_detail = ""
+                detail = native_detail or str(tor_proxy_info.get("error") or "proxy_not_available")
+                return (
+                    "### OnionTracker\n"
+                    f"- Seed: `{html.escape(onion_link)}`\n"
+                    "- Error: Tor SOCKS proxy is not available, so the onion browser cannot open yet.\n"
+                    f"- Detail: `{html.escape(detail)}`\n"
+                    "- Fix: start Tor Browser and use `oniontracker.tor_proxy=socks5://127.0.0.1:9150`, "
+                    "or set `oniontracker.tor_exe_path` to Tor Browser's `Browser\\TorBrowser\\Tor\\tor.exe`.",
+                    {
+                        "ok": False,
+                        "error": "tor_proxy_unavailable",
+                        "detail": detail,
+                        "tor_proxy_info": tor_proxy_info,
+            "tor_force_torexe_after_interactive": tor_force_torexe_after_interactive,
+            "tor_tracker_socks_host": tor_tracker_socks_host,
+            "tor_tracker_socks_port": tor_tracker_socks_port,
+            "tracker_use_js_after_interactive": tracker_use_js_after_interactive,
+            "tracker_attach_interactive_cookies": tracker_attach_interactive_cookies,
+                        "onion_link": onion_link,
+                    },
+                )
+
         session = await self._build_aiohttp_session(
             timeout=timeout,
             http_retries=http_retries,
@@ -40193,16 +41756,35 @@ class OnionTrackerBlock(BaseBlock):
             user_agent=user_agent,
         )
         seed = self._canonicalize_url(onion_link)
-        if interactive_mode and use_js:
-            start_url = self._canonicalize_url(interactive_start_url or onion_link)
-            auth_result = await self._interactive_auth_session(
-                start_url,
-                proxy_url=tor_proxy,
-                timeout_ms=timeout_ms,
-                session_file=interactive_session_file,
-                close_mode=interactive_close_mode,
-                wait_poll_ms=interactive_wait_poll_ms,
-            )
+        if interactive_mode:
+            # By default, bring up the onion site itself in the visible
+            # browser. For .onion sites, use real Tor Browser by default, not
+            # Chromium/Playwright.
+            start_url = self._canonicalize_url(interactive_start_url or (onion_link if interactive_open_onion_site else seed))
+
+            if interactive_browser == "torbrowser":
+                auth_result = await self._interactive_tor_browser_session(
+                    start_url,
+                    tor_browser_path=tor_browser_path,
+                    tor_browser_profile_dir=tor_browser_profile_dir,
+                    socks_host=tor_browser_socks_host,
+                    socks_port=tor_browser_socks_port,
+                    startup_timeout=tor_browser_startup_timeout,
+                    close_mode=interactive_close_mode,
+                    wait_poll_ms=interactive_wait_poll_ms,
+                    open_url=tor_browser_open_url,
+                )
+            else:
+                auth_result = await self._interactive_auth_session(
+                    start_url,
+                    proxy_url=tor_proxy,
+                    timeout_ms=timeout_ms,
+                    session_file=interactive_session_file,
+                    close_mode=interactive_close_mode,
+                    wait_poll_ms=interactive_wait_poll_ms,
+                )
+
+            interactive_auth_result = dict(auth_result or {})
 
             if not auth_result.get("ok"):
                 try:
@@ -40212,21 +41794,173 @@ class OnionTrackerBlock(BaseBlock):
                 return (
                     "### OnionTracker\n"
                     f"- Seed: `{html.escape(seed if 'seed' in locals() else onion_link)}`\n"
-                    f"- Error: interactive authentication failed\n"
+                    f"- Error: interactive browser session failed\n"
+                    f"- Browser: `{html.escape(interactive_browser)}`\n"
                     f"- Detail: `{html.escape(str(auth_result.get('error') or 'unknown'))}`",
                     {
                         "ok": False,
-                        "error": "interactive_auth_failed",
+                        "error": "interactive_session_failed",
+                        "browser": interactive_browser,
                         "detail": auth_result.get("error"),
                         "onion_link": onion_link,
                     },
                 )
 
-            interactive_storage_state_path = auth_result.get("storage_state_path") or ""
+            interactive_storage_state_path = auth_result.get("storage_state_path") or auth_result.get("profile_dir") or ""
+
+            interactive_history_urls = []
+            if interactive_storage_state_path and interactive_history_as_seeds:
+                try:
+                    if interactive_browser == "torbrowser":
+                        # Tor Browser history is handled by final_url/places.sqlite.
+                        last_from_profile = self._last_url_from_tor_profile(interactive_storage_state_path)
+                        if last_from_profile:
+                            interactive_history_urls.append(self._canonicalize_url(last_from_profile))
+                    else:
+                        interactive_history_urls = self._read_chromium_history_urls_from_profile(
+                            interactive_storage_state_path,
+                            root_url=onion_link,
+                            limit=interactive_history_seed_limit,
+                        )
+                except Exception:
+                    interactive_history_urls = []
+
+            # Attach Tor Browser session cookies to HTTP crawler requests. This
+            # is the part that makes the tracker use the interactive-mode
+            # session instead of starting a fresh anonymous fetch.
+            if interactive_browser == "torbrowser" and tor_browser_session_cookies and interactive_storage_state_path:
+                try:
+                    tor_browser_cookie_header = self._cookie_header_from_profile(interactive_storage_state_path, onion_link)
+                    if tor_browser_cookie_header:
+                        session.headers.update({"Cookie": tor_browser_cookie_header})
+                except Exception:
+                    tor_browser_cookie_header = ""
+
+            # Start exactly where the interactive browser left off whenever
+            # possible. The final_url captured by Playwright is preferred, then
+            # browser history is used as a fallback. This prevents root-only
+            # crawls when the onion root returns a generic Error/500 page.
+            auth_final_url = self._canonicalize_url(str(auth_result.get("final_url") or ""))
+            last_profile_url = ""
+            try:
+                if interactive_browser == "torbrowser" and interactive_storage_state_path:
+                    last_profile_url = self._canonicalize_url(self._last_url_from_tor_profile(interactive_storage_state_path) or "")
+                elif interactive_storage_state_path:
+                    last_profile_url = self._last_interactive_url_from_profile(
+                        interactive_storage_state_path,
+                        root_url=onion_link,
+                    )
+            except Exception:
+                last_profile_url = ""
+
+            for candidate_seed in [auth_final_url, last_profile_url] + list(interactive_history_urls or []):
+                candidate_seed = self._canonicalize_url(str(candidate_seed or ""))
+                if not candidate_seed:
+                    continue
+                if self._allowed_url(
+                    candidate_seed,
+                    root_url=onion_link,
+                    same_host_only=same_host_only,
+                    allow_non_onion=allow_non_onion,
+                ):
+                    if interactive_track_final_url or interactive_start_from_last_url:
+                        seed = candidate_seed
+                    break
+        # After interactive mode closes, do not trust the proxy/session that was
+        # used by the visible browser. Closing Tor Browser commonly kills 9150,
+        # and closing Playwright can leave its session connector stale. Start a
+        # dedicated tracker-owned tor.exe SOCKS endpoint and rebuild the HTTP
+        # session so .onion DNS is resolved by Tor during the crawler phase.
+        tracker_proxy_info: Dict[str, Any] = {}
+        if interactive_mode and tor_force_torexe_after_interactive:
+            try:
+                if session is not None:
+                    await session.close()
+            except Exception:
+                pass
+
+            tracker_proxy_info = self._force_tracker_tor_proxy_after_interactive(
+                tor_exe_path=tor_exe_path,
+                tracker_host=tor_tracker_socks_host,
+                tracker_port=tor_tracker_socks_port,
+                tracker_data_dir=tor_tracker_data_dir,
+                startup_timeout=tor_tracker_startup_timeout,
+                tor_extra_args=tor_extra_args,
+            )
+            if not tracker_proxy_info.get("ok"):
+                return (
+                    "### OnionTracker\n"
+                    f"- Seed: `{html.escape(seed)}`\n"
+                    "- Error: tracker tor.exe SOCKS proxy is not available after interactive mode closed.\n"
+                    f"- Detail: `{html.escape(str(tracker_proxy_info.get('error') or 'unknown'))}`\n"
+                    f"- tor.exe: `{html.escape(str(tor_exe_path))}`\n"
+                    f"- Tracker SOCKS: `{html.escape(str(tracker_proxy_info.get('proxy_url') or ''))}`",
+                    {
+                        "ok": False,
+                        "error": "tracker_tor_proxy_unavailable_after_interactive",
+                        "detail": tracker_proxy_info.get("error"),
+                        "tracker_proxy_info": tracker_proxy_info,
+                        "interactive_auth_result": interactive_auth_result,
+                        "onion_link": onion_link,
+                    },
+                )
+
+            tor_proxy = self._socks_remote_dns_proxy_url(str(tracker_proxy_info.get("proxy_url") or tor_proxy))
+            tor_proxy_info = tracker_proxy_info
+
+            # Tracker phase MUST stay on the interactive session and cookies.
+            # Use Playwright by default so the persistent interactive profile
+            # carries cookies/localStorage/sessionStorage into the crawl while
+            # the proxy for every request remains base Tor on 127.0.0.1:9150.
+            if tracker_force_playwright_after_interactive:
+                use_js = True
+            else:
+                use_js = tracker_use_js_after_interactive
+            use_camoufox = False if use_js else use_camoufox
+            tor_proxy = self._format_proxy_url("127.0.0.1", 9150, "socks5")
+
+            session = await self._build_aiohttp_session(
+                timeout=timeout,
+                http_retries=http_retries,
+                http_max_conn_per_host=http_max_conn_per_host,
+                proxy_url=tor_proxy,
+                http_verify_tls=http_verify_tls,
+                http_ca_bundle=http_ca_bundle,
+                user_agent=user_agent,
+            )
+
+            if tracker_attach_interactive_cookies and interactive_storage_state_path:
+                try:
+                    if interactive_browser == "torbrowser":
+                        tor_browser_cookie_header = self._cookie_header_from_profile(interactive_storage_state_path, seed or onion_link)
+                    else:
+                        tor_browser_cookie_header = self._build_plain_cookie_header_from_playwright_profile(interactive_storage_state_path, seed or onion_link)
+                    if tor_browser_cookie_header:
+                        session.headers.update({"Cookie": tor_browser_cookie_header})
+                except Exception:
+                    tor_browser_cookie_header = ""
+
+            if tracker_probe_after_interactive:
+                phost, pport, _pscheme = self._parse_proxy_endpoint(tor_proxy)
+                if not self._tcp_port_open(phost, int(pport), timeout=1.0):
+                    return (
+                        "### OnionTracker\n"
+                        f"- Seed: `{html.escape(seed)}`\n"
+                        "- Error: tracker SOCKS proxy died immediately after restart.\n"
+                        f"- Proxy: `{html.escape(tor_proxy)}`",
+                        {
+                            "ok": False,
+                            "error": "tracker_proxy_died_after_restart",
+                            "tracker_proxy_info": tracker_proxy_info,
+                            "tor_proxy": tor_proxy,
+                        },
+                    )
+
         queue_: collections.deque[Tuple[str, int]] = collections.deque()
         seen: Set[str] = set()
         pages: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
+        query_filtered: List[Dict[str, Any]] = []
         network_links_all: List[str] = []
         runtime_hits_all: List[Any] = []
         react_hits_all: List[Any] = []
@@ -40234,6 +41968,19 @@ class OnionTrackerBlock(BaseBlock):
         interaction_hits_all: List[Any] = []
 
         queue_.append((seed, 0))
+
+        # Start from where interactive browsing left off, then add recent
+        # same-site history URLs. This makes the tracker continue the
+        # interactive session instead of restarting from onion root.
+        try:
+            for u in list(interactive_history_urls or []):
+                cu = self._canonicalize_url(str(u or ""))
+                if not cu or cu == seed:
+                    continue
+                if self._allowed_url(cu, root_url=seed, same_host_only=same_host_only, allow_non_onion=allow_non_onion):
+                    queue_.append((cu, 0))
+        except Exception:
+            pass
 
         # Optional DB seeds from same host
         if use_database and self.store:
@@ -40281,10 +42028,24 @@ class OnionTrackerBlock(BaseBlock):
                 memory_sources=memory_sources,
                 max_terms=64,
             )
+            if query_terms:
+                # Query terms come first so ranking/final lexicon are centered
+                # on the user's requested target instead of only root-page terms.
+                root_terms = self._merge_terms_unique(query_terms, root_terms, max_terms=96)
 
-            # Requeue root as first page
+            # Requeue the actual interactive landing page first, then history
+            # seeds from the same interactive profile.
             queue_.clear()
             queue_.append((seed, 0))
+            try:
+                for u in list(interactive_history_urls or []):
+                    cu = self._canonicalize_url(str(u or ""))
+                    if not cu or cu == seed:
+                        continue
+                    if self._allowed_url(cu, root_url=seed, same_host_only=same_host_only, allow_non_onion=allow_non_onion):
+                        queue_.append((cu, 0))
+            except Exception:
+                pass
 
             while queue_ and len(pages) < max_pages_total and len(seen) < max(scan_limit, max_pages_total * 4):
                 current_url, depth = queue_.popleft()
@@ -40356,6 +42117,16 @@ class OnionTrackerBlock(BaseBlock):
                         if current_url != seed:
                             continue
 
+                query_hits = self._query_overlap_score(
+                    url=current_url,
+                    title=title,
+                    text=text if use_body else "",
+                    query_terms=query_terms,
+                    search_url=query_search_url,
+                    search_title=query_search_title,
+                    search_body=query_search_body,
+                )
+
                 score = self._score_page(
                     current_url,
                     root_url=seed,
@@ -40366,6 +42137,20 @@ class OnionTrackerBlock(BaseBlock):
                     strict_keywords=strict_keywords,
                     min_term_overlap=min_term_overlap,
                 )
+                if query_terms:
+                    score += float(query_hits) * query_boost
+
+                keep_page = True
+                if query_terms and query_required and query_hits < query_min_overlap:
+                    keep_page = False
+                    if len(query_filtered) < 128:
+                        query_filtered.append({
+                            "url": current_url,
+                            "depth": depth,
+                            "title": title,
+                            "query_hits": query_hits,
+                            "required": query_min_overlap,
+                        })
 
                 row = {
                     "url": current_url,
@@ -40375,6 +42160,9 @@ class OnionTrackerBlock(BaseBlock):
                     "host": (urlparse(current_url).hostname or "").lower(),
                     "depth": depth,
                     "score": score,
+                    "query": query,
+                    "query_hits": query_hits,
+                    "query_required": query_required,
                     "engine": page.get("engine"),
                     "text": text if use_body else "",
                     "snippet": (text or "")[:600],
@@ -40387,10 +42175,25 @@ class OnionTrackerBlock(BaseBlock):
                     "interaction_hits": page.get("interaction_hits") or [],
                 }
 
-                if html_text or title or text:
-                    pages.append(row)
-                    if use_database:
-                        self._store_page(row)
+                browser_error_page = self._looks_like_browser_error_page(
+                    title=title,
+                    text=text,
+                    html_text=html_text,
+                )
+
+                if browser_error_page:
+                    failed.append({
+                        "url": current_url,
+                        "depth": depth,
+                        "error": page.get("error") or "browser_error_page_after_interactive",
+                        "title": title,
+                        "engine": page.get("engine"),
+                    })
+                elif html_text or title or text:
+                    if keep_page:
+                        pages.append(row)
+                        if use_database:
+                            self._store_page(row)
                 else:
                     failed.append({
                         "url": current_url,
@@ -40443,7 +42246,8 @@ class OnionTrackerBlock(BaseBlock):
         discovered_links = [str(r.get("url") or "") for r in pages if r.get("url")]
         lexicon = _extract_terms(
             " ".join(
-                [
+                ([query] if query else [])
+                + [
                     " ".join([str(r.get("title") or ""), str(r.get("text") or "")[:2000]])
                     for r in pages
                 ]
@@ -40475,19 +42279,65 @@ class OnionTrackerBlock(BaseBlock):
             out_obj = {
                 "seed": seed,
                 "count": len(pages),
+                "query": query,
+                "query_terms": query_terms,
+                "query_required": query_required,
+                "query_filtered_count": len(query_filtered),
+                "query_filtered": query_filtered,
                 "pages": pages,
                 "failed": failed,
                 "lexicon": lexicon,
+                "interactive": {
+                    "enabled": interactive_mode,
+                    "browser": interactive_browser,
+                    "session_profile": interactive_storage_state_path,
+                    "session_cookie_count": interactive_auth_result.get("cookie_count", 0),
+                    "cookies_attached_to_tracker": bool(tor_browser_cookie_header) or bool(interactive_storage_state_path),
+                    "history_seed_count": len(interactive_history_urls or []),
+                    "history_seeds": list(interactive_history_urls or [])[:32],
+                    "auth_result": interactive_auth_result,
+                },
             }
             out = json.dumps(out_obj, indent=2, ensure_ascii=False)
         else:
             lines: List[str] = []
             lines.append("### OnionTracker")
             lines.append(f"- Seed: `{seed}`")
+            lines.append(f"- Query: `{html.escape(query) if query else '(none)'}`")
+            if query_terms:
+                lines.append(f"- Query terms: `{', '.join(query_terms[:12])}`")
+                lines.append(f"- Query required: **{query_required}** | min overlap: **{query_min_overlap}** | filtered: **{len(query_filtered)}**")
             lines.append(f"- Pages: **{len(pages)}**")
             lines.append(f"- Failures: **{len(failed)}**")
             lines.append(f"- Same-host only: **{same_host_only}**")
             lines.append(f"- Engine: **{'camoufox' if use_camoufox else 'playwright' if use_js else 'http'}**")
+            lines.append(f"- Interactive browser: **{interactive_browser if interactive_mode else 'none'}**")
+            lines.append(f"- Tor proxy: `{tor_proxy}`")
+            if tor_proxy_info:
+                lines.append(f"- Tor proxy source: **{html.escape(str(tor_proxy_info.get('source') or 'unknown'))}**")
+                started = tor_proxy_info.get("started_tor") if isinstance(tor_proxy_info, dict) else None
+                if isinstance(started, dict) and started.get("tor_exe"):
+                    lines.append(f"- tor.exe: `{html.escape(str(started.get('tor_exe')))} `")
+            if tor_browser_native_proxy:
+                lines.append("- Tor Browser proxy mode: **native 9150**")
+                if tor_browser_info.get("already_open"):
+                    lines.append("- Tor Browser: **already running**")
+                elif tor_browser_info.get("browser_exe"):
+                    lines.append(f"- Tor Browser: `{tor_browser_info.get('browser_exe')}`")
+            if interactive_mode:
+                lines.append(f"- Interactive session: **enabled**")
+                if interactive_storage_state_path:
+                    lines.append(f"- Session profile: `{interactive_storage_state_path}`")
+                    lines.append("- Tracker session reuse: **enabled**")
+                if interactive_history_as_seeds:
+                    lines.append(f"- Interactive history seeds: **{len(interactive_history_urls or [])}**")
+                if interactive_browser == "torbrowser":
+                    lines.append(f"- Tor Browser cookies found: **{interactive_auth_result.get('cookie_count', 0)}**")
+                    lines.append(f"- Tracker session cookies attached: **{bool(tor_browser_cookie_header)}**")
+                if interactive_auth_result.get("final_url"):
+                    lines.append(f"- Browser final URL: `{interactive_auth_result.get('final_url')}`")
+            else:
+                lines.append(f"- Interactive session: **disabled**")
 
             if lexicon:
                 lines.append("\n### Lexicon")
@@ -40564,6 +42414,12 @@ class OnionTrackerBlock(BaseBlock):
             "seed": seed,
             "count": len(pages),
             "failed_count": len(failed),
+            "query": query,
+            "query_terms": query_terms,
+            "query_required": query_required,
+            "query_min_overlap": query_min_overlap,
+            "query_filtered_count": len(query_filtered),
+            "query_filtered": query_filtered,
             "pages": pages,
             "failed": failed,
             "lexicon": lexicon,
@@ -40577,6 +42433,25 @@ class OnionTrackerBlock(BaseBlock):
             "use_database": use_database,
             "db_path": db_path if use_database else None,
             "tor_proxy": tor_proxy,
+            "tor_proxy_info": tor_proxy_info,
+            "tor_force_torexe_after_interactive": tor_force_torexe_after_interactive,
+            "tor_tracker_socks_host": tor_tracker_socks_host,
+            "tor_tracker_socks_port": tor_tracker_socks_port,
+            "tracker_use_js_after_interactive": tracker_use_js_after_interactive,
+            "tracker_attach_interactive_cookies": tracker_attach_interactive_cookies,
+            "tor_exe_path": tor_exe_path,
+            "tor_auto_start": tor_auto_start,
+            "tor_browser_native_proxy": tor_browser_native_proxy,
+            "tor_browser_info": tor_browser_info,
+            "tor_browser_profile_dir": tor_browser_profile_dir,
+            "tor_browser_session_cookies": tor_browser_session_cookies,
+            "tor_browser_cookie_header_attached": bool(tor_browser_cookie_header),
+            "interactive_mode": interactive_mode,
+            "interactive_browser": interactive_browser,
+            "interactive_session_profile": interactive_storage_state_path,
+            "interactive_auth_result": interactive_auth_result,
+            "interactive_track_final_url": interactive_track_final_url,
+            "interactive_open_onion_site": interactive_open_onion_site,
             "network_links": network_links_all[:256],
             "runtime_hits": runtime_hits_all[:128],
             "react_hits": react_hits_all[:128],
@@ -40588,6 +42463,14 @@ class OnionTrackerBlock(BaseBlock):
     def get_params_info(self) -> Dict[str, Any]:
         return {
             "onion_link": "http://examplehiddenserviceexample.onion/",
+            "query": "",  # what to look for after the interactive browser closes; falls back to payload
+            "query_required": True,
+            "query_min_overlap": 1,
+            "query_max_terms": 32,
+            "query_boost": 5.0,
+            "query_search_url": True,
+            "query_search_title": True,
+            "query_search_body": True,
             "timeout": 15,
             "mode": "pages",  # pages | json
             "scan_limit": 32,
@@ -40595,7 +42478,7 @@ class OnionTrackerBlock(BaseBlock):
             "extensions": "",
             "url_keywords": "",
             "site_require": "",
-            "use_js": False,
+            "use_js": True,  # interactive mode uses Playwright through tor.exe by default
             "return_all_js_links": False,
             "max_links_per_page": 500,
             "strict_keywords": False,
@@ -40630,7 +42513,39 @@ class OnionTrackerBlock(BaseBlock):
             "use_body": True,
             "use_camoufox": False,
             "camoufox_options": {},
-            "tor_proxy": "socks5://127.0.0.1:9050",
+            # tor.exe session mode. By default the block starts tor.exe from
+            # Tor Browser's bundled Tor path and exposes SOCKS on 127.0.0.1:9150.
+            # Override tor_exe_path / tor_socks_port / tor_proxy as needed.
+            "tor_proxy": self.DEFAULT_ONIONTRACKER_TOR_PROXY,
+            "tor_auto_detect": True,
+            "tor_auto_start": True,  # starts tor.exe from tor_exe_path before opening interactive browser
+            "tor_require_proxy": True,
+            "tor_fallback_ports": "9150",
+            "tor_exe_path": self.DEFAULT_ONIONTRACKER_TOR_EXE_PATH,
+            "tor_socks_host": "127.0.0.1",
+            "tor_socks_port": 9150,
+            "tor_data_dir": "oniontracker_tor_data",
+            "tor_startup_timeout": 45,
+            "tor_extra_args": "",
+            "tor_force_torexe_after_interactive": True,
+            "tor_tracker_socks_host": "127.0.0.1",
+            "tor_tracker_socks_port": 9150,
+            "tor_tracker_data_dir": "oniontracker_tor_data_9150",
+            "tor_tracker_startup_timeout": 60,
+            "tor_rebuild_session_after_interactive": True,
+            "tracker_use_js_after_interactive": True,
+            "tracker_attach_interactive_cookies": True,
+            "tracker_probe_after_interactive": True,
+            "tor_browser_native_proxy": False,
+            "tor_browser_auto_open": True,
+            "tor_browser_path": "",  # e.g. C:\Users\natem\Desktop\Tor Browser\Browser\firefox.exe
+            "tor_browser_socks_host": "127.0.0.1",
+            "tor_browser_socks_port": 9150,
+            "tor_browser_startup_timeout": 60,
+            "tor_browser_open_url": True,
+            "tor_browser_profile_dir": "",
+            "tor_browser_session_cookies": True,
+            "torbrowser_disable_playwright_crawl": True,
             "same_host_only": True,
             "allow_non_onion": False,
             "user_agent": "Mozilla/5.0 OnionTrackerBlock/1.0",
@@ -40638,16 +42553,22 @@ class OnionTrackerBlock(BaseBlock):
             "lexicon_key": "oniontracker_lexicon",
             "pages_key": "oniontracker_pages",
             "interactive_mode": True,
+            "interactive_browser": "playwright",  # playwright uses tor.exe SOCKS by default; torbrowser is optional
+            "interactive_open_onion_site": True,
+            "interactive_history_as_seeds": True,
+            "interactive_history_seed_limit": 64,
+            "interactive_start_from_last_url": True,
+            "tracker_force_playwright_after_interactive": True,
             "interactive_start_url": "",
-            "interactive_close_mode": "close_browser",  # close_browser | enter
+            "interactive_close_mode": "close_browser",  # close the visible interactive browser to start tracking
             "interactive_session_file": "oniontracker_session.json",
             "interactive_wait_poll_ms": 750,
             "interactive_headless_after_login": True,
+            "interactive_track_final_url": True,
         }
 
 
 BLOCKS.register("oniontracker", OnionTrackerBlock)
-
 
 
 @dataclass
@@ -41718,3 +43639,3071 @@ class OllamaBlock(BaseBlock):
 
 
 BLOCKS.register("ollama", OllamaBlock)
+
+
+# ======================================================================
+# Advanced Enterprise Interactive Browser
+# Register name: interactive_browser
+# ======================================================================
+
+class InteractiveBrowserBlock(BaseBlock):
+    """
+    Advanced enterprise interactive browser block.
+
+    Goals:
+      - Real clickable Qt WebEngine / Chromium browser.
+      - Background HTTPSSubmanager + Playwright sniffer worker.
+      - Active runtime hooks for fetch, XHR, WebSocket, EventSource,
+        workers, service workers, forms, React/SPA metadata, storage metadata,
+        DOM-hidden content, embedded JSON, scripts, stylesheets, and links.
+      - Advanced Sniffer tab with:
+          * Discoveries
+          * Raw Hits
+          * Runtime Events
+          * Database / React / Storage
+          * Rendered Sniffer Preview
+          * HTML Source
+          * Metadata
+          * Log
+      - No flashing between pages:
+          * Live Browser and Sniffer Render Preview are separate web views.
+          * Sniffer HTML is cached, not auto-swapped into the live browser.
+      - Safer discovery:
+          * Finds hidden-but-reachable content and metadata.
+          * Does not bypass auth, brute-force private paths, dump passwords,
+            capture credential bodies, or defeat authorization boundaries.
+
+    Requirements:
+        pip install PyQtWebEngine playwright aiohttp beautifulsoup4
+        playwright install chromium
+    """
+
+    # ------------------------------------------------------------------
+    # Small helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _truthy(value, default=False):
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _safe_int(value, default):
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def _safe_float(value, default):
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    @staticmethod
+    def _normalize_url(raw):
+        raw = str(raw or "").strip()
+        if not raw:
+            return "about:blank"
+        low = raw.lower()
+        if low.startswith(("http://", "https://", "file://", "about:", "data:")):
+            return raw
+        return "https://" + raw
+
+    @staticmethod
+    def _dict_from_param(value):
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            import json
+            parsed = json.loads(str(value))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------------
+    # Child process source
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _child_script_source(cls):
+        return r'''
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import os
+import re
+import sys
+import time
+import traceback
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+
+
+SENSITIVE_KEY_RE = re.compile(
+    r"(?i)(token|auth|authorization|cookie|session|sess|secret|password|passwd|jwt|sig|signature|key|credential|csrf|api[_-]?key)"
+)
+
+URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>`]+", re.I)
+
+
+def truthy(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def list_from_param(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(x).strip() for x in value if str(x).strip()]
+    return [x.strip() for x in str(value).split(",") if x.strip()]
+
+
+def normalize_url(raw: str) -> str:
+    raw = str(raw or "").strip()
+    if not raw:
+        return "about:blank"
+    if raw.lower().startswith(("http://", "https://", "file://", "about:", "data:")):
+        return raw
+    return "https://" + raw
+
+
+def redact_url(url: str) -> str:
+    try:
+        p = urlparse(str(url or ""))
+        if not p.scheme or not p.netloc:
+            return str(url or "")[:2048]
+
+        pairs = []
+        for k, v in parse_qsl(p.query, keep_blank_values=True):
+            if SENSITIVE_KEY_RE.search(str(k)):
+                pairs.append((k, "[redacted]"))
+            else:
+                pairs.append((k, v))
+
+        return urlunparse(
+            (
+                p.scheme,
+                p.netloc,
+                p.path,
+                p.params,
+                urlencode(pairs, doseq=True),
+                "",
+            )
+        )[:4096]
+    except Exception:
+        return str(url or "")[:2048]
+
+
+def safe_text(text: str, max_len: int = 1800) -> str:
+    s = str(text or "")
+    s = SENSITIVE_KEY_RE.sub("[redacted-key]", s)
+    s = re.sub(
+        r"(?i)(bearer\s+)[a-z0-9._\-+/=]{16,}",
+        r"\1[redacted]",
+        s,
+    )
+    s = re.sub(
+        r"(?i)(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*['\"]?[^'\"\s,;<>]{8,}",
+        r"\1=[redacted]",
+        s,
+    )
+    s = re.sub(r"\s+", " ", s).strip()
+    if len(s) > max_len:
+        return s[:max_len] + "…[truncated]"
+    return s
+
+
+def sanitize_obj(obj, max_depth=6, max_string=2400):
+    if max_depth <= 0:
+        return "[depth-limit]"
+
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+
+    if isinstance(obj, bytes):
+        return f"[bytes:{len(obj)}]"
+
+    if isinstance(obj, str):
+        s = obj
+        if s.startswith(("http://", "https://", "ws://", "wss://")):
+            s = redact_url(s)
+        else:
+            s = safe_text(s, max_string)
+
+        if len(s) > max_string:
+            s = s[:max_string] + "…[truncated]"
+        return s
+
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in list(obj.items())[:500]:
+            ks = str(k)
+            if SENSITIVE_KEY_RE.search(ks):
+                out[ks] = "[redacted]"
+            else:
+                out[ks] = sanitize_obj(v, max_depth=max_depth - 1, max_string=max_string)
+        return out
+
+    if isinstance(obj, (list, tuple, set)):
+        return [
+            sanitize_obj(x, max_depth=max_depth - 1, max_string=max_string)
+            for x in list(obj)[:900]
+        ]
+
+    try:
+        return sanitize_obj(str(obj), max_depth=max_depth - 1, max_string=max_string)
+    except Exception:
+        return "[unserializable]"
+
+
+def write_jsonl(path: str, row: dict) -> None:
+    try:
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        row = sanitize_obj(row)
+        with out.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
+
+def classify_url(url: str, content_type: str = "", text: str = "") -> str:
+    u = str(url or "").lower()
+    ct = str(content_type or "").lower()
+    blob = f"{u} {ct} {str(text or '').lower()}"
+
+    if u.startswith(("ws://", "wss://")) or "websocket" in blob:
+        return "websocket"
+    if "graphql" in blob:
+        return "graphql/api"
+    if "/api/" in u or "application/json" in ct or u.endswith(".json") or "json" in blob:
+        return "api/json"
+    if "serviceworker" in blob or "service-worker" in blob or "sw.js" in u:
+        return "service-worker"
+    if "worker" in blob:
+        return "worker"
+    if any(x in u for x in (".m3u8", ".mpd", ".mp4", ".m4s", ".ts", "segment", "chunk", "hls", "dash")):
+        return "media"
+    if u.endswith((".js", ".mjs")):
+        return "script"
+    if u.endswith((".css", ".scss")):
+        return "css-url"
+    if "indexeddb" in blob or "localstorage" in blob or "sessionstorage" in blob or "cache" in blob:
+        return "browser-storage"
+    if "react" in blob or "__next_data__" in blob or "nuxt" in blob:
+        return "react/spa"
+    if "hidden" in blob:
+        return "hidden-dom"
+    if url:
+        return "url"
+    return "metadata"
+
+
+JS_BROWSER_HOOK = r"""
+(() => {
+  try {
+    if (window.__NATE_ADVANCED_INTERACTIVE_BROWSER_HOOKED__) return;
+    window.__NATE_ADVANCED_INTERACTIVE_BROWSER_HOOKED__ = true;
+
+    const PREFIX = "__NATE_BROWSER_EVENT__";
+    const sensitive = /(token|auth|authorization|cookie|session|sess|secret|password|passwd|jwt|sig|signature|key|credential|csrf|api[_-]?key)/i;
+
+    function scrubText(input, maxLen = 900) {
+      try {
+        let s = String(input || "");
+        s = s.replace(sensitive, "[redacted-key]");
+        s = s.replace(/(bearer\s+)[a-z0-9._\-+/=]{16,}/ig, "$1[redacted]");
+        s = s.replace(/(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*['"]?[^'"\s,;<>]{8,}/ig, "$1=[redacted]");
+        s = s.replace(/\s+/g, " ").trim();
+        return s.slice(0, maxLen);
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function scrubUrl(input) {
+      try {
+        const u = new URL(String(input || ""), location.href);
+        for (const k of Array.from(u.searchParams.keys())) {
+          if (sensitive.test(k)) u.searchParams.set(k, "[redacted]");
+        }
+        u.hash = "";
+        return u.href.slice(0, 4096);
+      } catch (_) {
+        return scrubText(input, 2048);
+      }
+    }
+
+    function emit(ev) {
+      try {
+        ev.ts = Date.now();
+        ev.location = scrubUrl(location.href);
+        console.info(PREFIX + JSON.stringify(ev));
+      } catch (_) {}
+    }
+
+    function urlsFromText(s, limit = 120) {
+      try {
+        const text = String(s || "");
+        const m = text.match(/\b(?:https?|wss?):\/\/[^"'\s<>`]+/g) || [];
+        return Array.from(new Set(m.map(scrubUrl))).slice(0, limit);
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function classifyUrl(url) {
+      const u = String(url || "").toLowerCase();
+      if (u.startsWith("ws://") || u.startsWith("wss://")) return "websocket";
+      if (u.includes("graphql")) return "graphql/api";
+      if (u.includes("/api/") || u.endsWith(".json")) return "api/json";
+      if (u.includes("serviceworker") || u.includes("service-worker") || u.endsWith("/sw.js") || u.endsWith("sw.js")) return "service-worker";
+      if (u.includes("worker")) return "worker";
+      if (u.endsWith(".js") || u.endsWith(".mjs")) return "script";
+      if (u.endsWith(".css")) return "css-url";
+      if (u.includes(".m3u8") || u.includes(".mpd") || u.includes(".m4s") || u.includes("segment") || u.includes("hls") || u.includes("dash")) return "media";
+      return "url";
+    }
+
+    // ------------------------------------------------------------------
+    // Network runtime hooks
+    // ------------------------------------------------------------------
+
+    if (window.fetch && !window.fetch.__nateHooked) {
+      const origFetch = window.fetch;
+
+      const hookedFetch = function(input, init) {
+        let url = "";
+        let method = "GET";
+
+        try {
+          url = input && input.url ? input.url : String(input || "");
+          method = (init && init.method) || (input && input.method) || "GET";
+        } catch (_) {}
+
+        emit({
+          type: "fetch.request",
+          method: String(method || "GET").toUpperCase(),
+          url: scrubUrl(url),
+          category: classifyUrl(url)
+        });
+
+        return origFetch.apply(this, arguments).then(resp => {
+          try {
+            emit({
+              type: "fetch.response",
+              method: String(method || "GET").toUpperCase(),
+              url: scrubUrl(resp.url || url),
+              status: resp.status,
+              ok: resp.ok,
+              contentType: resp.headers ? (resp.headers.get("content-type") || "") : "",
+              category: classifyUrl(resp.url || url)
+            });
+          } catch (_) {}
+          return resp;
+        }).catch(err => {
+          emit({
+            type: "fetch.error",
+            method: String(method || "GET").toUpperCase(),
+            url: scrubUrl(url),
+            error: scrubText(err && err.message || err, 500),
+            category: classifyUrl(url)
+          });
+          throw err;
+        });
+      };
+
+      hookedFetch.__nateHooked = true;
+      window.fetch = hookedFetch;
+    }
+
+    if (window.XMLHttpRequest && !XMLHttpRequest.prototype.__nateHooked) {
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+
+      XMLHttpRequest.prototype.open = function(method, url) {
+        this.__nateMeta = {
+          method: String(method || "GET").toUpperCase(),
+          url: scrubUrl(url),
+          rawUrl: String(url || "")
+        };
+
+        emit({
+          type: "xhr.open",
+          method: this.__nateMeta.method,
+          url: this.__nateMeta.url,
+          category: classifyUrl(this.__nateMeta.rawUrl)
+        });
+
+        return origOpen.apply(this, arguments);
+      };
+
+      XMLHttpRequest.prototype.send = function() {
+        try {
+          this.addEventListener("loadend", function() {
+            const m = this.__nateMeta || {};
+            emit({
+              type: "xhr.done",
+              method: m.method || "GET",
+              url: m.url || "",
+              status: this.status || 0,
+              contentType: this.getResponseHeader ? (this.getResponseHeader("content-type") || "") : "",
+              category: classifyUrl(m.rawUrl || m.url || "")
+            });
+          });
+        } catch (_) {}
+
+        return origSend.apply(this, arguments);
+      };
+
+      XMLHttpRequest.prototype.__nateHooked = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Runtime surfaces
+    // ------------------------------------------------------------------
+
+    if (window.WebSocket && !window.WebSocket.__nateHooked) {
+      const OrigWS = window.WebSocket;
+      window.WebSocket = function(url, protocols) {
+        try {
+          emit({ type: "websocket.open", url: scrubUrl(url), category: "websocket" });
+        } catch (_) {}
+        return protocols === undefined ? new OrigWS(url) : new OrigWS(url, protocols);
+      };
+      window.WebSocket.prototype = OrigWS.prototype;
+      window.WebSocket.__nateHooked = true;
+    }
+
+    if (window.EventSource && !window.EventSource.__nateHooked) {
+      const OrigES = window.EventSource;
+      window.EventSource = function(url, config) {
+        try {
+          emit({ type: "eventsource.open", url: scrubUrl(url), category: "eventsource" });
+        } catch (_) {}
+        return new OrigES(url, config);
+      };
+      window.EventSource.prototype = OrigES.prototype;
+      window.EventSource.__nateHooked = true;
+    }
+
+    if (window.Worker && !window.Worker.__nateHooked) {
+      const OrigWorker = window.Worker;
+      window.Worker = function(scriptURL, options) {
+        try {
+          emit({ type: "worker.create", url: scrubUrl(scriptURL), category: "worker" });
+        } catch (_) {}
+        return new OrigWorker(scriptURL, options);
+      };
+      window.Worker.prototype = OrigWorker.prototype;
+      window.Worker.__nateHooked = true;
+    }
+
+    if (window.SharedWorker && !window.SharedWorker.__nateHooked) {
+      const OrigSharedWorker = window.SharedWorker;
+      window.SharedWorker = function(scriptURL, name, options) {
+        try {
+          emit({
+            type: "sharedworker.create",
+            url: scrubUrl(scriptURL),
+            name: scrubText(name, 180),
+            category: "worker"
+          });
+        } catch (_) {}
+        return new OrigSharedWorker(scriptURL, name, options);
+      };
+      window.SharedWorker.prototype = OrigSharedWorker.prototype;
+      window.SharedWorker.__nateHooked = true;
+    }
+
+    if (window.BroadcastChannel && !window.BroadcastChannel.__nateHooked) {
+      const OrigBC = window.BroadcastChannel;
+      window.BroadcastChannel = function(name) {
+        const bc = new OrigBC(name);
+        try {
+          emit({ type: "broadcast.channel", name: scrubText(name, 180), category: "runtime" });
+          const origPost = bc.postMessage;
+          bc.postMessage = function(message) {
+            try {
+              const urls = urlsFromText(JSON.stringify(message), 80);
+              if (urls.length) {
+                emit({ type: "broadcast.urls", name: scrubText(name, 180), urls, category: "runtime" });
+              }
+            } catch (_) {}
+            return origPost.apply(this, arguments);
+          };
+        } catch (_) {}
+        return bc;
+      };
+      window.BroadcastChannel.prototype = OrigBC.prototype;
+      window.BroadcastChannel.__nateHooked = true;
+    }
+
+    if (navigator.serviceWorker && navigator.serviceWorker.register && !navigator.serviceWorker.__nateHooked) {
+      const origRegister = navigator.serviceWorker.register.bind(navigator.serviceWorker);
+      navigator.serviceWorker.register = function(scriptURL, options) {
+        try {
+          emit({
+            type: "serviceworker.register",
+            url: scrubUrl(scriptURL),
+            scope: options && options.scope ? scrubUrl(options.scope) : "",
+            category: "service-worker"
+          });
+        } catch (_) {}
+        return origRegister(scriptURL, options);
+      };
+      navigator.serviceWorker.__nateHooked = true;
+    }
+
+    // ------------------------------------------------------------------
+    // Clicks and forms
+    // ------------------------------------------------------------------
+
+    document.addEventListener("click", function(e) {
+      try {
+        const t = e.target;
+        if (!t) return;
+
+        emit({
+          type: "click",
+          tag: scrubText(t.tagName, 40),
+          id: scrubText(t.id, 140),
+          className: scrubText(t.className, 200),
+          text: scrubText(t.innerText || t.value || t.alt, 260),
+          href: scrubUrl(t.href || ""),
+          category: "interaction"
+        });
+      } catch (_) {}
+    }, true);
+
+    document.addEventListener("submit", function(e) {
+      try {
+        const f = e.target;
+        if (!f) return;
+
+        emit({
+          type: "form.submit",
+          action: scrubUrl(f.action || ""),
+          method: scrubText(f.method || "GET", 20),
+          id: scrubText(f.id, 140),
+          name: scrubText(f.name, 140),
+          category: "form"
+        });
+      } catch (_) {}
+    }, true);
+
+    // ------------------------------------------------------------------
+    // Active page inventory scans
+    // ------------------------------------------------------------------
+
+    function scanResources() {
+      try {
+        const urls = [];
+
+        function push(kind, raw, text) {
+          try {
+            if (!raw) return;
+            const url = scrubUrl(raw);
+            urls.push({ kind, url, text: scrubText(text || "", 300), category: classifyUrl(url) });
+          } catch (_) {}
+        }
+
+        for (const a of Array.from(document.querySelectorAll("a[href]")).slice(0, 400)) {
+          push("anchor", a.href, a.innerText || a.title || "");
+        }
+
+        for (const s of Array.from(document.scripts || []).slice(0, 250)) {
+          push("script", s.src || "", s.type || "");
+          if (!s.src && s.textContent) {
+            const found = urlsFromText(s.textContent, 50);
+            for (const u of found) push("inline-script-url", u, "inline script url");
+          }
+        }
+
+        for (const l of Array.from(document.querySelectorAll("link[href]")).slice(0, 250)) {
+          push("link", l.href, l.rel || "");
+        }
+
+        for (const img of Array.from(document.images || []).slice(0, 250)) {
+          push("image", img.src || img.currentSrc || "", img.alt || "");
+        }
+
+        for (const source of Array.from(document.querySelectorAll("source[src], video[src], audio[src], track[src]")).slice(0, 250)) {
+          push("media", source.src || "", source.type || source.kind || "");
+        }
+
+        for (const f of Array.from(document.querySelectorAll("form[action]")).slice(0, 120)) {
+          push("form-action", f.action || "", f.method || "");
+        }
+
+        for (const meta of Array.from(document.querySelectorAll("meta[content]")).slice(0, 250)) {
+          const c = meta.content || "";
+          const found = urlsFromText(c, 30);
+          for (const u of found) push("meta-url", u, meta.name || meta.property || "");
+        }
+
+        const uniq = [];
+        const seen = new Set();
+        for (const it of urls) {
+          const key = it.kind + "|" + it.url;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          uniq.push(it);
+        }
+
+        emit({ type: "resource.snapshot", count: uniq.length, items: uniq.slice(0, 700), category: "resource-snapshot" });
+      } catch (e) {
+        emit({ type: "resource.snapshot.error", error: scrubText(e && e.message || e, 500) });
+      }
+    }
+
+    function scanHiddenDOM() {
+      try {
+        const out = [];
+        const nodes = Array.from(document.querySelectorAll("body *")).slice(0, 2500);
+
+        for (const el of nodes) {
+          if (out.length >= 220) break;
+
+          let style = null;
+          try { style = getComputedStyle(el); } catch (_) {}
+
+          const hidden =
+            el.hidden ||
+            el.getAttribute("aria-hidden") === "true" ||
+            el.getAttribute("type") === "hidden" ||
+            (style && (style.display === "none" || style.visibility === "hidden" || parseFloat(style.opacity || "1") === 0));
+
+          if (!hidden) continue;
+
+          const href = el.href || el.src || el.action || "";
+          const txt = scrubText(el.innerText || el.value || el.textContent || el.getAttribute("content") || "", 300);
+
+          if (!href && !txt) continue;
+
+          out.push({
+            tag: scrubText(el.tagName, 40),
+            id: scrubText(el.id, 120),
+            className: scrubText(el.className, 160),
+            text: txt,
+            href: href ? scrubUrl(href) : "",
+            category: "hidden-dom"
+          });
+        }
+
+        emit({ type: "hidden.dom", count: out.length, items: out, category: "hidden-dom" });
+      } catch (e) {
+        emit({ type: "hidden.dom.error", error: scrubText(e && e.message || e, 500) });
+      }
+    }
+
+    function scanEmbeddedJSON() {
+      try {
+        const out = [];
+
+        for (const s of Array.from(document.querySelectorAll('script[type*="json"], script#__NEXT_DATA__, script[data-nscript]')).slice(0, 120)) {
+          const id = s.id || "";
+          const type = s.type || "";
+          const text = s.textContent || "";
+          const urls = urlsFromText(text, 100);
+
+          out.push({
+            id: scrubText(id, 120),
+            type: scrubText(type, 120),
+            chars: text.length,
+            urls,
+            category: id === "__NEXT_DATA__" ? "react/spa" : "embedded-json"
+          });
+        }
+
+        emit({ type: "embedded.json", count: out.length, items: out, category: "embedded-json" });
+      } catch (e) {
+        emit({ type: "embedded.json.error", error: scrubText(e && e.message || e, 500) });
+      }
+    }
+
+    function inspectReactQuick() {
+      try {
+        const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+        const renderers = hook && hook.renderers ? Array.from(hook.renderers.keys()) : [];
+        const nextData = document.getElementById("__NEXT_DATA__");
+        const hasNuxt = typeof window.__NUXT__ !== "undefined";
+        const scripts = Array.from(document.scripts || [])
+          .map(s => scrubUrl(s.src || ""))
+          .filter(Boolean)
+          .slice(0, 160);
+
+        let nextKeys = [];
+        let nextUrls = [];
+        try {
+          if (nextData && nextData.textContent) {
+            const parsed = JSON.parse(nextData.textContent);
+            nextKeys = Object.keys(parsed || {}).slice(0, 80);
+            nextUrls = urlsFromText(nextData.textContent, 120);
+          }
+        } catch (_) {}
+
+        emit({
+          type: "react.quick",
+          hasReactDevtoolsHook: !!hook,
+          rendererCount: renderers.length,
+          hasNextData: !!nextData,
+          nextDataKeys: nextKeys,
+          nextUrls,
+          hasNuxt: !!hasNuxt,
+          scripts,
+          category: "react/spa"
+        });
+      } catch (_) {}
+    }
+
+    async function inspectStorageQuick() {
+      try {
+        const localKeys = [];
+        const sessionKeys = [];
+
+        try {
+          for (let i = 0; i < localStorage.length && i < 300; i++) {
+            localKeys.push(scrubText(localStorage.key(i), 200));
+          }
+        } catch (_) {}
+
+        try {
+          for (let i = 0; i < sessionStorage.length && i < 300; i++) {
+            sessionKeys.push(scrubText(sessionStorage.key(i), 200));
+          }
+        } catch (_) {}
+
+        let idbNames = [];
+        try {
+          if (indexedDB && indexedDB.databases) {
+            const dbs = await indexedDB.databases();
+            idbNames = (dbs || [])
+              .map(d => d && d.name ? scrubText(d.name, 200) : "")
+              .filter(Boolean)
+              .slice(0, 160);
+          }
+        } catch (_) {}
+
+        let cacheNames = [];
+        try {
+          if (window.caches && caches.keys) {
+            cacheNames = (await caches.keys()).map(x => scrubText(x, 200)).slice(0, 160);
+          }
+        } catch (_) {}
+
+        emit({
+          type: "database.quick",
+          localStorageKeys: localKeys,
+          sessionStorageKeys: sessionKeys,
+          indexedDBNames: idbNames,
+          cacheNames,
+          category: "browser-storage"
+        });
+      } catch (_) {}
+    }
+
+    window.addEventListener("error", function(e) {
+      emit({
+        type: "js.error",
+        message: scrubText(e.message, 500),
+        source: scrubUrl(e.filename || ""),
+        line: e.lineno || 0,
+        col: e.colno || 0,
+        category: "runtime-error"
+      });
+    });
+
+    window.addEventListener("unhandledrejection", function(e) {
+      emit({
+        type: "js.unhandledrejection",
+        message: scrubText(e.reason && (e.reason.message || e.reason), 500),
+        category: "runtime-error"
+      });
+    });
+
+    setTimeout(scanResources, 900);
+    setTimeout(inspectReactQuick, 1200);
+    setTimeout(scanEmbeddedJSON, 1450);
+    setTimeout(scanHiddenDOM, 1700);
+    setTimeout(inspectStorageQuick, 2100);
+
+    const mo = new MutationObserver(() => {
+      clearTimeout(window.__nateMutationTimer);
+      window.__nateMutationTimer = setTimeout(() => {
+        try {
+          scanResources();
+          scanHiddenDOM();
+        } catch (_) {}
+      }, 1200);
+    });
+
+    try {
+      mo.observe(document.documentElement || document.body, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["src", "href", "style", "class", "hidden", "aria-hidden"]
+      });
+    } catch (_) {}
+
+    emit({
+      type: "hook.installed",
+      ready: document.readyState || "",
+      title: document.title || "",
+      category: "runtime"
+    });
+  } catch (e) {
+    try {
+      console.info("__NATE_BROWSER_EVENT__" + JSON.stringify({
+        type: "hook.install.error",
+        error: String(e && e.message || e).slice(0, 500)
+      }));
+    } catch (_) {}
+  }
+})();
+"""
+
+
+def build_config(cls, overrides: dict | None = None):
+    cfg_cls = getattr(cls, "Config", None)
+    if cfg_cls is None:
+        return None
+
+    try:
+        cfg = cfg_cls()
+    except Exception:
+        return None
+
+    overrides = overrides or {}
+    for k, v in overrides.items():
+        try:
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        except Exception:
+            pass
+
+    return cfg
+
+
+def safe_make_sniffer(submanagers, class_name: str, config_overrides=None, http=None, logger=None):
+    cls = getattr(submanagers, class_name, None)
+    if cls is None:
+        return None
+
+    cfg = build_config(cls, config_overrides or {})
+
+    attempts = []
+
+    if cfg is not None:
+        attempts.extend([
+            lambda: cls(cfg, logger=logger, http=http),
+            lambda: cls(config=cfg, logger=logger, http=http),
+            lambda: cls(cfg, logger=logger),
+            lambda: cls(config=cfg, logger=logger),
+            lambda: cls(cfg),
+            lambda: cls(config=cfg),
+        ])
+
+    attempts.extend([
+        lambda: cls(logger=logger, http=http),
+        lambda: cls(logger=logger),
+        lambda: cls(http=http),
+        lambda: cls(),
+    ])
+
+    for make in attempts:
+        try:
+            inst = make()
+            if http is not None and hasattr(inst, "http"):
+                try:
+                    inst.http = http
+                except Exception:
+                    pass
+            return inst
+        except Exception:
+            continue
+
+    return None
+
+
+async def call_sniffer(sniffer, context, url, timeout, log, extensions=None):
+    if sniffer is None or not hasattr(sniffer, "sniff"):
+        return "", []
+
+    fn = sniffer.sniff
+
+    call_attempts = [
+        lambda: fn(context, url, timeout, log, extensions),
+        lambda: fn(context, url, timeout, log),
+        lambda: fn(context, url, timeout=timeout, log=log, extensions=extensions),
+        lambda: fn(context, url, timeout=timeout, log=log),
+        lambda: fn(context, url, log=log),
+        lambda: fn(context, url),
+    ]
+
+    last_err = None
+
+    for call in call_attempts:
+        try:
+            result = call()
+            if inspect.isawaitable(result):
+                result = await result
+
+            html = ""
+            hits = []
+
+            if isinstance(result, tuple):
+                if len(result) >= 1:
+                    html = result[0] or ""
+                if len(result) >= 2:
+                    hits = result[1] or []
+                if len(result) >= 3:
+                    extra = result[2] or []
+                    if isinstance(extra, list):
+                        hits = list(hits or []) + extra
+                    elif extra:
+                        hits = list(hits or []) + [{"kind": "json_hits", "json": extra}]
+            elif isinstance(result, list):
+                hits = result
+            elif isinstance(result, str):
+                html = result
+
+            if not isinstance(hits, list):
+                hits = [hits]
+
+            return html or "", hits
+
+        except TypeError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            break
+
+    log.append(f"[sniffer-call] {type(sniffer).__name__} failed: {last_err}")
+    return "", []
+
+
+async def safe_http_text(http, url, *, max_bytes=900000, allow_redirects=True, headers=None):
+    try:
+        if hasattr(http, "get_text"):
+            try:
+                return await http.get_text(
+                    url,
+                    max_bytes=max_bytes,
+                    allow_redirects=allow_redirects,
+                    headers=headers,
+                )
+            except TypeError:
+                return await http.get_text(url)
+    except Exception:
+        return ""
+    return ""
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("Missing config path", file=sys.stderr)
+        return 2
+
+    cfg_path = sys.argv[1]
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    log_path = str(cfg.get("log_path") or "browser_events.jsonl")
+    error_path = str(cfg.get("error_path") or "browser_errors.log")
+
+    try:
+        proxy = str(cfg.get("proxy") or "").strip()
+        if proxy:
+            existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                existing + f" --proxy-server={proxy} "
+            ).strip()
+
+        extra_chrome_flags = str(cfg.get("chromium_flags") or "").strip()
+        if extra_chrome_flags:
+            existing = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
+            os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+                existing + " " + extra_chrome_flags
+            ).strip()
+
+        from PyQt5.QtCore import QThread, Qt, QTimer, QUrl, pyqtSignal
+        from PyQt5.QtGui import QKeySequence
+        from PyQt5.QtWidgets import (
+            QApplication,
+            QFileDialog,
+            QCheckBox,
+            QComboBox,
+            QHBoxLayout,
+            QHeaderView,
+            QLabel,
+            QLineEdit,
+            QMainWindow,
+            QMessageBox,
+            QPushButton,
+            QPlainTextEdit,
+            QProgressBar,
+            QShortcut,
+            QSplitter,
+            QTabWidget,
+            QTableWidget,
+            QTableWidgetItem,
+            QToolBar,
+            QVBoxLayout,
+            QWidget,
+        )
+        from PyQt5.QtWebEngineWidgets import (
+            QWebEnginePage,
+            QWebEngineProfile,
+            QWebEngineScript,
+            QWebEngineView,
+        )
+
+        try:
+            from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor
+        except Exception:
+            from PyQt5.QtWebEngineWidgets import QWebEngineUrlRequestInterceptor
+
+        start_url = normalize_url(cfg.get("url") or "about:blank")
+        blocked_domains = [x.lower() for x in list_from_param(cfg.get("blocked_domains"))]
+        allowed_domains = [x.lower() for x in list_from_param(cfg.get("allowed_domains"))]
+        extra_headers = cfg.get("extra_headers") or {}
+
+        capture_console = truthy(cfg.get("capture_console"), True)
+        capture_requests = truthy(cfg.get("capture_requests"), True)
+        enable_javascript_hooks = truthy(cfg.get("enable_javascript_hooks"), True)
+        enable_domain_blocking = truthy(cfg.get("enable_domain_blocking"), True)
+        enable_allowlist = truthy(cfg.get("enable_allowlist"), False)
+
+        def event(ev: dict) -> None:
+            try:
+                ev = sanitize_obj(dict(ev or {}))
+                ev.setdefault("ts", time.time())
+                ev.setdefault("pid", os.getpid())
+                for key in ("url", "location", "href", "src", "source", "scope", "action"):
+                    if key in ev:
+                        ev[key] = redact_url(str(ev.get(key) or ""))
+                write_jsonl(log_path, ev)
+            except Exception:
+                pass
+
+        class SnifferThread(QThread):
+            event_signal = pyqtSignal(dict)
+            html_signal = pyqtSignal(str, str)
+            hits_signal = pyqtSignal(str, list)
+            finished_signal = pyqtSignal(dict)
+
+            def __init__(self, config, parent=None):
+                super().__init__(parent)
+                self.config = dict(config or {})
+
+            def cancel(self):
+                try:
+                    self.requestInterruption()
+                    self.emit_event({"type": "sniffer.cancel.requested"})
+                except Exception:
+                    pass
+
+            def emit_event(self, ev):
+                try:
+                    ev = sanitize_obj(ev)
+                    event(ev)
+                    self.event_signal.emit(ev)
+                except Exception:
+                    pass
+
+            def emit_hits(self, name, hits):
+                try:
+                    safe_hits = sanitize_obj(hits or [])
+                    if not isinstance(safe_hits, list):
+                        safe_hits = [safe_hits]
+                    self.hits_signal.emit(str(name), safe_hits)
+                    self.emit_event({"type": "sniffer.hits", "sniffer": name, "count": len(safe_hits)})
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.hits.error", "sniffer": name, "error": str(e)})
+
+            def emit_html(self, name, html):
+                try:
+                    html = str(html or "")
+                    if not html:
+                        return
+                    max_chars = int(self.config.get("max_render_html_chars") or 1800000)
+                    if len(html) > max_chars:
+                        html = html[:max_chars] + "\n<!-- truncated by InteractiveBrowserBlock -->"
+                    self.html_signal.emit(str(name), html)
+                    self.emit_event({"type": "sniffer.html.cached", "sniffer": name, "chars": len(html)})
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.html.error", "sniffer": name, "error": str(e)})
+
+            def run(self):
+                try:
+                    asyncio.run(self._run_async())
+                except Exception as e:
+                    tb = traceback.format_exc()
+                    self.emit_event({
+                        "type": "sniffer.thread.crash",
+                        "error": str(e),
+                        "traceback": tb[-4000:],
+                    })
+                    self.finished_signal.emit({"ok": False, "error": str(e)})
+
+            async def _run_async(self):
+                c = self.config
+                page_url = normalize_url(c.get("url") or start_url)
+                timeout = float(c.get("sniffer_timeout") or c.get("timeout") or 12.0)
+                log = []
+
+                all_hits = []
+                html_by_source = {}
+
+                self.emit_event({"type": "sniffer.started", "url": page_url})
+
+                try:
+                    import submanagers
+                except Exception as e:
+                    self.emit_event({
+                        "type": "sniffer.import.error",
+                        "module": "submanagers",
+                        "error": str(e),
+                    })
+                    self.finished_signal.emit({"ok": False, "error": "submanagers import failed"})
+                    return
+
+                ua = str(
+                    c.get("user_agent")
+                    or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/AdvancedInteractiveBrowser"
+                )
+                verify_tls = truthy(c.get("http_verify_tls"), True)
+                ca_bundle = str(c.get("http_ca_bundle") or "") or None
+                retries = int(c.get("http_retries") or 2)
+                max_conn_per_host = int(c.get("http_max_conn_per_host") or 8)
+                max_html_bytes = int(c.get("http_max_html_bytes") or 900000)
+                allow_redirects = truthy(c.get("http_allow_redirects"), True)
+
+                http_cls = getattr(submanagers, "HTTPSSubmanager", None)
+                if http_cls is None:
+                    self.emit_event({"type": "https.missing", "error": "submanagers.HTTPSSubmanager not found"})
+                    self.finished_signal.emit({"ok": False, "error": "HTTPSSubmanager missing"})
+                    return
+
+                http_kwargs = {
+                    "user_agent": ua,
+                    "timeout": timeout,
+                    "retries": retries,
+                    "max_conn_per_host": max_conn_per_host,
+                    "verify": verify_tls,
+                    "ca_bundle": ca_bundle,
+                }
+
+                try:
+                    http_ctx = http_cls(**http_kwargs)
+                except TypeError:
+                    http_kwargs.pop("ca_bundle", None)
+                    try:
+                        http_ctx = http_cls(**http_kwargs)
+                    except TypeError:
+                        http_ctx = http_cls()
+
+                async with http_ctx as http:
+                    self.emit_event({"type": "https.ready", "manager": "HTTPSSubmanager"})
+
+                    if truthy(c.get("use_https_fetch"), True):
+                        try:
+                            direct_html = await safe_http_text(
+                                http,
+                                page_url,
+                                max_bytes=max_html_bytes,
+                                allow_redirects=allow_redirects,
+                                headers=c.get("http_headers") or None,
+                            )
+                            if direct_html:
+                                html_by_source["https"] = direct_html
+                                self.emit_html("https", direct_html)
+                        except Exception as e:
+                            self.emit_event({"type": "https.fetch.error", "error": str(e)})
+
+                    use_network = truthy(c.get("use_network_sniff"), True)
+                    use_js = truthy(c.get("use_js_sniff"), True)
+                    use_runtime = truthy(c.get("use_runtime_sniff"), True)
+                    use_react = truthy(c.get("use_react_sniff"), True)
+                    use_database = truthy(c.get("use_database_sniff"), True)
+                    use_interaction = truthy(c.get("use_interaction_sniff"), True)
+
+                    needs_pw = any([use_network, use_js, use_runtime, use_react, use_database, use_interaction])
+
+                    if not needs_pw:
+                        self.finished_signal.emit({
+                            "ok": True,
+                            "url": page_url,
+                            "hits": len(all_hits),
+                            "html_sources": list(html_by_source.keys()),
+                            "log": log[-300:],
+                        })
+                        return
+
+                    try:
+                        from playwright.async_api import async_playwright
+                    except Exception as e:
+                        self.emit_event({"type": "playwright.import.error", "error": str(e)})
+                        self.finished_signal.emit({"ok": False, "error": "playwright import failed"})
+                        return
+
+                    pw = None
+                    browser = None
+                    context = None
+
+                    try:
+                        pw = await async_playwright().start()
+
+                        launch_args = list_from_param(c.get("pw_launch_args"))
+                        if not launch_args:
+                            launch_args = [
+                                "--disable-quic",
+                                "--disable-http3",
+                                "--disable-blink-features=AutomationControlled",
+                            ]
+
+                        browser_kwargs = {
+                            "headless": truthy(c.get("pw_headless"), True),
+                            "args": launch_args,
+                        }
+
+                        channel = str(c.get("pw_channel") or "").strip()
+                        if channel:
+                            browser_kwargs["channel"] = channel
+
+                        browser = await pw.chromium.launch(**browser_kwargs)
+
+                        context_kwargs = {
+                            "user_agent": ua,
+                            "ignore_https_errors": not verify_tls,
+                            "java_script_enabled": True,
+                            "bypass_csp": truthy(c.get("pw_bypass_csp"), False),
+                        }
+
+                        pw_proxy = str(c.get("pw_proxy") or c.get("proxy") or "").strip()
+                        if pw_proxy:
+                            context_kwargs["proxy"] = {"server": pw_proxy}
+
+                        context = await browser.new_context(**context_kwargs)
+
+                        if blocked_domains or allowed_domains:
+                            async def route_filter(route):
+                                try:
+                                    req = route.request
+                                    u = req.url
+                                    host = (urlparse(u).hostname or "").lower()
+
+                                    blocked = False
+                                    if allowed_domains:
+                                        blocked = not any(d and d in host for d in allowed_domains)
+                                    if blocked_domains and any(d and d in host for d in blocked_domains):
+                                        blocked = True
+
+                                    if blocked:
+                                        await route.abort()
+                                    else:
+                                        await route.continue_()
+                                except Exception:
+                                    try:
+                                        await route.continue_()
+                                    except Exception:
+                                        pass
+
+                            await context.route("**/*", route_filter)
+
+                        self.emit_event({"type": "playwright.ready", "headless": browser_kwargs["headless"]})
+
+                        common_cfg = {
+                            "timeout": timeout,
+                            "enable_auto_scroll": truthy(c.get("sniffer_auto_scroll"), True),
+                            "max_scroll_steps": int(c.get("sniffer_scroll_steps") or 38),
+                            "scroll_step_delay_ms": int(c.get("sniffer_scroll_delay_ms") or 325),
+                        }
+
+                        extensions = list_from_param(c.get("extensions"))
+
+                        sniffer_specs = []
+
+                        if use_network:
+                            sniffer_specs.append((
+                                "network",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "NetworkSniffer",
+                                    {
+                                        **common_cfg,
+                                        "max_items": int(c.get("network_max_items") or 500),
+                                        "max_json_hits": int(c.get("network_max_json_hits") or 500),
+                                        "enable_json_sniff": truthy(c.get("network_json_sniff"), True),
+                                        "enable_graphql_sniff": truthy(c.get("network_graphql_sniff"), True),
+                                        "enable_mse_sniff": truthy(c.get("network_mse_sniff"), True),
+                                        "enable_param_sniff": truthy(c.get("network_param_sniff"), True),
+                                        "enable_bundle_param_scan": truthy(c.get("network_bundle_scan"), True),
+                                        "enable_header_url_mining": truthy(c.get("network_header_url_mining"), True),
+                                        "enable_redirect_tracking": truthy(c.get("network_redirect_tracking"), True),
+                                        "enable_url_salvage": truthy(c.get("network_url_salvage"), True),
+                                        "enable_binary_signature_sniff": truthy(c.get("network_binary_signature_sniff"), True),
+                                        "enable_candidate_promotion": truthy(c.get("network_candidate_promotion"), True),
+                                        "require_probe_for_weak_candidates": False,
+                                    },
+                                    http=http,
+                                ),
+                            ))
+
+                        if use_js:
+                            sniffer_specs.append((
+                                "js",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "JSSniffer",
+                                    common_cfg,
+                                    http=http,
+                                ),
+                            ))
+
+                        if use_runtime:
+                            sniffer_specs.append((
+                                "runtime",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "RuntimeSniffer",
+                                    {
+                                        **common_cfg,
+                                        "enable_websocket_sniff": truthy(c.get("runtime_websocket_sniff"), True),
+                                        "enable_perf_sniff": truthy(c.get("runtime_perf_sniff"), True),
+                                        "enable_storage_sniff": truthy(c.get("runtime_storage_sniff"), True),
+                                        "enable_media_events_sniff": truthy(c.get("runtime_media_events_sniff"), True),
+                                        "enable_mediasource_sniff": truthy(c.get("runtime_mediasource_sniff"), True),
+                                        "enable_console_sniff": truthy(c.get("runtime_console_sniff"), True),
+                                        "enable_runtime_url_hooks": truthy(c.get("runtime_url_hooks"), True),
+                                        "enable_mutation_observer": truthy(c.get("runtime_mutation_observer"), True),
+                                    },
+                                    http=http,
+                                ),
+                            ))
+
+                        if use_react:
+                            sniffer_specs.append((
+                                "react",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "ReactSniffer",
+                                    {
+                                        **common_cfg,
+                                        "hook_history_api": truthy(c.get("react_hook_history_api"), True),
+                                        "hook_link_clicks": truthy(c.get("react_hook_link_clicks"), True),
+                                        "inspect_react_devtools_hook": truthy(c.get("react_devtools_hook"), True),
+                                    },
+                                    http=http,
+                                ),
+                            ))
+
+                        if use_database:
+                            sniffer_specs.append((
+                                "database",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "DatabaseSniffer",
+                                    {
+                                        **common_cfg,
+                                        "enable_indexeddb_dump": truthy(c.get("database_indexeddb_dump"), True),
+                                        "enable_backend_fingerprint": truthy(c.get("database_backend_fingerprint"), True),
+                                        "enable_html_link_scan": truthy(c.get("database_html_link_scan"), True),
+                                        "enable_backend_link_scan": truthy(c.get("database_backend_link_scan"), True),
+                                        "max_idb_records": int(c.get("database_max_idb_records") or 30),
+                                        "max_idb_stores": int(c.get("database_max_idb_stores") or 24),
+                                        "max_idb_databases": int(c.get("database_max_idb_databases") or 24),
+                                    },
+                                    http=http,
+                                ),
+                            ))
+
+                        if use_interaction:
+                            sniffer_specs.append((
+                                "interaction",
+                                safe_make_sniffer(
+                                    submanagers,
+                                    "InteractionSniffer",
+                                    {
+                                        **common_cfg,
+                                        "enable_cdp_listeners": truthy(c.get("interaction_cdp_listeners"), True),
+                                        "enable_overlay_detection": truthy(c.get("interaction_overlay_detection"), True),
+                                        "enable_form_extraction": truthy(c.get("interaction_form_extraction"), True),
+                                    },
+                                    http=http,
+                                ),
+                            ))
+
+                        for name, sniffer in sniffer_specs:
+                            if self.isInterruptionRequested():
+                                self.emit_event({"type": "sniffer.cancelled.before", "sniffer": name})
+                                break
+
+                            if sniffer is None:
+                                self.emit_event({"type": "sniffer.missing", "sniffer": name})
+                                continue
+
+                            self.emit_event({"type": "sniffer.run", "sniffer": name, "url": page_url})
+
+                            try:
+                                html, hits = await asyncio.wait_for(
+                                    call_sniffer(sniffer, context, page_url, timeout, log, extensions=extensions),
+                                    timeout=max(timeout + 5.0, timeout * 2.25),
+                                )
+
+                                if html:
+                                    html_by_source[name] = html
+                                    self.emit_html(name, html)
+
+                                if hits:
+                                    safe_hits = []
+                                    for hit in hits:
+                                        if isinstance(hit, dict):
+                                            h = dict(hit)
+                                            h.setdefault("sniffer", name)
+                                            h.setdefault("source", name + "_sniffer")
+                                            safe_hits.append(h)
+                                        else:
+                                            safe_hits.append({"sniffer": name, "value": hit})
+
+                                    all_hits.extend(safe_hits)
+                                    self.emit_hits(name, safe_hits)
+
+                                    if hasattr(http, "register_sniffer_candidates"):
+                                        try:
+                                            await http.register_sniffer_candidates(
+                                                page_url,
+                                                safe_hits,
+                                                source=f"{name}_sniffer",
+                                                query=str(c.get("query") or ""),
+                                            )
+                                        except Exception as e:
+                                            self.emit_event({
+                                                "type": "https.register_sniffer_candidates.error",
+                                                "sniffer": name,
+                                                "error": str(e),
+                                            })
+
+                            except asyncio.TimeoutError:
+                                self.emit_event({"type": "sniffer.timeout", "sniffer": name})
+                            except Exception as e:
+                                self.emit_event({
+                                    "type": "sniffer.error",
+                                    "sniffer": name,
+                                    "error": str(e),
+                                    "traceback": traceback.format_exc()[-2500:],
+                                })
+
+                        self.finished_signal.emit({
+                            "ok": True,
+                            "url": page_url,
+                            "hits": len(all_hits),
+                            "html_sources": list(html_by_source.keys()),
+                            "log": log[-300:],
+                        })
+
+                    finally:
+                        try:
+                            if context is not None:
+                                await context.close()
+                        except Exception:
+                            pass
+                        try:
+                            if browser is not None:
+                                await browser.close()
+                        except Exception:
+                            pass
+                        try:
+                            if pw is not None:
+                                await pw.stop()
+                        except Exception:
+                            pass
+
+        class NateRequestInterceptor(QWebEngineUrlRequestInterceptor):
+            def interceptRequest(self, info):
+                if not capture_requests:
+                    return
+
+                try:
+                    qurl = info.requestUrl()
+                    url = qurl.toString()
+                    host = str(qurl.host() or "").lower()
+
+                    method = "GET"
+                    try:
+                        method = bytes(info.requestMethod()).decode("ascii", "ignore") or "GET"
+                    except Exception:
+                        pass
+
+                    blocked = False
+
+                    if enable_allowlist and allowed_domains:
+                        blocked = not any(d and d in host for d in allowed_domains)
+
+                    if enable_domain_blocking and blocked_domains:
+                        if any(d and d in host for d in blocked_domains):
+                            blocked = True
+
+                    if blocked:
+                        info.block(True)
+
+                    for hk, hv in extra_headers.items():
+                        try:
+                            if SENSITIVE_KEY_RE.search(str(hk)):
+                                continue
+                            info.setHttpHeader(
+                                bytes(str(hk), "utf-8"),
+                                bytes(str(hv), "utf-8"),
+                            )
+                        except Exception:
+                            pass
+
+                    event({
+                        "type": "qt.request",
+                        "method": method,
+                        "url": url,
+                        "host": host,
+                        "resourceType": int(info.resourceType()),
+                        "blocked": bool(blocked),
+                        "category": classify_url(url),
+                    })
+                except Exception as e:
+                    event({
+                        "type": "qt.interceptor.error",
+                        "error": str(e)[:500],
+                    })
+
+        class NatePage(QWebEnginePage):
+            PREFIX = "__NATE_BROWSER_EVENT__"
+
+            def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+                msg = str(message or "")
+
+                if msg.startswith(self.PREFIX):
+                    raw = msg[len(self.PREFIX):]
+                    try:
+                        ev = json.loads(raw)
+                        if isinstance(ev, dict):
+                            ev["source"] = str(sourceID or "")
+                            ev["line"] = int(lineNumber or 0)
+                            event(ev)
+                            try:
+                                window_ref.append_log(ev)
+                                window_ref.ingest_runtime_event(ev)
+                            except Exception:
+                                pass
+                            return
+                    except Exception as e:
+                        ev = {
+                            "type": "hook.parse.error",
+                            "error": str(e)[:300],
+                            "raw": raw[:500],
+                        }
+                        event(ev)
+                        try:
+                            window_ref.append_log(ev)
+                        except Exception:
+                            pass
+                        return
+
+                if capture_console:
+                    ev = {
+                        "type": "console",
+                        "level": int(level),
+                        "message": safe_text(msg, 1800),
+                        "source": str(sourceID or ""),
+                        "line": int(lineNumber or 0),
+                        "category": "console",
+                    }
+                    event(ev)
+                    try:
+                        window_ref.append_log(ev)
+                    except Exception:
+                        pass
+
+        class BrowserWindow(QMainWindow):
+            def __init__(self):
+                super().__init__()
+
+                self.session_id = f"advanced-enterprise-browser-{os.getpid()}-{int(time.time())}"
+                self.latest_html_by_source = {}
+                self.latest_hits = []
+                self.discovered_urls = {}
+                self.sniffer_thread = None
+                self.sniffers_running = False
+
+                self.setWindowTitle(str(cfg.get("title") or "Advanced Enterprise Interactive Browser"))
+                self.resize(int(cfg.get("width") or 1620), int(cfg.get("height") or 1020))
+                self.setMinimumSize(1220, 780)
+
+                self.profile = QWebEngineProfile("NateAdvancedEnterpriseBrowserProfile", self)
+
+                profile_dir = str(cfg.get("profile_dir") or ".interactive_browser/profile_default")
+                cache_dir = str(Path(profile_dir) / "cache")
+
+                try:
+                    Path(profile_dir).mkdir(parents=True, exist_ok=True)
+                    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+                    self.profile.setPersistentStoragePath(profile_dir)
+                    self.profile.setCachePath(cache_dir)
+                except Exception:
+                    pass
+
+                self.interceptor = NateRequestInterceptor(self)
+                try:
+                    self.profile.setUrlRequestInterceptor(self.interceptor)
+                except Exception:
+                    try:
+                        self.profile.setRequestInterceptor(self.interceptor)
+                    except Exception:
+                        pass
+
+                # Separate views prevent flashing.
+                self.live_page = NatePage(self.profile, self)
+                self.live_view = QWebEngineView(self)
+                self.live_view.setPage(self.live_page)
+
+                self.sniff_page = NatePage(self.profile, self)
+                self.sniff_view = QWebEngineView(self)
+                self.sniff_view.setPage(self.sniff_page)
+
+                self.view = self.live_view
+                self.page = self.live_page
+
+                if enable_javascript_hooks:
+                    self.install_js_hooks(self.live_page, self.profile)
+                    self.install_js_hooks(self.sniff_page, self.profile)
+
+                # Controls.
+                self.address = QLineEdit()
+                self.address.setPlaceholderText("Enter URL...")
+                self.address.returnPressed.connect(self.go_address)
+
+                self.result_source_combo = QComboBox()
+                self.result_source_combo.setMinimumWidth(220)
+                self.result_source_combo.currentTextChanged.connect(self.on_result_source_changed)
+
+                self.hit_filter = QLineEdit()
+                self.hit_filter.setPlaceholderText("Filter discoveries, APIs, workers, hidden DOM, media...")
+                self.hit_filter.textChanged.connect(self.apply_hit_filter)
+
+                self.status_label = QLabel("Ready")
+                self.status_label.setMinimumWidth(280)
+
+                self.progress = QProgressBar()
+                self.progress.setMaximumWidth(180)
+                self.progress.setRange(0, 100)
+                self.progress.setValue(0)
+
+                self.auto_sniff_box = QCheckBox("Auto sniff on navigation")
+                self.auto_sniff_box.setChecked(truthy(cfg.get("sniff_on_navigation"), False))
+
+                self.btn_back = QPushButton("Back")
+                self.btn_forward = QPushButton("Forward")
+                self.btn_reload = QPushButton("Reload")
+                self.btn_stop = QPushButton("Stop")
+                self.btn_go = QPushButton("Go")
+                self.btn_run_sniffers = QPushButton("Run Sniffers")
+                self.btn_cancel_sniffers = QPushButton("Cancel")
+                self.btn_render_selected = QPushButton("Render Selected")
+                self.btn_render_best = QPushButton("Render Best")
+                self.btn_open_hit = QPushButton("Open Selected URL")
+                self.btn_copy_hit = QPushButton("Copy URL")
+                self.btn_dump_dom = QPushButton("Dump DOM")
+                self.btn_scan_live = QPushButton("Scan Live Page")
+                self.btn_save_html = QPushButton("Save HTML")
+                self.btn_clear = QPushButton("Clear")
+
+                self.btn_back.clicked.connect(self.live_view.back)
+                self.btn_forward.clicked.connect(self.live_view.forward)
+                self.btn_reload.clicked.connect(self.live_view.reload)
+                self.btn_stop.clicked.connect(self.live_view.stop)
+                self.btn_go.clicked.connect(self.go_address)
+                self.btn_run_sniffers.clicked.connect(self.run_sniffers)
+                self.btn_cancel_sniffers.clicked.connect(self.cancel_sniffers)
+                self.btn_render_selected.clicked.connect(self.render_selected_sniffer_html)
+                self.btn_render_best.clicked.connect(self.render_best_sniffer_html)
+                self.btn_open_hit.clicked.connect(self.open_selected_url)
+                self.btn_copy_hit.clicked.connect(self.copy_selected_url)
+                self.btn_dump_dom.clicked.connect(self.dump_dom)
+                self.btn_scan_live.clicked.connect(self.scan_live_page)
+                self.btn_save_html.clicked.connect(self.save_html_as)
+                self.btn_clear.clicked.connect(self.clear_runtime_views)
+
+                self.btn_cancel_sniffers.setEnabled(False)
+
+                toolbar = QToolBar("Advanced Enterprise Browser")
+                toolbar.setMovable(False)
+                self.addToolBar(toolbar)
+
+                for b in (self.btn_back, self.btn_forward, self.btn_reload, self.btn_stop):
+                    toolbar.addWidget(b)
+
+                toolbar.addWidget(QLabel(" URL: "))
+                toolbar.addWidget(self.address)
+                toolbar.addWidget(self.btn_go)
+                toolbar.addSeparator()
+
+                toolbar.addWidget(self.btn_run_sniffers)
+                toolbar.addWidget(self.btn_cancel_sniffers)
+                toolbar.addWidget(self.btn_scan_live)
+                toolbar.addWidget(self.auto_sniff_box)
+                toolbar.addSeparator()
+
+                toolbar.addWidget(QLabel(" Render: "))
+                toolbar.addWidget(self.result_source_combo)
+                toolbar.addWidget(self.btn_render_selected)
+                toolbar.addWidget(self.btn_render_best)
+                toolbar.addSeparator()
+
+                toolbar.addWidget(self.btn_open_hit)
+                toolbar.addWidget(self.btn_copy_hit)
+                toolbar.addSeparator()
+
+                toolbar.addWidget(self.btn_dump_dom)
+                toolbar.addWidget(self.btn_save_html)
+                toolbar.addWidget(self.btn_clear)
+
+                # Tables.
+                self.discovery_table = QTableWidget(0, 7)
+                self.discovery_table.setHorizontalHeaderLabels(
+                    ["category", "url", "source", "status", "content-type", "score", "evidence"]
+                )
+                self._setup_table(self.discovery_table)
+                self.discovery_table.itemDoubleClicked.connect(lambda _item: self.open_selected_url())
+
+                self.hits_table = QTableWidget(0, 7)
+                self.hits_table.setHorizontalHeaderLabels(
+                    ["source", "kind", "tag/type", "url", "text/title", "content-type", "status"]
+                )
+                self._setup_table(self.hits_table)
+                self.hits_table.itemDoubleClicked.connect(lambda _item: self.open_selected_url())
+
+                self.runtime_table = QTableWidget(0, 6)
+                self.runtime_table.setHorizontalHeaderLabels(
+                    ["type", "category", "method", "status", "url", "summary"]
+                )
+                self._setup_table(self.runtime_table)
+                self.runtime_table.itemDoubleClicked.connect(lambda _item: self.open_selected_url())
+
+                self.database_table = QTableWidget(0, 5)
+                self.database_table.setHorizontalHeaderLabels(
+                    ["source", "kind", "name/key", "url", "summary"]
+                )
+                self._setup_table(self.database_table)
+                self.database_table.itemDoubleClicked.connect(lambda _item: self.open_selected_url())
+
+                self.html_view = QPlainTextEdit()
+                self.html_view.setReadOnly(True)
+                self.html_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+
+                self.meta_view = QPlainTextEdit()
+                self.meta_view.setReadOnly(True)
+                self.meta_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+
+                self.log_view = QPlainTextEdit()
+                self.log_view.setReadOnly(True)
+                self.log_view.setMaximumBlockCount(int(cfg.get("max_log_lines") or 10000))
+
+                self.browser_tabs = QTabWidget()
+                self.browser_tabs.addTab(self.live_view, "Live Browser")
+                self.browser_tabs.addTab(self.sniff_view, "Rendered Sniffer Preview")
+
+                self.analysis_tabs = QTabWidget()
+                self.analysis_tabs.addTab(self.discovery_table, "Discoveries")
+                self.analysis_tabs.addTab(self.hits_table, "Raw Hits")
+                self.analysis_tabs.addTab(self.runtime_table, "Runtime")
+                self.analysis_tabs.addTab(self.database_table, "Database / React / Hidden")
+                self.analysis_tabs.addTab(self.html_view, "Sniffer HTML Source")
+                self.analysis_tabs.addTab(self.meta_view, "Metadata")
+                self.analysis_tabs.addTab(self.log_view, "Log")
+
+                right_panel = QWidget()
+                right_layout = QVBoxLayout(right_panel)
+                right_layout.setContentsMargins(4, 4, 4, 4)
+
+                filter_row = QHBoxLayout()
+                filter_row.addWidget(QLabel("Filter:"))
+                filter_row.addWidget(self.hit_filter)
+                filter_row.addWidget(self.status_label)
+                filter_row.addWidget(self.progress)
+
+                right_layout.addLayout(filter_row)
+                right_layout.addWidget(self.analysis_tabs)
+
+                splitter = QSplitter(Qt.Horizontal)
+                splitter.addWidget(self.browser_tabs)
+                splitter.addWidget(right_panel)
+                splitter.setStretchFactor(0, 3)
+                splitter.setStretchFactor(1, 2)
+                splitter.setSizes([980, 640])
+
+                root = QWidget()
+                root_layout = QVBoxLayout(root)
+                root_layout.setContentsMargins(0, 0, 0, 0)
+                root_layout.addWidget(splitter)
+                self.setCentralWidget(root)
+
+                # Signals.
+                self.live_view.urlChanged.connect(lambda u: self.address.setText(u.toString()))
+                self.live_view.loadStarted.connect(lambda: self.on_live_load_started())
+                self.live_view.loadProgress.connect(lambda p: self.on_live_load_progress(int(p)))
+                self.live_view.loadFinished.connect(lambda ok: self.on_live_load_finished(bool(ok)))
+
+                self.sniff_view.loadStarted.connect(lambda: self.emit_event({"type": "preview.load.started"}))
+                self.sniff_view.loadFinished.connect(lambda ok: self.emit_event({"type": "preview.load.finished", "ok": bool(ok)}))
+
+                QShortcut(QKeySequence("Ctrl+L"), self, activated=lambda: self.address.setFocus())
+                QShortcut(QKeySequence("Ctrl+R"), self, activated=self.live_view.reload)
+                QShortcut(QKeySequence("F5"), self, activated=self.live_view.reload)
+                QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.run_sniffers)
+                QShortcut(QKeySequence("Ctrl+S"), self, activated=self.save_html_as)
+
+                start = normalize_url(cfg.get("url") or start_url or "about:blank")
+                self.address.setText(start)
+
+                self.emit_event({
+                    "type": "advanced.browser.started",
+                    "url": start,
+                    "profile_dir": profile_dir,
+                    "proxy": str(cfg.get("proxy") or ""),
+                })
+
+                if truthy(cfg.get("load_live_browser"), True):
+                    self.live_view.load(QUrl(start))
+
+                if truthy(cfg.get("auto_run_sniffers"), True):
+                    QTimer.singleShot(1200, self.run_sniffers)
+
+            # ----------------------------------------------------------
+            # UI helpers
+            # ----------------------------------------------------------
+
+            def _setup_table(self, table):
+                try:
+                    table.setAlternatingRowColors(True)
+                    table.setWordWrap(False)
+                    table.verticalHeader().setVisible(False)
+                    table.horizontalHeader().setStretchLastSection(True)
+                    table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+                    table.setSelectionBehavior(QTableWidget.SelectRows)
+                    table.setSelectionMode(QTableWidget.SingleSelection)
+                    table.setSortingEnabled(True)
+                except Exception:
+                    pass
+
+            def _set_busy(self, busy, message=None):
+                self.sniffers_running = bool(busy)
+
+                self.btn_run_sniffers.setEnabled(not busy)
+                self.btn_cancel_sniffers.setEnabled(busy)
+                self.btn_render_selected.setEnabled(not busy)
+                self.btn_render_best.setEnabled(not busy)
+
+                if message:
+                    self.status_label.setText(str(message))
+
+                if busy:
+                    self.progress.setRange(0, 0)
+                else:
+                    self.progress.setRange(0, 100)
+                    self.progress.setValue(0)
+
+            def _table_value(self, table, row, col):
+                try:
+                    item = table.item(row, col)
+                    return item.text() if item else ""
+                except Exception:
+                    return ""
+
+            def _selected_url_from_table(self, table):
+                try:
+                    row = table.currentRow()
+                    if row < 0:
+                        return ""
+
+                    for col in (1, 3, 4):
+                        val = self._table_value(table, row, col).strip()
+                        if val.startswith(("http://", "https://", "wss://", "ws://")):
+                            return val
+                except Exception:
+                    pass
+                return ""
+
+            def selected_url(self):
+                table = self.analysis_tabs.currentWidget()
+                if isinstance(table, QTableWidget):
+                    return self._selected_url_from_table(table)
+                return ""
+
+            # ----------------------------------------------------------
+            # Logging / events
+            # ----------------------------------------------------------
+
+            def append_log(self, ev):
+                try:
+                    ev = sanitize_obj(ev)
+                    self.log_view.appendPlainText(json.dumps(ev, ensure_ascii=False, default=str))
+                except Exception:
+                    pass
+
+            def emit_event(self, ev):
+                try:
+                    ev = dict(ev or {})
+                    ev.setdefault("session", self.session_id)
+
+                    current = ""
+                    try:
+                        current = self.live_view.url().toString()
+                    except Exception:
+                        pass
+
+                    if current and "location" not in ev:
+                        ev["location"] = current
+
+                    ev = sanitize_obj(ev)
+                    event(ev)
+                    self.append_log(ev)
+                    self.ingest_runtime_event(ev)
+                except Exception:
+                    pass
+
+            # ----------------------------------------------------------
+            # JS hook installer
+            # ----------------------------------------------------------
+
+            def install_js_hooks(self, page, profile):
+                script = QWebEngineScript()
+                script.setName("NateAdvancedEnterpriseInteractiveHooks")
+                script.setSourceCode(JS_BROWSER_HOOK)
+
+                try:
+                    script.setInjectionPoint(QWebEngineScript.DocumentCreation)
+                except Exception:
+                    pass
+
+                try:
+                    script.setWorldId(QWebEngineScript.MainWorld)
+                except Exception:
+                    pass
+
+                try:
+                    script.setRunsOnSubFrames(True)
+                except Exception:
+                    try:
+                        script.setRunOnSubframes(True)
+                    except Exception:
+                        pass
+
+                try:
+                    page.scripts().insert(script)
+                except Exception:
+                    try:
+                        profile.scripts().insert(script)
+                    except Exception:
+                        pass
+
+            # ----------------------------------------------------------
+            # Live browser
+            # ----------------------------------------------------------
+
+            def go_address(self):
+                u = normalize_url(self.address.text())
+                self.address.setText(u)
+                self.live_view.load(QUrl(u))
+                self.browser_tabs.setCurrentWidget(self.live_view)
+
+            def on_live_load_started(self):
+                self.progress.setRange(0, 100)
+                self.progress.setValue(0)
+                self.status_label.setText("Loading...")
+                self.emit_event({"type": "live.load.started"})
+
+            def on_live_load_progress(self, p):
+                if not self.sniffers_running:
+                    self.progress.setRange(0, 100)
+                    self.progress.setValue(int(p))
+                self.status_label.setText(f"Loading {p}%")
+
+            def on_live_load_finished(self, ok):
+                self.progress.setRange(0, 100)
+                self.progress.setValue(100 if ok else 0)
+                self.status_label.setText("Loaded" if ok else "Load failed")
+                self.emit_event({"type": "live.load.finished", "ok": bool(ok)})
+
+                if ok and self.auto_sniff_box.isChecked():
+                    QTimer.singleShot(1000, self.run_sniffers)
+
+            # ----------------------------------------------------------
+            # Sniffer worker controls
+            # ----------------------------------------------------------
+
+            def run_sniffers(self):
+                if self.sniffer_thread is not None and self.sniffer_thread.isRunning():
+                    self.emit_event({"type": "sniffer.already_running"})
+                    return
+
+                run_cfg = dict(cfg)
+                run_cfg["url"] = normalize_url(self.address.text() or start_url)
+
+                self._set_busy(True, "Sniffers running...")
+                self.emit_event({"type": "sniffer.thread.starting", "url": run_cfg["url"]})
+
+                self.sniffer_thread = SnifferThread(run_cfg, self)
+                self.sniffer_thread.event_signal.connect(self.on_sniffer_event)
+                self.sniffer_thread.html_signal.connect(self.on_sniffer_html)
+                self.sniffer_thread.hits_signal.connect(self.on_sniffer_hits)
+                self.sniffer_thread.finished_signal.connect(self.on_sniffer_finished)
+                self.sniffer_thread.start()
+
+            def cancel_sniffers(self):
+                try:
+                    if self.sniffer_thread is not None and self.sniffer_thread.isRunning():
+                        self.sniffer_thread.cancel()
+                        self.status_label.setText("Cancelling sniffers...")
+                        self.emit_event({"type": "sniffer.cancel.clicked"})
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.cancel.error", "error": str(e)})
+
+            def on_sniffer_event(self, ev):
+                self.append_log(ev)
+                self.ingest_runtime_event(ev)
+
+            def on_sniffer_html(self, source, html_text):
+                try:
+                    source = str(source or "unknown")
+                    html_text = str(html_text or "")
+
+                    if not html_text:
+                        return
+
+                    self.latest_html_by_source[source] = html_text
+
+                    if self.result_source_combo.findText(source) < 0:
+                        self.result_source_combo.addItem(source)
+
+                    if not self.html_view.toPlainText():
+                        self.html_view.setPlainText(
+                            f"<!-- source: {source}, chars={len(html_text)} -->\n\n{html_text}"
+                        )
+
+                    self.meta_view.setPlainText(json.dumps({
+                        "latest_html_source": source,
+                        "html_sources": {k: len(v or "") for k, v in self.latest_html_by_source.items()},
+                        "hit_count": len(self.latest_hits),
+                        "discovered_url_count": len(self.discovered_urls),
+                        "rendering_mode": "manual_no_flash",
+                    }, indent=2, ensure_ascii=False))
+
+                    self.emit_event({
+                        "type": "sniffer.html.cached",
+                        "source": source,
+                        "chars": len(html_text),
+                        "note": "cached only; not auto-rendered into live browser",
+                    })
+
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.html.cache.error", "error": str(e)})
+
+            def on_sniffer_hits(self, source, hits):
+                try:
+                    source = str(source or "unknown")
+                    hits = hits or []
+
+                    was_sorting_hits = self.hits_table.isSortingEnabled()
+                    was_sorting_disc = self.discovery_table.isSortingEnabled()
+                    was_sorting_db = self.database_table.isSortingEnabled()
+
+                    self.hits_table.setSortingEnabled(False)
+                    self.discovery_table.setSortingEnabled(False)
+                    self.database_table.setSortingEnabled(False)
+
+                    for h in hits:
+                        if not isinstance(h, dict):
+                            h = {"value": h}
+
+                        h = sanitize_obj(h)
+                        h.setdefault("sniffer", source)
+                        self.latest_hits.append(h)
+
+                        self.add_raw_hit_row(source, h)
+                        self.add_discovery_from_hit(source, h)
+
+                        if source in {"database", "react"} or "database" in str(h.get("sniffer") or "").lower():
+                            self.add_database_hit(source, h)
+
+                    self.hits_table.setSortingEnabled(was_sorting_hits)
+                    self.discovery_table.setSortingEnabled(was_sorting_disc)
+                    self.database_table.setSortingEnabled(was_sorting_db)
+
+                    self.hits_table.resizeColumnsToContents()
+                    self.discovery_table.resizeColumnsToContents()
+                    self.database_table.resizeColumnsToContents()
+
+                    self.status_label.setText(
+                        f"Hits: {len(self.latest_hits)} | Discoveries: {len(self.discovered_urls)}"
+                    )
+
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.hits.ui.error", "source": source, "error": str(e)})
+
+            def on_sniffer_finished(self, meta):
+                try:
+                    self._set_busy(False, "Sniffers finished")
+                    self.emit_event({"type": "sniffer.finished", "meta": meta})
+                    self.meta_view.setPlainText(json.dumps(sanitize_obj(meta), indent=2, ensure_ascii=False))
+                except Exception:
+                    self._set_busy(False, "Sniffers finished")
+
+            # ----------------------------------------------------------
+            # Active live page scan
+            # ----------------------------------------------------------
+
+            def scan_live_page(self):
+                js = """
+                (() => {
+                  try {
+                    if (window.__NATE_ADVANCED_INTERACTIVE_BROWSER_HOOKED__) {
+                      const event = new Event("nate-force-scan");
+                    }
+                    const out = {
+                      title: document.title || "",
+                      url: location.href,
+                      links: Array.from(document.querySelectorAll("a[href]")).slice(0, 300).map(a => ({
+                        url: a.href,
+                        text: (a.innerText || a.title || "").slice(0, 240)
+                      })),
+                      scripts: Array.from(document.scripts || []).slice(0, 200).map(s => ({
+                        url: s.src || "",
+                        type: s.type || "",
+                        inlineChars: s.src ? 0 : (s.textContent || "").length
+                      })),
+                      forms: Array.from(document.querySelectorAll("form")).slice(0, 120).map(f => ({
+                        action: f.action || "",
+                        method: f.method || "GET",
+                        id: f.id || "",
+                        name: f.name || ""
+                      })),
+                      hidden: Array.from(document.querySelectorAll("body *")).slice(0, 1800).filter(el => {
+                        let st = null;
+                        try { st = getComputedStyle(el); } catch(e) {}
+                        return el.hidden || el.getAttribute("aria-hidden")==="true" ||
+                               el.getAttribute("type")==="hidden" ||
+                               (st && (st.display==="none" || st.visibility==="hidden" || parseFloat(st.opacity || "1")===0));
+                      }).slice(0, 160).map(el => ({
+                        tag: el.tagName || "",
+                        href: el.href || el.src || el.action || "",
+                        text: (el.innerText || el.value || el.textContent || "").replace(/\\s+/g, " ").slice(0, 240)
+                      }))
+                    };
+                    return JSON.stringify(out);
+                  } catch (e) {
+                    return JSON.stringify({error: String(e && e.message || e)});
+                  }
+                })();
+                """
+
+                def done(raw):
+                    try:
+                        data = json.loads(raw or "{}")
+                        self.emit_event({"type": "live.manual.scan", "data": data, "category": "manual-scan"})
+                        self.ingest_runtime_event({"type": "live.manual.scan", "data": data, "category": "manual-scan"})
+                    except Exception as e:
+                        self.emit_event({"type": "live.manual.scan.error", "error": str(e)})
+
+                try:
+                    self.live_page.runJavaScript(js, done)
+                except Exception as e:
+                    self.emit_event({"type": "live.manual.scan.run.error", "error": str(e)})
+
+            # ----------------------------------------------------------
+            # Rendering
+            # ----------------------------------------------------------
+
+            def on_result_source_changed(self, source):
+                try:
+                    html_text = self.latest_html_by_source.get(str(source or ""), "")
+                    if html_text:
+                        self.html_view.setPlainText(
+                            f"<!-- source: {source}, chars={len(html_text)} -->\n\n{html_text}"
+                        )
+                except Exception:
+                    pass
+
+            def render_selected_sniffer_html(self):
+                try:
+                    source = self.result_source_combo.currentText().strip()
+                    html_text = self.latest_html_by_source.get(source)
+
+                    if not source or not html_text:
+                        QMessageBox.information(self, "Render", "No sniffer HTML is selected yet.")
+                        return
+
+                    self.sniff_view.setHtml(
+                        html_text,
+                        QUrl(normalize_url(self.address.text() or start_url)),
+                    )
+                    self.browser_tabs.setCurrentWidget(self.sniff_view)
+                    self.html_view.setPlainText(
+                        f"<!-- rendered source: {source}, chars={len(html_text)} -->\n\n{html_text}"
+                    )
+                    self.emit_event({"type": "sniffer.render.selected", "source": source, "chars": len(html_text)})
+
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.render.selected.error", "error": str(e)})
+
+            def render_best_sniffer_html(self):
+                try:
+                    preferred = ["react", "runtime", "js", "database", "network", "https", "interaction"]
+
+                    chosen_name = ""
+                    chosen_html = ""
+
+                    for name in preferred:
+                        html_text = self.latest_html_by_source.get(name)
+                        if html_text:
+                            chosen_name = name
+                            chosen_html = html_text
+                            break
+
+                    if not chosen_html and self.latest_html_by_source:
+                        chosen_name, chosen_html = next(iter(self.latest_html_by_source.items()))
+
+                    if not chosen_html:
+                        QMessageBox.information(self, "Render", "No sniffer HTML has been returned yet.")
+                        return
+
+                    idx = self.result_source_combo.findText(chosen_name)
+                    if idx >= 0:
+                        self.result_source_combo.setCurrentIndex(idx)
+
+                    self.sniff_view.setHtml(
+                        chosen_html,
+                        QUrl(normalize_url(self.address.text() or start_url)),
+                    )
+                    self.browser_tabs.setCurrentWidget(self.sniff_view)
+                    self.html_view.setPlainText(
+                        f"<!-- rendered source: {chosen_name}, chars={len(chosen_html)} -->\n\n{chosen_html}"
+                    )
+
+                    self.emit_event({"type": "sniffer.render.best", "source": chosen_name, "chars": len(chosen_html)})
+
+                except Exception as e:
+                    self.emit_event({"type": "sniffer.render.best.error", "error": str(e)})
+
+            # ----------------------------------------------------------
+            # Discovery ingestion
+            # ----------------------------------------------------------
+
+            def extract_url_from_hit(self, h):
+                for key in ("url", "href", "src", "scriptURL", "scope", "endpoint", "action", "location"):
+                    v = h.get(key)
+                    if isinstance(v, str) and v.startswith(("http://", "https://", "ws://", "wss://")):
+                        return redact_url(v)
+
+                try:
+                    blob = json.dumps(h, ensure_ascii=False, default=str)
+                    m = URL_RE.search(blob)
+                    if m:
+                        return redact_url(m.group(0))
+                except Exception:
+                    pass
+
+                return ""
+
+            def add_raw_hit_row(self, source, h):
+                row = self.hits_table.rowCount()
+                self.hits_table.insertRow(row)
+
+                values = [
+                    h.get("sniffer") or source,
+                    h.get("kind") or h.get("type") or h.get("category") or "",
+                    h.get("tag") or h.get("source") or "",
+                    h.get("url") or h.get("href") or h.get("src") or h.get("action") or "",
+                    h.get("text") or h.get("title") or h.get("name") or h.get("summary") or "",
+                    h.get("content_type") or h.get("contentType") or h.get("mime") or "",
+                    h.get("status") or "",
+                ]
+
+                for col, val in enumerate(values):
+                    self.hits_table.setItem(row, col, QTableWidgetItem(str(val or "")[:3000]))
+
+            def add_discovery_from_hit(self, source, h):
+                url = self.extract_url_from_hit(h)
+                category = h.get("category") or classify_url(
+                    url,
+                    str(h.get("content_type") or h.get("contentType") or h.get("mime") or ""),
+                    json.dumps(h, ensure_ascii=False, default=str)[:1200],
+                )
+
+                if not url and category == "metadata":
+                    return
+
+                key = f"{category}|{url}|{source}|{h.get('tag') or h.get('kind') or h.get('type') or ''}"
+                if key in self.discovered_urls:
+                    return
+
+                self.discovered_urls[key] = h
+
+                row = self.discovery_table.rowCount()
+                self.discovery_table.insertRow(row)
+
+                evidence = (
+                    h.get("evidence")
+                    or h.get("text")
+                    or h.get("title")
+                    or h.get("summary")
+                    or h.get("tag")
+                    or h.get("type")
+                    or h.get("message")
+                    or ""
+                )
+
+                score = h.get("score") or h.get("confidence") or ""
+
+                values = [
+                    category,
+                    url,
+                    source,
+                    h.get("status") or "",
+                    h.get("content_type") or h.get("contentType") or h.get("mime") or "",
+                    score,
+                    evidence,
+                ]
+
+                for col, val in enumerate(values):
+                    self.discovery_table.setItem(row, col, QTableWidgetItem(str(val or "")[:3000]))
+
+            def add_database_hit(self, source, h):
+                try:
+                    row = self.database_table.rowCount()
+                    self.database_table.insertRow(row)
+
+                    name = (
+                        h.get("name")
+                        or h.get("key")
+                        or h.get("database")
+                        or h.get("store")
+                        or h.get("tag")
+                        or h.get("type")
+                        or h.get("category")
+                        or ""
+                    )
+
+                    summary = h.get("summary") or h.get("text") or h.get("evidence") or ""
+                    if not summary:
+                        try:
+                            summary = json.dumps(h.get("json") or h.get("meta") or h, ensure_ascii=False)[:2000]
+                        except Exception:
+                            summary = ""
+
+                    values = [
+                        source,
+                        h.get("kind") or h.get("type") or h.get("category") or "",
+                        name,
+                        h.get("url") or h.get("href") or h.get("src") or h.get("action") or "",
+                        summary,
+                    ]
+
+                    for col, val in enumerate(values):
+                        self.database_table.setItem(row, col, QTableWidgetItem(str(val or "")[:3000]))
+                except Exception:
+                    pass
+
+            def ingest_runtime_event(self, ev):
+                try:
+                    if not isinstance(ev, dict):
+                        return
+
+                    ev_type = str(ev.get("type") or "")
+                    category = str(ev.get("category") or classify_url(
+                        str(ev.get("url") or ev.get("href") or ev.get("location") or ""),
+                        str(ev.get("contentType") or ev.get("content_type") or ""),
+                        ev_type,
+                    ))
+
+                    visible_runtime = any(x in ev_type for x in (
+                        "fetch", "xhr", "websocket", "eventsource", "worker",
+                        "serviceworker", "broadcast", "runtime", "react.quick",
+                        "database.quick", "js.error", "qt.request", "live.load",
+                        "preview.load", "form.submit", "resource.snapshot",
+                        "hidden.dom", "embedded.json", "manual.scan"
+                    ))
+
+                    if visible_runtime:
+                        row = self.runtime_table.rowCount()
+                        self.runtime_table.insertRow(row)
+
+                        url = ev.get("url") or ev.get("href") or ev.get("location") or ev.get("action") or ""
+                        summary = ev.get("message") or ev.get("error") or ev.get("contentType") or ""
+                        if not summary:
+                            try:
+                                summary = json.dumps(ev, ensure_ascii=False)[:1400]
+                            except Exception:
+                                summary = ""
+
+                        values = [
+                            ev_type,
+                            category,
+                            ev.get("method") or "",
+                            ev.get("status") or "",
+                            url,
+                            summary,
+                        ]
+
+                        for col, val in enumerate(values):
+                            self.runtime_table.setItem(row, col, QTableWidgetItem(str(val or "")[:3000]))
+
+                    # Expand batched JS hook items into discovery rows.
+                    items = ev.get("items")
+                    if isinstance(items, list):
+                        for item in items:
+                            if isinstance(item, dict):
+                                h = dict(item)
+                                h.setdefault("type", ev_type)
+                                h.setdefault("sniffer", "live_hook")
+                                h.setdefault("source", ev_type)
+                                self.add_discovery_from_hit("live_hook", h)
+
+                                if category in {"hidden-dom", "browser-storage", "react/spa", "embedded-json"} or ev_type in {"hidden.dom", "database.quick", "react.quick", "embedded.json"}:
+                                    self.add_database_hit("live_hook", h)
+
+                    data = ev.get("data")
+                    if isinstance(data, dict):
+                        for bucket in ("links", "scripts", "forms", "hidden"):
+                            arr = data.get(bucket)
+                            if isinstance(arr, list):
+                                for item in arr:
+                                    if isinstance(item, dict):
+                                        h = dict(item)
+                                        h.setdefault("type", bucket)
+                                        h.setdefault("sniffer", "manual_live_scan")
+                                        h.setdefault("source", "manual_live_scan")
+                                        self.add_discovery_from_hit("manual_live_scan", h)
+                                        if bucket == "hidden":
+                                            self.add_database_hit("manual_live_scan", h)
+
+                    # Single URL events.
+                    if ev.get("url") or ev.get("href") or ev.get("action"):
+                        h = dict(ev)
+                        h.setdefault("sniffer", "live_hook")
+                        h.setdefault("source", ev_type)
+                        self.add_discovery_from_hit("live_hook", h)
+
+                    if ev_type in {"database.quick", "react.quick", "hidden.dom", "embedded.json"}:
+                        self.add_database_hit("live_hook", {
+                            "kind": ev_type,
+                            "name": ev_type,
+                            "summary": json.dumps(ev, ensure_ascii=False)[:2000],
+                            "url": ev.get("location") or "",
+                            "category": category,
+                        })
+
+                except Exception:
+                    pass
+
+            # ----------------------------------------------------------
+            # Easy actions
+            # ----------------------------------------------------------
+
+            def open_selected_url(self):
+                try:
+                    u = self.selected_url()
+                    if not u:
+                        QMessageBox.information(self, "Open URL", "Select a row with a URL first.")
+                        return
+
+                    u = normalize_url(u)
+                    self.address.setText(u)
+                    self.live_view.load(QUrl(u))
+                    self.browser_tabs.setCurrentWidget(self.live_view)
+                    self.emit_event({"type": "selected.url.opened", "url": u})
+                except Exception as e:
+                    self.emit_event({"type": "selected.url.open.error", "error": str(e)})
+
+            def copy_selected_url(self):
+                try:
+                    u = self.selected_url()
+                    if not u:
+                        return
+                    QApplication.clipboard().setText(u)
+                    self.status_label.setText("Copied URL")
+                    self.emit_event({"type": "selected.url.copied", "url": u})
+                except Exception as e:
+                    self.emit_event({"type": "selected.url.copy.error", "error": str(e)})
+
+            def apply_hit_filter(self):
+                needle = self.hit_filter.text().strip().lower()
+
+                for table in (self.discovery_table, self.hits_table, self.runtime_table, self.database_table):
+                    try:
+                        for row in range(table.rowCount()):
+                            if not needle:
+                                table.setRowHidden(row, False)
+                                continue
+
+                            row_text = []
+                            for col in range(table.columnCount()):
+                                item = table.item(row, col)
+                                if item:
+                                    row_text.append(item.text().lower())
+
+                            table.setRowHidden(row, needle not in " ".join(row_text))
+                    except Exception:
+                        pass
+
+            # ----------------------------------------------------------
+            # DOM / save / clear
+            # ----------------------------------------------------------
+
+            def dump_dom(self):
+                active_view = self.browser_tabs.currentWidget()
+                if active_view not in (self.live_view, self.sniff_view):
+                    active_view = self.live_view
+
+                js = """
+                (() => {
+                  try {
+                    return document.documentElement ? document.documentElement.outerHTML.slice(0, 1800000) : "";
+                  } catch (e) {
+                    return "[DOM dump error] " + String(e && e.message || e);
+                  }
+                })();
+                """
+
+                def done(html_text):
+                    try:
+                        out_dir = Path(cfg.get("dump_dir") or "browser_dumps")
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        path = out_dir / f"dom_{int(time.time())}.html"
+                        Path(path).write_text(str(html_text or ""), encoding="utf-8", errors="ignore")
+                        self.emit_event({
+                            "type": "dom.dumped",
+                            "path": str(path),
+                            "chars": len(str(html_text or "")),
+                        })
+                    except Exception as e:
+                        self.emit_event({
+                            "type": "dom.dump.error",
+                            "error": str(e)[:500],
+                        })
+
+                try:
+                    active_view.page().runJavaScript(js, done)
+                except Exception as e:
+                    self.emit_event({"type": "dom.dump.run.error", "error": str(e)})
+
+            def save_html_as(self):
+                html_source = self.html_view.toPlainText()
+
+                if not html_source:
+                    source = self.result_source_combo.currentText().strip()
+                    html_source = self.latest_html_by_source.get(source, "")
+
+                if not html_source:
+                    active_view = self.browser_tabs.currentWidget()
+                    if active_view not in (self.live_view, self.sniff_view):
+                        active_view = self.live_view
+
+                    js = """
+                    (() => {
+                      try {
+                        return document.documentElement ? document.documentElement.outerHTML : "";
+                      } catch (e) {
+                        return "[HTML save error] " + String(e && e.message || e);
+                      }
+                    })();
+                    """
+
+                    def done(html_text):
+                        self._save_html_text(html_text)
+
+                    active_view.page().runJavaScript(js, done)
+                    return
+
+                self._save_html_text(html_source)
+
+            def _save_html_text(self, html_text):
+                try:
+                    path, _ = QFileDialog.getSaveFileName(
+                        self,
+                        "Save rendered/sniffed HTML",
+                        "rendered_or_sniffed_page.html",
+                        "HTML Files (*.html);;All Files (*)",
+                    )
+                    if not path:
+                        return
+
+                    Path(path).write_text(str(html_text or ""), encoding="utf-8", errors="ignore")
+                    self.emit_event({
+                        "type": "html.saved",
+                        "path": str(path),
+                        "chars": len(str(html_text or "")),
+                    })
+                except Exception as e:
+                    QMessageBox.warning(self, "Save failed", str(e))
+                    self.emit_event({
+                        "type": "html.save.error",
+                        "error": str(e)[:500],
+                    })
+
+            def clear_runtime_views(self):
+                try:
+                    self.log_view.clear()
+                    self.meta_view.clear()
+                    self.html_view.clear()
+
+                    for table in (
+                        self.hits_table,
+                        self.discovery_table,
+                        self.runtime_table,
+                        self.database_table,
+                    ):
+                        table.setRowCount(0)
+
+                    self.latest_hits = []
+                    self.discovered_urls = {}
+                    self.latest_html_by_source = {}
+                    self.result_source_combo.clear()
+
+                    self.status_label.setText("Cleared")
+                    self.emit_event({"type": "ui.cleared"})
+                except Exception:
+                    pass
+
+            def closeEvent(self, ev):
+                self.emit_event({"type": "browser.closed"})
+                try:
+                    if self.sniffer_thread is not None and self.sniffer_thread.isRunning():
+                        self.sniffer_thread.cancel()
+                        self.sniffer_thread.wait(1500)
+                except Exception:
+                    pass
+                return super().closeEvent(ev)
+
+        app = QApplication.instance() or QApplication(sys.argv)
+
+        window_ref = BrowserWindow()
+        window_ref.show()
+
+        return int(app.exec_())
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        try:
+            Path(error_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(error_path).write_text(tb, encoding="utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        write_jsonl(log_path, {
+            "type": "browser.child.crash",
+            "error": str(e),
+            "traceback": tb[-4000:],
+        })
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
+
+    def execute(self, payload: Any, *, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        import json
+        import os
+        import subprocess
+        import sys
+        import time
+        from pathlib import Path
+
+        url = self._normalize_url(params.get("url") or payload or "about:blank")
+
+        base_dir = Path(str(params.get("base_dir") or ".interactive_browser")).resolve()
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        log_path = Path(str(params.get("log_path") or (base_dir / "browser_events.jsonl"))).resolve()
+        error_path = Path(str(params.get("error_path") or (base_dir / "browser_errors.log"))).resolve()
+        profile_dir = Path(str(params.get("profile_dir") or (base_dir / "profile_default"))).resolve()
+        dump_dir = Path(str(params.get("dump_dir") or (base_dir / "dumps"))).resolve()
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        dump_dir.mkdir(parents=True, exist_ok=True)
+
+        extra_headers = self._dict_from_param(params.get("extra_headers"))
+        http_headers = self._dict_from_param(params.get("http_headers"))
+
+        cfg = {
+            "url": url,
+            "title": str(params.get("title") or "Advanced Enterprise Interactive Browser"),
+            "width": self._safe_int(params.get("width"), 1620),
+            "height": self._safe_int(params.get("height"), 1020),
+
+            "base_dir": str(base_dir),
+            "log_path": str(log_path),
+            "error_path": str(error_path),
+            "profile_dir": str(profile_dir),
+            "dump_dir": str(dump_dir),
+
+            # UI behavior.
+            "load_live_browser": self._truthy(params.get("load_live_browser"), True),
+            "auto_run_sniffers": self._truthy(params.get("auto_run_sniffers"), True),
+            "sniff_on_navigation": self._truthy(params.get("sniff_on_navigation"), False),
+            "render_sniffer_html": self._truthy(params.get("render_sniffer_html"), False),
+            "wait": self._truthy(params.get("wait"), False),
+
+            # Browser capture.
+            "capture_console": self._truthy(params.get("capture_console"), True),
+            "capture_requests": self._truthy(params.get("capture_requests"), True),
+            "enable_javascript_hooks": self._truthy(params.get("enable_javascript_hooks"), True),
+            "max_log_lines": self._safe_int(params.get("max_log_lines"), 10000),
+            "max_render_html_chars": self._safe_int(params.get("max_render_html_chars"), 1_800_000),
+
+            # Qt / Chromium proxy and flags.
+            "proxy": str(params.get("proxy") or ""),
+            "chromium_flags": str(params.get("chromium_flags") or "--disable-quic --disable-http3"),
+
+            # Filtering.
+            "enable_domain_blocking": self._truthy(params.get("enable_domain_blocking"), True),
+            "blocked_domains": params.get(
+                "blocked_domains",
+                "doubleclick,googlesyndication,analytics,adservice,scorecardresearch"
+            ),
+            "enable_allowlist": self._truthy(params.get("enable_allowlist"), False),
+            "allowed_domains": params.get("allowed_domains", ""),
+            "extra_headers": extra_headers,
+
+            # HTTPSSubmanager.
+            "use_https_fetch": self._truthy(params.get("use_https_fetch"), True),
+            "http_headers": http_headers,
+            "http_retries": self._safe_int(params.get("http_retries"), 2),
+            "http_max_conn_per_host": self._safe_int(params.get("http_max_conn_per_host"), 8),
+            "http_verify_tls": self._truthy(params.get("http_verify_tls"), True),
+            "http_ca_bundle": str(params.get("http_ca_bundle") or ""),
+            "http_allow_redirects": self._truthy(params.get("http_allow_redirects"), True),
+            "http_max_html_bytes": self._safe_int(params.get("http_max_html_bytes"), 900_000),
+
+            # Playwright sniffer context.
+            "timeout": self._safe_float(params.get("timeout"), 12.0),
+            "sniffer_timeout": self._safe_float(
+                params.get("sniffer_timeout"),
+                self._safe_float(params.get("timeout"), 12.0),
+            ),
+            "user_agent": str(
+                params.get("user_agent")
+                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/AdvancedInteractiveBrowser"
+            ),
+            "pw_headless": self._truthy(params.get("pw_headless"), True),
+            "pw_channel": str(params.get("pw_channel") or ""),
+            "pw_proxy": str(params.get("pw_proxy") or params.get("proxy") or ""),
+            "pw_bypass_csp": self._truthy(params.get("pw_bypass_csp"), False),
+            "pw_launch_args": params.get(
+                "pw_launch_args",
+                "--disable-quic,--disable-http3,--disable-blink-features=AutomationControlled",
+            ),
+
+            # Sniffer toggles.
+            "use_network_sniff": self._truthy(params.get("use_network_sniff"), True),
+            "use_js_sniff": self._truthy(params.get("use_js_sniff"), True),
+            "use_runtime_sniff": self._truthy(params.get("use_runtime_sniff"), True),
+            "use_react_sniff": self._truthy(params.get("use_react_sniff"), True),
+            "use_database_sniff": self._truthy(params.get("use_database_sniff"), True),
+            "use_interaction_sniff": self._truthy(params.get("use_interaction_sniff"), True),
+
+            # NetworkSniffer advanced toggles.
+            "network_max_items": self._safe_int(params.get("network_max_items"), 500),
+            "network_max_json_hits": self._safe_int(params.get("network_max_json_hits"), 500),
+            "network_json_sniff": self._truthy(params.get("network_json_sniff"), True),
+            "network_graphql_sniff": self._truthy(params.get("network_graphql_sniff"), True),
+            "network_mse_sniff": self._truthy(params.get("network_mse_sniff"), True),
+            "network_param_sniff": self._truthy(params.get("network_param_sniff"), True),
+            "network_bundle_scan": self._truthy(params.get("network_bundle_scan"), True),
+            "network_header_url_mining": self._truthy(params.get("network_header_url_mining"), True),
+            "network_redirect_tracking": self._truthy(params.get("network_redirect_tracking"), True),
+            "network_url_salvage": self._truthy(params.get("network_url_salvage"), True),
+            "network_binary_signature_sniff": self._truthy(params.get("network_binary_signature_sniff"), True),
+            "network_candidate_promotion": self._truthy(params.get("network_candidate_promotion"), True),
+
+            # RuntimeSniffer.
+            "runtime_websocket_sniff": self._truthy(params.get("runtime_websocket_sniff"), True),
+            "runtime_perf_sniff": self._truthy(params.get("runtime_perf_sniff"), True),
+            "runtime_storage_sniff": self._truthy(params.get("runtime_storage_sniff"), True),
+            "runtime_media_events_sniff": self._truthy(params.get("runtime_media_events_sniff"), True),
+            "runtime_mediasource_sniff": self._truthy(params.get("runtime_mediasource_sniff"), True),
+            "runtime_console_sniff": self._truthy(params.get("runtime_console_sniff"), True),
+            "runtime_url_hooks": self._truthy(params.get("runtime_url_hooks"), True),
+            "runtime_mutation_observer": self._truthy(params.get("runtime_mutation_observer"), True),
+
+            # ReactSniffer.
+            "react_hook_history_api": self._truthy(params.get("react_hook_history_api"), True),
+            "react_hook_link_clicks": self._truthy(params.get("react_hook_link_clicks"), True),
+            "react_devtools_hook": self._truthy(params.get("react_devtools_hook"), True),
+
+            # DatabaseSniffer.
+            "database_indexeddb_dump": self._truthy(params.get("database_indexeddb_dump"), True),
+            "database_backend_fingerprint": self._truthy(params.get("database_backend_fingerprint"), True),
+            "database_html_link_scan": self._truthy(params.get("database_html_link_scan"), True),
+            "database_backend_link_scan": self._truthy(params.get("database_backend_link_scan"), True),
+            "database_max_idb_records": self._safe_int(params.get("database_max_idb_records"), 30),
+            "database_max_idb_stores": self._safe_int(params.get("database_max_idb_stores"), 24),
+            "database_max_idb_databases": self._safe_int(params.get("database_max_idb_databases"), 24),
+
+            # InteractionSniffer.
+            "interaction_cdp_listeners": self._truthy(params.get("interaction_cdp_listeners"), True),
+            "interaction_overlay_detection": self._truthy(params.get("interaction_overlay_detection"), True),
+            "interaction_form_extraction": self._truthy(params.get("interaction_form_extraction"), True),
+
+            # Common sniffer behavior.
+            "sniffer_auto_scroll": self._truthy(params.get("sniffer_auto_scroll"), True),
+            "sniffer_scroll_steps": self._safe_int(params.get("sniffer_scroll_steps"), 38),
+            "sniffer_scroll_delay_ms": self._safe_int(params.get("sniffer_scroll_delay_ms"), 325),
+            "extensions": params.get("extensions", ""),
+            "query": str(params.get("query") or ""),
+        }
+
+        script_path = base_dir / "interactive_browser_child.py"
+        cfg_path = base_dir / f"interactive_browser_config_{int(time.time() * 1000)}.json"
+
+        script_path.write_text(self._child_script_source(), encoding="utf-8")
+        cfg_path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        cmd = [
+            sys.executable,
+            str(script_path),
+            str(cfg_path),
+        ]
+
+        env = os.environ.copy()
+
+        # Make sure the child can import submanagers.py and local project modules.
+        cwd = Path.cwd().resolve()
+        try:
+            module_dir = Path(__file__).resolve().parent
+        except Exception:
+            module_dir = cwd
+
+        py_paths = [str(module_dir), str(cwd)]
+        existing_pp = env.get("PYTHONPATH")
+        if existing_pp:
+            py_paths.append(existing_pp)
+        env["PYTHONPATH"] = os.pathsep.join(py_paths)
+
+        if getattr(sys, "frozen", False):
+            try:
+                cert_path = os.path.join(sys._MEIPASS, "certifi", "cacert.pem")
+                if os.path.exists(cert_path):
+                    env["REQUESTS_CA_BUNDLE"] = cert_path
+                    env["SSL_CERT_FILE"] = cert_path
+            except Exception:
+                pass
+
+        wait = self._truthy(params.get("wait"), False)
+
+        if wait:
+            proc = subprocess.run(cmd, env=env)
+            return (
+                f"[interactive_browser] closed url={url} returncode={proc.returncode}",
+                {
+                    "ok": proc.returncode == 0,
+                    "url": url,
+                    "returncode": proc.returncode,
+                    "waited": True,
+                    "log_path": str(log_path),
+                    "error_path": str(error_path),
+                    "profile_dir": str(profile_dir),
+                    "dump_dir": str(dump_dir),
+                    "config_path": str(cfg_path),
+                    "script_path": str(script_path),
+                    "enabled_sniffers": {
+                        "network": cfg["use_network_sniff"],
+                        "js": cfg["use_js_sniff"],
+                        "runtime": cfg["use_runtime_sniff"],
+                        "react": cfg["use_react_sniff"],
+                        "database": cfg["use_database_sniff"],
+                        "interaction": cfg["use_interaction_sniff"],
+                    },
+                },
+            )
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=(os.name != "nt"),
+            )
+        except Exception as e:
+            return (
+                f"[interactive_browser] failed to launch: {type(e).__name__}: {e}",
+                {
+                    "ok": False,
+                    "error": str(e),
+                    "url": url,
+                    "log_path": str(log_path),
+                    "error_path": str(error_path),
+                    "profile_dir": str(profile_dir),
+                    "dump_dir": str(dump_dir),
+                    "config_path": str(cfg_path),
+                    "script_path": str(script_path),
+                },
+            )
+
+        return (
+            f"[interactive_browser] opened pid={proc.pid} url={url}",
+            {
+                "ok": True,
+                "url": url,
+                "pid": proc.pid,
+                "waited": False,
+                "log_path": str(log_path),
+                "error_path": str(error_path),
+                "profile_dir": str(profile_dir),
+                "dump_dir": str(dump_dir),
+                "config_path": str(cfg_path),
+                "script_path": str(script_path),
+                "enabled_sniffers": {
+                    "network": cfg["use_network_sniff"],
+                    "js": cfg["use_js_sniff"],
+                    "runtime": cfg["use_runtime_sniff"],
+                    "react": cfg["use_react_sniff"],
+                    "database": cfg["use_database_sniff"],
+                    "interaction": cfg["use_interaction_sniff"],
+                },
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # GUI params
+    # ------------------------------------------------------------------
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "url": "URL to open. Defaults to payload.",
+            "title": "Advanced Enterprise Interactive Browser",
+            "width": 1620,
+            "height": 1020,
+
+            "base_dir": ".interactive_browser",
+            "log_path": ".interactive_browser/browser_events.jsonl",
+            "error_path": ".interactive_browser/browser_errors.log",
+            "profile_dir": ".interactive_browser/profile_default",
+            "dump_dir": ".interactive_browser/dumps",
+
+            "load_live_browser": True,
+            "auto_run_sniffers": True,
+            "sniff_on_navigation": False,
+            "render_sniffer_html": False,
+            "wait": False,
+
+            "capture_console": True,
+            "capture_requests": True,
+            "enable_javascript_hooks": True,
+
+            "proxy": "Optional Qt proxy, e.g. http://127.0.0.1:8888",
+            "pw_proxy": "Optional Playwright proxy, defaults to proxy.",
+            "chromium_flags": "--disable-quic --disable-http3",
+            "pw_headless": True,
+            "pw_channel": "",
+            "pw_bypass_csp": False,
+
+            "enable_domain_blocking": True,
+            "blocked_domains": "doubleclick,googlesyndication,analytics,adservice,scorecardresearch",
+            "enable_allowlist": False,
+            "allowed_domains": "",
+            "extra_headers": {},
+            "http_headers": {},
+
+            "use_https_fetch": True,
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_verify_tls": True,
+            "http_ca_bundle": "",
+            "http_allow_redirects": True,
+            "http_max_html_bytes": 900000,
+
+            "timeout": 12,
+            "sniffer_timeout": 12,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/AdvancedInteractiveBrowser",
+
+            "use_network_sniff": True,
+            "use_js_sniff": True,
+            "use_runtime_sniff": True,
+            "use_react_sniff": True,
+            "use_database_sniff": True,
+            "use_interaction_sniff": True,
+
+            "network_max_items": 500,
+            "network_max_json_hits": 500,
+            "network_json_sniff": True,
+            "network_graphql_sniff": True,
+            "network_mse_sniff": True,
+            "network_param_sniff": True,
+            "network_bundle_scan": True,
+            "network_header_url_mining": True,
+            "network_redirect_tracking": True,
+            "network_url_salvage": True,
+            "network_binary_signature_sniff": True,
+            "network_candidate_promotion": True,
+
+            "runtime_websocket_sniff": True,
+            "runtime_perf_sniff": True,
+            "runtime_storage_sniff": True,
+            "runtime_media_events_sniff": True,
+            "runtime_mediasource_sniff": True,
+            "runtime_console_sniff": True,
+            "runtime_url_hooks": True,
+            "runtime_mutation_observer": True,
+
+            "react_hook_history_api": True,
+            "react_hook_link_clicks": True,
+            "react_devtools_hook": True,
+
+            "database_indexeddb_dump": True,
+            "database_backend_fingerprint": True,
+            "database_html_link_scan": True,
+            "database_backend_link_scan": True,
+            "database_max_idb_records": 30,
+            "database_max_idb_stores": 24,
+            "database_max_idb_databases": 24,
+
+            "interaction_cdp_listeners": True,
+            "interaction_overlay_detection": True,
+            "interaction_form_extraction": True,
+
+            "sniffer_auto_scroll": True,
+            "sniffer_scroll_steps": 38,
+            "sniffer_scroll_delay_ms": 325,
+            "extensions": "",
+            "query": "",
+            "max_log_lines": 10000,
+            "max_render_html_chars": 1800000,
+        }
+
+
+BLOCKS.register("interactive_browser", InteractiveBrowserBlock)
