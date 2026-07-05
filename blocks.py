@@ -46707,3 +46707,4423 @@ if __name__ == "__main__":
 
 
 BLOCKS.register("interactive_browser", InteractiveBrowserBlock)
+
+
+
+
+
+
+
+@dataclass
+class ApiTrackerBlock(BaseBlock):
+    """
+    Async, search + crawl + API/data endpoint finder.
+
+    Similar to PageTrackerBlock, but instead of returning similar pages, this
+    block discovers URLs that look like public data/API endpoints and optionally
+    validates that they return parseable structured data.
+
+      • Supports DuckDuckGo / Google CSE / SearXNG / sites / database engines.
+      • Integrates with DatabaseSubmanager + PageTrackerStore/ApiTrackerStore.
+      • Uses JS / Network / Runtime / React / Database / Interaction sniffers.
+      • Returns ranked API/data endpoints with kind, content type, host, source.
+      • Can validate JSON, NDJSON, CSV/TSV, XML/RSS/Atom, text-like data.
+    """
+
+    # ------------------------------------------------------------------ #
+    # Static ignored assets
+    # ------------------------------------------------------------------ #
+
+    JUNK_FILENAME_KEYWORDS = {
+        "sprite",
+        "icon",
+        "favicon",
+        "logo",
+        "tracking",
+        "pixel",
+        "blank",
+        "placeholder",
+        "analytics",
+        "beacon",
+        "ads",
+        "advert",
+        "manifest",
+        "service-worker",
+        "sw.js",
+    }
+
+    IGNORED_STATIC_EXTENSIONS = {
+        ".css",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".svg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".webp",
+        ".avif",
+        ".bmp",
+        ".tiff",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".otf",
+        ".map",
+        ".mp3",
+        ".m4a",
+        ".flac",
+        ".ogg",
+        ".wav",
+        ".mp4",
+        ".m4v",
+        ".mov",
+        ".avi",
+        ".mkv",
+        ".webm",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".exe",
+        ".dll",
+        ".dmg",
+        ".pkg",
+        ".apk",
+        ".ipa",
+        ".iso",
+    }
+
+    DATA_EXTENSIONS = {
+        ".json",
+        ".jsonp",
+        ".ndjson",
+        ".geojson",
+        ".csv",
+        ".tsv",
+        ".xml",
+        ".rss",
+        ".atom",
+        ".txt",
+        ".yaml",
+        ".yml",
+    }
+
+    API_PATH_MARKERS = (
+        "/api/",
+        "/apis/",
+        "/rest/",
+        "/graphql",
+        "/gql",
+        "/query",
+        "/queries/",
+        "/ajax/",
+        "/rpc/",
+        "/json/",
+        "/data/",
+        "/dataset/",
+        "/datasets/",
+        "/feed/",
+        "/feeds/",
+        "/rss",
+        "/atom",
+        "/oembed",
+        "/wp-json/",
+        "/wp-json",
+        "/api.php",
+        "/api.json",
+        "/metadata/",
+        "/advancedsearch.php",
+        "/services/",
+        "/service/",
+        "/endpoint/",
+        "/endpoints/",
+        "/v1/",
+        "/v2/",
+        "/v3/",
+        "/v4/",
+        "/v5/",
+    )
+
+    API_QUERY_MARKERS = (
+        "format=json",
+        "output=json",
+        "response=json",
+        "type=json",
+        "view=json",
+        "alt=json",
+        "callback=",
+        "jsonp=",
+        "page=",
+        "per_page=",
+        "limit=",
+        "offset=",
+        "rows=",
+        "q=",
+        "query=",
+        "search=",
+        "filter=",
+        "sort=",
+    )
+
+    CONTENT_TYPE_DATA_MARKERS = (
+        "application/json",
+        "application/ld+json",
+        "application/vnd.api+json",
+        "application/geo+json",
+        "application/x-ndjson",
+        "application/xml",
+        "text/xml",
+        "application/rss+xml",
+        "application/atom+xml",
+        "text/csv",
+        "text/tab-separated-values",
+        "application/csv",
+        "application/yaml",
+        "text/yaml",
+        "text/plain",
+    )
+
+    SENSITIVE_PATH_MARKERS = (
+        "/admin",
+        "/administrator",
+        "/wp-admin",
+        "/login",
+        "/logout",
+        "/signin",
+        "/sign-in",
+        "/signup",
+        "/sign-up",
+        "/register",
+        "/account",
+        "/accounts",
+        "/profile",
+        "/me",
+        "/user",
+        "/users/me",
+        "/session",
+        "/sessions",
+        "/auth",
+        "/oauth",
+        "/sso",
+        "/token",
+        "/tokens",
+        "/secret",
+        "/secrets",
+        "/private",
+        "/internal",
+        "/debug",
+        "/config",
+        "/configs",
+        "/env",
+        "/.env",
+        "/password",
+        "/reset",
+        "/billing",
+        "/payment",
+        "/payments",
+        "/checkout",
+        "/cart",
+        "/order",
+        "/orders",
+    )
+
+    SENSITIVE_QUERY_KEYS = {
+        "token",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "auth",
+        "authorization",
+        "password",
+        "passwd",
+        "secret",
+        "client_secret",
+        "api_secret",
+        "session",
+        "sid",
+        "key",
+        "api_key",
+        "apikey",
+    }
+
+    # Query keys/values that LinkTracker-style resolvers often append to force
+    # downloads or PDFs. ApiTracker must clean these off JSON/data URLs before
+    # validating so URLs like `file.json?format=pdf&export=download` do not
+    # poison the endpoint probe.
+    API_NOISE_QUERY_KEYS = {
+        "download",
+        "export",
+    }
+
+    API_BAD_FORMAT_VALUES = {
+        "pdf",
+        "html",
+        "htm",
+        "doc",
+        "docx",
+        "zip",
+        "rar",
+        "7z",
+    }
+
+    _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
+
+    _REL_API_RE = re.compile(
+        r"""(?:
+            ["'`(=:\s]
+            (
+                /(?:api|apis|rest|graphql|gql|ajax|rpc|json|data|dataset|datasets|wp-json|feed|feeds|v[0-9])[^"'`\s<>)]+
+            )
+        )""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    _FETCH_LITERAL_RE = re.compile(
+        r"""(?:fetch|axios\.get|\$\.get|getJSON|XMLHttpRequest|open)\s*\(\s*["']([^"']+)["']""",
+        re.IGNORECASE,
+    )
+
+    _JSON_SCRIPT_TYPES = {
+        "application/json",
+        "application/ld+json",
+        "application/vnd.api+json",
+        "application/geo+json",
+        "application/x-ndjson",
+    }
+
+    MEGA_HOSTS = {"mega.nz", "www.mega.nz", "mega.co.nz", "www.mega.co.nz"}
+
+    # ------------------------------------------------------------------ #
+    # Initialization
+    # ------------------------------------------------------------------ #
+
+    def __post_init__(self):
+        self.db: Optional[submanagers.DatabaseSubmanager] = None
+        self.store: Optional[Any] = None
+
+        self.js_sniffer = submanagers.JSSniffer(
+            submanagers.JSSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+
+        self.network_sniffer = submanagers.NetworkSniffer(
+            submanagers.NetworkSniffer.Config(
+                enable_auto_scroll=True,
+                max_scroll_steps=40,
+                scroll_step_delay_ms=500,
+            )
+        )
+
+        self.runtime_sniffer = submanagers.RuntimeSniffer(
+            submanagers.RuntimeSniffer.Config()
+        )
+
+        self.react_sniffer = submanagers.ReactSniffer(
+            submanagers.ReactSniffer.Config(
+                hook_history_api=True,
+                hook_link_clicks=True,
+                inspect_react_devtools_hook=True,
+            )
+        )
+
+        self.database_sniffer = submanagers.DatabaseSniffer(
+            submanagers.DatabaseSniffer.Config(
+                enable_indexeddb_dump=True,
+                enable_backend_fingerprint=True,
+                enable_html_link_scan=True,
+                enable_backend_link_scan=True,
+            )
+        )
+
+        self.interaction_sniffer = submanagers.InteractionSniffer(
+            submanagers.InteractionSniffer.Config(
+                enable_cdp_listeners=True,
+                enable_overlay_detection=True,
+                enable_form_extraction=True,
+            )
+        )
+
+    # ------------------------------------------------------------------ #
+    # Database lifecycle
+    # ------------------------------------------------------------------ #
+
+    def _initialize_database(self, db_path: str, logger=None) -> None:
+        """
+        Create/open DBSubmanager + store.
+
+        This tries ApiTrackerStore first if your project has one.
+        Otherwise it falls back to PageTrackerStore so this block is still
+        drop-in with the same DB wiring as PageTrackerBlock.
+        """
+        if self.db and self.store:
+            return
+
+        cfg = submanagers.DatabaseConfig(path=str(db_path or "link_corpus.db"))
+        self.db = submanagers.DatabaseSubmanager(cfg, logger=logger)
+        self.db.open()
+
+        store_cls = globals().get("ApiTrackerStore") or globals().get("PageTrackerStore")
+        if not store_cls:
+            self.store = None
+            return
+
+        self.store = store_cls(db=self.db)
+
+        ensure_schema = getattr(self.store, "ensure_schema", None)
+        if callable(ensure_schema):
+            ensure_schema()
+
+    def _store_upsert_api(self, item: Dict[str, Any]) -> None:
+        """
+        Persist an API/data endpoint if the active store supports it.
+        Falls back to upsert_page for compatibility.
+        """
+        if not self.store:
+            return
+
+        try:
+            if hasattr(self.store, "upsert_api"):
+                self.store.upsert_api(item)
+                return
+
+            if hasattr(self.store, "upsert_endpoint"):
+                self.store.upsert_endpoint(item)
+                return
+
+            if hasattr(self.store, "upsert_page"):
+                page_item = {
+                    "title": item.get("title") or item.get("kind") or "[api endpoint]",
+                    "url": item.get("url"),
+                    "source": item.get("source"),
+                    "depth": item.get("depth", 0),
+                    "score": item.get("score", 0),
+                    "status": item.get("status", "found"),
+                }
+                self.store.upsert_page(page_item)
+        except Exception as e:
+            try:
+                DEBUG_LOGGER.log_message(f"[ApiTracker][db] upsert failed: {e}")
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Basic URL helpers
+    # ------------------------------------------------------------------ #
+
+    def _safe_strip_url(self, u: str) -> str:
+        u = str(u or "").strip()
+        u = u.strip("\"'`<>[]{}")
+        u = u.rstrip(".,;)")
+        return u
+
+    def _clean_domain(self, u: str) -> str:
+        try:
+            return urlparse(u).netloc.lower().split(":")[0]
+        except Exception:
+            return ""
+
+    def _clean_path(self, u: str) -> str:
+        try:
+            return urlparse(u).path.lower()
+        except Exception:
+            return ""
+
+    def _normalize_url_for_key(self, u: str, drop_fragment: bool = True) -> str:
+        """
+        Stable dedupe key. Keeps query because APIs often depend on query args.
+        Removes fragments by default.
+        """
+        try:
+            pu = urlparse(self._safe_strip_url(u))
+            scheme = (pu.scheme or "https").lower()
+            netloc = pu.netloc.lower()
+            path = pu.path or "/"
+            query = pu.query or ""
+            fragment = "" if drop_fragment else pu.fragment
+
+            # Remove common tracker-only query keys and LinkTracker-style
+            # forced-download/PDF variants. Keeps real API params like q, page,
+            # limit, output=json, format=json, etc.
+            if query:
+                keep = []
+                path_low = path.lower()
+                is_data_path = any(path_low.endswith(ext) for ext in self.DATA_EXTENSIONS)
+
+                for k, v in parse_qsl(query, keep_blank_values=True):
+                    lk = str(k or "").lower().strip()
+                    lv = str(v or "").lower().strip()
+
+                    if lk.startswith("utm_"):
+                        continue
+                    if lk in {"fbclid", "gclid", "mc_cid", "mc_eid", "igshid"}:
+                        continue
+                    if lk in self.API_NOISE_QUERY_KEYS:
+                        continue
+                    if is_data_path and lk in {"format", "as", "type"} and lv in self.API_BAD_FORMAT_VALUES:
+                        continue
+
+                    keep.append((k, v))
+
+                query = urlencode(keep, doseq=True)
+
+            return urlunparse((scheme, netloc, path, "", query, fragment))
+        except Exception:
+            return self._safe_strip_url(u)
+
+    def _is_mega_link(self, u: str) -> bool:
+        try:
+            host = (urlparse(u).netloc or "").lower().split(":")[0]
+            return host in self.MEGA_HOSTS
+        except Exception:
+            return False
+
+    def _looks_like_sitemap(self, url: str) -> bool:
+        u = url.lower()
+        return any(
+            u.endswith(x)
+            for x in [
+                ".xml",
+                ".xml.gz",
+                "sitemap",
+                "sitemap.xml",
+                "sitemap_index.xml",
+                "sitemap-index.xml",
+            ]
+        )
+
+    def _decompress_if_needed(self, url: str, raw: bytes) -> str:
+        if not raw:
+            return ""
+
+        if url.lower().endswith(".gz"):
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                return ""
+
+        try:
+            return raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    def _parse_sitemap_any(self, xml_text: str) -> tuple[list[str], list[str]]:
+        if not xml_text.strip():
+            return [], []
+
+        try:
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return [], []
+
+        ns = ""
+        if root.tag.startswith("{"):
+            ns = root.tag.split("}", 1)[0] + "}"
+
+        sitemap_urls = []
+        page_urls = []
+
+        if root.tag.endswith("sitemapindex"):
+            for sm in root.findall(f".//{ns}sitemap/{ns}loc"):
+                if sm.text and sm.text.strip().startswith("http"):
+                    sitemap_urls.append(sm.text.strip())
+
+        if root.tag.endswith("urlset"):
+            for loc in root.findall(f".//{ns}url/{ns}loc"):
+                if loc.text and loc.text.strip().startswith("http"):
+                    page_urls.append(loc.text.strip())
+
+        return sitemap_urls, page_urls
+
+    def _extract_sitemap_urls_from_robots(self, text: str) -> list[str]:
+        urls = []
+        for line in (text or "").splitlines():
+            if line.lower().startswith("sitemap:"):
+                u = line.split(":", 1)[1].strip()
+                if u.startswith("http"):
+                    urls.append(u)
+        return urls
+
+    # ------------------------------------------------------------------ #
+    # API detection helpers
+    # ------------------------------------------------------------------ #
+
+    def _has_data_extension(self, u: str) -> bool:
+        path = self._clean_path(u)
+        return any(path.endswith(ext) for ext in self.DATA_EXTENSIONS)
+
+    def _has_ignored_static_extension(self, u: str) -> bool:
+        path = self._clean_path(u)
+        return any(path.endswith(ext) for ext in self.IGNORED_STATIC_EXTENSIONS)
+
+    def _contains_junk_filename_keyword(self, u: str) -> bool:
+        low = unquote(str(u or "")).lower()
+        return any(k in low for k in self.JUNK_FILENAME_KEYWORDS)
+
+    def _is_probably_sensitive_endpoint(self, u: str) -> bool:
+        """
+        Default safety filter. This does not mean the endpoint is dangerous;
+        it means the block should avoid probing/returning account/auth/private
+        looking URLs unless the user explicitly disables this filter.
+        """
+        try:
+            pu = urlparse(u)
+            path = (pu.path or "").lower()
+            query_pairs = parse_qsl(pu.query or "", keep_blank_values=True)
+
+            if any(path == m or path.startswith(m + "/") or m in path for m in self.SENSITIVE_PATH_MARKERS):
+                return True
+
+            for k, _v in query_pairs:
+                if k.lower() in self.SENSITIVE_QUERY_KEYS:
+                    return True
+
+            return False
+        except Exception:
+            return True
+
+    def _looks_like_api_url(self, u: str, text: str = "") -> bool:
+        """
+        Heuristic: URL shape says this is probably a data/API endpoint.
+        """
+        u = self._safe_strip_url(u)
+        if not u:
+            return False
+
+        if not u.startswith(("http://", "https://", "/")):
+            return False
+
+        low = unquote(u).lower()
+        text_low = str(text or "").lower()
+
+        if self._is_mega_link(u):
+            return False
+
+        if self._has_ignored_static_extension(u):
+            return False
+
+        if self._contains_junk_filename_keyword(u):
+            return False
+
+        if self._has_data_extension(u):
+            return True
+
+        path = urlparse(u).path.lower() if "://" in u else u.lower()
+        query = urlparse(u).query.lower() if "://" in u else ""
+
+        if any(marker in path for marker in self.API_PATH_MARKERS):
+            return True
+
+        if any(marker in query for marker in self.API_QUERY_MARKERS):
+            return True
+
+        if "application/json" in text_low or "json" == text_low.strip():
+            return True
+
+        if "api" in text_low and any(x in low for x in ["json", "/v1/", "/v2/", "/api/", "graphql"]):
+            return True
+
+        return False
+
+    def _classify_api_url(self, u: str, content_type: str = "", sample_text: str = "") -> str:
+        low = unquote(str(u or "")).lower()
+        path = self._clean_path(low)
+        ct = str(content_type or "").lower()
+        sample = str(sample_text or "").lstrip()[:200].lower()
+
+        if "application/ld+json" in ct:
+            return "json_ld"
+
+        if "application/vnd.api+json" in ct:
+            return "json_api"
+
+        if "application/geo+json" in ct or path.endswith(".geojson"):
+            return "geojson"
+
+        if "application/json" in ct or path.endswith(".json"):
+            return "json"
+
+        if "application/x-ndjson" in ct or path.endswith(".ndjson"):
+            return "ndjson"
+
+        if "text/csv" in ct or "application/csv" in ct or path.endswith(".csv"):
+            return "csv"
+
+        if "text/tab-separated-values" in ct or path.endswith(".tsv"):
+            return "tsv"
+
+        if "rss" in ct or path.endswith(".rss") or "<rss" in sample:
+            return "rss"
+
+        if "atom" in ct or path.endswith(".atom") or "<feed" in sample:
+            return "atom"
+
+        if "xml" in ct or path.endswith(".xml") or sample.startswith("<?xml") or sample.startswith("<"):
+            return "xml"
+
+        if "/graphql" in path or "/gql" in path:
+            return "graphql"
+
+        if "/wp-json" in path:
+            return "wordpress_rest"
+
+        if "archive.org/metadata/" in low:
+            return "archive_metadata"
+
+        if "advancedsearch.php" in path and "output=json" in low:
+            return "archive_advancedsearch_json"
+
+        if "/api/" in path or "/apis/" in path:
+            return "api"
+
+        if "/ajax/" in path:
+            return "ajax"
+
+        if "/data/" in path or "/dataset" in path:
+            return "data_endpoint"
+
+        if sample.startswith("{") or sample.startswith("["):
+            return "json"
+
+        if "\n" in sample_text and "," in sample_text:
+            return "csv_or_text"
+
+        return "possible_api"
+
+    def _score_api_url(
+        self,
+        u: str,
+        keywords: list[str],
+        targets: set[str],
+        *,
+        content_type: str = "",
+        kind: str = "",
+        valid: bool = False,
+        source_tag: str = "",
+        text: str = "",
+    ) -> int:
+        low = unquote(str(u or "")).lower()
+        path = self._clean_path(low)
+        query = urlparse(low).query or ""
+        ct = str(content_type or "").lower()
+        kind_low = str(kind or "").lower()
+        source_tag_low = str(source_tag or "").lower()
+
+        score = 0
+
+        if valid:
+            score += 50
+
+        if kind_low in {
+            "json",
+            "json_api",
+            "json_ld",
+            "geojson",
+            "ndjson",
+            "archive_metadata",
+            "archive_advancedsearch_json",
+        }:
+            score += 35
+        elif kind_low in {"csv", "tsv", "xml", "rss", "atom"}:
+            score += 24
+        elif kind_low in {"graphql", "wordpress_rest", "api", "data_endpoint", "ajax"}:
+            score += 18
+
+        for tok, w in [
+            ("/api/", 18),
+            ("/apis/", 16),
+            ("/wp-json/", 22),
+            ("/graphql", 18),
+            ("/gql", 12),
+            ("/rest/", 14),
+            ("/json/", 16),
+            ("/data/", 14),
+            ("/dataset", 12),
+            ("/metadata/", 16),
+            ("/advancedsearch.php", 16),
+            ("/ajax/", 7),
+            ("/v1/", 8),
+            ("/v2/", 8),
+            ("/v3/", 7),
+            ("/feed/", 5),
+            ("/rss", 8),
+            ("/atom", 8),
+        ]:
+            if tok in path:
+                score += w
+
+        for ext, w in [
+            (".json", 24),
+            (".geojson", 22),
+            (".ndjson", 20),
+            (".csv", 18),
+            (".tsv", 18),
+            (".xml", 12),
+            (".rss", 14),
+            (".atom", 14),
+        ]:
+            if path.endswith(ext):
+                score += w
+
+        if any(marker in query for marker in self.API_QUERY_MARKERS):
+            score += 10
+
+        if "format=json" in query or "output=json" in query or "alt=json" in query:
+            score += 20
+
+        if "application/json" in ct:
+            score += 20
+        if "application/ld+json" in ct:
+            score += 16
+        if "text/csv" in ct:
+            score += 14
+        if "xml" in ct:
+            score += 8
+
+        if source_tag_low in {"network_sniff", "fetch_literal", "runtime_url", "db_link"}:
+            score += 12
+
+        if keywords:
+            hay = f"{low} {text}".lower()
+            score += sum(4 for k in keywords if k and k in hay)
+
+        for ext in targets:
+            if ext and path.endswith(ext):
+                score += 8
+
+        if self._contains_junk_filename_keyword(u):
+            score -= 20
+
+        if any(bad in path for bad in ["/login", "/admin", "/auth", "/oauth", "/cart"]):
+            score -= 35
+
+        return score
+
+    def _term_overlap_ok(self, haystack: str, keywords: list[str], min_term_overlap: int) -> bool:
+        if not keywords:
+            return True
+
+        h = str(haystack or "").lower()
+        hits = 0
+
+        for k in keywords:
+            if k and k in h:
+                hits += 1
+                if hits >= min_term_overlap:
+                    return True
+
+        return False
+
+    def _allowed_by_required_sites(self, u: str, required_sites: List[str]) -> bool:
+        if not required_sites:
+            return True
+
+        d = self._clean_domain(u)
+        return any(req in d for req in required_sites)
+
+    def _is_search_url(self, u: str) -> bool:
+        try:
+            pu = urlparse(u)
+            path = (pu.path or "").lower()
+            q = (pu.query or "").lower()
+
+            if any(tok in path for tok in ["/search", "/results", "/query", "search.php"]):
+                return True
+
+            if any(k + "=" in q for k in ["q", "query", "s", "search", "keyword"]):
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    def _dedupe(self, seq: List[str]) -> List[str]:
+        seen = set()
+        out = []
+
+        for s in seq:
+            key = self._normalize_url_for_key(str(s))
+            if key not in seen:
+                seen.add(key)
+                out.append(str(s))
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Structured data validation
+    # ------------------------------------------------------------------ #
+
+    def _parse_jsonish(self, text: str) -> tuple[bool, str]:
+        """
+        Try JSON / JSONP / NDJSON.
+        """
+        s = str(text or "").strip()
+        if not s:
+            return False, ""
+
+        # Plain JSON.
+        if s.startswith("{") or s.startswith("["):
+            try:
+                json.loads(s)
+                return True, "json"
+            except Exception:
+                pass
+
+        # JSONP callback(...).
+        m = re.match(r"^[a-zA-Z_$][\w$.\[\]]*\s*\((.*)\)\s*;?\s*$", s, re.DOTALL)
+        if m:
+            inner = m.group(1).strip()
+            try:
+                json.loads(inner)
+                return True, "jsonp"
+            except Exception:
+                pass
+
+        # NDJSON.
+        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            ok = 0
+            for ln in lines[:10]:
+                try:
+                    json.loads(ln)
+                    ok += 1
+                except Exception:
+                    break
+            if ok >= 2:
+                return True, "ndjson"
+
+        return False, ""
+
+    def _looks_like_csv_or_tsv(self, text: str) -> tuple[bool, str]:
+        s = str(text or "")
+        if not s.strip():
+            return False, ""
+
+        lines = [ln for ln in s.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            return False, ""
+
+        first = lines[0]
+        second = lines[1]
+
+        comma_count = first.count(",")
+        tab_count = first.count("\t")
+
+        if comma_count >= 1 and second.count(",") >= 1:
+            return True, "csv"
+
+        if tab_count >= 1 and second.count("\t") >= 1:
+            return True, "tsv"
+
+        return False, ""
+
+    def _looks_like_xml_data(self, text: str) -> tuple[bool, str]:
+        s = str(text or "").strip()
+        if not s.startswith("<"):
+            return False, ""
+
+        try:
+            root = ET.fromstring(s[:2_000_000])
+            tag = root.tag.lower()
+
+            if tag.endswith("rss"):
+                return True, "rss"
+
+            if tag.endswith("feed"):
+                return True, "atom"
+
+            return True, "xml"
+        except Exception:
+            return False, ""
+
+    def _clean_api_probe_url(self, url: str) -> str:
+        """
+        Clean API probe URLs before validation.
+
+        This fixes noisy resolver output like:
+          https://host/file.json?output=1&format=pdf&export=download
+
+        into:
+          https://host/file.json?output=1
+
+        The function keeps real API arguments and only removes forced download
+        and non-data format hints from URLs that are already data-looking.
+        """
+        return self._normalize_url_for_key(url)
+
+    async def _read_probe_with_active_http(
+        self,
+        http: Any,
+        url: str,
+        *,
+        max_probe_bytes: int,
+    ) -> tuple[Optional[int], str, str, int, str]:
+        """
+        Read an endpoint with an already-open HTTPSSubmanager instance.
+
+        This is the important async-context fix: callers can pass the `http`
+        object created by:
+
+            async with submanagers.HTTPSSubmanager(...) as http:
+
+        so ApiTracker never constructs or uses HTTPSSubmanager outside its
+        async context during validation.
+        """
+        try:
+            # Most project HTTPSSubmanager implementations expose get_bytes.
+            get_bytes = getattr(http, "get_bytes", None)
+            if callable(get_bytes):
+                raw = await get_bytes(url)
+                raw = raw or b""
+                if len(raw) > max_probe_bytes:
+                    raw = raw[:max_probe_bytes]
+                text = raw.decode("utf-8", errors="ignore")
+                return 200, "", text, len(raw), ""
+
+            # Fallback to get_text if bytes are unavailable.
+            get_text = getattr(http, "get_text", None)
+            if callable(get_text):
+                text = await get_text(url)
+                text = str(text or "")
+                if len(text.encode("utf-8", errors="ignore")) > max_probe_bytes:
+                    text = text[:max_probe_bytes]
+                return 200, "", text, len(text.encode("utf-8", errors="ignore")), ""
+
+            return None, "", "", 0, "active HTTPSSubmanager has no get_bytes/get_text"
+
+        except Exception as e:
+            return None, "", "", 0, str(e)
+
+    def _validate_structured_data_text(self, text: str, content_type: str = "", url: str = "") -> tuple[bool, str, str]:
+        """
+        Returns:
+          (is_valid_structured_data, kind, summary)
+        """
+        s = str(text or "")
+        ct = str(content_type or "").lower()
+
+        if not s.strip():
+            return False, "", "empty response"
+
+        json_ok, json_kind = self._parse_jsonish(s)
+        if json_ok:
+            return True, json_kind, "parseable JSON data"
+
+        xml_ok, xml_kind = self._looks_like_xml_data(s)
+        if xml_ok:
+            return True, xml_kind, "parseable XML/feed data"
+
+        csv_ok, csv_kind = self._looks_like_csv_or_tsv(s)
+        if csv_ok:
+            return True, csv_kind, f"table-like {csv_kind.upper()} data"
+
+        if any(x in ct for x in ["application/json", "application/ld+json", "application/vnd.api+json"]):
+            return False, "json", "JSON content-type but parse failed"
+
+        if "text/plain" in ct:
+            # Accept text only if the URL shape says data and text is not HTML.
+            low = s[:300].lower()
+            if "<html" not in low and len(s.strip()) >= 20:
+                return True, "text_data", "plain text data-like response"
+
+        return False, "", "not structured data"
+
+    async def _probe_endpoint(
+        self,
+        url: str,
+        *,
+        timeout: float,
+        user_agent: str,
+        max_probe_bytes: int,
+        exclude_sensitive_like: bool,
+        verify_tls: bool,
+        ca_bundle: Optional[str] = None,
+        http: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        GET-only validation probe.
+
+        Fixed behavior:
+          - Cleans LinkTracker-style `format=pdf`, `export=download`, and
+            `download=1` noise before probing JSON/data URLs.
+          - If an active HTTPSSubmanager is supplied, uses that open async
+            context instead of creating/using HTTPSSubmanager incorrectly.
+          - Falls back to aiohttp ClientSession if no active HTTPSSubmanager
+            is supplied.
+          - Does not POST, does not auth, and reads only a capped preview.
+        """
+        cleaned_url = self._clean_api_probe_url(url)
+
+        result = {
+            "url": cleaned_url,
+            "ok": False,
+            "status": None,
+            "content_type": "",
+            "kind": "",
+            "summary": "",
+            "preview": "",
+            "bytes_read": 0,
+            "error": "",
+        }
+
+        if exclude_sensitive_like and self._is_probably_sensitive_endpoint(cleaned_url):
+            result["error"] = "skipped sensitive-looking endpoint"
+            result["summary"] = result["error"]
+            result["kind"] = self._classify_api_url(cleaned_url)
+            return result
+
+        # Prefer the active HTTPSSubmanager when the caller has one.
+        # This directly prevents:
+        #   HTTPSSubmanager must be used in an async context
+        if http is not None:
+            status, content_type, text, bytes_read, error = await self._read_probe_with_active_http(
+                http,
+                cleaned_url,
+                max_probe_bytes=max_probe_bytes,
+            )
+
+            result["status"] = status
+            result["content_type"] = content_type or ""
+            result["bytes_read"] = bytes_read
+            result["preview"] = (text or "")[:1000]
+
+            if error:
+                result["error"] = error
+                result["summary"] = f"probe error: {error}"
+                result["kind"] = self._classify_api_url(cleaned_url, content_type or "", text or "")
+                return result
+
+            valid, kind, summary = self._validate_structured_data_text(
+                text or "",
+                content_type=content_type or "",
+                url=cleaned_url,
+            )
+            result["ok"] = bool(valid)
+            result["kind"] = kind or self._classify_api_url(cleaned_url, content_type or "", text or "")
+            result["summary"] = summary
+            return result
+
+        ssl_arg = None
+        if not verify_tls:
+            ssl_arg = False
+
+        headers = {
+            "User-Agent": user_agent,
+            "Accept": "application/json, application/ld+json, application/xml, text/xml, text/csv, text/plain, */*;q=0.5",
+            "Accept-Language": "en-US,en;q=0.9",
+            "DNT": "1",
+        }
+
+        try:
+            timeout_obj = aiohttp.ClientTimeout(total=timeout)
+
+            async with aiohttp.ClientSession(headers=headers, timeout=timeout_obj) as session:
+                async with session.get(
+                    cleaned_url,
+                    allow_redirects=True,
+                    ssl=ssl_arg,
+                ) as resp:
+                    result["status"] = resp.status
+                    result["content_type"] = resp.headers.get("content-type", "")
+
+                    raw = await resp.content.read(max_probe_bytes + 1)
+                    result["bytes_read"] = len(raw)
+
+                    if result["bytes_read"] > max_probe_bytes:
+                        raw = raw[:max_probe_bytes]
+
+                    try:
+                        text = raw.decode(resp.charset or "utf-8", errors="ignore")
+                    except Exception:
+                        text = raw.decode("utf-8", errors="ignore")
+
+                    result["preview"] = text[:1000]
+
+                    if resp.status < 200 or resp.status >= 400:
+                        result["error"] = f"HTTP {resp.status}"
+                        result["summary"] = result["error"]
+                        result["kind"] = self._classify_api_url(
+                            cleaned_url,
+                            result["content_type"],
+                            text,
+                        )
+                        return result
+
+                    valid, kind, summary = self._validate_structured_data_text(
+                        text,
+                        content_type=result["content_type"],
+                        url=cleaned_url,
+                    )
+
+                    result["ok"] = bool(valid)
+                    result["kind"] = kind or self._classify_api_url(
+                        cleaned_url,
+                        result["content_type"],
+                        text,
+                    )
+                    result["summary"] = summary
+                    return result
+
+        except Exception as e:
+            result["error"] = str(e)
+            result["summary"] = f"probe error: {e}"
+            result["kind"] = self._classify_api_url(cleaned_url)
+            return result
+
+    # ------------------------------------------------------------------ #
+    # API candidate extraction
+    # ------------------------------------------------------------------ #
+
+    def _add_api_candidate(
+        self,
+        out: List[Dict[str, Any]],
+        *,
+        url: str,
+        base_url: str,
+        source: Optional[str],
+        text: str = "",
+        tag: str = "candidate",
+        required_sites: Optional[List[str]] = None,
+        keywords: Optional[List[str]] = None,
+        min_term_overlap: int = 1,
+        exclude_sensitive_like: bool = True,
+        targets: Optional[set[str]] = None,
+        depth: int = 0,
+    ) -> None:
+        required_sites = required_sites or []
+        keywords = keywords or []
+        targets = targets or set()
+
+        raw = self._safe_strip_url(url)
+        if not raw:
+            return
+
+        full_url = urljoin(base_url, raw)
+
+        if not full_url.startswith(("http://", "https://")):
+            return
+
+        if not self._allowed_by_required_sites(full_url, required_sites):
+            return
+
+        if self._has_ignored_static_extension(full_url):
+            return
+
+        if exclude_sensitive_like and self._is_probably_sensitive_endpoint(full_url):
+            return
+
+        if not self._looks_like_api_url(full_url, text=text):
+            return
+
+        if keywords:
+            hay = f"{text} {full_url}"
+            if not self._term_overlap_ok(hay, keywords, min_term_overlap):
+                # API endpoints should not be discarded too aggressively if the
+                # source page matched; however direct candidates with no lexical
+                # overlap are often analytics/noise.
+                if not any(str(full_url).lower().endswith(ext) for ext in self.DATA_EXTENSIONS):
+                    return
+
+        kind = self._classify_api_url(full_url)
+        score = self._score_api_url(
+            full_url,
+            keywords,
+            targets,
+            kind=kind,
+            source_tag=tag,
+            text=text,
+        )
+
+        out.append(
+            {
+                "title": (text or f"[{kind}]")[:200],
+                "url": self._normalize_url_for_key(full_url),
+                "source": source,
+                "depth": depth,
+                "score": score,
+                "kind": kind,
+                "tag": tag,
+                "status": "found",
+                "valid": False,
+                "content_type": "",
+                "summary": "",
+                "preview": "",
+            }
+        )
+
+    def _harvest_api_candidates_from_text(
+        self,
+        text: str,
+        *,
+        base_url: str,
+        source: Optional[str],
+        tag: str,
+        required_sites: List[str],
+        keywords: List[str],
+        min_term_overlap: int,
+        exclude_sensitive_like: bool,
+        targets: set[str],
+        depth: int,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+
+        if not text:
+            return out
+
+        # Absolute URLs.
+        for m in self._URL_RE.finditer(text[:2_000_000]):
+            self._add_api_candidate(
+                out,
+                url=m.group(0),
+                base_url=base_url,
+                source=source,
+                text="regex-url",
+                tag=tag,
+                required_sites=required_sites,
+                keywords=keywords,
+                min_term_overlap=min_term_overlap,
+                exclude_sensitive_like=exclude_sensitive_like,
+                targets=targets,
+                depth=depth,
+            )
+            if len(out) >= limit:
+                return out
+
+        # Relative API paths.
+        for m in self._REL_API_RE.finditer(text[:2_000_000]):
+            self._add_api_candidate(
+                out,
+                url=m.group(1),
+                base_url=base_url,
+                source=source,
+                text="relative-api",
+                tag=tag,
+                required_sites=required_sites,
+                keywords=keywords,
+                min_term_overlap=min_term_overlap,
+                exclude_sensitive_like=exclude_sensitive_like,
+                targets=targets,
+                depth=depth,
+            )
+            if len(out) >= limit:
+                return out
+
+        # fetch('/api/...') / axios.get('/api/...') literals.
+        for m in self._FETCH_LITERAL_RE.finditer(text[:2_000_000]):
+            self._add_api_candidate(
+                out,
+                url=m.group(1),
+                base_url=base_url,
+                source=source,
+                text="fetch literal",
+                tag="fetch_literal",
+                required_sites=required_sites,
+                keywords=keywords,
+                min_term_overlap=min_term_overlap,
+                exclude_sensitive_like=exclude_sensitive_like,
+                targets=targets,
+                depth=depth,
+            )
+            if len(out) >= limit:
+                return out
+
+        return out
+
+    def _extract_urls_from_jsonish_object(self, obj: Any, limit: int = 500) -> List[str]:
+        out: List[str] = []
+        seen = set()
+
+        def walk(v: Any):
+            if len(out) >= limit:
+                return
+
+            if isinstance(v, str):
+                for m in self._URL_RE.finditer(v):
+                    u = self._safe_strip_url(m.group(0))
+                    if u and u not in seen:
+                        seen.add(u)
+                        out.append(u)
+                        if len(out) >= limit:
+                            return
+
+                if v.startswith("/") and any(x in v.lower() for x in ["/api/", "/wp-json", "/graphql", "/data/"]):
+                    if v not in seen:
+                        seen.add(v)
+                        out.append(v)
+
+            elif isinstance(v, dict):
+                for vv in v.values():
+                    walk(vv)
+                    if len(out) >= limit:
+                        return
+
+            elif isinstance(v, list):
+                for vv in v:
+                    walk(vv)
+                    if len(out) >= limit:
+                        return
+
+        walk(obj)
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Search engines
+    # ------------------------------------------------------------------ #
+
+    async def _search_searxng(
+        self,
+        q: str,
+        max_results: int,
+        timeout: float,
+        base_url: Optional[str] = None,
+        page_limit: int = 1,
+    ) -> List[str]:
+        import os
+
+        base_url = (
+            base_url
+            or os.environ.get("SEARXNG_URL")
+            or "http://127.0.0.1:8080"
+        ).rstrip("/")
+
+        search_url = base_url + "/search"
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(page_limit):
+                    if len(out) >= max_results:
+                        break
+
+                    params = {
+                        "q": q,
+                        "format": "json",
+                        "pageno": str(page_idx + 1),
+                    }
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                            search_url,
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            if status == 403:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][SearXNG][debug] HTTP 403 "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            if status != 200:
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][SearXNG][debug] HTTP {status} "
+                                        f"query={q!r} pageno={page_idx + 1}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                DEBUG_LOGGER.log_message(
+                                    f"[ApiTracker][SearXNG] JSON decode error: {e}"
+                                )
+                                if not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][SearXNG][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            results = data.get("results") or []
+                            if not results:
+                                break
+
+                            for item in results:
+                                u = item.get("url")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_results:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][SearXNG] AIOHTTP error: {e}"
+                        )
+                        if not did_dump_debug and text:
+                            preview = text[:1500].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][SearXNG][debug] ClientError body preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[ApiTracker][SearXNG] General error: {e}")
+
+        return out[:max_results]
+
+    async def _search_duckduckgo(
+        self,
+        q: str,
+        max_results: int,
+        ua: str,
+        timeout: float,
+        page_limit: int = 1,
+        per_page: int = 50,
+    ) -> List[str]:
+        import random
+
+        pages: List[str] = []
+        seen_urls: set[str] = set()
+        did_dump_debug = False
+
+        real_ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/115.0.0.0 Safari/537.36"
+        )
+
+        headers = {
+            "User-Agent": real_ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://duckduckgo.com/",
+            "Origin": "https://duckduckgo.com",
+            "DNT": "1",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Dest": "document",
+        }
+
+        max_results = max(1, min(int(max_results), 256))
+        page_limit = max(1, min(int(page_limit), 5))
+        base_url = "https://html.duckduckgo.com/html/"
+
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                for page_idx in range(page_limit):
+                    if len(pages) >= max_results:
+                        break
+
+                    if page_idx > 0:
+                        st = random.uniform(2.0, 5.0)
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker] Sleeping {st:.2f}s between search pages..."
+                        )
+                        await asyncio.sleep(st)
+
+                    offset = page_idx * 30
+                    text = ""
+                    status = None
+                    final_url = base_url
+
+                    try:
+                        data = {
+                            "q": q,
+                            "s": str(offset),
+                            "dc": str(offset),
+                        }
+
+                        async with session.post(
+                            base_url,
+                            data=data,
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            final_url = str(resp.url)
+
+                            if status == 403:
+                                DEBUG_LOGGER.log_message(
+                                    f"[ApiTracker] 403 Forbidden on DDG page {page_idx}."
+                                )
+                                if not pages and not did_dump_debug:
+                                    text = await resp.text()
+                                    preview = text[:2000].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][DDG][debug] 403 body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                return pages
+
+                            resp.raise_for_status()
+                            text = await resp.text()
+
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker] DuckDuckGo request failed page={page_idx}: {e}"
+                        )
+                        if not pages and text and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][DDG][debug] Failed page HTML preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+                    if "Unfortunately, bots use DuckDuckGo too." in text:
+                        DEBUG_LOGGER.log_message("[ApiTracker] Bot detected by DDG.")
+                        if not pages and not did_dump_debug:
+                            preview = text[:2000].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][DDG][debug] Bot wall preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+                    soup = BeautifulSoup(text, "html.parser")
+                    found_new = False
+
+                    for a in soup.select("a.result__a"):
+                        if len(pages) >= max_results:
+                            break
+
+                        href = a.get("href")
+                        if not href:
+                            continue
+
+                        if "uddg=" in href:
+                            try:
+                                href = unquote(href.split("uddg=", 1)[1].split("&", 1)[0])
+                            except Exception:
+                                pass
+
+                        if href.startswith("http") and href not in seen_urls:
+                            seen_urls.add(href)
+                            pages.append(href)
+                            found_new = True
+
+                    if not found_new and not pages and not did_dump_debug:
+                        preview = text[:2000].replace("\n", " ")
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][DDG][debug] No results page={page_idx} query={q!r} "
+                            f"status={status} url={final_url}. HTML preview: {preview}"
+                        )
+                        did_dump_debug = True
+
+                    if not found_new:
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[ApiTracker] DDG outer error: {e}")
+
+        return pages[:max_results]
+
+    async def _search_google_cse(
+        self,
+        q: str,
+        n: int,
+        timeout: float,
+        page_limit: int = 1,
+    ) -> List[str]:
+        import os
+
+        cx = os.environ.get("GOOGLE_CSE_ID")
+        key = os.environ.get("GOOGLE_API_KEY")
+
+        if not (cx and key):
+            DEBUG_LOGGER.log_message(
+                "[ApiTracker][GoogleCSE] Missing GOOGLE_CSE_ID or GOOGLE_API_KEY env vars."
+            )
+            return []
+
+        max_total = max(1, min(int(n), 100))
+        per_page = min(10, max_total)
+        max_pages_by_n = (max_total + per_page - 1) // per_page
+        pages_to_fetch = max(1, min(int(page_limit) or 1, max_pages_by_n))
+
+        out: List[str] = []
+        did_dump_debug = False
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                for page_idx in range(pages_to_fetch):
+                    if len(out) >= max_total:
+                        break
+
+                    start = 1 + page_idx * per_page
+                    if start > 100:
+                        break
+
+                    text = ""
+                    status = None
+
+                    try:
+                        async with session.get(
+                            "https://www.googleapis.com/customsearch/v1",
+                            params={
+                                "q": q,
+                                "cx": cx,
+                                "key": key,
+                                "num": per_page,
+                                "start": start,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=timeout),
+                        ) as resp:
+                            status = resp.status
+                            text = await resp.text()
+
+                            if status != 200:
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][GoogleCSE][debug] HTTP {status} "
+                                        f"query={q!r} start={start}. Body preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            try:
+                                data = json.loads(text)
+                            except json.JSONDecodeError as e:
+                                DEBUG_LOGGER.log_message(
+                                    f"[ApiTracker][GoogleCSE] JSON decode error: {e}"
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][GoogleCSE][debug] Bad JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            err_obj = data.get("error")
+                            if err_obj:
+                                msg = err_obj.get("message") or "Unknown CSE error"
+                                reason = ""
+                                errors = err_obj.get("errors") or []
+                                if errors and isinstance(errors, list):
+                                    reason = errors[0].get("reason") or ""
+
+                                DEBUG_LOGGER.log_message(
+                                    f"[ApiTracker][GoogleCSE] API error query={q!r}, "
+                                    f"start={start}: {msg} ({reason})"
+                                )
+
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][GoogleCSE][debug] Error JSON preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            items = data.get("items") or []
+                            if not items:
+                                DEBUG_LOGGER.log_message(
+                                    f"[ApiTracker][GoogleCSE] No items query={q!r}, start={start}."
+                                )
+                                if not out and not did_dump_debug:
+                                    preview = text[:1500].replace("\n", " ")
+                                    DEBUG_LOGGER.log_message(
+                                        f"[ApiTracker][GoogleCSE][debug] Empty items preview: {preview}"
+                                    )
+                                    did_dump_debug = True
+                                break
+
+                            for item in items:
+                                u = item.get("link")
+                                if u:
+                                    out.append(u)
+                                    if len(out) >= max_total:
+                                        break
+
+                    except aiohttp.ClientError as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][GoogleCSE] AIOHTTP error: {e}"
+                        )
+                        if not out and text and not did_dump_debug:
+                            preview = text[:1500].replace("\n", " ")
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][GoogleCSE][debug] ClientError preview: {preview}"
+                            )
+                            did_dump_debug = True
+                        break
+
+        except Exception as e:
+            DEBUG_LOGGER.log_message(f"[ApiTracker][GoogleCSE] General error: {e}")
+
+        return out
+
+    # ------------------------------------------------------------------ #
+    # Sites / sitemap helpers
+    # ------------------------------------------------------------------ #
+
+    def _extract_next_page_links(self, soup, base_url: str) -> list[str]:
+        out = []
+
+        for a in soup.select(
+            "a[rel=next], a.next, a:-soup-contains('Next'), a:-soup-contains('Older')"
+        ):
+            href = a.get("href")
+            if href:
+                out.append(urljoin(base_url, href))
+
+        return out[:3]
+
+    def _extract_internal_result_links(self, soup, base_url: str, site_host: str) -> list[str]:
+        out = []
+        containers = soup.select(
+            "article a[href], .result a[href], .search-result a[href], "
+            ".item a[href], li a[href], a[href]"
+        )
+
+        for a in containers:
+            href = a.get("href")
+            if not href:
+                continue
+
+            full = urljoin(base_url, href)
+            host = urlparse(full).netloc.lower()
+
+            if site_host in host:
+                out.append(full)
+
+            if len(out) >= 300:
+                break
+
+        return list(dict.fromkeys(out))
+
+    def _archive_ident_to_data_endpoints(self, ident: str) -> list[str]:
+        return [
+            f"https://archive.org/metadata/{ident}",
+            f"https://archive.org/advancedsearch.php?q=identifier:{quote_plus(ident)}&fl[]=identifier&fl[]=title&fl[]=mediatype&rows=1&output=json",
+            f"https://archive.org/services/img/{ident}",
+            f"https://archive.org/details/{ident}",
+        ]
+
+    async def _crawl_sitemaps_for_site(
+        self,
+        http: submanagers.HTTPSSubmanager,
+        root: str,
+        sm_urls: list[str],
+        keywords: list[str],
+        targets: set[str],
+        per_site_cap: int,
+        global_seen: set[str],
+    ) -> list[str]:
+        to_visit = list(dict.fromkeys(sm_urls))
+        visited_sm = set()
+        collected = []
+
+        while to_visit and len(collected) < per_site_cap * 6:
+            sm = to_visit.pop(0)
+
+            if sm in visited_sm:
+                continue
+
+            visited_sm.add(sm)
+
+            raw = await http.get_bytes(sm)
+            xml = self._decompress_if_needed(sm, raw)
+            child_sms, pages = self._parse_sitemap_any(xml)
+
+            for c in child_sms:
+                if c not in visited_sm and self._looks_like_sitemap(c):
+                    to_visit.append(c)
+
+            for p in pages:
+                if p in global_seen:
+                    continue
+
+                global_seen.add(p)
+                collected.append(p)
+
+        collected.sort(
+            key=lambda u: self._score_api_url(
+                u,
+                keywords,
+                targets,
+                kind=self._classify_api_url(u),
+            ),
+            reverse=True,
+        )
+
+        return collected[:per_site_cap]
+
+    def _seed_pages_from_required_sites(
+        self,
+        required_sites,
+        queries,
+        probe_cap_per_site=5,
+        sitemap_cap_per_site=8,
+        hub_cap_per_site=8,
+    ):
+        out: List[str] = []
+        synthetic_search_seeds: set[str] = set()
+        explicit_site_seeds: set[str] = set()
+
+        norm_sites = []
+
+        for raw in required_sites or []:
+            s = (raw or "").strip()
+            if not s:
+                continue
+
+            norm_sites.append(
+                s.rstrip("/")
+                if "://" in s
+                else "https://" + s.lstrip(".").rstrip("/")
+            )
+
+        for s in norm_sites:
+            u = s + "/"
+            out.append(u)
+            explicit_site_seeds.add(u)
+
+        common_sitemaps = [
+            "/sitemap.xml",
+            "/sitemap_index.xml",
+            "/sitemap/sitemap.xml",
+            "/sitemap-index.xml",
+            "/sitemap.php",
+            "/sitemap.txt",
+            "/robots.txt",
+        ]
+
+        for s in norm_sites:
+            added = 0
+            for sm in common_sitemaps:
+                if added >= sitemap_cap_per_site:
+                    break
+                u = s + sm
+                out.append(u)
+                explicit_site_seeds.add(u)
+                added += 1
+
+        hub_paths = [
+            "/api/",
+            "/apis/",
+            "/api",
+            "/wp-json/",
+            "/wp-json",
+            "/graphql",
+            "/gql",
+            "/rest/",
+            "/json/",
+            "/data/",
+            "/datasets/",
+            "/dataset/",
+            "/feed/",
+            "/feeds/",
+            "/rss",
+            "/atom",
+            "/search",
+            "/search/",
+            "/archive/",
+            "/archives/",
+            "/browse/",
+            "/collections/",
+            "/docs/",
+            "/developers/",
+            "/developer/",
+        ]
+
+        for s in norm_sites:
+            added = 0
+            for hp in hub_paths:
+                if added >= hub_cap_per_site:
+                    break
+                u = s + hp
+                out.append(u)
+                explicit_site_seeds.add(u)
+                added += 1
+
+        def _extra_probes_for_site(base: str, enc_query: str) -> list[str]:
+            host = urlparse(base).netloc.lower()
+
+            if "archive.org" in host:
+                return [
+                    base + f"/advancedsearch.php?q={enc_query}&fl[]=identifier&fl[]=title&rows=50&page=1&output=json",
+                    base + f"/metadata/{enc_query}",
+                    base + f"/search.php?query={enc_query}",
+                    base + f"/details/{enc_query}",
+                ]
+
+            return [
+                base + f"/api/search?q={enc_query}",
+                base + f"/api/search?query={enc_query}",
+                base + f"/api/v1/search?q={enc_query}",
+                base + f"/api/v2/search?q={enc_query}",
+                base + f"/wp-json/wp/v2/search?search={enc_query}",
+                base + f"/wp-json/wp/v2/posts?search={enc_query}",
+                base + f"/search?q={enc_query}",
+                base + f"/search?query={enc_query}",
+                base + f"/?s={enc_query}",
+            ]
+
+        if queries:
+            for s in norm_sites:
+                probes_added = 0
+
+                for qv in queries:
+                    if probes_added >= probe_cap_per_site:
+                        break
+
+                    qv = (qv or "").strip()
+                    if not qv:
+                        continue
+
+                    enc = quote_plus(qv)
+                    probes = _extra_probes_for_site(s, enc)
+
+                    for p in probes:
+                        out.append(p)
+
+                        if self._looks_like_api_url(p):
+                            synthetic_search_seeds.add(p)
+                        else:
+                            explicit_site_seeds.add(p)
+
+                        probes_added += 1
+
+                        if probes_added >= probe_cap_per_site:
+                            break
+
+        return out, synthetic_search_seeds, explicit_site_seeds
+
+    # ------------------------------------------------------------------ #
+    # Playwright shared context
+    # ------------------------------------------------------------------ #
+
+    async def _open_playwright_context(
+        self,
+        ua: str,
+        block_resources: bool,
+        blocked_resource_types: set[str],
+        block_domains: bool,
+        blocked_domains: set[str],
+        log: List[str],
+        *,
+        use_camoufox: bool = False,
+        camoufox_options: Optional[Dict[str, Any]] = None,
+    ):
+        def _host_matches_blocked(host: str) -> bool:
+            host = host.split(":", 1)[0].lower()
+
+            for bd in blocked_domains:
+                bd = bd.lower()
+                if not bd:
+                    continue
+                if host == bd or host.endswith("." + bd):
+                    return True
+
+            return False
+
+        if use_camoufox:
+            if globals().get("AsyncCamoufox") is None:
+                log.append(
+                    "[PlaywrightCtx] Camoufox requested but not installed; falling back to Chromium."
+                )
+            else:
+                try:
+                    options = {
+                        "headless": True,
+                        "block_images": block_resources,
+                        "block_webrtc": True,
+                        "geoip": False,
+                        "humanize": False,
+                    }
+
+                    if camoufox_options:
+                        options.update(camoufox_options)
+
+                    cf_cm = AsyncCamoufox(**options)
+                    browser = await cf_cm.__aenter__()
+                    context = await browser.new_context(user_agent=ua)
+
+                    if block_resources or block_domains:
+                        async def route_blocker(route, request):
+                            rtype = (request.resource_type or "").lower()
+
+                            try:
+                                host = urlparse(request.url).netloc.lower()
+                            except Exception:
+                                host = ""
+
+                            if block_domains and _host_matches_blocked(host):
+                                await route.abort()
+                                return
+
+                            if block_resources and rtype in blocked_resource_types:
+                                await route.abort()
+                                return
+
+                            await route.continue_()
+
+                        await context.route("**/*", route_blocker)
+
+                    log.append("[PlaywrightCtx] Camoufox context ready.")
+                    return cf_cm, browser, context
+
+                except Exception as e:
+                    log.append(
+                        f"[PlaywrightCtx] Camoufox init failed ({e}); falling back to Chromium."
+                    )
+
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            log.append("Playwright not installed.")
+            return None, None, None
+
+        p = await async_playwright().start()
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(user_agent=ua)
+
+        if block_resources or block_domains:
+            async def route_blocker(route, request):
+                rtype = (request.resource_type or "").lower()
+
+                try:
+                    host = urlparse(request.url).netloc.lower()
+                except Exception:
+                    host = ""
+
+                if block_domains and _host_matches_blocked(host):
+                    await route.abort()
+                    return
+
+                if block_resources and rtype in blocked_resource_types:
+                    await route.abort()
+                    return
+
+                await route.continue_()
+
+            await context.route("**/*", route_blocker)
+
+        log.append("Playwright shared context ready.")
+        return p, browser, context
+
+    async def _close_playwright_context(self, p, browser, context, log: List[str]):
+        try:
+            if context:
+                close_ctx = getattr(context, "close", None)
+                if callable(close_ctx):
+                    if asyncio.iscoroutinefunction(close_ctx):
+                        await close_ctx()
+                    else:
+                        close_ctx()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox context: {e}")
+
+        try:
+            if browser:
+                close_browser = getattr(browser, "close", None)
+                if callable(close_browser):
+                    if asyncio.iscoroutinefunction(close_browser):
+                        await close_browser()
+                    else:
+                        close_browser()
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox browser: {e}")
+
+        try:
+            if p:
+                stop = getattr(p, "stop", None)
+
+                if stop:
+                    if asyncio.iscoroutinefunction(stop):
+                        await stop()
+                    else:
+                        stop()
+                else:
+                    aexit = getattr(p, "__aexit__", None)
+                    if aexit:
+                        if asyncio.iscoroutinefunction(aexit):
+                            await aexit(None, None, None)
+                        else:
+                            aexit(None, None, None)
+
+            log.append("Playwright/Camoufox shared context closed.")
+        except Exception as e:
+            log.append(f"Error closing Playwright/Camoufox handle: {e}")
+
+    async def _pw_fetch_with_sniff(self, context, page_url, timeout, log, extensions=None):
+        """
+        ApiTracker-specific Playwright network capture.
+
+        This intentionally does NOT call submanagers.NetworkSniffer here. The
+        generic NetworkSniffer/LinkResolver path can try to resolve links using
+        HTTPSSubmanager outside `async with`, producing:
+
+            HTTPSSubmanager must be used in an async context
+
+        For API discovery we only need response URLs/content-types/previews, so
+        this local capture is safer and avoids the old resolver entirely.
+
+        Returns the same rough shape expected by the caller:
+            (html, sniff_items, sniff_json)
+        """
+        sniff_items: List[Dict[str, Any]] = []
+        sniff_json: List[Dict[str, Any]] = []
+        pending_tasks: List[asyncio.Task] = []
+
+        async def _capture_response(response):
+            try:
+                resp_url = self._clean_api_probe_url(response.url)
+                headers = response.headers or {}
+                content_type = (
+                    headers.get("content-type")
+                    or headers.get("Content-Type")
+                    or ""
+                )
+                status = getattr(response, "status", None)
+
+                looks_data = (
+                    self._looks_like_api_url(resp_url, text=content_type)
+                    or any(marker in content_type.lower() for marker in self.CONTENT_TYPE_DATA_MARKERS)
+                )
+
+                if not looks_data:
+                    return
+
+                size = headers.get("content-length") or "?"
+                item = {
+                    "url": resp_url,
+                    "text": f"HTTP {status or '?'} {content_type}".strip(),
+                    "tag": "network_sniff",
+                    "size": size,
+                    "status": status,
+                    "content_type": content_type,
+                }
+                sniff_items.append(item)
+
+                # Only read bodies that are likely structured/text and keep it
+                # bounded. Playwright may throw for some cached/opaque bodies;
+                # that should never break the crawl.
+                ct_low = content_type.lower()
+                if any(x in ct_low for x in [
+                    "json",
+                    "xml",
+                    "csv",
+                    "text/",
+                    "application/rss",
+                    "application/atom",
+                ]) or self._has_data_extension(resp_url):
+                    try:
+                        body_text = await response.text()
+                    except Exception:
+                        body_text = ""
+
+                    if body_text:
+                        valid, kind, _summary = self._validate_structured_data_text(
+                            body_text[:1_000_000],
+                            content_type=content_type,
+                            url=resp_url,
+                        )
+                        if valid and kind in {"json", "jsonp", "ndjson", "geojson", "json_ld", "json_api"}:
+                            try:
+                                stripped = body_text.strip()
+                                if stripped.startswith(("{", "[")):
+                                    parsed = json.loads(stripped)
+                                    sniff_json.append({"url": resp_url, "json": parsed})
+                                elif kind == "ndjson":
+                                    first = next((ln for ln in stripped.splitlines() if ln.strip()), "")
+                                    if first:
+                                        sniff_json.append({"url": resp_url, "json": json.loads(first)})
+                            except Exception:
+                                pass
+
+            except Exception as e:
+                try:
+                    log.append(f"[ApiTracker][NetworkCapture] response capture error: {e}")
+                except Exception:
+                    pass
+
+        page = None
+        html = ""
+
+        try:
+            page = await context.new_page()
+
+            def _on_response(response):
+                try:
+                    pending_tasks.append(asyncio.create_task(_capture_response(response)))
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            try:
+                await page.goto(
+                    page_url,
+                    wait_until="domcontentloaded",
+                    timeout=max(1000, int(float(timeout) * 1000)),
+                )
+            except Exception as e:
+                log.append(f"[ApiTracker][NetworkCapture] goto warning on {page_url}: {e}")
+
+            # Let late XHR/fetch calls settle briefly.
+            try:
+                await page.wait_for_timeout(750)
+            except Exception:
+                pass
+
+            # Small bounded scroll to trigger lazy API calls without making this
+            # full sniffer mode expensive.
+            for _ in range(3):
+                try:
+                    await page.evaluate("window.scrollBy(0, Math.max(600, window.innerHeight || 800))")
+                    await page.wait_for_timeout(250)
+                except Exception:
+                    break
+
+            try:
+                html = await page.content()
+            except Exception:
+                html = ""
+
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        except Exception as e:
+            log.append(f"[ApiTracker][NetworkCapture] failed on {page_url}: {e}")
+
+        finally:
+            try:
+                if page:
+                    await page.close()
+            except Exception:
+                pass
+
+        return html, sniff_items, sniff_json
+
+    async def _pw_fetch_js_links(self, context, page_url, timeout, log, extensions=None):
+        return await asyncio.wait_for(
+            self.js_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+                extensions=extensions,
+            ),
+            timeout=timeout,
+        )
+
+    async def _pw_fetch_runtime_hits(self, context, page_url, timeout, log):
+        return await asyncio.wait_for(
+            self.runtime_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
+            timeout=timeout,
+        )
+
+    async def _pw_fetch_react_hits(self, context, page_url, timeout, log):
+        return await asyncio.wait_for(
+            self.react_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
+            timeout=timeout,
+        )
+
+    async def _pw_fetch_database_hits(self, context, page_url, timeout, log):
+        return await asyncio.wait_for(
+            self.database_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
+            timeout=timeout,
+        )
+
+    async def _pw_fetch_interaction_hits(self, context, page_url, timeout, log):
+        return await asyncio.wait_for(
+            self.interaction_sniffer.sniff(
+                context,
+                page_url,
+                timeout=timeout,
+                log=log,
+            ),
+            timeout=25,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Search query augmentation
+    # ------------------------------------------------------------------ #
+
+    def _augment_search_query(self, q: str, mode: str, required_sites: List[str]) -> str:
+        sq = str(q or "").strip()
+
+        site_clauses = []
+        for raw in required_sites or []:
+            s = (raw or "").strip().lower()
+            if not s:
+                continue
+
+            if "://" in s:
+                s = s.split("://", 1)[1]
+
+            s = s.split("/", 1)[0].lstrip(".")
+            if s:
+                site_clauses.append(f"site:{s}")
+
+        if site_clauses:
+            sites_expr = " OR ".join(site_clauses)
+            sq = f"({sites_expr}) {sq}" if sq else f"({sites_expr})"
+
+        q_lower = sq.lower()
+
+        if mode in {"api", "apis", "data"}:
+            if not any(x in q_lower for x in ["inurl:api", "filetype:json", "output=json", "format=json", "wp-json", "graphql"]):
+                sq = f"{sq} (inurl:api OR inurl:json OR filetype:json OR output=json OR format=json OR wp-json OR graphql)".strip()
+
+        elif mode == "json":
+            if "filetype:json" not in q_lower:
+                sq = f"{sq} filetype:json".strip()
+
+        elif mode == "csv":
+            if "filetype:csv" not in q_lower:
+                sq = f"{sq} filetype:csv".strip()
+
+        elif mode == "feeds":
+            if not any(x in q_lower for x in ["rss", "atom", "feed"]):
+                sq = f"{sq} (rss OR atom OR feed)".strip()
+
+        return sq
+
+    # ------------------------------------------------------------------ #
+    # Main execution
+    # ------------------------------------------------------------------ #
+
+    async def _execute_async(
+        self,
+        payload: Any,
+        *,
+        params: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+
+        # --------- Natural ChatBlock-style parsing of context / lexicon ---------
+
+        text = str(payload or "")
+
+        inline_ctx: str = ""
+        inline_lex: List[str] = []
+
+        try:
+            inline_ctx = text.rsplit("[context]\n", 1)[1]
+        except Exception:
+            inline_ctx = ""
+
+        try:
+            lex_part = text.rsplit("[lexicon]\n", 1)[1]
+            lex_part = lex_part.split("\n[", 1)[0]
+            inline_lex = [w.strip() for w in lex_part.split(",") if w.strip()]
+        except Exception:
+            inline_lex = []
+
+        core = text
+        if inline_ctx:
+            core = core.rsplit("[context]\n", 1)[0]
+        if inline_lex:
+            core = core.rsplit("[lexicon]\n", 1)[0]
+        core = core.strip()
+
+        query_raw = str(params.get("query", "") or str(payload or "")).strip()
+        subpipeline = params.get("subpipeline", None)
+
+        # --------- Extract URL seeds from context + lexicon ---------
+
+        context_urls: List[str] = []
+        if inline_ctx:
+            ctx_slice = inline_ctx[:20000]
+            for m in self._URL_RE.finditer(ctx_slice):
+                context_urls.append(m.group(0))
+
+        lexicon_url_seeds: List[str] = []
+        non_url_lex_terms: List[str] = []
+
+        for term in inline_lex:
+            t = term.strip()
+            if not t:
+                continue
+            if self._URL_RE.match(t):
+                lexicon_url_seeds.append(t)
+            else:
+                non_url_lex_terms.append(t)
+
+        # ------------------- Config --------------------- #
+
+        mode = str(params.get("mode", "api")).lower()
+        scan_limit = int(params.get("scan_limit", 5))
+        max_pages_total = max(1, int(params.get("max_pages_total", scan_limit)))
+
+        timeout = float(params.get("timeout", 5.0))
+        engine = str(params.get("engine", "duckduckgo")).lower()
+
+        use_body = bool(params.get("use_body", True))
+
+        use_js = bool(params.get("use_js", False))
+        return_all_js_links = bool(params.get("return_all_js_links", False))
+        max_links_per_page = int(params.get("max_links_per_page", 500))
+
+        search_results_cap = int(params.get("search_results_cap", 256))
+        search_page_limit = int(params.get("search_page_limit", 1))
+        search_per_page = int(params.get("search_per_page", 50))
+
+        use_network_sniff = bool(params.get("use_network_sniff", True))
+        return_network_sniff_links = bool(params.get("return_network_sniff_links", False))
+
+        use_runtime_sniff = bool(params.get("use_runtime_sniff", False))
+        return_runtime_sniff_hits = bool(params.get("return_runtime_sniff_hits", False))
+
+        use_react_sniff = bool(params.get("use_react_sniff", False))
+        return_react_sniff_hits = bool(params.get("return_react_sniff_hits", False))
+
+        use_database_sniff = bool(params.get("use_database_sniff", False))
+        return_database_sniff_hits = bool(params.get("return_database_sniff_hits", False))
+
+        use_interaction_sniff = bool(params.get("use_interaction_sniff", False))
+        return_interaction_sniff_hits = bool(params.get("return_interaction_sniff_hits", False))
+
+        use_camoufox = bool(params.get("use_camoufox", False))
+        camoufox_options = params.get("camoufox_options") or {}
+        if not isinstance(camoufox_options, dict):
+            camoufox_options = {}
+        camoufox_options.update({"i_know_what_im_doing": True})
+
+        min_term_overlap_raw = int(params.get("min_term_overlap", 1))
+        min_term_overlap = max(1, min_term_overlap_raw)
+
+        custom_ext = str(params.get("extensions", "")).split(",")
+        keywords_in_url = str(params.get("url_keywords", "")).split(",")
+        site_require_raw = str(params.get("site_require", "")).split(",")
+
+        required_sites = [s.strip().lower() for s in site_require_raw if s.strip()]
+        max_depth = max(0, int(params.get("max_depth", 0)))
+
+        http_retries = int(params.get("http_retries", 2))
+        http_max_conn_per_host = int(params.get("http_max_conn_per_host", 8))
+        http_verify_tls = bool(params.get("http_verify_tls", True))
+        http_ca_bundle = params.get("http_ca_bundle", None)
+
+        validate_endpoints = bool(params.get("validate_endpoints", True))
+        max_endpoint_probes = int(params.get("max_endpoint_probes", 50))
+        max_probe_bytes = int(params.get("max_probe_bytes", 1_000_000))
+
+        include_unvalidated = bool(params.get("include_unvalidated", True))
+        only_valid = bool(params.get("only_valid", False))
+        exclude_sensitive_like = bool(params.get("exclude_sensitive_like", True))
+
+        db_allow_rescan = bool(params.get("db_allow_rescan", False))
+        db_seed_limit = int(params.get("db_seed_limit", 250))
+
+        block_resources = bool(params.get("block_resources", False))
+        blocked_resource_types = {
+            t.strip().lower()
+            for t in str(params.get("blocked_resource_types", "")).split(",")
+            if t.strip()
+        } or {"image", "stylesheet", "font"}
+
+        block_domains = bool(params.get("block_domains", True))
+        user_blocked_domains = {
+            d.strip().lower()
+            for d in str(params.get("blocked_domains", "")).split(",")
+            if d.strip()
+        }
+
+        default_blocked_domains = {
+            "google-analytics.com",
+            "googletagmanager.com",
+            "doubleclick.net",
+            "facebook.com",
+            "facebook.net",
+            "twitter.com",
+            "x.com",
+            "scorecardresearch.com",
+            "quantserve.com",
+            "hotjar.com",
+            "segment.io",
+            "mixpanel.com",
+            "cloudflareinsights.com",
+            "stats.g.doubleclick.net",
+            "adservice.google.com",
+            "ads.yahoo.com",
+            "adsafeprotected.com",
+        }
+
+        blocked_domains: set[str] = set()
+        if block_domains:
+            blocked_domains = default_blocked_domains.union(user_blocked_domains)
+
+        # ------------------- DB setup ------------------- #
+
+        use_database = bool(params.get("use_database", False))
+        db_path = params.get("db_path", "link_corpus.db")
+
+        if use_database:
+            self._initialize_database(db_path, logger=getattr(self, "logger", None))
+
+        store = self.store
+
+        # ------------------- Targets -------------------- #
+
+        targets: set[str] = set()
+        for e in custom_ext:
+            e = e.strip()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            targets.add(e.lower())
+
+        if not targets:
+            targets = set(self.DATA_EXTENSIONS)
+
+        # ------------------- Keywords ------------------- #
+
+        keywords: List[str] = [
+            k.strip().lower()
+            for k in keywords_in_url
+            if k.strip()
+        ]
+
+        strict_keywords = bool(params.get("strict_keywords", False))
+
+        if query_raw:
+            if strict_keywords:
+                whole = query_raw.lower().strip()
+                if whole and whole not in keywords:
+                    keywords.append(whole)
+            else:
+                for qt in [w.strip().lower() for w in query_raw.split() if w.strip()]:
+                    if qt not in keywords:
+                        keywords.append(qt)
+
+        for term in non_url_lex_terms:
+            lt = term.lower()
+            if lt and lt not in keywords:
+                keywords.append(lt)
+
+        # ----------------- Subpipeline ------------------ #
+
+        pipeline_result: Any = query_raw
+        pipeline_queries: List[str] = []
+        pipeline_urls: List[str] = []
+
+        if subpipeline:
+            subpipe_out: Any = self.run_sub_pipeline(
+                initial_value=query_raw,
+                pipeline_param_name="subpipeline",
+                parent_params=params,
+                collect=True,
+            )
+
+            if isinstance(subpipe_out, dict) and subpipe_out.get("__subpipeline__"):
+                pipeline_result = subpipe_out.get("final")
+                pipeline_queries = list(subpipe_out.get("queries") or [])
+                pipeline_urls = list(subpipe_out.get("urls") or [])
+            else:
+                pipeline_result = subpipe_out
+
+        extra_seed_urls: List[str] = []
+
+        if context_urls:
+            extra_seed_urls.extend(context_urls)
+
+        if lexicon_url_seeds:
+            extra_seed_urls.extend(lexicon_url_seeds)
+
+        if extra_seed_urls:
+            if not pipeline_urls:
+                pipeline_urls = []
+            pipeline_urls.extend(extra_seed_urls)
+
+        # =========================================================================
+        # Memory Sources Ingestion
+        # =========================================================================
+
+        memory_sources_raw = str(params.get("memory_sources", "")).strip()
+
+        if memory_sources_raw:
+            try:
+                mem_data = Memory.load()
+                keys_to_read = [
+                    k.strip()
+                    for k in memory_sources_raw.split(",")
+                    if k.strip()
+                ]
+
+                for key in keys_to_read:
+                    data = mem_data.get(key)
+                    if not data:
+                        continue
+
+                    items = data if isinstance(data, list) else [data]
+
+                    for item in items:
+                        candidate = None
+
+                        if isinstance(item, dict):
+                            candidate = (
+                                item.get("url")
+                                or item.get("api")
+                                or item.get("endpoint")
+                                or item.get("domain")
+                                or item.get("text")
+                            )
+                        elif isinstance(item, (str, int, float)):
+                            candidate = str(item)
+
+                        if not candidate:
+                            continue
+
+                        cand_str = str(candidate).strip()
+                        if not cand_str:
+                            continue
+
+                        if "://" in cand_str or cand_str.startswith(("http:", "https:")):
+                            pipeline_urls.append(cand_str)
+                        elif "." in cand_str and " " not in cand_str and not cand_str.startswith("."):
+                            pipeline_urls.append(f"https://{cand_str}")
+                        else:
+                            non_url_lex_terms.append(cand_str)
+
+            except Exception as e:
+                DEBUG_LOGGER.log_message(
+                    f"[ApiTracker] Error reading memory sources '{memory_sources_raw}': {e}"
+                )
+
+        DEBUG_LOGGER.log_message(
+            f"[ApiTracker][memory] Ingested {len(pipeline_urls)} URL seed(s)"
+        )
+
+        # -------------------- Triage -------------------- #
+
+        candidate_pages: List[str] = []
+        direct_api_urls: List[str] = []
+        queries_to_run: List[str] = []
+        skip_search_engine = False
+
+        if pipeline_urls:
+            skip_search_engine = False
+            unique_urls = self._dedupe(
+                [str(u).strip() for u in pipeline_urls if str(u).strip()]
+            )
+
+            for u in unique_urls:
+                if not self._allowed_by_required_sites(u, required_sites):
+                    continue
+
+                if self._is_mega_link(u):
+                    continue
+
+                if self._has_ignored_static_extension(u):
+                    continue
+
+                if exclude_sensitive_like and self._is_probably_sensitive_endpoint(u):
+                    continue
+
+                if self._looks_like_api_url(u):
+                    direct_api_urls.append(u)
+                else:
+                    candidate_pages.append(u)
+
+            candidate_pages = candidate_pages[:max_pages_total]
+
+        if (not skip_search_engine) and pipeline_queries:
+            for qv in pipeline_queries:
+                qv_s = str(qv).strip()
+                if qv_s:
+                    queries_to_run.append(qv_s)
+
+        if not pipeline_urls and not pipeline_queries:
+            if isinstance(pipeline_result, list) and pipeline_result:
+                for qv in pipeline_result:
+                    qv_s = str(qv).strip()
+                    if qv_s:
+                        queries_to_run.append(qv_s)
+            else:
+                base_q: Optional[str] = None
+
+                if isinstance(pipeline_result, str) and pipeline_result.strip():
+                    base_q = pipeline_result.strip()
+                elif query_raw:
+                    base_q = query_raw
+
+                if base_q:
+                    queries_to_run.append(base_q)
+
+        if not queries_to_run and query_raw and not skip_search_engine:
+            queries_to_run = [query_raw]
+
+        queries_to_run = self._dedupe(queries_to_run)
+        query = queries_to_run[0] if queries_to_run else query_raw
+
+        # ---------------- Search discovery --------------- #
+
+        explicit_site_seeds: set[str] = set()
+        synthetic_search_seeds: set[str] = set()
+
+        if not skip_search_engine and queries_to_run:
+            ua_search = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "PromptChat/ApiTracker"
+            )
+
+            seen_search_urls: set[str] = set()
+
+            if engine == "database":
+                if not use_database or not self.store:
+                    DEBUG_LOGGER.log_message(
+                        "[ApiTracker][db] engine=database requires use_database=True."
+                    )
+                else:
+                    DEBUG_LOGGER.log_message("[ApiTracker] Running Database Intelligence...")
+
+                    if hasattr(self.store, "fetch_seed_apis"):
+                        try:
+                            db_apis = self.store.fetch_seed_apis(
+                                limit=db_seed_limit,
+                                required_sites=required_sites,
+                                keywords=keywords if strict_keywords else None,
+                                min_score=0,
+                                query_text=query,
+                                min_term_overlap=min_term_overlap,
+                            )
+                            direct_api_urls.extend(db_apis)
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][db] Loaded {len(db_apis)} API seed(s)."
+                            )
+                        except Exception as e:
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][db] fetch_seed_apis failed: {e}"
+                            )
+
+                    if hasattr(self.store, "fetch_seed_pages"):
+                        try:
+                            db_pages = self.store.fetch_seed_pages(
+                                limit=db_seed_limit,
+                                required_sites=required_sites,
+                                keywords=keywords if strict_keywords else None,
+                                min_score=0,
+                                query_text=query,
+                                min_term_overlap=min_term_overlap,
+                            )
+                            candidate_pages.extend(db_pages)
+                            candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][db] Loaded {len(db_pages)} page seed(s)."
+                            )
+                        except Exception as e:
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][db] fetch_seed_pages failed: {e}"
+                            )
+
+            if engine == "sites" and required_sites:
+                seed_pages, syn_seeds, exp_seeds = self._seed_pages_from_required_sites(
+                    required_sites=required_sites,
+                    queries=queries_to_run,
+                    probe_cap_per_site=max(12, len(queries_to_run) * 4),
+                    sitemap_cap_per_site=12,
+                    hub_cap_per_site=16,
+                )
+
+                synthetic_search_seeds = syn_seeds
+                explicit_site_seeds = exp_seeds
+
+                for u in seed_pages:
+                    if self._looks_like_api_url(u):
+                        direct_api_urls.append(u)
+                    else:
+                        candidate_pages.append(u)
+
+                per_site_cap = max(5, max_pages_total // max(1, len(required_sites)))
+                global_seen = set()
+
+                ua_http_sites = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "PromptChat/ApiTracker"
+                )
+
+                async with submanagers.HTTPSSubmanager(
+                    user_agent=ua_http_sites,
+                    timeout=timeout,
+                    retries=http_retries,
+                    max_conn_per_host=http_max_conn_per_host,
+                    verify=http_verify_tls,
+                    ca_bundle=http_ca_bundle,
+                ) as http_sites:
+                    for site in required_sites:
+                        root = f"https://{site.strip().lstrip('.')}".rstrip("/") + "/"
+                        host = urlparse(root).netloc.lower()
+
+                        robots_url = root + "robots.txt"
+
+                        try:
+                            robots_txt = await http_sites.get_text(robots_url)
+                        except Exception:
+                            robots_txt = ""
+
+                        sm_urls = self._extract_sitemap_urls_from_robots(robots_txt)
+
+                        if not sm_urls:
+                            sm_urls = [u for u in seed_pages if "sitemap" in u and site in u][:8]
+
+                        best_from_sitemaps = await self._crawl_sitemaps_for_site(
+                            http=http_sites,
+                            root=root,
+                            sm_urls=sm_urls,
+                            keywords=keywords,
+                            targets=targets,
+                            per_site_cap=per_site_cap,
+                            global_seen=global_seen,
+                        )
+
+                        hub_like = [u for u in seed_pages if site in u and self._is_search_url(u)]
+                        expanded_from_hubs: list[str] = []
+
+                        for hub in hub_like[:5]:
+                            try:
+                                html_hub = await http_sites.get_text(hub)
+                                soup_ = BeautifulSoup(html_hub or "", "html.parser")
+
+                                expanded_from_hubs.extend(
+                                    self._extract_internal_result_links(soup_, hub, host)
+                                )
+
+                                for nxt in self._extract_next_page_links(soup_, hub):
+                                    html_nxt = await http_sites.get_text(nxt)
+                                    soup_nxt = BeautifulSoup(html_nxt or "", "html.parser")
+                                    expanded_from_hubs.extend(
+                                        self._extract_internal_result_links(soup_nxt, nxt, host)
+                                    )
+                            except Exception:
+                                pass
+
+                        expanded_from_hubs = list(dict.fromkeys(expanded_from_hubs))
+                        expanded_from_hubs.sort(
+                            key=lambda u: self._score_api_url(
+                                u,
+                                keywords,
+                                targets,
+                                kind=self._classify_api_url(u),
+                            ),
+                            reverse=True,
+                        )
+                        expanded_from_hubs = expanded_from_hubs[:per_site_cap]
+
+                        merged = list(
+                            dict.fromkeys(
+                                [root]
+                                + best_from_sitemaps
+                                + expanded_from_hubs
+                                + [u for u in seed_pages if site in u]
+                            )
+                        )
+
+                        merged.sort(
+                            key=lambda u: self._score_api_url(
+                                u,
+                                keywords,
+                                targets,
+                                kind=self._classify_api_url(u),
+                            ),
+                            reverse=True,
+                        )
+
+                        for u in merged:
+                            if len(candidate_pages) >= max_pages_total:
+                                break
+
+                            if not self._allowed_by_required_sites(u, required_sites):
+                                continue
+
+                            if self._looks_like_api_url(u):
+                                direct_api_urls.append(u)
+                                continue
+
+                            if not keywords or self._term_overlap_ok(u, keywords, min_term_overlap):
+                                candidate_pages.append(u)
+
+                candidate_pages = list(dict.fromkeys(candidate_pages))[:max_pages_total]
+
+            elif engine == "duckduckgo":
+                for qv in queries_to_run:
+                    sq = self._augment_search_query(qv, mode, required_sites)
+
+                    try:
+                        urls = await self._search_duckduckgo(
+                            sq,
+                            max_results=search_results_cap,
+                            ua=ua_search,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                            per_page=search_per_page,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][search][ddg] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not self._allowed_by_required_sites(u, required_sites):
+                            continue
+
+                        seen_search_urls.add(u)
+
+                        if self._looks_like_api_url(u):
+                            direct_api_urls.append(u)
+                        else:
+                            if len(candidate_pages) < max_pages_total:
+                                candidate_pages.append(u)
+
+            elif engine == "google_cse":
+                for qv in queries_to_run:
+                    sq = self._augment_search_query(qv, mode, required_sites)
+
+                    try:
+                        urls = await self._search_google_cse(
+                            sq,
+                            n=search_results_cap,
+                            timeout=timeout,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][search][cse] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not self._allowed_by_required_sites(u, required_sites):
+                            continue
+
+                        seen_search_urls.add(u)
+
+                        if self._looks_like_api_url(u):
+                            direct_api_urls.append(u)
+                        else:
+                            if len(candidate_pages) < max_pages_total:
+                                candidate_pages.append(u)
+
+            elif engine == "searxng":
+                searxng_url = params.get("searxng_url") or None
+
+                for qv in queries_to_run:
+                    sq = self._augment_search_query(qv, mode, required_sites)
+
+                    try:
+                        urls = await self._search_searxng(
+                            sq,
+                            max_results=search_results_cap,
+                            timeout=timeout,
+                            base_url=searxng_url,
+                            page_limit=search_page_limit,
+                        )
+                    except Exception as e:
+                        DEBUG_LOGGER.log_message(
+                            f"[ApiTracker][search][searxng] error for {sq!r}: {e}"
+                        )
+                        urls = []
+
+                    for u in urls:
+                        if not u or u in seen_search_urls:
+                            continue
+                        if not self._allowed_by_required_sites(u, required_sites):
+                            continue
+
+                        seen_search_urls.add(u)
+
+                        if self._looks_like_api_url(u):
+                            direct_api_urls.append(u)
+                        else:
+                            if len(candidate_pages) < max_pages_total:
+                                candidate_pages.append(u)
+
+        # ---------------- Crawl state ------------------ #
+
+        found_apis: List[Dict[str, Any]] = []
+        seen_api_urls: set[str] = set()
+        visited_pages: set[str] = set()
+
+        log: List[str] = []
+
+        all_js_links: List[Dict[str, str]] = []
+        all_network_links: List[Dict[str, str]] = []
+        all_runtime_hits: List[Dict[str, Any]] = []
+        all_react_hits: List[Dict[str, Any]] = []
+        all_database_hits: List[Dict[str, Any]] = []
+        all_interaction_hits: List[Dict[str, Any]] = []
+
+        ua_http = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PromptChat/ApiTracker"
+        )
+
+        # Add direct API URLs before crawling pages.
+        for u in self._dedupe(direct_api_urls):
+            if not self._allowed_by_required_sites(u, required_sites):
+                continue
+
+            if exclude_sensitive_like and self._is_probably_sensitive_endpoint(u):
+                continue
+
+            kind = self._classify_api_url(u)
+            item = {
+                "title": f"[direct] {kind}",
+                "url": self._normalize_url_for_key(u),
+                "source": None,
+                "depth": 0,
+                "score": self._score_api_url(
+                    u,
+                    keywords,
+                    targets,
+                    kind=kind,
+                    source_tag="direct",
+                ),
+                "kind": kind,
+                "tag": "direct",
+                "status": "found",
+                "valid": False,
+                "content_type": "",
+                "summary": "",
+                "preview": "",
+            }
+
+            key = item["url"]
+            if key not in seen_api_urls:
+                seen_api_urls.add(key)
+                found_apis.append(item)
+
+        async with submanagers.HTTPSSubmanager(
+            user_agent=ua_http,
+            timeout=timeout,
+            retries=http_retries,
+            max_conn_per_host=http_max_conn_per_host,
+            verify=http_verify_tls,
+            ca_bundle=http_ca_bundle,
+        ) as http:
+
+            def _should_persist_page(u: str) -> bool:
+                if engine != "sites":
+                    return True
+                if u in explicit_site_seeds or u in synthetic_search_seeds:
+                    return False
+                if self._is_search_url(u):
+                    return False
+                return True
+
+            pw_needed = (
+                use_js
+                or use_network_sniff
+                or use_runtime_sniff
+                or use_react_sniff
+                or use_database_sniff
+                or use_interaction_sniff
+            )
+
+            pw_p = pw_browser = pw_context = None
+
+            try:
+                if pw_needed:
+                    ua_pw = (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "PromptChat/ApiTracker"
+                    )
+
+                    pw_p, pw_browser, pw_context = await self._open_playwright_context(
+                        ua=ua_pw,
+                        block_resources=block_resources,
+                        blocked_resource_types=blocked_resource_types,
+                        block_domains=block_domains,
+                        blocked_domains=blocked_domains,
+                        log=log,
+                        use_camoufox=use_camoufox,
+                        camoufox_options=camoufox_options,
+                    )
+            except Exception as e:
+                log.append(f"[ApiTracker] Playwright context open failed: {e}")
+                if pw_needed and (pw_p or pw_browser or pw_context):
+                    await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+            async def _process_page(
+                page_url: str,
+                depth: int,
+                http: submanagers.HTTPSSubmanager,
+            ) -> Dict[str, Any]:
+                local_log: List[str] = []
+                local_js_links: List[Dict[str, str]] = []
+                local_network_links: List[Dict[str, str]] = []
+                local_runtime_hits: List[Dict[str, Any]] = []
+                local_react_hits: List[Dict[str, Any]] = []
+                local_database_hits: List[Dict[str, Any]] = []
+                local_interaction_hits: List[Dict[str, Any]] = []
+
+                local_apis: List[Dict[str, Any]] = []
+                next_pages: List[str] = []
+
+                self.network_sniffer.http = http
+
+                try:
+                    links_on_page: List[Dict[str, str]] = []
+                    html = ""
+
+                    sniff_items: List[Dict[str, str]] = []
+                    sniff_parent_pages: List[str] = []
+
+                    # 1) Network sniff.
+                    if use_network_sniff and pw_context:
+                        sniff_html = ""
+                        sniff_json = None
+
+                        try:
+                            sniff_result = await self._pw_fetch_with_sniff(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                                targets,
+                            )
+                        except Exception as e:
+                            sniff_result = ""
+                            local_log.append(f"[ApiTracker][Network] Error sniffing {page_url}: {e}")
+
+                        if isinstance(sniff_result, tuple):
+                            if len(sniff_result) == 3:
+                                sniff_html, sniff_items, sniff_json = sniff_result
+                            elif len(sniff_result) == 2:
+                                sniff_html, sniff_items = sniff_result
+                            elif len(sniff_result) == 1:
+                                sniff_html = sniff_result[0]
+                        else:
+                            sniff_html = sniff_result
+
+                        html = sniff_html or html
+
+                        # Network JSON response parsing.
+                        try:
+                            if sniff_json:
+                                for hit in sniff_json:
+                                    data = hit.get("json") or {}
+                                    docs = ((data.get("response") or {}).get("docs")) or []
+
+                                    for d in docs:
+                                        ident = d.get("identifier")
+                                        if ident:
+                                            for u2 in self._archive_ident_to_data_endpoints(ident):
+                                                self._add_api_candidate(
+                                                    local_apis,
+                                                    url=u2,
+                                                    base_url=page_url,
+                                                    source=page_url,
+                                                    text="[Archive identifier API]",
+                                                    tag="archive_ident",
+                                                    required_sites=required_sites,
+                                                    keywords=keywords,
+                                                    min_term_overlap=min_term_overlap,
+                                                    exclude_sensitive_like=exclude_sensitive_like,
+                                                    targets=targets,
+                                                    depth=depth + 1,
+                                                )
+
+                                    for u2 in self._extract_urls_from_jsonish_object(data):
+                                        self._add_api_candidate(
+                                            local_apis,
+                                            url=u2,
+                                            base_url=page_url,
+                                            source=page_url,
+                                            text="[JSON payload URL]",
+                                            tag="network_json_url",
+                                            required_sites=required_sites,
+                                            keywords=keywords,
+                                            min_term_overlap=min_term_overlap,
+                                            exclude_sensitive_like=exclude_sensitive_like,
+                                            targets=targets,
+                                            depth=depth + 1,
+                                        )
+
+                        except Exception as e:
+                            local_log.append(f"JSON sniff parse error on {page_url}: {e}")
+
+                        for si in sniff_items:
+                            url_hit = si.get("url", "")
+                            if not url_hit:
+                                continue
+
+                            local_network_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": url_hit,
+                                    "text": si.get("text", ""),
+                                    "tag": si.get("tag", "network_sniff"),
+                                    "size": si.get("size", "?"),
+                                }
+                            )
+
+                            local_js_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": url_hit,
+                                    "text": si.get("text", ""),
+                                    "tag": si.get("tag", "network_sniff"),
+                                }
+                            )
+
+                            self._add_api_candidate(
+                                local_apis,
+                                url=url_hit,
+                                base_url=page_url,
+                                source=page_url,
+                                text=si.get("text", "") or "[network]",
+                                tag=si.get("tag", "network_sniff"),
+                                required_sites=required_sites,
+                                keywords=keywords,
+                                min_term_overlap=min_term_overlap,
+                                exclude_sensitive_like=exclude_sensitive_like,
+                                targets=targets,
+                                depth=depth + 1,
+                            )
+
+                            try:
+                                parsed = urlparse(url_hit)
+                                path = parsed.path or ""
+                                if "/" in path:
+                                    parent_path = path.rsplit("/", 1)[0] + "/"
+                                    parent_url = f"{parsed.scheme}://{parsed.netloc}{parent_path}"
+                                    if self._allowed_by_required_sites(parent_url, required_sites):
+                                        sniff_parent_pages.append(parent_url)
+                            except Exception:
+                                pass
+
+                    # 1b) Runtime sniff.
+                    if use_runtime_sniff and pw_context:
+                        rt_html = ""
+                        rt_hits: list[dict[str, Any]] = []
+
+                        try:
+                            rt_result = await self._pw_fetch_runtime_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                        except Exception as e:
+                            rt_result = ""
+                            local_log.append(f"[ApiTracker][Runtime] Error sniffing {page_url}: {e}")
+
+                        if isinstance(rt_result, tuple):
+                            if len(rt_result) == 3:
+                                rt_html, _rt_items, rt_hits = rt_result
+                            elif len(rt_result) == 2:
+                                rt_html, rt_hits = rt_result
+                            elif len(rt_result) == 1:
+                                rt_html = rt_result[0]
+                        else:
+                            rt_html = rt_result
+
+                        if rt_html and not html:
+                            html = rt_html
+
+                        if rt_hits:
+                            local_runtime_hits.extend(rt_hits)
+
+                            for hit in rt_hits:
+                                try:
+                                    payload = hit.get("json") or hit.get("payload") or hit
+                                    for u2 in self._extract_urls_from_jsonish_object(payload):
+                                        self._add_api_candidate(
+                                            local_apis,
+                                            url=u2,
+                                            base_url=page_url,
+                                            source=page_url,
+                                            text="[runtime payload URL]",
+                                            tag="runtime_url",
+                                            required_sites=required_sites,
+                                            keywords=keywords,
+                                            min_term_overlap=min_term_overlap,
+                                            exclude_sensitive_like=exclude_sensitive_like,
+                                            targets=targets,
+                                            depth=depth + 1,
+                                        )
+                                except Exception:
+                                    continue
+
+                    # 1c) Database/content sniff.
+                    if use_database_sniff and pw_context:
+                        try:
+                            db_html, db_hits = await self._pw_fetch_database_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+
+                            if db_html and not html:
+                                html = db_html
+
+                            if db_hits:
+                                local_database_hits.extend(db_hits)
+
+                                for hit in db_hits:
+                                    if hit.get("kind") == "content_link":
+                                        u = hit.get("url")
+                                        if u:
+                                            local_js_links.append(
+                                                {
+                                                    "page": page_url,
+                                                    "url": u,
+                                                    "text": "[DB Content Link]",
+                                                    "tag": "db_link",
+                                                }
+                                            )
+
+                                            self._add_api_candidate(
+                                                local_apis,
+                                                url=u,
+                                                base_url=page_url,
+                                                source=page_url,
+                                                text="[DB Content Link]",
+                                                tag="db_link",
+                                                required_sites=required_sites,
+                                                keywords=keywords,
+                                                min_term_overlap=min_term_overlap,
+                                                exclude_sensitive_like=exclude_sensitive_like,
+                                                targets=targets,
+                                                depth=depth + 1,
+                                            )
+
+                                    elif hit.get("kind") == "db_config_detected":
+                                        meta = hit.get("meta") or {}
+                                        for u2 in self._extract_urls_from_jsonish_object(meta):
+                                            self._add_api_candidate(
+                                                local_apis,
+                                                url=u2,
+                                                base_url=page_url,
+                                                source=page_url,
+                                                text="[DB config URL]",
+                                                tag="db_config_url",
+                                                required_sites=required_sites,
+                                                keywords=keywords,
+                                                min_term_overlap=min_term_overlap,
+                                                exclude_sensitive_like=exclude_sensitive_like,
+                                                targets=targets,
+                                                depth=depth + 1,
+                                            )
+
+                        except Exception as e:
+                            local_log.append(f"[ApiTracker][DB] Error sniffing {page_url}: {e}")
+
+                    # 2) JS-render/gather.
+                    if use_js and pw_context:
+                        try:
+                            js_html, js_links = await self._pw_fetch_js_links(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                                targets,
+                            )
+                        except Exception as e:
+                            js_html, js_links = "", []
+                            local_log.append(f"[ApiTracker][JS] Error sniffing {page_url}: {e}")
+
+                        if js_html:
+                            html = js_html
+
+                        links_on_page.extend(js_links)
+
+                        if not js_links:
+                            preview = (html or "")[:2000].replace("\n", " ")
+                            local_log.append(
+                                f"[debug] JS DOM preview first 2000 chars: {preview}"
+                            )
+
+                        for jl in js_links:
+                            u = jl.get("url", "")
+
+                            local_js_links.append(
+                                {
+                                    "page": page_url,
+                                    "url": u,
+                                    "text": jl.get("text", ""),
+                                    "tag": jl.get("tag", ""),
+                                }
+                            )
+
+                            self._add_api_candidate(
+                                local_apis,
+                                url=u,
+                                base_url=page_url,
+                                source=page_url,
+                                text=jl.get("text", "") or "[js link]",
+                                tag=jl.get("tag", "js_link"),
+                                required_sites=required_sites,
+                                keywords=keywords,
+                                min_term_overlap=min_term_overlap,
+                                exclude_sensitive_like=exclude_sensitive_like,
+                                targets=targets,
+                                depth=depth + 1,
+                            )
+
+                    # 2b) React routes.
+                    if use_react_sniff and pw_context:
+                        try:
+                            react_html, react_hits = await self._pw_fetch_react_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+                        except Exception as e:
+                            local_log.append(f"[ApiTracker][React] Error sniffing {page_url}: {e}")
+                            react_html, react_hits = "", []
+
+                        if react_html and not html:
+                            html = react_html
+
+                        if react_hits:
+                            local_react_hits.extend(react_hits)
+
+                            for rh in react_hits:
+                                try:
+                                    rh_url = str(rh.get("url") or "").strip()
+                                    if not rh_url:
+                                        continue
+
+                                    if self._looks_like_api_url(rh_url):
+                                        self._add_api_candidate(
+                                            local_apis,
+                                            url=rh_url,
+                                            base_url=page_url,
+                                            source=page_url,
+                                            text=rh.get("route") or "[react route]",
+                                            tag=rh.get("kind") or "react_nav",
+                                            required_sites=required_sites,
+                                            keywords=keywords,
+                                            min_term_overlap=min_term_overlap,
+                                            exclude_sensitive_like=exclude_sensitive_like,
+                                            targets=targets,
+                                            depth=depth + 1,
+                                        )
+                                    elif depth < max_depth:
+                                        if self._allowed_by_required_sites(rh_url, required_sites):
+                                            rpath = urlparse(rh_url).path.lower()
+                                            if not any(rpath.endswith(ext) for ext in self.IGNORED_STATIC_EXTENSIONS):
+                                                next_pages.append(rh_url)
+                                except Exception:
+                                    continue
+
+                    # 2c) Interaction sniff.
+                    if use_interaction_sniff and pw_context:
+                        try:
+                            int_html, int_hits = await self._pw_fetch_interaction_hits(
+                                pw_context,
+                                page_url,
+                                timeout,
+                                local_log,
+                            )
+
+                            if int_html and not html:
+                                html = int_html
+
+                            if int_hits:
+                                local_interaction_hits.extend(int_hits)
+
+                                for ih in int_hits:
+                                    meta = ih.get("meta") or {}
+                                    for u2 in self._extract_urls_from_jsonish_object(meta):
+                                        self._add_api_candidate(
+                                            local_apis,
+                                            url=u2,
+                                            base_url=page_url,
+                                            source=page_url,
+                                            text="[interaction URL]",
+                                            tag=ih.get("kind") or "interaction",
+                                            required_sites=required_sites,
+                                            keywords=keywords,
+                                            min_term_overlap=min_term_overlap,
+                                            exclude_sensitive_like=exclude_sensitive_like,
+                                            targets=targets,
+                                            depth=depth + 1,
+                                        )
+
+                        except Exception as e:
+                            local_log.append(f"[ApiTracker][Interaction] Error sniffing {page_url}: {e}")
+
+                    # 3) Plain HTML fallback.
+                    if not html:
+                        try:
+                            html = await http.get_text(page_url)
+                            if not html:
+                                raise RuntimeError("Empty HTML")
+                        except Exception as e:
+                            local_log.append(f"Error fetching {page_url}: {e}")
+
+                            if use_database and self.store and _should_persist_page(page_url):
+                                try:
+                                    self.store.mark_scan_complete(page_url)
+                                except Exception:
+                                    pass
+
+                            return {
+                                "page": page_url,
+                                "apis": local_apis,
+                                "next_pages": next_pages,
+                                "js_links": local_js_links,
+                                "network_links": local_network_links,
+                                "runtime_hits": local_runtime_hits,
+                                "react_hits": local_react_hits,
+                                "database_hits": local_database_hits,
+                                "interaction_hits": local_interaction_hits,
+                                "log": local_log,
+                            }
+
+                    # 4) HTML parsing.
+                    soup = BeautifulSoup(html or "", "html.parser")
+
+                    page_title = ""
+                    try:
+                        if soup.title and soup.title.string:
+                            page_title = soup.title.string.strip()
+                    except Exception:
+                        page_title = ""
+
+                    body_text = ""
+                    if use_body:
+                        try:
+                            body_text = soup.get_text(" ", strip=True)[:8000]
+                        except Exception:
+                            body_text = ""
+
+                    page_haystack = f"{page_title} {page_url} {body_text}"
+                    page_has_keywords = self._term_overlap_ok(
+                        page_haystack,
+                        keywords,
+                        min_term_overlap,
+                    )
+
+                    # 4a) Current URL itself may be an API/data URL.
+                    if self._looks_like_api_url(page_url, text=page_title):
+                        self._add_api_candidate(
+                            local_apis,
+                            url=page_url,
+                            base_url=page_url,
+                            source=None,
+                            text=page_title or "[current url]",
+                            tag="current_url",
+                            required_sites=required_sites,
+                            keywords=keywords,
+                            min_term_overlap=min_term_overlap,
+                            exclude_sensitive_like=exclude_sensitive_like,
+                            targets=targets,
+                            depth=depth,
+                        )
+
+                    # 4b) Script tags with JSON.
+                    for script in soup.find_all("script"):
+                        stype = (script.get("type") or "").lower().strip()
+                        src = script.get("src")
+
+                        if src:
+                            self._add_api_candidate(
+                                local_apis,
+                                url=src,
+                                base_url=page_url,
+                                source=page_url,
+                                text="[script src]",
+                                tag="script_src",
+                                required_sites=required_sites,
+                                keywords=keywords,
+                                min_term_overlap=min_term_overlap,
+                                exclude_sensitive_like=exclude_sensitive_like,
+                                targets=targets,
+                                depth=depth + 1,
+                            )
+
+                        script_text = script.string or script.get_text() or ""
+
+                        if stype in self._JSON_SCRIPT_TYPES:
+                            try:
+                                parsed = json.loads(script_text)
+                                for u2 in self._extract_urls_from_jsonish_object(parsed):
+                                    self._add_api_candidate(
+                                        local_apis,
+                                        url=u2,
+                                        base_url=page_url,
+                                        source=page_url,
+                                        text="[json script url]",
+                                        tag="json_script_url",
+                                        required_sites=required_sites,
+                                        keywords=keywords,
+                                        min_term_overlap=min_term_overlap,
+                                        exclude_sensitive_like=exclude_sensitive_like,
+                                        targets=targets,
+                                        depth=depth + 1,
+                                    )
+                            except Exception:
+                                pass
+
+                        # Generic URL/fetch extraction from inline JS.
+                        if script_text:
+                            local_apis.extend(
+                                self._harvest_api_candidates_from_text(
+                                    script_text,
+                                    base_url=page_url,
+                                    source=page_url,
+                                    tag="inline_script",
+                                    required_sites=required_sites,
+                                    keywords=keywords,
+                                    min_term_overlap=min_term_overlap,
+                                    exclude_sensitive_like=exclude_sensitive_like,
+                                    targets=targets,
+                                    depth=depth + 1,
+                                    limit=200,
+                                )
+                            )
+
+                    # 4c) link tags: alternate feeds, API docs, JSON manifests.
+                    for link in soup.find_all("link", href=True):
+                        href = link.get("href")
+                        rel = " ".join(link.get("rel") or [])
+                        ltype = link.get("type") or ""
+                        label = f"rel={rel} type={ltype}".strip()
+
+                        if "json" in ltype.lower() or "rss" in ltype.lower() or "atom" in ltype.lower() or self._looks_like_api_url(href, label):
+                            self._add_api_candidate(
+                                local_apis,
+                                url=href,
+                                base_url=page_url,
+                                source=page_url,
+                                text=label or "[link tag]",
+                                tag="link_tag",
+                                required_sites=required_sites,
+                                keywords=keywords,
+                                min_term_overlap=min_term_overlap,
+                                exclude_sensitive_like=exclude_sensitive_like,
+                                targets=targets,
+                                depth=depth + 1,
+                            )
+
+                    # 4d) Anchor links and normal outgoing page links.
+                    link_count = 0
+
+                    for a in soup.find_all("a", href=True):
+                        href = a["href"]
+                        text_a = a.get_text(" ", strip=True)
+
+                        links_on_page.append(
+                            {
+                                "url": href,
+                                "text": text_a,
+                                "tag": "a",
+                            }
+                        )
+
+                        link_count += 1
+                        if link_count >= max_links_per_page:
+                            break
+
+                    for link in links_on_page:
+                        raw_link = link.get("url") or ""
+                        if not raw_link:
+                            continue
+
+                        full_url = urljoin(page_url, raw_link)
+                        path = urlparse(full_url).path.lower()
+
+                        if not self._allowed_by_required_sites(full_url, required_sites):
+                            continue
+
+                        if any(path.endswith(ext) for ext in self.IGNORED_STATIC_EXTENSIONS):
+                            continue
+
+                        link_text = link.get("text") or ""
+
+                        if self._looks_like_api_url(full_url, text=link_text):
+                            self._add_api_candidate(
+                                local_apis,
+                                url=full_url,
+                                base_url=page_url,
+                                source=page_url,
+                                text=link_text or "[anchor]",
+                                tag=link.get("tag", "a"),
+                                required_sites=required_sites,
+                                keywords=keywords,
+                                min_term_overlap=min_term_overlap,
+                                exclude_sensitive_like=exclude_sensitive_like,
+                                targets=targets,
+                                depth=depth + 1,
+                            )
+                        else:
+                            if depth < max_depth:
+                                if keywords and not page_has_keywords:
+                                    haystack = f"{link_text} {full_url}"
+                                    if not self._term_overlap_ok(haystack, keywords, min_term_overlap):
+                                        continue
+
+                                if engine == "sites":
+                                    if self._is_search_url(full_url) and full_url not in explicit_site_seeds:
+                                        continue
+
+                                next_pages.append(full_url)
+
+                    # 4e) Regex/fetch extraction from full HTML.
+                    local_apis.extend(
+                        self._harvest_api_candidates_from_text(
+                            html or "",
+                            base_url=page_url,
+                            source=page_url,
+                            tag="html_regex",
+                            required_sites=required_sites,
+                            keywords=keywords,
+                            min_term_overlap=min_term_overlap,
+                            exclude_sensitive_like=exclude_sensitive_like,
+                            targets=targets,
+                            depth=depth + 1,
+                            limit=400,
+                        )
+                    )
+
+                    # 4f) Sniffed parent pages for next crawl hop.
+                    if depth < max_depth and sniff_parent_pages:
+                        for parent_url in sniff_parent_pages:
+                            if self._allowed_by_required_sites(parent_url, required_sites):
+                                next_pages.append(parent_url)
+
+                    # 5) Persist scan complete.
+                    if use_database and store and _should_persist_page(page_url):
+                        try:
+                            store.mark_scan_complete(page_url)
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    local_log.append(f"Error scanning {page_url}: {e}")
+
+                    if use_database and store and _should_persist_page(page_url):
+                        try:
+                            store.mark_scan_complete(page_url)
+                        except Exception as ee:
+                            local_log.append(f"Error marking page scanned {page_url}: {ee}")
+
+                return {
+                    "page": page_url,
+                    "apis": local_apis,
+                    "next_pages": next_pages,
+                    "js_links": local_js_links,
+                    "network_links": local_network_links,
+                    "runtime_hits": local_runtime_hits,
+                    "react_hits": local_react_hits,
+                    "database_hits": local_database_hits,
+                    "interaction_hits": local_interaction_hits,
+                    "log": local_log,
+                }
+
+            # ---------------- BFS frontier ----------------- #
+
+            frontier: List[str] = []
+            site_buckets = {s: [] for s in required_sites} if required_sites else {}
+
+            for u in candidate_pages:
+                if not self._allowed_by_required_sites(u, required_sites):
+                    continue
+
+                if required_sites:
+                    d = self._clean_domain(u)
+
+                    for s in required_sites:
+                        if s in d:
+                            site_buckets[s].append(u)
+                            break
+                else:
+                    frontier.append(u)
+
+            if required_sites:
+                per_site_cap = max(3, max_pages_total // len(required_sites))
+
+                for _s, bucket in site_buckets.items():
+                    frontier.extend(bucket[:per_site_cap])
+
+            frontier = list(dict.fromkeys(frontier))[:max_pages_total]
+            current_depth = 0
+            logged_rescan_notice = False
+
+            while frontier and current_depth <= max_depth:
+                DEBUG_LOGGER.log_message(
+                    f"[ApiTracker][BFS] --- Starting Depth {current_depth} | "
+                    f"Frontier Size: {len(frontier)} | Visited: {len(visited_pages)}/{max_pages_total} ---"
+                )
+
+                remaining_page_slots = max_pages_total
+                batch: List[str] = []
+
+                for u in frontier:
+                    if len(batch) >= remaining_page_slots:
+                        break
+
+                    if u in visited_pages:
+                        continue
+
+                    if use_database and self.store and hasattr(self.store, "is_recently_scanned"):
+                        try:
+                            if self.store.is_recently_scanned(u):
+                                if not (db_allow_rescan and params.get("source", "database") == "database"):
+                                    visited_pages.add(u)
+                                    continue
+
+                                if not logged_rescan_notice:
+                                    DEBUG_LOGGER.log_message(
+                                        "[ApiTracker][db] Rescan enabled: processing previously scanned pages."
+                                    )
+                                    logged_rescan_notice = True
+                        except Exception:
+                            pass
+
+                    batch.append(u)
+                    visited_pages.add(u)
+
+                if not batch:
+                    DEBUG_LOGGER.log_message(
+                        f"[ApiTracker][BFS] Depth {current_depth}: no unique pages to process; stopping."
+                    )
+                    break
+
+                DEBUG_LOGGER.log_message(
+                    f"[ApiTracker][BFS] Processing depth {current_depth} batch of {len(batch)} URLs..."
+                )
+
+                if use_camoufox:
+                    results: List[Dict[str, Any]] = []
+
+                    for url in batch:
+                        try:
+                            res = await _process_page(url, current_depth, http)
+                            results.append(res)
+                        except Exception as e:
+                            DEBUG_LOGGER.log_message(
+                                f"[ApiTracker][Camoufox] Fatal error on {url}: {e}"
+                            )
+                            continue
+                else:
+                    results = await asyncio.gather(
+                        *[_process_page(url, current_depth, http) for url in batch]
+                    )
+
+                next_frontier_candidates: List[str] = []
+
+                for res in results:
+                    log.extend(res.get("log", []))
+                    all_js_links.extend(res.get("js_links", []))
+                    all_network_links.extend(res.get("network_links", []))
+                    all_runtime_hits.extend(res.get("runtime_hits", []))
+                    all_react_hits.extend(res.get("react_hits", []))
+                    all_database_hits.extend(res.get("database_hits", []))
+                    all_interaction_hits.extend(res.get("interaction_hits", []))
+
+                    for api in res.get("apis", []):
+                        api_url = api.get("url")
+                        if not api_url:
+                            continue
+
+                        key = self._normalize_url_for_key(api_url)
+
+                        if key in seen_api_urls:
+                            continue
+
+                        seen_api_urls.add(key)
+                        api["url"] = key
+                        found_apis.append(api)
+
+                        DEBUG_LOGGER.log_message(f"[ApiTracker][BFS] FOUND API: {key}")
+
+                    if current_depth < max_depth:
+                        next_frontier_candidates.extend(res.get("next_pages", []))
+
+                next_frontier = []
+                seen_in_next = set()
+
+                for url in next_frontier_candidates:
+                    key = self._normalize_url_for_key(url)
+
+                    if key not in visited_pages and key not in seen_in_next:
+                        next_frontier.append(url)
+                        seen_in_next.add(key)
+
+                frontier = next_frontier[:max_pages_total]
+
+                DEBUG_LOGGER.log_message(
+                    f"[ApiTracker][BFS] Depth {current_depth} complete. "
+                    f"Discovered {len(frontier)} new unique pages for next hop."
+                )
+
+                current_depth += 1
+
+            if pw_needed:
+                await self._close_playwright_context(pw_p, pw_browser, pw_context, log)
+
+        # ---------------- Endpoint validation ------------- #
+
+        if validate_endpoints and found_apis:
+            probe_candidates = sorted(
+                found_apis,
+                key=lambda x: x.get("score", 0),
+                reverse=True,
+            )[:max_endpoint_probes]
+
+            sem = asyncio.Semaphore(max(1, int(params.get("probe_concurrency", 6))))
+
+            async def _probe_one(item: Dict[str, Any]) -> Dict[str, Any]:
+                async with sem:
+                    u = item.get("url") or ""
+                    probe = await self._probe_endpoint(
+                        u,
+                        timeout=timeout,
+                        user_agent=ua_http,
+                        max_probe_bytes=max_probe_bytes,
+                        exclude_sensitive_like=exclude_sensitive_like,
+                        verify_tls=http_verify_tls,
+                        ca_bundle=http_ca_bundle,
+                    )
+
+                    # Use the cleaned final probe URL so forced variants like
+                    # ?format=pdf&export=download do not survive dedupe/output.
+                    if probe.get("url"):
+                        item["url"] = probe.get("url")
+                        u = item["url"]
+
+                    item["valid"] = bool(probe.get("ok"))
+                    item["status_code"] = probe.get("status")
+                    item["content_type"] = probe.get("content_type") or ""
+                    item["kind"] = probe.get("kind") or item.get("kind") or self._classify_api_url(u)
+                    item["summary"] = probe.get("summary") or ""
+                    item["preview"] = probe.get("preview") or ""
+                    item["probe_error"] = probe.get("error") or ""
+                    item["bytes_read"] = probe.get("bytes_read") or 0
+
+                    item["score"] = self._score_api_url(
+                        u,
+                        keywords,
+                        targets,
+                        content_type=item.get("content_type", ""),
+                        kind=item.get("kind", ""),
+                        valid=item.get("valid", False),
+                        source_tag=item.get("tag", ""),
+                        text=item.get("title", ""),
+                    )
+
+                    return item
+
+            probed = await asyncio.gather(*[_probe_one(x) for x in probe_candidates])
+
+            probed_by_url = {p["url"]: p for p in probed if p.get("url")}
+            updated = []
+
+            for item in found_apis:
+                u = item.get("url")
+                if u in probed_by_url:
+                    updated.append(probed_by_url[u])
+                else:
+                    updated.append(item)
+
+            found_apis = updated
+
+        # ---------------- Persist API results ------------- #
+
+        if use_database and self.store:
+            for item in found_apis:
+                try:
+                    self._store_upsert_api(item)
+                except Exception:
+                    pass
+
+        # ---------------- Final filtering / ranking ------- #
+
+        final_map: Dict[str, Dict[str, Any]] = {}
+
+        for item in found_apis:
+            u = item.get("url")
+            if not u:
+                continue
+
+            if only_valid and not item.get("valid"):
+                continue
+
+            if not include_unvalidated and validate_endpoints and not item.get("valid"):
+                continue
+
+            score = item.get("score", 0)
+
+            if u not in final_map or score > final_map[u].get("score", 0):
+                final_map[u] = item
+
+        final_list = sorted(
+            final_map.values(),
+            key=lambda x: x.get("score", 0),
+            reverse=True,
+        )
+
+        # ---------------- Output formatting ------------- #
+
+        from urllib.parse import urlparse as _urlparse
+
+        if not final_list:
+            base_text = (
+                "### ApiTracker: No API/data endpoints found.\n"
+                f"Scanned {len(candidate_pages)} candidate page seed(s).\n"
+                f"Direct API seed(s): {len(direct_api_urls)}\n"
+                f"Required keywords: {keywords}\n"
+                f"Required sites: {required_sites or '[none]'}\n"
+                f"min_term_overlap: {min_term_overlap}\n"
+                f"Engine: {engine}\n"
+                f"Validate endpoints: {validate_endpoints}\n"
+                f"Only valid: {only_valid}\n"
+            )
+
+            lines = [base_text]
+
+            if return_all_js_links and all_js_links:
+                lines.append("\n### All JS-Gathered Links (debug)\n")
+                for jl in all_js_links:
+                    host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                    url = jl["url"]
+                    text_j = jl["text"] or "(no text)"
+                    tag = jl["tag"] or "a"
+                    lines.append(f"- **[{text_j}]({url})**")
+                    lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
+
+            if return_network_sniff_links and all_network_links:
+                lines.append("\n### All Network-Sniffed Links (debug)\n")
+                for nl in all_network_links:
+                    host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                    url = nl["url"]
+                    text_n = nl["text"] or "(no text)"
+                    tag = nl.get("tag", "network_sniff")
+                    size = nl.get("size", "?")
+                    lines.append(f"- **[{text_n}]({url})**")
+                    lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+
+            return "\n".join(lines), {
+                "count": 0,
+                "found": 0,
+                "scanned_pages": len(visited_pages),
+                "keywords_used": keywords,
+                "min_term_overlap": min_term_overlap,
+                "engine": engine,
+                "required_sites": required_sites,
+                "apis": [],
+                "js_links": all_js_links,
+                "network_sniff_links": all_network_links,
+                "runtime_hits": all_runtime_hits,
+                "react_hits": all_react_hits,
+                "database_hits": all_database_hits,
+                "interaction_hits": all_interaction_hits,
+                "log": log,
+                "queries_run": queries_to_run,
+            }
+
+        valid_count = sum(1 for x in final_list if x.get("valid"))
+
+        lines = [f"### ApiTracker Found {len(final_list)} API/Data Endpoint(s)"]
+        lines.append(
+            f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
+            f"Valid: {valid_count}/{len(final_list)} | "
+            f"Required Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
+            f"Required Sites: {required_sites or '[none]'}_"
+        )
+        lines.append("")
+
+        for api in final_list:
+            title = api.get("title") or f"[{api.get('kind', 'api')}]"
+            url = api.get("url")
+            score = api.get("score", 0)
+            host = _urlparse(url).netloc
+            depth = api.get("depth", 0)
+            kind = api.get("kind") or "possible_api"
+            tag = api.get("tag") or "candidate"
+            valid = "yes" if api.get("valid") else "no"
+            content_type = api.get("content_type") or "?"
+            status_code = api.get("status_code")
+            summary = api.get("summary") or api.get("probe_error") or ""
+
+            lines.append(f"- **[{title}]({url})**")
+            lines.append(
+                f"  - *Host: {host} | Kind: {kind} | Valid: {valid} | "
+                f"HTTP: {status_code or '?'} | Content-Type: {content_type} | "
+                f"Score: {score} | Depth: {depth} | Source tag: {tag}*"
+            )
+            if summary:
+                lines.append(f"  - {summary}")
+
+        if return_all_js_links and all_js_links:
+            lines.append("\n### All JS-Gathered Links (debug)\n")
+            for jl in all_js_links:
+                host = _urlparse(jl["page"]).netloc if jl.get("page") else "(unknown)"
+                url = jl["url"]
+                text_j = jl["text"] or "(no text)"
+                tag = jl["tag"] or "a"
+                lines.append(f"- **[{text_j}]({url})**")
+                lines.append(f"  - *Tag: <{tag}> | From page: {host}*")
+
+        if return_network_sniff_links and all_network_links:
+            lines.append("\n### All Network-Sniffed Links (debug)\n")
+            for nl in all_network_links:
+                host = _urlparse(nl["page"]).netloc if nl.get("page") else "(unknown)"
+                url = nl["url"]
+                text_n = nl["text"] or "(no text)"
+                tag = nl.get("tag", "network_sniff")
+                size = nl.get("size", "?")
+                lines.append(f"- **[{text_n}]({url})**")
+                lines.append(f"  - *Tag: <{tag}> | From page: {host} | Size: {size}*")
+
+        if return_react_sniff_hits and all_react_hits:
+            lines.append("\n### React / SPA Hits (debug)\n")
+            for rh in all_react_hits[:100]:
+                url = rh.get("url") or "(no url)"
+                route = rh.get("route") or ""
+                kind = rh.get("kind") or "react_nav"
+                lines.append(f"- `{kind}` **{route}** → {url}")
+
+        if return_runtime_sniff_hits and all_runtime_hits:
+            lines.append("\n### Runtime Sniff Hits (debug)\n")
+            for hit in all_runtime_hits[:100]:
+                url = hit.get("url") or "(no url)"
+                payload = hit.get("json") or {}
+
+                desc_parts = []
+
+                if "console" in payload:
+                    desc_parts.append(f"Console: {str(payload['console'])[:100]}...")
+                elif "ws_frame" in payload:
+                    desc_parts.append(f"WebSocket: {str(payload['ws_frame'])[:100]}...")
+                elif "request_body" in payload:
+                    desc_parts.append("Request Body")
+                elif "media_events" in payload:
+                    evts = payload["media_events"]
+                    desc_parts.append(f"Media Events: {len(evts)}")
+                elif "storage" in payload:
+                    desc_parts.append(f"Storage Items: {len(payload['storage'])}")
+                elif "perf_entries" in payload:
+                    desc_parts.append(f"Perf Entries: {len(payload['perf_entries'])}")
+                else:
+                    try:
+                        dump = json.dumps(payload)
+                        desc_parts.append(f"Data: {dump[:100]}...")
+                    except Exception:
+                        desc_parts.append("Data: complex object")
+
+                desc = " | ".join(desc_parts)
+                lines.append(f"- `{desc}` found on **{url}**")
+
+        if return_database_sniff_hits and all_database_hits:
+            lines.append("\n### Database / Content Sniff Hits (debug)\n")
+            for dbh in all_database_hits[:100]:
+                kind = dbh.get("kind")
+                url = dbh.get("url")
+                meta = dbh.get("meta") or {}
+
+                if kind == "content_link":
+                    src = meta.get("source", "?")
+                    lines.append(f"- `db_link` ({src}) **{url}**")
+                elif kind == "indexeddb_dump":
+                    db_name = meta.get("name", "?")
+                    stores = meta.get("stores", [])
+                    store_str = ", ".join(
+                        [
+                            f"{s['name']}(~{s.get('approx_count')})"
+                            for s in stores
+                        ]
+                    )
+                    lines.append(f"- `indexed_db` **{db_name}**: [{store_str}]")
+                elif kind == "db_config_detected":
+                    name = meta.get("name")
+                    lines.append(f"- `backend_config` **{name}** detected")
+
+        if return_interaction_sniff_hits and all_interaction_hits:
+            lines.append("\n### Interaction / CDP Hits (debug)\n")
+            for ih in all_interaction_hits[:100]:
+                kind = ih.get("kind")
+                meta = ih.get("meta") or {}
+                url = ih.get("url")
+
+                if kind == "event_listener":
+                    node = meta.get("nodeName", "UNK")
+                    types = meta.get("types", [])
+                    lines.append(f"- `listener` **{node}** {types} on {url}")
+                elif kind == "form_definition":
+                    ins = meta.get("input_count", 0)
+                    method = meta.get("method", "get")
+                    lines.append(f"- `form` **{method.upper()}** ({ins} inputs) on {url}")
+                elif kind == "overlay_detected":
+                    cov = meta.get("coverage", "?")
+                    z = meta.get("zIndex", "?")
+                    lines.append(f"- `overlay` (z={z}, cov={cov}) on {url}")
+                elif kind == "summary":
+                    lc = meta.get("listener_count", 0)
+                    fc = meta.get("form_count", 0)
+                    lines.append(f"- `summary` Listeners: {lc}, Forms: {fc}")
+
+        return "\n".join(lines), {
+            "found": len(final_list),
+            "valid_found": valid_count,
+            "scanned_pages": len(visited_pages),
+            "apis": final_list,
+            "keywords_used": keywords,
+            "min_term_overlap": min_term_overlap,
+            "engine": engine,
+            "required_sites": required_sites,
+            "js_links": all_js_links,
+            "network_sniff_links": all_network_links,
+            "runtime_hits": all_runtime_hits,
+            "react_hits": all_react_hits,
+            "database_hits": all_database_hits,
+            "interaction_hits": all_interaction_hits,
+            "log": log,
+            "queries_run": queries_to_run,
+        }
+
+    # ------------------------------------------------------------------ #
+    # Predictive sequencing
+    # ------------------------------------------------------------------ #
+
+    def _predict_next_in_sequence(self, urls: List[str]) -> List[str]:
+        generated = set()
+        re_seq = re.compile(r"([0-9]+)(\.[a-z0-9]+)$", re.IGNORECASE)
+
+        for u in urls:
+            match = re_seq.search(u)
+            if match:
+                original_num_str = match.group(1)
+
+                try:
+                    width = len(original_num_str)
+                    val = int(original_num_str)
+
+                    for i in range(1, 4):
+                        next_val = val + i
+                        next_str = f"{next_val:0{width}d}"
+                        new_url = u[: match.start(1)] + next_str + u[match.end(1) :]
+                        generated.add(new_url)
+                except ValueError:
+                    pass
+
+        return list(generated)
+
+    # ------------------------------------------------------------------ #
+    # Sync wrapper
+    # ------------------------------------------------------------------ #
+
+    def execute(
+        self,
+        payload: Any,
+        *,
+        params: Dict[str, Any],
+    ) -> Tuple[str, Dict[str, Any]]:
+        return asyncio.run(self._execute_async(payload, params=params))
+
+    def get_params_info(self) -> Dict[str, Any]:
+        return {
+            "query": "public dataset api json",
+            "timeout": 5,
+            "mode": "api",
+            "scan_limit": 5,
+            "max_pages_total": 32,
+            "search_results_cap": 256,
+            "search_page_limit": 1,
+            "search_per_page": 50,
+
+            # API/data targeting.
+            "extensions": "json,geojson,ndjson,csv,tsv,xml,rss,atom",
+            "url_keywords": "api,json,data,metadata,graphql,wp-json,feed",
+            "engine": "duckduckgo",
+            "site_require": "",
+            "strict_keywords": False,
+            "min_term_overlap": 1,
+            "max_depth": 0,
+
+            # Endpoint validation.
+            "validate_endpoints": True,
+            "max_endpoint_probes": 50,
+            "probe_concurrency": 6,
+            "max_probe_bytes": 1000000,
+            "include_unvalidated": True,
+            "only_valid": False,
+            "exclude_sensitive_like": True,
+
+            # Body matching.
+            "use_body": True,
+            "max_links_per_page": 500,
+
+            # Sniffers.
+            "use_js": False,
+            "return_all_js_links": False,
+            "use_network_sniff": True,
+            "return_network_sniff_links": False,
+            "use_runtime_sniff": False,
+            "return_runtime_sniff_hits": False,
+            "use_react_sniff": False,
+            "return_react_sniff_hits": False,
+            "use_database_sniff": False,
+            "return_database_sniff_hits": False,
+            "use_interaction_sniff": False,
+            "return_interaction_sniff_hits": False,
+
+            # Subpipeline / DB / memory.
+            "subpipeline": "",
+            "use_database": False,
+            "db_path": "link_corpus.db",
+            "db_seed_limit": 250,
+            "db_seed_max_age_days": None,
+            "db_allow_rescan": False,
+            "memory_sources": "",
+
+            # HTTP.
+            "http_retries": 2,
+            "http_max_conn_per_host": 8,
+            "http_verify_tls": True,
+            "http_ca_bundle": "",
+
+            # Playwright / blocking.
+            "block_resources": False,
+            "blocked_resource_types": "image,stylesheet,font",
+            "block_domains": True,
+            "blocked_domains": "",
+            "use_camoufox": False,
+            "camoufox_options": {},
+
+            # SearXNG.
+            "searxng_url": "http://127.0.0.1:8080",
+        }
+
+
+BLOCKS.register("apitracker", ApiTrackerBlock)

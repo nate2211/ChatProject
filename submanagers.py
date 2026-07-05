@@ -22616,8 +22616,6 @@ class LinkResolver:
             pass
 
 
-
-
 class HTTPSSubmanager:
     """
     Shared aiohttp HTTPS engine.
