@@ -43746,6 +43746,8 @@ import re
 import sys
 import time
 import traceback
+import html as _html
+from collections import Counter
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -43755,6 +43757,10 @@ SENSITIVE_KEY_RE = re.compile(
 )
 
 URL_RE = re.compile(r"\b(?:https?|wss?)://[^\s\"'<>`]+", re.I)
+CSS_URL_RE = re.compile(r"url\(\s*[\'\"]?([^\'\")]+)", re.I)
+ATTR_URL_RE = re.compile(r"(?i)(?:href|src|action|poster|data-src|data-href|srcset)\s*=\s*[\'\"]([^\'\"]{2,2048})")
+SOURCE_MAP_RE = re.compile(r"(?i)sourceMappingURL=([^\s*]+)")
+RELATIVE_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9_])((?:/|\.\.?/)[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%\-]{2,512})")
 
 
 def truthy(value, default=False):
@@ -44619,6 +44625,544 @@ async def safe_http_text(http, url, *, max_bytes=900000, allow_redirects=True, h
     return ""
 
 
+# ------------------------------------------------------------------
+# Advanced passive extraction / report renderer
+# ------------------------------------------------------------------
+
+def _is_safe_browser_url(raw: str) -> bool:
+    s = str(raw or "").strip()
+    if not s or s.startswith(("#", "//")):
+        return False
+    low = s.lower()
+    if low.startswith(("javascript:", "mailto:", "tel:", "sms:", "data:", "blob:", "about:")):
+        return False
+    return True
+
+
+def absolute_url(base_url: str, raw: str) -> str:
+    try:
+        raw = str(raw or "").strip().strip('"\'')
+        if not _is_safe_browser_url(raw):
+            return ""
+        if raw.startswith(("http://", "https://", "ws://", "wss://")):
+            return redact_url(raw)
+        return redact_url(urljoin(base_url, raw))
+    except Exception:
+        return ""
+
+
+def extract_urls_from_text(text: str, base_url: str = "", limit: int = 500) -> list[str]:
+    """Extract observed URL-like strings only. No guessing, brute forcing, or auth bypass."""
+    out = []
+    seen = set()
+
+    def push(raw):
+        u = absolute_url(base_url, raw) if base_url else redact_url(str(raw or ""))
+        if not u or u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    blob = str(text or "")
+    for m in URL_RE.finditer(blob):
+        push(m.group(0).rstrip(').,;]'))
+        if len(out) >= limit:
+            return out
+
+    for rgx in (CSS_URL_RE, ATTR_URL_RE, SOURCE_MAP_RE, RELATIVE_CANDIDATE_RE):
+        for m in rgx.finditer(blob):
+            raw = m.group(1) if m.groups() else m.group(0)
+            raw = raw.strip().rstrip(').,;]')
+            if raw.startswith(("/", "./", "../", "http://", "https://", "ws://", "wss://")):
+                push(raw)
+            if len(out) >= limit:
+                return out
+
+    return out
+
+
+def extract_urls_from_obj(obj, base_url: str = "", limit: int = 800) -> list[str]:
+    try:
+        return extract_urls_from_text(json.dumps(obj, ensure_ascii=False, default=str), base_url, limit=limit)
+    except Exception:
+        return []
+
+
+def _html_escape(value) -> str:
+    return _html.escape(str(value or ""), quote=True)
+
+
+def build_sniffer_report_html(page_url: str, hits: list[dict], html_sources: dict[str, str], log: list[str] | None = None) -> str:
+    """Build a safe, clickable report so the Rendered Sniffer Preview tab always has useful output."""
+    hits = [h if isinstance(h, dict) else {"value": h} for h in (hits or [])]
+    log = log or []
+
+    by_cat = Counter(str(h.get("category") or h.get("kind") or h.get("type") or "uncategorized") for h in hits)
+    by_src = Counter(str(h.get("sniffer") or h.get("source") or "unknown") for h in hits)
+
+    rows = []
+    seen_rows = set()
+    for h in hits[:2400]:
+        urls = []
+        for key in ("url", "href", "src", "scriptURL", "scope", "endpoint", "action", "location"):
+            v = h.get(key)
+            if isinstance(v, str):
+                u = absolute_url(page_url, v)
+                if u:
+                    urls.append(u)
+        if not urls:
+            urls.extend(extract_urls_from_obj(h, page_url, limit=8))
+        if not urls:
+            urls = [""]
+
+        for u in urls[:12]:
+            cat = str(h.get("category") or classify_url(u, str(h.get("content_type") or h.get("contentType") or ""), str(h.get("kind") or h.get("type") or "")))
+            src = str(h.get("sniffer") or h.get("source") or "")
+            title = str(h.get("title") or h.get("text") or h.get("name") or h.get("summary") or h.get("kind") or h.get("type") or "")
+            status = str(h.get("status") or "")
+            key = (cat, src, u, title[:160], status)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            rows.append((cat, src, u, title, status))
+            break
+
+    cards = []
+    for cat, src, u, title, status in rows[:1200]:
+        link = f'<a href="{_html_escape(u)}">{_html_escape(u)}</a>' if u else '<span class="muted">no direct URL</span>'
+        cards.append(f"""
+        <article class="card cat-{_html_escape(cat).replace('/', '-')}">
+          <div class="card-head"><span class="pill">{_html_escape(cat)}</span><span class="src">{_html_escape(src)}</span><span class="status">{_html_escape(status)}</span></div>
+          <div class="url">{link}</div>
+          <pre>{_html_escape(safe_text(title, 850))}</pre>
+        </article>""")
+
+    source_rows = []
+    for name, html_text in (html_sources or {}).items():
+        source_rows.append(f'<tr><td>{_html_escape(name)}</td><td>{len(str(html_text or "")):,}</td></tr>')
+
+    cat_lis = ''.join(f'<li><b>{_html_escape(k)}</b><span>{v}</span></li>' for k, v in by_cat.most_common(30))
+    src_lis = ''.join(f'<li><b>{_html_escape(k)}</b><span>{v}</span></li>' for k, v in by_src.most_common(30))
+    log_html = '\n'.join(_html_escape(x) for x in log[-120:])
+
+    return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' data: blob: https: http:; script-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
+<title>Rendered Sniffer Report</title>
+<style>
+  :root {{ color-scheme: light dark; font-family: Inter, Segoe UI, Arial, sans-serif; }}
+  body {{ margin: 0; padding: 0; background: #0b1020; color: #eef2ff; }}
+  header {{ position: sticky; top: 0; z-index: 2; padding: 18px 22px; background: rgba(11,16,32,.95); border-bottom: 1px solid rgba(255,255,255,.12); }}
+  h1 {{ margin: 0 0 8px 0; font-size: 22px; }}
+  .base {{ color: #9fb3ff; overflow-wrap: anywhere; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; padding: 16px 22px; }}
+  .panel, .card {{ border: 1px solid rgba(255,255,255,.12); border-radius: 14px; background: rgba(255,255,255,.055); box-shadow: 0 12px 40px rgba(0,0,0,.22); }}
+  .panel {{ padding: 14px; }}
+  .panel h2 {{ margin: 0 0 10px 0; font-size: 16px; }}
+  ul {{ margin: 0; padding: 0; list-style: none; }}
+  li {{ display:flex; justify-content:space-between; gap:12px; padding: 6px 0; border-bottom: 1px dashed rgba(255,255,255,.09); }}
+  .cards {{ padding: 0 22px 24px 22px; display: grid; gap: 10px; }}
+  .card {{ padding: 12px; }}
+  .card-head {{ display:flex; gap: 8px; align-items:center; flex-wrap:wrap; margin-bottom: 8px; }}
+  .pill {{ padding: 3px 9px; border-radius: 999px; background: rgba(125,168,255,.18); border: 1px solid rgba(125,168,255,.28); color:#cfe0ff; font-size: 12px; }}
+  .src, .status, .muted {{ color: #9aa7bd; font-size: 12px; }}
+  .url {{ overflow-wrap: anywhere; margin-bottom: 8px; }}
+  a {{ color: #95c5ff; text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  pre {{ white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; color: #d7def5; font-size: 12px; font-family: ui-monospace, Consolas, monospace; }}
+  table {{ width:100%; border-collapse: collapse; }}
+  td {{ padding:6px 8px; border-bottom:1px solid rgba(255,255,255,.08); }}
+</style>
+</head>
+<body>
+<header>
+  <h1>Rendered Sniffer Report</h1>
+  <div class="base">{_html_escape(page_url)}</div>
+  <div class="muted">{len(hits):,} hits · {len(rows):,} preview rows · {len(html_sources or {})} HTML sources. Sensitive keys and auth-like values are redacted.</div>
+</header>
+<section class="grid">
+  <div class="panel"><h2>Categories</h2><ul>{cat_lis or '<li><b>none</b><span>0</span></li>'}</ul></div>
+  <div class="panel"><h2>Sources</h2><ul>{src_lis or '<li><b>none</b><span>0</span></li>'}</ul></div>
+  <div class="panel"><h2>HTML Sources</h2><table>{''.join(source_rows) or '<tr><td>none</td><td>0</td></tr>'}</table></div>
+  <div class="panel"><h2>Worker Log</h2><pre>{log_html}</pre></div>
+</section>
+<section class="cards">
+{''.join(cards) or '<article class="card"><b>No hits yet.</b><pre>Run sniffers or scan the live page.</pre></article>'}
+</section>
+</body>
+</html>"""
+
+
+async def collect_passive_http_candidates(http, page_url: str, html_text: str = "", cfg: dict | None = None) -> list[dict]:
+    """Fetch only common public metadata files and parse observed links. No brute force."""
+    cfg = cfg or {}
+    if not truthy(cfg.get("enable_passive_metadata_probe"), True):
+        return []
+
+    hits = []
+    seen = set()
+
+    def push(kind, url, text="", category=""):
+        u = absolute_url(page_url, url)
+        if not u or u in seen:
+            return
+        seen.add(u)
+        hits.append({
+            "sniffer": "passive",
+            "source": kind,
+            "kind": kind,
+            "url": u,
+            "text": safe_text(text, 500),
+            "category": category or classify_url(u, "", text),
+            "evidence": "observed or public metadata reference",
+        })
+
+    for u in extract_urls_from_text(html_text or "", page_url, limit=int(cfg.get("passive_html_url_limit") or 1200)):
+        push("html-observed", u, "observed in HTML/source")
+
+    parsed = urlparse(page_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    default_paths = [
+        "/robots.txt",
+        "/sitemap.xml",
+        "/sitemap_index.xml",
+        "/manifest.json",
+        "/site.webmanifest",
+        "/asset-manifest.json",
+        "/humans.txt",
+        "/.well-known/security.txt",
+        "/.well-known/assetlinks.json",
+        "/.well-known/apple-app-site-association",
+    ]
+    paths = list_from_param(cfg.get("passive_probe_paths")) or default_paths
+    max_probes = int(cfg.get("passive_metadata_probe_limit") or 12)
+
+    if html_text:
+        m = re.search(r'"buildId"\s*:\s*"([^"\\]{3,120})"', html_text)
+        if m:
+            bid = m.group(1)
+            paths.extend([
+                f"/_next/static/{bid}/_buildManifest.js",
+                f"/_next/static/{bid}/_ssgManifest.js",
+            ])
+        if "wp-content" in html_text or "wp-includes" in html_text:
+            paths.extend(["/wp-json/", "/wp-sitemap.xml"])
+
+    probed = 0
+    for path in paths:
+        if probed >= max_probes:
+            break
+        u = urljoin(origin + "/", str(path).lstrip("/"))
+        try:
+            txt = await safe_http_text(
+                http,
+                u,
+                max_bytes=int(cfg.get("passive_probe_max_bytes") or 450000),
+                allow_redirects=True,
+                headers=cfg.get("http_headers") or None,
+            )
+            probed += 1
+            if not txt:
+                continue
+            push("public-metadata", u, f"{path} returned {len(txt)} chars", "metadata")
+            for found in extract_urls_from_text(txt, u, limit=400):
+                push("public-metadata-link", found, f"linked from {path}")
+        except Exception:
+            continue
+
+    return hits
+
+
+DEEP_SURFACE_SCAN_JS = r"""
+(async () => {
+  const sensitive = /(token|auth|authorization|cookie|session|sess|secret|password|passwd|jwt|sig|signature|key|credential|csrf|api[_-]?key)/i;
+  function cleanText(input, maxLen = 700) {
+    try {
+      let s = String(input || "");
+      s = s.replace(/(bearer\s+)[a-z0-9._\-+/=]{16,}/ig, "$1[redacted]");
+      s = s.replace(/(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*['"]?[^'"\s,;<>]{8,}/ig, "$1=[redacted]");
+      s = s.replace(/\s+/g, " ").trim();
+      return s.slice(0, maxLen);
+    } catch (_) { return ""; }
+  }
+  function cleanUrl(input) {
+    try {
+      const u = new URL(String(input || ""), location.href);
+      if (["javascript:", "mailto:", "tel:", "sms:", "data:", "blob:"].includes(u.protocol)) return "";
+      for (const k of Array.from(u.searchParams.keys())) if (sensitive.test(k)) u.searchParams.set(k, "[redacted]");
+      u.hash = "";
+      return u.href.slice(0, 4096);
+    } catch (_) { return ""; }
+  }
+  function urlsFromText(text, limit = 100) {
+    const out = [];
+    const seen = new Set();
+    function push(raw) {
+      const u = cleanUrl(raw);
+      if (!u || seen.has(u)) return;
+      seen.add(u); out.push(u);
+    }
+    try {
+      const s = String(text || "");
+      const abs = s.match(/\b(?:https?|wss?):\/\/[^"'\s<>`]+/ig) || [];
+      abs.forEach(x => push(x.replace(/[),.;\]]+$/g, "")));
+      const rel = s.match(/(?<![A-Za-z0-9_])(?:\/|\.\.?\/)[A-Za-z0-9._~:\/?#\[\]@!$&()*+,;=%\-]{2,512}/g) || [];
+      rel.forEach(x => push(x.replace(/[),.;\]]+$/g, "")));
+      const css = Array.from(s.matchAll(/url\(\s*['"]?([^'"\)]+)['"]?\s*\)/ig)).map(m => m[1]);
+      css.forEach(push);
+    } catch (_) {}
+    return out.slice(0, limit);
+  }
+  function classify(url, hint = "") {
+    const u = String(url || "").toLowerCase();
+    const h = String(hint || "").toLowerCase();
+    if (u.startsWith("ws://") || u.startsWith("wss://")) return "websocket";
+    if (u.includes("graphql") || h.includes("graphql")) return "graphql/api";
+    if (u.includes("/api/") || u.endsWith(".json") || h.includes("json")) return "api/json";
+    if (u.includes("serviceworker") || u.includes("service-worker") || u.endsWith("sw.js")) return "service-worker";
+    if (u.endsWith(".js") || u.endsWith(".mjs")) return "script";
+    if (u.endsWith(".css")) return "css-url";
+    if (u.includes(".m3u8") || u.includes(".mpd") || u.includes(".m4s") || u.includes("hls") || u.includes("dash")) return "media";
+    if (h.includes("shadow")) return "shadow-dom";
+    if (h.includes("hidden")) return "hidden-dom";
+    return "url";
+  }
+  const hits = [];
+  const seen = new Set();
+  function push(kind, rawUrl, text = "", extra = {}) {
+    const url = cleanUrl(rawUrl);
+    const key = kind + "|" + url + "|" + cleanText(text, 120);
+    if (!url && !text) return;
+    if (seen.has(key)) return;
+    seen.add(key);
+    hits.push(Object.assign({ kind, type: kind, url, text: cleanText(text), category: classify(url, kind) }, extra || {}));
+  }
+  function pushText(kind, text, extra = {}) {
+    const urls = urlsFromText(text, 160);
+    if (urls.length) urls.forEach(u => push(kind, u, text, extra));
+    else if (String(text || "").trim()) push(kind, "", text, extra);
+  }
+
+  try {
+    for (const a of Array.from(document.querySelectorAll('a[href]')).slice(0, 1200)) push('anchor', a.href, a.innerText || a.title || a.getAttribute('aria-label') || '');
+    for (const s of Array.from(document.scripts || []).slice(0, 600)) {
+      if (s.src) push('script', s.src, s.type || '');
+      else pushText('inline-script', s.textContent || '', { chars: (s.textContent || '').length });
+    }
+    for (const l of Array.from(document.querySelectorAll('link[href]')).slice(0, 600)) push('link-' + (l.rel || 'link'), l.href, l.as || l.type || l.media || '');
+    for (const i of Array.from(document.querySelectorAll('img[src], img[srcset], picture source[srcset]')).slice(0, 600)) push('image', i.currentSrc || i.src || i.srcset || i.getAttribute('srcset') || '', i.alt || i.type || '');
+    for (const m of Array.from(document.querySelectorAll('video[src], audio[src], source[src], track[src], video[poster]')).slice(0, 400)) push('media', m.src || m.poster || '', m.type || m.kind || '');
+    for (const f of Array.from(document.querySelectorAll('form')).slice(0, 220)) push('form-action', f.action || location.href, (f.method || 'GET') + ' ' + (f.id || f.name || ''));
+    for (const fr of Array.from(document.querySelectorAll('iframe[src], frame[src], object[data], embed[src]')).slice(0, 220)) push('frame-embed', fr.src || fr.data || '', fr.title || fr.type || '');
+    for (const meta of Array.from(document.querySelectorAll('meta[content]')).slice(0, 500)) pushText('meta', meta.content || '', { name: meta.name || meta.property || '' });
+    for (const el of Array.from(document.querySelectorAll('[style]')).slice(0, 900)) pushText('inline-style-url', el.getAttribute('style') || '', { tag: el.tagName || '' });
+    for (const el of Array.from(document.querySelectorAll('*')).slice(0, 3000)) {
+      for (const attr of Array.from(el.attributes || [])) {
+        const n = attr.name || '';
+        const v = attr.value || '';
+        if (/^(data-|aria-|srcset|poster|href|src|action)/i.test(n) && /(?:https?:|wss?:|\/|\.\.?\/)/.test(v)) {
+          pushText('attribute-' + n.slice(0, 40), v, { tag: el.tagName || '' });
+        }
+      }
+    }
+    for (const style of Array.from(document.styleSheets || []).slice(0, 90)) {
+      try {
+        for (const rule of Array.from(style.cssRules || []).slice(0, 900)) pushText('css-rule-url', rule.cssText || '', { href: style.href || '' });
+      } catch (_) {}
+    }
+    for (const el of Array.from(document.querySelectorAll('template, noscript')).slice(0, 180)) pushText(el.tagName.toLowerCase(), el.innerHTML || el.textContent || '', { category: 'hidden-dom' });
+
+    const hidden = [];
+    for (const el of Array.from(document.querySelectorAll('body *')).slice(0, 5000)) {
+      if (hidden.length >= 420) break;
+      let st = null; try { st = getComputedStyle(el); } catch (_) {}
+      const isHidden = el.hidden || el.getAttribute('aria-hidden') === 'true' || el.getAttribute('type') === 'hidden' ||
+        (st && (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity || '1') === 0 || parseFloat(st.width || '1') === 0 || parseFloat(st.height || '1') === 0));
+      if (!isHidden) continue;
+      const url = el.href || el.src || el.action || el.getAttribute('data-href') || el.getAttribute('data-src') || '';
+      const text = el.innerText || el.value || el.textContent || el.getAttribute('content') || '';
+      if (!url && !text) continue;
+      hidden.push({ tag: el.tagName || '', id: el.id || '', className: String(el.className || '').slice(0, 120), url: cleanUrl(url), text: cleanText(text, 500), category: 'hidden-dom' });
+      push('hidden-dom', url, text, { tag: el.tagName || '', id: el.id || '', category: 'hidden-dom' });
+    }
+
+    for (const host of Array.from(document.querySelectorAll('*')).slice(0, 2500)) {
+      const sr = host.shadowRoot;
+      if (!sr) continue;
+      for (const el of Array.from(sr.querySelectorAll('a[href], img[src], script[src], link[href], [data-src], [data-href]')).slice(0, 250)) {
+        push('shadow-dom', el.href || el.src || el.getAttribute('data-src') || el.getAttribute('data-href') || '', el.innerText || el.alt || '', { host: host.tagName || '', category: 'shadow-dom' });
+      }
+    }
+
+    try {
+      const perf = performance.getEntriesByType('resource').slice(-900);
+      for (const r of perf) push('performance-resource', r.name, r.initiatorType || '', { duration: Math.round(r.duration || 0), transferSize: r.transferSize || 0 });
+    } catch (_) {}
+
+    try {
+      if (navigator.serviceWorker && navigator.serviceWorker.getRegistrations) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        for (const r of regs.slice(0, 80)) push('service-worker-registration', (r.active && r.active.scriptURL) || (r.installing && r.installing.scriptURL) || '', r.scope || '', { scope: cleanUrl(r.scope || ''), category: 'service-worker' });
+      }
+    } catch (_) {}
+
+    const storage = { localStorageKeys: [], sessionStorageKeys: [], indexedDBNames: [], cacheNames: [] };
+    try { for (let i = 0; i < localStorage.length && i < 350; i++) storage.localStorageKeys.push(cleanText(localStorage.key(i), 220)); } catch (_) {}
+    try { for (let i = 0; i < sessionStorage.length && i < 350; i++) storage.sessionStorageKeys.push(cleanText(sessionStorage.key(i), 220)); } catch (_) {}
+    try { if (indexedDB && indexedDB.databases) storage.indexedDBNames = (await indexedDB.databases()).map(d => cleanText(d && d.name || '', 220)).filter(Boolean).slice(0, 180); } catch (_) {}
+    try { if (window.caches && caches.keys) storage.cacheNames = (await caches.keys()).map(x => cleanText(x, 220)).slice(0, 180); } catch (_) {}
+    push('browser-storage-summary', '', JSON.stringify(storage), { category: 'browser-storage', storage });
+
+    const framework = {
+      title: document.title || '',
+      nextData: !!document.getElementById('__NEXT_DATA__'),
+      nuxt: typeof window.__NUXT__ !== 'undefined',
+      vite: !!document.querySelector('script[type="module"][src*="/assets/"]') || !!document.querySelector('script[src*="@vite"]'),
+      reactHook: !!window.__REACT_DEVTOOLS_GLOBAL_HOOK__,
+      scripts: Array.from(document.scripts || []).map(s => cleanUrl(s.src || '')).filter(Boolean).slice(0, 250),
+      hiddenCount: hidden.length,
+    };
+    push('framework-summary', '', JSON.stringify(framework), { category: 'react/spa', framework });
+
+    const html = document.documentElement ? document.documentElement.outerHTML : '';
+    return JSON.stringify({ ok: true, url: location.href, title: document.title || '', hitCount: hits.length, hidden, hits, framework, storage, htmlChars: html.length });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message || e) });
+  }
+})()
+"""
+
+
+async def playwright_deep_surface_scan(context, page_url: str, cfg: dict, emit_event, log: list[str]):
+    """Supplement external sniffers with a built-in Playwright inventory pass."""
+    if not truthy(cfg.get("enable_deep_surface_scan"), True):
+        return "", []
+
+    page = None
+    hits = []
+    network_seen = set()
+    console_events = []
+
+    def push_hit(h):
+        if not isinstance(h, dict):
+            h = {"value": h}
+        h.setdefault("sniffer", "deep_scan")
+        h.setdefault("source", h.get("kind") or "deep_scan")
+        hits.append(sanitize_obj(h))
+
+    try:
+        page = await context.new_page()
+        try:
+            await page.add_init_script(JS_BROWSER_HOOK)
+        except Exception:
+            pass
+
+        async def on_response(resp):
+            try:
+                u = redact_url(resp.url)
+                if u in network_seen:
+                    return
+                network_seen.add(u)
+                ct = ""
+                try:
+                    ct = resp.headers.get("content-type", "") if resp.headers else ""
+                except Exception:
+                    pass
+                push_hit({
+                    "kind": "network-response",
+                    "type": "network-response",
+                    "url": u,
+                    "status": resp.status,
+                    "content_type": ct,
+                    "method": resp.request.method,
+                    "category": classify_url(u, ct, ""),
+                })
+            except Exception:
+                pass
+
+        def on_console(msg):
+            try:
+                txt = msg.text or ""
+                if txt.startswith("__NATE_BROWSER_EVENT__"):
+                    raw = txt[len("__NATE_BROWSER_EVENT__"):]
+                    ev = json.loads(raw)
+                    if isinstance(ev, dict):
+                        ev = sanitize_obj(ev)
+                        console_events.append(ev)
+                        emit_event(ev)
+                        push_hit({**ev, "sniffer": "deep_scan", "source": "runtime-hook"})
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        page.on("console", on_console)
+
+        await page.goto(page_url, wait_until="domcontentloaded", timeout=int(float(cfg.get("timeout") or 12) * 1000))
+        try:
+            await page.wait_for_load_state("networkidle", timeout=int(float(cfg.get("timeout") or 12) * 1000))
+        except Exception:
+            pass
+
+        if truthy(cfg.get("sniffer_auto_scroll"), True):
+            steps = int(cfg.get("sniffer_scroll_steps") or 38)
+            delay = int(cfg.get("sniffer_scroll_delay_ms") or 325)
+            for _ in range(max(0, min(steps, 80))):
+                try:
+                    await page.mouse.wheel(0, 1100)
+                    await page.wait_for_timeout(max(40, min(delay, 1000)))
+                except Exception:
+                    break
+
+        raw = await page.evaluate(DEEP_SURFACE_SCAN_JS)
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {"ok": False, "raw": safe_text(raw, 1200)}
+
+        for h in data.get("hits") or []:
+            push_hit(h)
+        for h in data.get("hidden") or []:
+            push_hit({**h, "kind": "hidden-dom", "category": "hidden-dom"})
+
+        try:
+            html_text = await page.content()
+        except Exception:
+            html_text = ""
+
+        push_hit({
+            "kind": "deep-scan-summary",
+            "type": "deep-scan-summary",
+            "url": page_url,
+            "summary": json.dumps({
+                "hits": len(hits),
+                "consoleEvents": len(console_events),
+                "networkResources": len(network_seen),
+                "framework": data.get("framework") or {},
+                "storage": data.get("storage") or {},
+            }, ensure_ascii=False),
+            "category": "metadata",
+        })
+
+        log.append(f"[deep-scan] hits={len(hits)} network={len(network_seen)} console={len(console_events)}")
+        return html_text, hits
+
+    except Exception as e:
+        log.append(f"[deep-scan] failed: {e}")
+        try:
+            emit_event({"type": "deep.scan.error", "error": str(e)})
+        except Exception:
+            pass
+        return "", hits
+    finally:
+        try:
+            if page is not None:
+                await page.close()
+        except Exception:
+            pass
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("Missing config path", file=sys.stderr)
@@ -44838,6 +45382,13 @@ def main() -> int:
                             if direct_html:
                                 html_by_source["https"] = direct_html
                                 self.emit_html("https", direct_html)
+                                try:
+                                    passive_hits = await collect_passive_http_candidates(http, page_url, direct_html, c)
+                                    if passive_hits:
+                                        all_hits.extend(passive_hits)
+                                        self.emit_hits("passive", passive_hits)
+                                except Exception as e:
+                                    self.emit_event({"type": "passive.metadata.error", "error": str(e)})
                         except Exception as e:
                             self.emit_event({"type": "https.fetch.error", "error": str(e)})
 
@@ -44851,6 +45402,12 @@ def main() -> int:
                     needs_pw = any([use_network, use_js, use_runtime, use_react, use_database, use_interaction])
 
                     if not needs_pw:
+                        try:
+                            report_html = build_sniffer_report_html(page_url, all_hits, html_by_source, log)
+                            html_by_source["sniffer_report"] = report_html
+                            self.emit_html("sniffer_report", report_html)
+                        except Exception as e:
+                            self.emit_event({"type": "sniffer.report.error", "error": str(e)})
                         self.finished_signal.emit({
                             "ok": True,
                             "url": page_url,
@@ -44932,6 +45489,17 @@ def main() -> int:
                             await context.route("**/*", route_filter)
 
                         self.emit_event({"type": "playwright.ready", "headless": browser_kwargs["headless"]})
+
+                        try:
+                            deep_html, deep_hits = await playwright_deep_surface_scan(context, page_url, c, self.emit_event, log)
+                            if deep_html:
+                                html_by_source["deep_scan"] = deep_html
+                                self.emit_html("deep_scan", deep_html)
+                            if deep_hits:
+                                all_hits.extend(deep_hits)
+                                self.emit_hits("deep_scan", deep_hits)
+                        except Exception as e:
+                            self.emit_event({"type": "deep.scan.wrapper.error", "error": str(e)})
 
                         common_cfg = {
                             "timeout": timeout,
@@ -45113,6 +45681,13 @@ def main() -> int:
                                     "error": str(e),
                                     "traceback": traceback.format_exc()[-2500:],
                                 })
+
+                        try:
+                            report_html = build_sniffer_report_html(page_url, all_hits, html_by_source, log)
+                            html_by_source["sniffer_report"] = report_html
+                            self.emit_html("sniffer_report", report_html)
+                        except Exception as e:
+                            self.emit_event({"type": "sniffer.report.error", "error": str(e)})
 
                         self.finished_signal.emit({
                             "ok": True,
@@ -45772,6 +46347,8 @@ def main() -> int:
                     self._set_busy(False, "Sniffers finished")
                     self.emit_event({"type": "sniffer.finished", "meta": meta})
                     self.meta_view.setPlainText(json.dumps(sanitize_obj(meta), indent=2, ensure_ascii=False))
+                    if truthy(cfg.get("render_sniffer_html"), False):
+                        QTimer.singleShot(80, self.render_best_sniffer_html)
                 except Exception:
                     self._set_busy(False, "Sniffers finished")
 
@@ -45783,40 +46360,60 @@ def main() -> int:
                 js = """
                 (() => {
                   try {
-                    if (window.__NATE_ADVANCED_INTERACTIVE_BROWSER_HOOKED__) {
-                      const event = new Event("nate-force-scan");
+                    const sensitive = /(token|auth|authorization|cookie|session|secret|password|passwd|jwt|signature|credential|csrf|api[_-]?key)/i;
+                    function scrub(s, n=500) {
+                      try {
+                        return String(s || "")
+                          .replace(/(bearer\s+)[a-z0-9._\-+/=]{16,}/ig, "$1[redacted]")
+                          .replace(/(password|passwd|token|secret|api[_-]?key|authorization)\s*[:=]\s*['"]?[^'"\s,;<>]{8,}/ig, "$1=[redacted]")
+                          .replace(/\s+/g, " ").trim().slice(0, n);
+                      } catch(e) { return ""; }
                     }
-                    const out = {
+                    function safeUrl(v) {
+                      try {
+                        const u = new URL(String(v || ""), location.href);
+                        if (["javascript:", "mailto:", "tel:", "sms:", "data:", "blob:"].includes(u.protocol)) return "";
+                        for (const k of Array.from(u.searchParams.keys())) if (sensitive.test(k)) u.searchParams.set(k, "[redacted]");
+                        u.hash = "";
+                        return u.href;
+                      } catch(e) { return ""; }
+                    }
+                    function urlsFromText(text, limit=140) {
+                      const out = [], seen = new Set();
+                      function push(x){ const u = safeUrl(x); if (u && !seen.has(u)) { seen.add(u); out.push(u); } }
+                      const s = String(text || "");
+                      (s.match(/\b(?:https?|wss?):\/\/[^"'\s<>`]+/ig) || []).forEach(x => push(x.replace(/[),.;\]]+$/g,"")));
+                      (s.match(/(?<![A-Za-z0-9_])(?:\/|\.\.?\/)[A-Za-z0-9._~:\/?#\[\]@!$&()*+,;=%\-]{2,512}/g) || []).forEach(x => push(x.replace(/[),.;\]]+$/g,"")));
+                      Array.from(s.matchAll(/url\(\s*['"]?([^'"\)]+)['"]?\s*\)/ig)).forEach(m => push(m[1]));
+                      return out.slice(0, limit);
+                    }
+                    const data = {
                       title: document.title || "",
                       url: location.href,
-                      links: Array.from(document.querySelectorAll("a[href]")).slice(0, 300).map(a => ({
-                        url: a.href,
-                        text: (a.innerText || a.title || "").slice(0, 240)
-                      })),
-                      scripts: Array.from(document.scripts || []).slice(0, 200).map(s => ({
-                        url: s.src || "",
-                        type: s.type || "",
-                        inlineChars: s.src ? 0 : (s.textContent || "").length
-                      })),
-                      forms: Array.from(document.querySelectorAll("form")).slice(0, 120).map(f => ({
-                        action: f.action || "",
-                        method: f.method || "GET",
-                        id: f.id || "",
-                        name: f.name || ""
-                      })),
-                      hidden: Array.from(document.querySelectorAll("body *")).slice(0, 1800).filter(el => {
-                        let st = null;
-                        try { st = getComputedStyle(el); } catch(e) {}
-                        return el.hidden || el.getAttribute("aria-hidden")==="true" ||
-                               el.getAttribute("type")==="hidden" ||
-                               (st && (st.display==="none" || st.visibility==="hidden" || parseFloat(st.opacity || "1")===0));
-                      }).slice(0, 160).map(el => ({
-                        tag: el.tagName || "",
-                        href: el.href || el.src || el.action || "",
-                        text: (el.innerText || el.value || el.textContent || "").replace(/\\s+/g, " ").slice(0, 240)
-                      }))
+                      links: [], scripts: [], styles: [], media: [], forms: [], frames: [], hidden: [], shadow: [], embedded: [], attributes: [], cssUrls: [], performance: [], storage: {}, framework: {}
                     };
-                    return JSON.stringify(out);
+                    Array.from(document.querySelectorAll("a[href]")).slice(0, 800).forEach(a => data.links.push({url:safeUrl(a.href), text:scrub(a.innerText || a.title || a.getAttribute('aria-label'), 300)}));
+                    Array.from(document.scripts || []).slice(0, 500).forEach(s => {
+                      data.scripts.push({url:safeUrl(s.src || ''), type:s.type || '', inlineChars:s.src ? 0 : (s.textContent || '').length, urls: s.src ? [] : urlsFromText(s.textContent, 80)});
+                    });
+                    Array.from(document.querySelectorAll("link[href]")).slice(0, 500).forEach(l => data.styles.push({url:safeUrl(l.href), rel:l.rel || '', as:l.as || '', type:l.type || ''}));
+                    Array.from(document.querySelectorAll("img[src],img[srcset],source[src],source[srcset],video[src],video[poster],audio[src],track[src]")).slice(0, 600).forEach(m => data.media.push({url:safeUrl(m.currentSrc || m.src || m.srcset || m.poster || ''), tag:m.tagName || '', text:scrub(m.alt || m.type || m.kind, 180)}));
+                    Array.from(document.querySelectorAll("form")).slice(0, 200).forEach(f => data.forms.push({action:safeUrl(f.action || location.href), method:f.method || 'GET', id:scrub(f.id,120), name:scrub(f.name,120)}));
+                    Array.from(document.querySelectorAll("iframe[src],frame[src],object[data],embed[src]")).slice(0, 200).forEach(f => data.frames.push({url:safeUrl(f.src || f.data || ''), tag:f.tagName || '', title:scrub(f.title || f.type,200)}));
+                    Array.from(document.querySelectorAll("meta[content],template,noscript,script[type*='json'],script#__NEXT_DATA__")).slice(0, 500).forEach(el => data.embedded.push({tag:el.tagName || '', id:scrub(el.id,120), name:scrub(el.name || el.property || el.type,160), chars:(el.content || el.textContent || el.innerHTML || '').length, urls:urlsFromText(el.content || el.textContent || el.innerHTML || '', 120)}));
+                    Array.from(document.querySelectorAll("body *")).slice(0, 5000).forEach(el => {
+                      let st=null; try{ st=getComputedStyle(el); }catch(e){}
+                      const isHidden = el.hidden || el.getAttribute("aria-hidden")==="true" || el.getAttribute("type")==="hidden" || (st && (st.display==="none" || st.visibility==="hidden" || parseFloat(st.opacity||"1")===0 || parseFloat(st.width||"1")===0 || parseFloat(st.height||"1")===0));
+                      if (isHidden && data.hidden.length < 450) data.hidden.push({tag:el.tagName||'', id:scrub(el.id,120), className:scrub(el.className,160), href:safeUrl(el.href || el.src || el.action || el.getAttribute('data-href') || el.getAttribute('data-src') || ''), text:scrub(el.innerText || el.value || el.textContent || el.getAttribute('content'), 420)});
+                      if (data.attributes.length < 700) Array.from(el.attributes || []).forEach(a => { if (/^(data-|aria-|srcset|poster|href|src|action)/i.test(a.name) && /(?:https?:|wss?:|\/|\.\.?\/)/.test(a.value||'')) data.attributes.push({tag:el.tagName||'', name:a.name, urls:urlsFromText(a.value,60), text:scrub(a.value,260)}); });
+                      if (el.shadowRoot && data.shadow.length < 300) Array.from(el.shadowRoot.querySelectorAll('a[href],img[src],script[src],link[href],[data-src],[data-href]')).slice(0,80).forEach(x => data.shadow.push({host:el.tagName||'', tag:x.tagName||'', url:safeUrl(x.href || x.src || x.getAttribute('data-src') || x.getAttribute('data-href') || ''), text:scrub(x.innerText || x.alt,260)}));
+                    });
+                    Array.from(document.styleSheets || []).slice(0,80).forEach(ss => { try { Array.from(ss.cssRules || []).slice(0,600).forEach(r => { const urls=urlsFromText(r.cssText,80); if (urls.length) data.cssUrls.push({href:safeUrl(ss.href || ''), urls}); }); } catch(e){} });
+                    try { data.performance = performance.getEntriesByType('resource').slice(-800).map(r => ({url:safeUrl(r.name), type:r.initiatorType || '', duration:Math.round(r.duration||0), transferSize:r.transferSize||0})); } catch(e){}
+                    try { data.storage.localStorageKeys = Array.from({length: Math.min(localStorage.length,350)}, (_,i)=>scrub(localStorage.key(i),220)); } catch(e){}
+                    try { data.storage.sessionStorageKeys = Array.from({length: Math.min(sessionStorage.length,350)}, (_,i)=>scrub(sessionStorage.key(i),220)); } catch(e){}
+                    data.framework = {nextData:!!document.getElementById('__NEXT_DATA__'), nuxt:typeof window.__NUXT__!=='undefined', reactHook:!!window.__REACT_DEVTOOLS_GLOBAL_HOOK__, vite:!!document.querySelector('script[type="module"][src*="/assets/"]')};
+                    return JSON.stringify(data);
                   } catch (e) {
                     return JSON.stringify({error: String(e && e.message || e)});
                   }
@@ -45874,7 +46471,7 @@ def main() -> int:
 
             def render_best_sniffer_html(self):
                 try:
-                    preferred = ["react", "runtime", "js", "database", "network", "https", "interaction"]
+                    preferred = ["sniffer_report", "deep_scan", "react", "runtime", "js", "database", "network", "passive", "https", "interaction"]
 
                     chosen_name = ""
                     chosen_html = ""
@@ -45916,16 +46513,41 @@ def main() -> int:
             # ----------------------------------------------------------
 
             def extract_url_from_hit(self, h):
+                try:
+                    base = normalize_url(self.address.text() or start_url)
+                except Exception:
+                    base = start_url
+
                 for key in ("url", "href", "src", "scriptURL", "scope", "endpoint", "action", "location"):
                     v = h.get(key)
-                    if isinstance(v, str) and v.startswith(("http://", "https://", "ws://", "wss://")):
-                        return redact_url(v)
+                    if isinstance(v, str) and v.strip():
+                        try:
+                            u = absolute_url(base, v)
+                        except Exception:
+                            u = redact_url(v) if v.startswith(("http://", "https://", "ws://", "wss://")) else ""
+                        if u:
+                            return u
+
+                for key in ("urls", "links", "scripts", "sources"):
+                    arr = h.get(key)
+                    if isinstance(arr, list):
+                        for v in arr:
+                            if isinstance(v, str):
+                                try:
+                                    u = absolute_url(base, v)
+                                except Exception:
+                                    u = redact_url(v) if v.startswith(("http://", "https://", "ws://", "wss://")) else ""
+                                if u:
+                                    return u
 
                 try:
                     blob = json.dumps(h, ensure_ascii=False, default=str)
                     m = URL_RE.search(blob)
                     if m:
                         return redact_url(m.group(0))
+                    m = RELATIVE_CANDIDATE_RE.search(blob)
+                    if m:
+                        return absolute_url(base, m.group(1))
                 except Exception:
                     pass
 
@@ -46090,7 +46712,7 @@ def main() -> int:
 
                     data = ev.get("data")
                     if isinstance(data, dict):
-                        for bucket in ("links", "scripts", "forms", "hidden"):
+                        for bucket in ("links", "scripts", "styles", "media", "forms", "frames", "hidden", "shadow", "embedded", "attributes", "cssUrls", "performance"):
                             arr = data.get(bucket)
                             if isinstance(arr, list):
                                 for item in arr:
@@ -46100,7 +46722,7 @@ def main() -> int:
                                         h.setdefault("sniffer", "manual_live_scan")
                                         h.setdefault("source", "manual_live_scan")
                                         self.add_discovery_from_hit("manual_live_scan", h)
-                                        if bucket == "hidden":
+                                        if bucket in {"hidden", "shadow", "embedded", "attributes", "cssUrls"}:
                                             self.add_database_hit("manual_live_scan", h)
 
                     # Single URL events.
@@ -46620,6 +47242,12 @@ if __name__ == "__main__":
             "sniff_on_navigation": False,
             "render_sniffer_html": False,
             "wait": False,
+            "enable_deep_surface_scan": True,
+            "enable_passive_metadata_probe": True,
+            "passive_metadata_probe_limit": 12,
+            "passive_probe_max_bytes": 450000,
+            "passive_html_url_limit": 1200,
+            "passive_probe_paths": "",
 
             "capture_console": True,
             "capture_requests": True,
