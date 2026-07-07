@@ -47356,6 +47356,8 @@ class ApiTrackerBlock(BaseBlock):
       • Uses JS / Network / Runtime / React / Database / Interaction sniffers.
       • Returns ranked API/data endpoints with kind, content type, host, source.
       • Can validate JSON, NDJSON, CSV/TSV, XML/RSS/Atom, text-like data.
+      • Repairs common 404/bad-format API guesses into real production endpoints.
+      • Finds OpenAPI/Swagger/WP REST/GraphQL roots and ranks usable APIs first.
     """
 
     # ------------------------------------------------------------------ #
@@ -47601,6 +47603,174 @@ class ApiTrackerBlock(BaseBlock):
         "7z",
     }
 
+    PRODUCTION_API_DOC_PATHS = (
+        "/openapi.json",
+        "/swagger.json",
+        "/api/openapi.json",
+        "/api/swagger.json",
+        "/api-docs",
+        "/api-docs.json",
+        "/v1/openapi.json",
+        "/v2/openapi.json",
+        "/v3/openapi.json",
+        "/wp-json",
+        "/wp-json/",
+        "/graphql",
+        "/gql",
+    )
+
+    PRODUCTION_API_PAGE_MARKERS = (
+        "openapi",
+        "swagger",
+        "redoc",
+        "rapidoc",
+        "api-docs",
+        "graphql",
+        "graphiql",
+        "playground",
+        "postman",
+        "insomnia",
+        "wp-json",
+    )
+
+    TRACKING_HOST_MARKERS = (
+        "google-analytics",
+        "googletagmanager",
+        "doubleclick",
+        "facebook",
+        "hotjar",
+        "segment",
+        "mixpanel",
+        "scorecardresearch",
+        "quantserve",
+        "cloudflareinsights",
+        "sentry.io",
+        "datadog",
+        "newrelic",
+        "bugsnag",
+    )
+
+    LOW_VALUE_JSON_KEYS = {
+        "cookie",
+        "cookies",
+        "consent",
+        "gdpr",
+        "ccpa",
+        "privacy",
+        "tracking",
+        "analytics",
+        "beacon",
+        "pixel",
+        "captcha",
+        "csrf",
+        "nonce",
+    }
+
+    ERROR_JSON_KEYS = {
+        "error",
+        "errors",
+        "message",
+        "detail",
+        "status",
+        "code",
+    }
+
+    PRODUCTION_DATA_KEYS = {
+        "data",
+        "items",
+        "results",
+        "records",
+        "rows",
+        "docs",
+        "documents",
+        "features",
+        "objects",
+        "entries",
+        "products",
+        "tracks",
+        "files",
+        "metadata",
+        "paths",
+        "components",
+        "schema",
+        "openapi",
+        "swagger",
+    }
+
+    USER_VISIBLE_DATA_HINT_KEYS = {
+        "title",
+        "name",
+        "description",
+        "summary",
+        "content",
+        "body",
+        "text",
+        "url",
+        "link",
+        "image",
+        "thumbnail",
+        "artwork",
+        "author",
+        "artist",
+        "creator",
+        "date",
+        "created_at",
+        "updated_at",
+        "duration",
+        "filesize",
+        "identifier",
+        "id",
+    }
+
+    PRIVATE_DATA_HINT_KEYS = {
+        "email",
+        "phone",
+        "address",
+        "ip",
+        "password",
+        "token",
+        "secret",
+        "session",
+        "ssn",
+        "credit_card",
+        "card_number",
+        "billing",
+        "payment",
+        "cookie",
+    }
+
+    READ_ONLY_PATH_MARKERS = (
+        "/search",
+        "/query",
+        "/list",
+        "/feed",
+        "/feeds",
+        "/items",
+        "/posts",
+        "/tracks",
+        "/files",
+        "/metadata",
+        "/datasets",
+        "/catalog",
+        "/public",
+        "/archive",
+    )
+
+    WRITE_PATH_MARKERS = (
+        "/create",
+        "/update",
+        "/delete",
+        "/remove",
+        "/edit",
+        "/upload",
+        "/submit",
+        "/checkout",
+        "/payment",
+        "/order",
+        "/login",
+        "/auth",
+    )
+
     _URL_RE = re.compile(r"https?://[^\s\"'<>\\)]+", re.IGNORECASE)
 
     _REL_API_RE = re.compile(
@@ -47614,7 +47784,23 @@ class ApiTrackerBlock(BaseBlock):
     )
 
     _FETCH_LITERAL_RE = re.compile(
-        r"""(?:fetch|axios\.get|\$\.get|getJSON|XMLHttpRequest|open)\s*\(\s*["']([^"']+)["']""",
+        r"""(?:fetch|axios\.get|axios\.post|axios\s*\.|\$\.get|\$\.post|getJSON|XMLHttpRequest|open)\s*\(\s*["']([^"']+)["']""",
+        re.IGNORECASE,
+    )
+
+    _API_BASE_LITERAL_RE = re.compile(
+        r"""(?:
+            baseURL|baseUrl|apiBase|apiBaseUrl|apiURL|apiUrl|apiRoot|apiHost|
+            endpoint|endpointUrl|graphqlEndpoint|restEndpoint|swaggerUrl|openapiUrl
+        )\s*[:=]\s*["']([^"']+)["']""",
+        re.IGNORECASE | re.VERBOSE,
+    )
+
+    _OPENAPI_HINT_RE = re.compile(
+        r"""(?:
+            openapi\.json|swagger\.json|api-docs(?:\.json)?|/wp-json/?|/graphql|/gql|
+            swagger-ui|redoc|rapidoc|graphiql|graphql-playground
+        )""",
         re.IGNORECASE,
     )
 
@@ -47919,9 +48105,14 @@ class ApiTrackerBlock(BaseBlock):
         except Exception:
             return True
 
+
     def _looks_like_api_url(self, u: str, text: str = "") -> bool:
         """
         Heuristic: URL shape says this is probably a data/API endpoint.
+
+        This intentionally includes API documentation roots such as OpenAPI,
+        Swagger, WP REST, and GraphQL. Those are production-useful because they
+        describe the callable endpoints even when a guessed leaf URL 404s.
         """
         u = self._safe_strip_url(u)
         if not u:
@@ -47942,6 +48133,9 @@ class ApiTrackerBlock(BaseBlock):
         if self._contains_junk_filename_keyword(u):
             return False
 
+        if self._is_tracking_or_telemetry_url(u):
+            return False
+
         if self._has_data_extension(u):
             return True
 
@@ -47951,22 +48145,41 @@ class ApiTrackerBlock(BaseBlock):
         if any(marker in path for marker in self.API_PATH_MARKERS):
             return True
 
+        if any(marker in path for marker in self.PRODUCTION_API_PAGE_MARKERS):
+            return True
+
+        if self._OPENAPI_HINT_RE.search(low):
+            return True
+
         if any(marker in query for marker in self.API_QUERY_MARKERS):
+            return True
+
+        if "rest_route=" in query:
             return True
 
         if "application/json" in text_low or "json" == text_low.strip():
             return True
 
-        if "api" in text_low and any(x in low for x in ["json", "/v1/", "/v2/", "/api/", "graphql"]):
+        if any(marker in text_low for marker in self.PRODUCTION_API_PAGE_MARKERS):
+            return True
+
+        if "api" in text_low and any(x in low for x in ["json", "/v1/", "/v2/", "/api/", "graphql", "swagger", "openapi"]):
             return True
 
         return False
+
 
     def _classify_api_url(self, u: str, content_type: str = "", sample_text: str = "") -> str:
         low = unquote(str(u or "")).lower()
         path = self._clean_path(low)
         ct = str(content_type or "").lower()
-        sample = str(sample_text or "").lstrip()[:200].lower()
+        sample = str(sample_text or "").lstrip()[:500].lower()
+
+        if "openapi" in sample[:200] or path.endswith("openapi.json"):
+            return "openapi"
+
+        if "swagger" in sample[:200] or path.endswith("swagger.json"):
+            return "swagger"
 
         if "application/ld+json" in ct:
             return "json_ld"
@@ -47998,7 +48211,7 @@ class ApiTrackerBlock(BaseBlock):
         if "xml" in ct or path.endswith(".xml") or sample.startswith("<?xml") or sample.startswith("<"):
             return "xml"
 
-        if "/graphql" in path or "/gql" in path:
+        if "/graphql" in path or "/gql" in path or "graphql" in sample[:200]:
             return "graphql"
 
         if "/wp-json" in path:
@@ -48009,6 +48222,9 @@ class ApiTrackerBlock(BaseBlock):
 
         if "advancedsearch.php" in path and "output=json" in low:
             return "archive_advancedsearch_json"
+
+        if "/api-docs" in path or "swagger-ui" in low or "redoc" in low:
+            return "api_docs"
 
         if "/api/" in path or "/apis/" in path:
             return "api"
@@ -48026,6 +48242,7 @@ class ApiTrackerBlock(BaseBlock):
             return "csv_or_text"
 
         return "possible_api"
+
 
     def _score_api_url(
         self,
@@ -48048,8 +48265,24 @@ class ApiTrackerBlock(BaseBlock):
 
         score = 0
 
+        if text:
+            # In validated result scoring, `text` may carry a compact summary
+            # string from the readiness evaluator.
+            if "website_ready=yes" in text:
+                score += 40
+            if "browser_requestable=yes" in text:
+                score += 14
+            if "display_ready=yes" in text:
+                score += 18
+            if "public_data=high" in text:
+                score += 12
+            if "production_grade=excellent" in text:
+                score += 18
+            elif "production_grade=good" in text:
+                score += 10
+
         if valid:
-            score += 50
+            score += 65
 
         if kind_low in {
             "json",
@@ -48059,29 +48292,34 @@ class ApiTrackerBlock(BaseBlock):
             "ndjson",
             "archive_metadata",
             "archive_advancedsearch_json",
+            "openapi",
+            "swagger",
         }:
-            score += 35
+            score += 38
         elif kind_low in {"csv", "tsv", "xml", "rss", "atom"}:
-            score += 24
-        elif kind_low in {"graphql", "wordpress_rest", "api", "data_endpoint", "ajax"}:
-            score += 18
+            score += 26
+        elif kind_low in {"graphql", "wordpress_rest", "api_docs", "api", "data_endpoint", "ajax"}:
+            score += 22
 
         for tok, w in [
-            ("/api/", 18),
-            ("/apis/", 16),
-            ("/wp-json/", 22),
-            ("/graphql", 18),
-            ("/gql", 12),
-            ("/rest/", 14),
-            ("/json/", 16),
-            ("/data/", 14),
-            ("/dataset", 12),
-            ("/metadata/", 16),
-            ("/advancedsearch.php", 16),
+            ("/openapi.json", 34),
+            ("/swagger.json", 32),
+            ("/api-docs", 28),
+            ("/wp-json/", 26),
+            ("/graphql", 24),
+            ("/gql", 16),
+            ("/api/", 20),
+            ("/apis/", 18),
+            ("/rest/", 16),
+            ("/json/", 18),
+            ("/data/", 16),
+            ("/dataset", 14),
+            ("/metadata/", 18),
+            ("/advancedsearch.php", 18),
             ("/ajax/", 7),
-            ("/v1/", 8),
-            ("/v2/", 8),
-            ("/v3/", 7),
+            ("/v1/", 9),
+            ("/v2/", 9),
+            ("/v3/", 8),
             ("/feed/", 5),
             ("/rss", 8),
             ("/atom", 8),
@@ -48106,10 +48344,13 @@ class ApiTrackerBlock(BaseBlock):
             score += 10
 
         if "format=json" in query or "output=json" in query or "alt=json" in query:
-            score += 20
+            score += 22
+
+        if "rest_route=" in query:
+            score += 18
 
         if "application/json" in ct:
-            score += 20
+            score += 22
         if "application/ld+json" in ct:
             score += 16
         if "text/csv" in ct:
@@ -48117,8 +48358,8 @@ class ApiTrackerBlock(BaseBlock):
         if "xml" in ct:
             score += 8
 
-        if source_tag_low in {"network_sniff", "fetch_literal", "runtime_url", "db_link"}:
-            score += 12
+        if source_tag_low in {"network_sniff", "fetch_literal", "runtime_url", "db_link", "openapi_hint", "api_doc_variant"}:
+            score += 14
 
         if keywords:
             hay = f"{low} {text}".lower()
@@ -48129,10 +48370,16 @@ class ApiTrackerBlock(BaseBlock):
                 score += 8
 
         if self._contains_junk_filename_keyword(u):
-            score -= 20
+            score -= 25
+
+        if self._is_tracking_or_telemetry_url(u):
+            score -= 55
 
         if any(bad in path for bad in ["/login", "/admin", "/auth", "/oauth", "/cart"]):
-            score -= 35
+            score -= 40
+
+        if any(noise in low for noise in ["cookie", "consent", "gdpr", "beacon", "pixel"]):
+            score -= 12
 
         return score
 
@@ -48331,10 +48578,427 @@ class ApiTrackerBlock(BaseBlock):
         except Exception as e:
             return None, "", "", 0, str(e)
 
+
+    def _is_tracking_or_telemetry_url(self, url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+            host = (parsed.netloc or "").lower()
+            path = (parsed.path or "").lower()
+            query = (parsed.query or "").lower()
+
+            if any(marker in host for marker in self.TRACKING_HOST_MARKERS):
+                return True
+
+            if any(marker in path for marker in ["/collect", "/beacon", "/pixel", "/analytics", "/telemetry", "/events"]):
+                return True
+
+            if any(marker in query for marker in ["ga=", "gtm=", "fbclid=", "gclid=", "msclkid="]):
+                return True
+
+            return False
+        except Exception:
+            return False
+
+    def _looks_like_html_error_document(self, text: str, content_type: str = "", status: Optional[int] = None) -> bool:
+        s = str(text or "").strip()
+        low = s[:3000].lower()
+        ct = str(content_type or "").lower()
+
+        if "text/html" in ct:
+            return True
+
+        if low.startswith("<!doctype html") or low.startswith("<html") or "<html" in low[:500]:
+            return True
+
+        if status and status >= 400:
+            return True
+
+        if any(marker in low for marker in [
+            "404 not found",
+            "page not found",
+            "not found",
+            "access denied",
+            "forbidden",
+            "unauthorized",
+            "cloudflare",
+            "enable javascript",
+            "captcha",
+        ]):
+            return True
+
+        return False
+
+    def _json_quality_summary(self, text: str, url: str = "") -> tuple[bool, str, str]:
+        s = str(text or "").strip()
+        if not s:
+            return False, "", "empty JSON response"
+
+        json_kind = "json"
+        parsed: Any
+
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            m = re.match(r"^[a-zA-Z_$][\w$.\[\]]*\s*\((.*)\)\s*;?\s*$", s, re.DOTALL)
+            if not m:
+                return False, "", "JSON parse failed"
+            try:
+                parsed = json.loads(m.group(1).strip())
+                json_kind = "jsonp"
+            except Exception:
+                return False, "", "JSONP parse failed"
+
+        if isinstance(parsed, dict):
+            keys = {str(k).lower() for k in parsed.keys()}
+
+            if "openapi" in keys and "paths" in keys:
+                path_count = len(parsed.get("paths") or {})
+                return True, "openapi", f"OpenAPI document with {path_count} path(s)"
+
+            if "swagger" in keys and "paths" in keys:
+                path_count = len(parsed.get("paths") or {})
+                return True, "swagger", f"Swagger document with {path_count} path(s)"
+
+            if "data" in keys and isinstance(parsed.get("data"), dict) and "__schema" in parsed.get("data", {}):
+                return True, "graphql_schema", "GraphQL introspection schema"
+
+            if keys and keys.issubset(self.ERROR_JSON_KEYS) and not (keys & self.PRODUCTION_DATA_KEYS):
+                return False, "json_error", "JSON error object, not a usable production data endpoint"
+
+            if keys and keys.issubset(self.LOW_VALUE_JSON_KEYS | self.ERROR_JSON_KEYS):
+                return False, "low_value_json", "cookie/consent/tracking JSON, not production API data"
+
+            if keys & self.PRODUCTION_DATA_KEYS:
+                return True, json_kind, "parseable JSON with production data keys"
+
+            nested_values = list(parsed.values())
+            if len(parsed) >= 2 and any(isinstance(v, (list, dict)) for v in nested_values):
+                return True, json_kind, "parseable JSON object with nested data"
+
+            if len(s) >= 120 and len(parsed) >= 3:
+                return True, json_kind, "parseable JSON object"
+
+            return False, "thin_json", "JSON parsed but response is too small/thin for production use"
+
+        if isinstance(parsed, list):
+            if not parsed:
+                return False, "empty_json_array", "empty JSON array"
+
+            if len(parsed) >= 2:
+                return True, json_kind, f"parseable JSON array with {len(parsed)} item(s)"
+
+            first = parsed[0]
+            if isinstance(first, dict) and len(first) >= 2:
+                return True, json_kind, "parseable JSON array with object data"
+
+            return False, "thin_json_array", "JSON array parsed but too small for production confidence"
+
+        return False, "primitive_json", "JSON primitive, not API data"
+
+    def _json_load_any(self, text: str) -> tuple[bool, Any, str]:
+        s = str(text or "").strip()
+        if not s:
+            return False, None, ""
+
+        try:
+            return True, json.loads(s), "json"
+        except Exception:
+            pass
+
+        m = re.match(r"^[a-zA-Z_$][\w$.\[\]]*\s*\((.*)\)\s*;?\s*$", s, re.DOTALL)
+        if m:
+            try:
+                return True, json.loads(m.group(1).strip()), "jsonp"
+            except Exception:
+                return False, None, ""
+
+        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            rows = []
+            for ln in lines[:50]:
+                try:
+                    rows.append(json.loads(ln))
+                except Exception:
+                    break
+            if len(rows) >= 2:
+                return True, rows, "ndjson"
+
+        return False, None, ""
+
+    def _flatten_json_keys(self, obj: Any, *, limit: int = 300) -> set[str]:
+        keys: set[str] = set()
+
+        def walk(value: Any) -> None:
+            if len(keys) >= limit:
+                return
+
+            if isinstance(value, dict):
+                for k, v in value.items():
+                    keys.add(str(k).lower())
+                    if len(keys) >= limit:
+                        return
+                    walk(v)
+            elif isinstance(value, list):
+                for item in value[:25]:
+                    walk(item)
+                    if len(keys) >= limit:
+                        return
+
+        walk(obj)
+        return keys
+
+    def _extract_display_records(self, obj: Any) -> list[Any]:
+        """
+        Pull likely user-visible record arrays from common API envelopes.
+        Keeps only a small sample so readiness scoring stays cheap.
+        """
+        if isinstance(obj, list):
+            return obj[:25]
+
+        if not isinstance(obj, dict):
+            return []
+
+        for key in [
+            "items",
+            "results",
+            "records",
+            "rows",
+            "docs",
+            "documents",
+            "data",
+            "features",
+            "entries",
+            "files",
+            "tracks",
+            "posts",
+            "products",
+        ]:
+            value = obj.get(key)
+            if isinstance(value, list):
+                return value[:25]
+            if isinstance(value, dict):
+                nested = self._extract_display_records(value)
+                if nested:
+                    return nested
+
+        for value in obj.values():
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                return value[:25]
+
+        return []
+
+    def _summarize_payload_shape(self, text: str, content_type: str = "") -> Dict[str, Any]:
+        ok, obj, fmt = self._json_load_any(text)
+        if ok:
+            flat_keys = sorted(self._flatten_json_keys(obj))[:80]
+            records = self._extract_display_records(obj)
+            record_keys: list[str] = []
+            if records and isinstance(records[0], dict):
+                record_keys = sorted(str(k) for k in records[0].keys())[:40]
+
+            if isinstance(obj, dict):
+                top_type = "object"
+                top_count = len(obj)
+            elif isinstance(obj, list):
+                top_type = "array"
+                top_count = len(obj)
+            else:
+                top_type = type(obj).__name__
+                top_count = 1
+
+            return {
+                "format": fmt,
+                "top_type": top_type,
+                "top_count": top_count,
+                "record_count_sample": len(records),
+                "top_keys": flat_keys,
+                "record_keys": record_keys,
+            }
+
+        csv_ok, csv_kind = self._looks_like_csv_or_tsv(text)
+        if csv_ok:
+            lines = [ln for ln in str(text or "").splitlines() if ln.strip()]
+            header = lines[0].split("\t" if csv_kind == "tsv" else ",") if lines else []
+            return {
+                "format": csv_kind,
+                "top_type": "table",
+                "top_count": max(0, len(lines) - 1),
+                "record_count_sample": min(max(0, len(lines) - 1), 25),
+                "top_keys": [h.strip() for h in header[:40]],
+                "record_keys": [h.strip() for h in header[:40]],
+            }
+
+        xml_ok, xml_kind = self._looks_like_xml_data(text)
+        if xml_ok:
+            return {
+                "format": xml_kind,
+                "top_type": "xml",
+                "top_count": 1,
+                "record_count_sample": 1,
+                "top_keys": [],
+                "record_keys": [],
+            }
+
+        return {
+            "format": "text",
+            "top_type": "text",
+            "top_count": 1 if str(text or "").strip() else 0,
+            "record_count_sample": 1 if str(text or "").strip() else 0,
+            "top_keys": [],
+            "record_keys": [],
+        }
+
+    def _assess_website_data_readiness(
+        self,
+        *,
+        url: str,
+        status: Optional[int],
+        headers: Optional[Dict[str, str]],
+        content_type: str,
+        text: str,
+        kind: str,
+        valid: bool,
+    ) -> Dict[str, Any]:
+        headers = headers or {}
+        lower_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+        path = self._clean_path(url)
+        query = (urlparse(url).query or "").lower()
+        content_length = lower_headers.get("content-length", "")
+        cache_control = lower_headers.get("cache-control", "")
+        cors = lower_headers.get("access-control-allow-origin", "")
+        vary = lower_headers.get("vary", "")
+        allow_methods = lower_headers.get("access-control-allow-methods", "")
+
+        shape = self._summarize_payload_shape(text, content_type)
+        all_keys = {str(k).lower() for k in shape.get("top_keys", [])}
+        record_keys = {str(k).lower() for k in shape.get("record_keys", [])}
+        key_haystack = all_keys | record_keys
+
+        reasons: list[str] = []
+        warnings: list[str] = []
+        score = 0
+
+        request_ready = bool(valid and status is not None and 200 <= int(status) < 300)
+        if request_ready:
+            score += 25
+            reasons.append("GET returned a successful structured response")
+        else:
+            warnings.append("not a successful structured GET response")
+
+        browser_requestable = cors == "*" or bool(cors and cors.lower() != "null")
+        if browser_requestable:
+            score += 16
+            reasons.append("CORS header allows browser-side requests")
+        else:
+            warnings.append("no open CORS header detected; use a same-origin Cloudflare proxy for browser display")
+
+        cacheable = False
+        if cache_control:
+            cc_low = cache_control.lower()
+            if "no-store" in cc_low or "private" in cc_low:
+                warnings.append(f"cache-control is restrictive: {cache_control}")
+            elif "max-age" in cc_low or "public" in cc_low or "s-maxage" in cc_low:
+                cacheable = True
+                score += 10
+                reasons.append(f"cache-friendly response: {cache_control}")
+        elif content_length:
+            reasons.append("content length present")
+
+        read_only_likelihood = "medium"
+        if any(marker in path for marker in self.WRITE_PATH_MARKERS):
+            read_only_likelihood = "low"
+            warnings.append("URL path looks write/action-oriented")
+            score -= 20
+        elif any(marker in path for marker in self.READ_ONLY_PATH_MARKERS) or any(k in query for k in ["q=", "query=", "search=", "limit=", "page=", "offset=", "format=json", "output=json"]):
+            read_only_likelihood = "high"
+            score += 8
+            reasons.append("URL shape looks read-only/queryable")
+
+        private_hits = sorted(key_haystack & self.PRIVATE_DATA_HINT_KEYS)
+        if private_hits:
+            public_data_likelihood = "low"
+            warnings.append(f"payload includes private-looking fields: {', '.join(private_hits[:8])}")
+            score -= 35
+        elif any(marker in path for marker in ["/public", "/open", "/archive", "/metadata", "/feed", "/search"]):
+            public_data_likelihood = "high"
+            score += 10
+            reasons.append("URL shape suggests public data")
+        else:
+            public_data_likelihood = "medium"
+
+        user_visible_hits = sorted(key_haystack & self.USER_VISIBLE_DATA_HINT_KEYS)
+        display_ready = False
+        if shape.get("record_count_sample", 0) >= 1 and user_visible_hits:
+            display_ready = True
+            score += 20
+            reasons.append(f"user-visible fields found: {', '.join(user_visible_hits[:10])}")
+        elif kind in {"rss", "atom", "csv", "tsv", "openapi", "swagger", "graphql_schema"}:
+            display_ready = True
+            score += 12
+            reasons.append(f"{kind} response can be transformed for display")
+        else:
+            warnings.append("sample does not expose obvious user-visible records")
+
+        if shape.get("record_count_sample", 0) >= 5:
+            score += 8
+            reasons.append("response includes multiple sample records")
+
+        size = len(str(text or "").encode("utf-8", errors="ignore"))
+        if size >= 512:
+            score += 6
+            reasons.append("response sample is large enough for useful data")
+        elif request_ready:
+            warnings.append("response sample is very small")
+
+        website_ready = bool(
+            request_ready
+            and display_ready
+            and public_data_likelihood != "low"
+            and read_only_likelihood != "low"
+        )
+
+        integration_mode = "direct_browser" if browser_requestable else "server_proxy"
+        if website_ready and not browser_requestable:
+            reasons.append("website-ready through a same-origin proxy endpoint")
+
+        production_grade = "reject"
+        if website_ready and score >= 70:
+            production_grade = "excellent"
+        elif website_ready and score >= 55:
+            production_grade = "good"
+        elif request_ready and display_ready:
+            production_grade = "review"
+
+        return {
+            "website_ready": website_ready,
+            "request_ready": request_ready,
+            "browser_requestable": browser_requestable,
+            "needs_proxy": not browser_requestable,
+            "integration_mode": integration_mode,
+            "cacheable": cacheable,
+            "cache_control": cache_control,
+            "cors": cors,
+            "vary": vary,
+            "allow_methods": allow_methods,
+            "read_only_likelihood": read_only_likelihood,
+            "public_data_likelihood": public_data_likelihood,
+            "display_ready": display_ready,
+            "production_grade": production_grade,
+            "readiness_score": max(0, min(100, score)),
+            "readiness_reasons": reasons[:12],
+            "readiness_warnings": warnings[:12],
+            "sample_shape": shape,
+        }
+
     def _validate_structured_data_text(self, text: str, content_type: str = "", url: str = "") -> tuple[bool, str, str]:
         """
         Returns:
           (is_valid_structured_data, kind, summary)
+
+        Production mode is intentionally stricter than "does json.loads work".
+        It rejects cookie/consent/tracking blobs, generic error objects,
+        captcha/HTML pages, and tiny placeholders so the block returns API
+        endpoints that are realistic to call from a website.
         """
         s = str(text or "")
         ct = str(content_type or "").lower()
@@ -48342,28 +49006,122 @@ class ApiTrackerBlock(BaseBlock):
         if not s.strip():
             return False, "", "empty response"
 
+        if self._looks_like_html_error_document(s, content_type=ct):
+            return False, "html_error", "HTML/error page, not API data"
+
         json_ok, json_kind = self._parse_jsonish(s)
         if json_ok:
-            return True, json_kind, "parseable JSON data"
+            return self._json_quality_summary(s, url=url)
 
         xml_ok, xml_kind = self._looks_like_xml_data(s)
         if xml_ok:
+            low = s[:2000].lower()
+            if "<html" in low:
+                return False, "html_error", "HTML document, not XML API data"
             return True, xml_kind, "parseable XML/feed data"
 
         csv_ok, csv_kind = self._looks_like_csv_or_tsv(s)
         if csv_ok:
+            if len([ln for ln in s.splitlines() if ln.strip()]) < 3:
+                return False, csv_kind, "table-like response is too small"
             return True, csv_kind, f"table-like {csv_kind.upper()} data"
 
         if any(x in ct for x in ["application/json", "application/ld+json", "application/vnd.api+json"]):
             return False, "json", "JSON content-type but parse failed"
 
         if "text/plain" in ct:
-            # Accept text only if the URL shape says data and text is not HTML.
             low = s[:300].lower()
-            if "<html" not in low and len(s.strip()) >= 20:
+            if "<html" not in low and len(s.strip()) >= 80:
                 return True, "text_data", "plain text data-like response"
 
-        return False, "", "not structured data"
+        return False, "", "not structured production data"
+
+    def _append_query_params(self, url: str, params: dict[str, str]) -> str:
+        try:
+            pu = urlparse(url)
+            pairs = parse_qsl(pu.query or "", keep_blank_values=True)
+            existing = {k.lower() for k, _ in pairs}
+            for k, v in params.items():
+                if k.lower() not in existing:
+                    pairs.append((k, v))
+            return urlunparse((pu.scheme, pu.netloc, pu.path or "/", "", urlencode(pairs, doseq=True), ""))
+        except Exception:
+            return url
+
+    def _origin_for_url(self, url: str) -> str:
+        try:
+            pu = urlparse(url)
+            if not pu.scheme or not pu.netloc:
+                return ""
+            return f"{pu.scheme}://{pu.netloc}"
+        except Exception:
+            return ""
+
+    def _build_probe_url_variants(self, url: str, *, max_variants: int = 18) -> list[str]:
+        cleaned = self._clean_api_probe_url(url)
+        variants: list[str] = []
+
+        def add(candidate: str) -> None:
+            candidate = self._clean_api_probe_url(candidate)
+            if candidate and candidate.startswith(("http://", "https://")) and candidate not in variants:
+                variants.append(candidate)
+
+        add(cleaned)
+
+        try:
+            pu = urlparse(cleaned)
+            origin = self._origin_for_url(cleaned)
+            path = pu.path or "/"
+            path_low = path.lower()
+            query_low = (pu.query or "").lower()
+
+            if path != "/" and path.endswith("/"):
+                add(urlunparse((pu.scheme, pu.netloc, path.rstrip("/"), "", pu.query, "")))
+            elif path != "/":
+                add(urlunparse((pu.scheme, pu.netloc, path + "/", "", pu.query, "")))
+
+            if path_low.endswith((".html", ".htm", ".php", ".aspx")):
+                base_path = re.sub(r"\.(html?|php|aspx)$", "", path, flags=re.IGNORECASE)
+                add(urlunparse((pu.scheme, pu.netloc, base_path, "", pu.query, "")))
+                add(urlunparse((pu.scheme, pu.netloc, base_path + ".json", "", pu.query, "")))
+
+            if not any(path_low.endswith(ext) for ext in self.DATA_EXTENSIONS):
+                add(urlunparse((pu.scheme, pu.netloc, path + ".json", "", pu.query, "")))
+
+            if "format=pdf" in query_low or "format=html" in query_low or "output=html" in query_low:
+                repaired_pairs = []
+                for k, v in parse_qsl(pu.query or "", keep_blank_values=True):
+                    lk = str(k).lower()
+                    lv = str(v).lower()
+                    if lk in {"format", "output", "response", "type", "view", "alt"} and lv in self.API_BAD_FORMAT_VALUES:
+                        repaired_pairs.append((k, "json"))
+                    elif lk not in self.API_NOISE_QUERY_KEYS:
+                        repaired_pairs.append((k, v))
+                add(urlunparse((pu.scheme, pu.netloc, path, "", urlencode(repaired_pairs, doseq=True), "")))
+
+            if any(marker in path_low for marker in ["/api", "/rest", "/ajax", "/data", "/advancedsearch.php"]):
+                add(self._append_query_params(cleaned, {"format": "json"}))
+                add(self._append_query_params(cleaned, {"output": "json"}))
+
+            if "/wp-json" not in path_low and origin:
+                add(origin + "/wp-json")
+
+            if origin and any(marker in path_low for marker in ["/api", "/apis", "/rest", "/graphql", "/gql", "/swagger", "/openapi", "/docs"]):
+                for doc_path in self.PRODUCTION_API_DOC_PATHS:
+                    add(origin + doc_path)
+
+            parts = [p for p in path.split("/") if p]
+            if origin and parts:
+                for idx in range(len(parts), 0, -1):
+                    parent = "/" + "/".join(parts[:idx])
+                    if any(marker in parent.lower() for marker in ["/api", "/apis", "/rest", "/v1", "/v2", "/v3"]):
+                        add(origin + parent)
+                        add(origin + parent + "/openapi.json")
+                        add(origin + parent + "/swagger.json")
+        except Exception:
+            pass
+
+        return variants[:max_variants]
 
     async def _probe_endpoint(
         self,
@@ -48376,20 +49134,21 @@ class ApiTrackerBlock(BaseBlock):
         verify_tls: bool,
         ca_bundle: Optional[str] = None,
         http: Optional[Any] = None,
+        probe_repair_variants: bool = True,
     ) -> Dict[str, Any]:
         """
         GET-only validation probe.
 
-        Fixed behavior:
-          - Cleans LinkTracker-style `format=pdf`, `export=download`, and
-            `download=1` noise before probing JSON/data URLs.
-          - If an active HTTPSSubmanager is supplied, uses that open async
-            context instead of creating/using HTTPSSubmanager incorrectly.
-          - Falls back to aiohttp ClientSession if no active HTTPSSubmanager
-            is supplied.
-          - Does not POST, does not auth, and reads only a capped preview.
+        Production upgrades:
+          - Cleans resolver noise before probing.
+          - Tries safe repair variants when the first URL is 404, HTML, PDF,
+            thin JSON, or otherwise not usable.
+          - Falls back to OpenAPI/Swagger/WP REST/GraphQL roots when a guessed
+            leaf endpoint is dead but the site's API documentation is real.
+          - Rejects cookie/consent/tracking JSON and generic error objects.
         """
         cleaned_url = self._clean_api_probe_url(url)
+        probe_urls = self._build_probe_url_variants(cleaned_url) if probe_repair_variants else [cleaned_url]
 
         result = {
             "url": cleaned_url,
@@ -48401,6 +49160,10 @@ class ApiTrackerBlock(BaseBlock):
             "preview": "",
             "bytes_read": 0,
             "error": "",
+            "probe_attempts": [],
+            "repaired_from": "",
+            "headers": {},
+            "readiness": {},
         }
 
         if exclude_sensitive_like and self._is_probably_sensitive_endpoint(cleaned_url):
@@ -48409,36 +49172,91 @@ class ApiTrackerBlock(BaseBlock):
             result["kind"] = self._classify_api_url(cleaned_url)
             return result
 
-        # Prefer the active HTTPSSubmanager when the caller has one.
-        # This directly prevents:
-        #   HTTPSSubmanager must be used in an async context
-        if http is not None:
-            status, content_type, text, bytes_read, error = await self._read_probe_with_active_http(
-                http,
-                cleaned_url,
-                max_probe_bytes=max_probe_bytes,
+        def remember_attempt(target: str, status: Optional[int], content_type: str, ok: bool, summary: str) -> None:
+            result["probe_attempts"].append(
+                {
+                    "url": target,
+                    "status": status,
+                    "content_type": content_type or "",
+                    "ok": bool(ok),
+                    "summary": summary or "",
+                }
             )
 
-            result["status"] = status
-            result["content_type"] = content_type or ""
-            result["bytes_read"] = bytes_read
-            result["preview"] = (text or "")[:1000]
+        def apply_probe(
+            target: str,
+            status: Optional[int],
+            content_type: str,
+            text: str,
+            bytes_read: int,
+            error: str = "",
+            response_headers: Optional[Dict[str, str]] = None,
+        ) -> Dict[str, Any]:
+            valid = False
+            kind = self._classify_api_url(target, content_type or "", text or "")
+            summary = error or ""
 
             if error:
-                result["error"] = error
-                result["summary"] = f"probe error: {error}"
-                result["kind"] = self._classify_api_url(cleaned_url, content_type or "", text or "")
-                return result
+                summary = f"probe error: {error}"
+            elif status is not None and (status < 200 or status >= 400):
+                summary = f"HTTP {status}"
+            else:
+                valid, parsed_kind, summary = self._validate_structured_data_text(
+                    text or "",
+                    content_type=content_type or "",
+                    url=target,
+                )
+                kind = parsed_kind or kind
 
-            valid, kind, summary = self._validate_structured_data_text(
-                text or "",
+            readiness = self._assess_website_data_readiness(
+                url=target,
+                status=status,
+                headers=response_headers or {},
                 content_type=content_type or "",
-                url=cleaned_url,
+                text=text or "",
+                kind=kind,
+                valid=bool(valid),
             )
-            result["ok"] = bool(valid)
-            result["kind"] = kind or self._classify_api_url(cleaned_url, content_type or "", text or "")
-            result["summary"] = summary
-            return result
+
+            remember_attempt(target, status, content_type or "", valid, summary)
+
+            out = dict(result)
+            out.update(
+                {
+                    "url": target,
+                    "ok": bool(valid),
+                    "status": status,
+                    "content_type": content_type or "",
+                    "kind": kind,
+                    "summary": summary,
+                    "preview": (text or "")[:1000],
+                    "bytes_read": bytes_read or 0,
+                    "error": error or ("" if valid else summary),
+                    "probe_attempts": list(result["probe_attempts"]),
+                    "repaired_from": cleaned_url if target != cleaned_url and valid else "",
+                    "headers": response_headers or {},
+                    "readiness": readiness,
+                }
+            )
+            return out
+
+        best_failure: Optional[Dict[str, Any]] = None
+
+        if http is not None:
+            for target in probe_urls:
+                if exclude_sensitive_like and self._is_probably_sensitive_endpoint(target):
+                    continue
+
+                status, content_type, text, bytes_read, error = await self._read_probe_with_active_http(
+                    http,
+                    target,
+                    max_probe_bytes=max_probe_bytes,
+                )
+                candidate = apply_probe(target, status, content_type or "", text or "", bytes_read, error or "", {})
+                if candidate.get("ok"):
+                    return candidate
+                best_failure = best_failure or candidate
+            return best_failure or result
 
         ssl_arg = None
         if not verify_tls:
@@ -48446,7 +49264,7 @@ class ApiTrackerBlock(BaseBlock):
 
         headers = {
             "User-Agent": user_agent,
-            "Accept": "application/json, application/ld+json, application/xml, text/xml, text/csv, text/plain, */*;q=0.5",
+            "Accept": "application/json, application/ld+json, application/vnd.api+json, application/xml, text/xml, text/csv, text/plain, */*;q=0.35",
             "Accept-Language": "en-US,en;q=0.9",
             "DNT": "1",
         }
@@ -48455,51 +49273,48 @@ class ApiTrackerBlock(BaseBlock):
             timeout_obj = aiohttp.ClientTimeout(total=timeout)
 
             async with aiohttp.ClientSession(headers=headers, timeout=timeout_obj) as session:
-                async with session.get(
-                    cleaned_url,
-                    allow_redirects=True,
-                    ssl=ssl_arg,
-                ) as resp:
-                    result["status"] = resp.status
-                    result["content_type"] = resp.headers.get("content-type", "")
-
-                    raw = await resp.content.read(max_probe_bytes + 1)
-                    result["bytes_read"] = len(raw)
-
-                    if result["bytes_read"] > max_probe_bytes:
-                        raw = raw[:max_probe_bytes]
+                for target in probe_urls:
+                    if exclude_sensitive_like and self._is_probably_sensitive_endpoint(target):
+                        continue
 
                     try:
-                        text = raw.decode(resp.charset or "utf-8", errors="ignore")
-                    except Exception:
-                        text = raw.decode("utf-8", errors="ignore")
+                        async with session.get(
+                            target,
+                            allow_redirects=True,
+                            ssl=ssl_arg,
+                        ) as resp:
+                            content_type = resp.headers.get("content-type", "")
+                            raw = await resp.content.read(max_probe_bytes + 1)
+                            bytes_read = len(raw)
 
-                    result["preview"] = text[:1000]
+                            if bytes_read > max_probe_bytes:
+                                raw = raw[:max_probe_bytes]
 
-                    if resp.status < 200 or resp.status >= 400:
-                        result["error"] = f"HTTP {resp.status}"
-                        result["summary"] = result["error"]
-                        result["kind"] = self._classify_api_url(
-                            cleaned_url,
-                            result["content_type"],
-                            text,
-                        )
-                        return result
+                            try:
+                                text = raw.decode(resp.charset or "utf-8", errors="ignore")
+                            except Exception:
+                                text = raw.decode("utf-8", errors="ignore")
 
-                    valid, kind, summary = self._validate_structured_data_text(
-                        text,
-                        content_type=result["content_type"],
-                        url=cleaned_url,
-                    )
+                            candidate = apply_probe(target, resp.status, content_type, text, bytes_read, "", dict(resp.headers))
 
-                    result["ok"] = bool(valid)
-                    result["kind"] = kind or self._classify_api_url(
-                        cleaned_url,
-                        result["content_type"],
-                        text,
-                    )
-                    result["summary"] = summary
-                    return result
+                            if candidate.get("ok"):
+                                return candidate
+
+                            best_failure = best_failure or candidate
+
+                            if resp.status in {401, 403}:
+                                continue
+                            if resp.status == 404:
+                                continue
+                            if self._looks_like_html_error_document(text, content_type=content_type, status=resp.status):
+                                continue
+
+                    except Exception as e:
+                        candidate = apply_probe(target, None, "", "", 0, str(e), {})
+                        best_failure = best_failure or candidate
+                        continue
+
+            return best_failure or result
 
         except Exception as e:
             result["error"] = str(e)
@@ -48588,6 +49403,7 @@ class ApiTrackerBlock(BaseBlock):
             }
         )
 
+
     def _harvest_api_candidates_from_text(
         self,
         text: str,
@@ -48608,8 +49424,10 @@ class ApiTrackerBlock(BaseBlock):
         if not text:
             return out
 
+        slice_text = text[:2_000_000]
+
         # Absolute URLs.
-        for m in self._URL_RE.finditer(text[:2_000_000]):
+        for m in self._URL_RE.finditer(slice_text):
             self._add_api_candidate(
                 out,
                 url=m.group(0),
@@ -48628,7 +49446,7 @@ class ApiTrackerBlock(BaseBlock):
                 return out
 
         # Relative API paths.
-        for m in self._REL_API_RE.finditer(text[:2_000_000]):
+        for m in self._REL_API_RE.finditer(slice_text):
             self._add_api_candidate(
                 out,
                 url=m.group(1),
@@ -48647,7 +49465,7 @@ class ApiTrackerBlock(BaseBlock):
                 return out
 
         # fetch('/api/...') / axios.get('/api/...') literals.
-        for m in self._FETCH_LITERAL_RE.finditer(text[:2_000_000]):
+        for m in self._FETCH_LITERAL_RE.finditer(slice_text):
             self._add_api_candidate(
                 out,
                 url=m.group(1),
@@ -48664,6 +49482,51 @@ class ApiTrackerBlock(BaseBlock):
             )
             if len(out) >= limit:
                 return out
+
+        # Modern frontend config literals: apiBaseUrl, graphqlEndpoint,
+        # swaggerUrl, openapiUrl, etc. These often point to real production APIs
+        # even when regular anchor crawling only sees docs pages.
+        for m in self._API_BASE_LITERAL_RE.finditer(slice_text):
+            value = self._safe_strip_url(m.group(1))
+            if not value:
+                continue
+            self._add_api_candidate(
+                out,
+                url=value,
+                base_url=base_url,
+                source=source,
+                text="api base literal",
+                tag="api_base_literal",
+                required_sites=required_sites,
+                keywords=keywords,
+                min_term_overlap=min_term_overlap,
+                exclude_sensitive_like=exclude_sensitive_like,
+                targets=targets,
+                depth=depth,
+            )
+            if len(out) >= limit:
+                return out
+
+        # OpenAPI/Swagger/GraphQL hints that are sometimes embedded as plain
+        # strings instead of fetch URLs.
+        if self._OPENAPI_HINT_RE.search(slice_text):
+            for doc_path in self.PRODUCTION_API_DOC_PATHS:
+                self._add_api_candidate(
+                    out,
+                    url=doc_path,
+                    base_url=base_url,
+                    source=source,
+                    text="openapi/swagger/graphql hint",
+                    tag="openapi_hint",
+                    required_sites=required_sites,
+                    keywords=keywords,
+                    min_term_overlap=min_term_overlap,
+                    exclude_sensitive_like=exclude_sensitive_like,
+                    targets=targets,
+                    depth=depth,
+                )
+                if len(out) >= limit:
+                    return out
 
         return out
 
@@ -49864,9 +50727,12 @@ class ApiTrackerBlock(BaseBlock):
         validate_endpoints = bool(params.get("validate_endpoints", True))
         max_endpoint_probes = int(params.get("max_endpoint_probes", 50))
         max_probe_bytes = int(params.get("max_probe_bytes", 1_000_000))
+        probe_repair_variants = bool(params.get("probe_repair_variants", True))
+        production_quality_filter = bool(params.get("production_quality_filter", True))
+        only_website_ready = bool(params.get("only_website_ready", False))
 
-        include_unvalidated = bool(params.get("include_unvalidated", True))
-        only_valid = bool(params.get("only_valid", False))
+        include_unvalidated = bool(params.get("include_unvalidated", False))
+        only_valid = bool(params.get("only_valid", True))
         exclude_sensitive_like = bool(params.get("exclude_sensitive_like", True))
 
         db_allow_rescan = bool(params.get("db_allow_rescan", False))
@@ -51342,6 +52208,7 @@ class ApiTrackerBlock(BaseBlock):
                         exclude_sensitive_like=exclude_sensitive_like,
                         verify_tls=http_verify_tls,
                         ca_bundle=http_ca_bundle,
+                        probe_repair_variants=probe_repair_variants,
                     )
 
                     # Use the cleaned final probe URL so forced variants like
@@ -51358,6 +52225,29 @@ class ApiTrackerBlock(BaseBlock):
                     item["preview"] = probe.get("preview") or ""
                     item["probe_error"] = probe.get("error") or ""
                     item["bytes_read"] = probe.get("bytes_read") or 0
+                    item["repaired_from"] = probe.get("repaired_from") or ""
+                    item["probe_attempts"] = probe.get("probe_attempts") or []
+                    item["headers"] = probe.get("headers") or {}
+                    item["readiness"] = probe.get("readiness") or {}
+
+                    readiness = item["readiness"]
+                    item["website_ready"] = bool(readiness.get("website_ready"))
+                    item["request_ready"] = bool(readiness.get("request_ready"))
+                    item["browser_requestable"] = bool(readiness.get("browser_requestable"))
+                    item["needs_proxy"] = bool(readiness.get("needs_proxy"))
+                    item["display_ready"] = bool(readiness.get("display_ready"))
+                    item["production_grade"] = readiness.get("production_grade") or "unknown"
+                    item["readiness_score"] = int(readiness.get("readiness_score") or 0)
+                    item["integration_mode"] = readiness.get("integration_mode") or "unknown"
+                    item["sample_shape"] = readiness.get("sample_shape") or {}
+
+                    readiness_score_text = (
+                        f" website_ready={'yes' if item['website_ready'] else 'no'}"
+                        f" browser_requestable={'yes' if item['browser_requestable'] else 'no'}"
+                        f" display_ready={'yes' if item['display_ready'] else 'no'}"
+                        f" public_data={readiness.get('public_data_likelihood', 'unknown')}"
+                        f" production_grade={item['production_grade']}"
+                    )
 
                     item["score"] = self._score_api_url(
                         u,
@@ -51367,7 +52257,7 @@ class ApiTrackerBlock(BaseBlock):
                         kind=item.get("kind", ""),
                         valid=item.get("valid", False),
                         source_tag=item.get("tag", ""),
-                        text=item.get("title", ""),
+                        text=(item.get("title", "") + readiness_score_text),
                     )
 
                     return item
@@ -51409,6 +52299,16 @@ class ApiTrackerBlock(BaseBlock):
 
             if not include_unvalidated and validate_endpoints and not item.get("valid"):
                 continue
+
+            if only_website_ready and not item.get("website_ready"):
+                continue
+
+            if production_quality_filter and item.get("valid") and item.get("readiness"):
+                readiness = item.get("readiness") or {}
+                if readiness.get("public_data_likelihood") == "low":
+                    continue
+                if readiness.get("read_only_likelihood") == "low":
+                    continue
 
             score = item.get("score", 0)
 
@@ -51481,11 +52381,15 @@ class ApiTrackerBlock(BaseBlock):
             }
 
         valid_count = sum(1 for x in final_list if x.get("valid"))
+        website_ready_count = sum(1 for x in final_list if x.get("website_ready"))
+        browser_ready_count = sum(1 for x in final_list if x.get("browser_requestable"))
 
         lines = [f"### ApiTracker Found {len(final_list)} API/Data Endpoint(s)"]
         lines.append(
             f"_Mode: {mode} | Query: {query} | Engine: {engine} | "
             f"Valid: {valid_count}/{len(final_list)} | "
+            f"Website-ready: {website_ready_count}/{len(final_list)} | "
+            f"Browser-CORS-ready: {browser_ready_count}/{len(final_list)} | "
             f"Required Keywords: {keywords} | min_term_overlap: {min_term_overlap} | "
             f"Required Sites: {required_sites or '[none]'}_"
         )
@@ -51503,6 +52407,19 @@ class ApiTrackerBlock(BaseBlock):
             content_type = api.get("content_type") or "?"
             status_code = api.get("status_code")
             summary = api.get("summary") or api.get("probe_error") or ""
+            repaired_from = api.get("repaired_from") or ""
+            readiness = api.get("readiness") or {}
+            website_ready = "yes" if api.get("website_ready") else "no"
+            browser_requestable = "yes" if api.get("browser_requestable") else "no"
+            needs_proxy = "yes" if api.get("needs_proxy") else "no"
+            display_ready = "yes" if api.get("display_ready") else "no"
+            production_grade = api.get("production_grade") or readiness.get("production_grade") or "unknown"
+            readiness_score = api.get("readiness_score") or readiness.get("readiness_score") or 0
+            integration_mode = api.get("integration_mode") or readiness.get("integration_mode") or "unknown"
+            sample_shape = api.get("sample_shape") or readiness.get("sample_shape") or {}
+            record_keys = sample_shape.get("record_keys") or []
+            readiness_reasons = readiness.get("readiness_reasons") or []
+            readiness_warnings = readiness.get("readiness_warnings") or []
 
             lines.append(f"- **[{title}]({url})**")
             lines.append(
@@ -51510,8 +52427,22 @@ class ApiTrackerBlock(BaseBlock):
                 f"HTTP: {status_code or '?'} | Content-Type: {content_type} | "
                 f"Score: {score} | Depth: {depth} | Source tag: {tag}*"
             )
+            lines.append(
+                f"  - Website-ready: **{website_ready}** | Direct browser CORS: **{browser_requestable}** | "
+                f"Needs proxy: **{needs_proxy}** | Display-ready: **{display_ready}** | "
+                f"Grade: **{production_grade}** | Readiness score: **{readiness_score}/100** | "
+                f"Integration: `{integration_mode}`"
+            )
+            if record_keys:
+                lines.append(f"  - Display fields: `{', '.join(record_keys[:16])}`")
+            if readiness_reasons:
+                lines.append(f"  - Ready because: {', '.join(readiness_reasons[:4])}")
+            if readiness_warnings:
+                lines.append(f"  - Review notes: {', '.join(readiness_warnings[:3])}")
             if summary:
                 lines.append(f"  - {summary}")
+            if repaired_from:
+                lines.append(f"  - Repaired from dead/noisy candidate: {repaired_from}")
 
         if return_all_js_links and all_js_links:
             lines.append("\n### All JS-Gathered Links (debug)\n")
@@ -51624,6 +52555,8 @@ class ApiTrackerBlock(BaseBlock):
         return "\n".join(lines), {
             "found": len(final_list),
             "valid_found": valid_count,
+            "website_ready_found": website_ready_count,
+            "browser_requestable_found": browser_ready_count,
             "scanned_pages": len(visited_pages),
             "apis": final_list,
             "keywords_used": keywords,
@@ -51701,12 +52634,15 @@ class ApiTrackerBlock(BaseBlock):
 
             # Endpoint validation.
             "validate_endpoints": True,
-            "max_endpoint_probes": 50,
+            "max_endpoint_probes": 100,
             "probe_concurrency": 6,
             "max_probe_bytes": 1000000,
-            "include_unvalidated": True,
-            "only_valid": False,
+            "include_unvalidated": False,
+            "only_valid": True,
             "exclude_sensitive_like": True,
+            "probe_repair_variants": True,
+            "production_quality_filter": True,
+            "only_website_ready": False,
 
             # Body matching.
             "use_body": True,
