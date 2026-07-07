@@ -43641,6 +43641,7 @@ class OllamaBlock(BaseBlock):
 BLOCKS.register("ollama", OllamaBlock)
 
 
+
 # ======================================================================
 # Advanced Enterprise Interactive Browser
 # Register name: interactive_browser
@@ -43656,6 +43657,12 @@ class InteractiveBrowserBlock(BaseBlock):
       - Active runtime hooks for fetch, XHR, WebSocket, EventSource,
         workers, service workers, forms, React/SPA metadata, storage metadata,
         DOM-hidden content, embedded JSON, scripts, stylesheets, and links.
+      - ApiTracker-style API discovery for OpenAPI, Swagger, WP REST, GraphQL,
+        JSON/NDJSON/CSV/XML/RSS/Atom endpoints, production docs, and public data.
+      - VideoLinkTracker-style media discovery for HLS/DASH manifests, stream
+        segments, direct video/audio assets, posters, thumbnails, and players.
+      - LinkTracker-style document/media crawling for PDFs, Office files,
+        archives, feeds, public metadata roots, sitemap/robots links, and assets.
       - Advanced Sniffer tab with:
           * Discoveries
           * Raw Hits
@@ -43762,6 +43769,98 @@ ATTR_URL_RE = re.compile(r"(?i)(?:href|src|action|poster|data-src|data-href|srcs
 SOURCE_MAP_RE = re.compile(r"(?i)sourceMappingURL=([^\s*]+)")
 RELATIVE_CANDIDATE_RE = re.compile(r"(?<![A-Za-z0-9_])((?:/|\.\.?/)[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%\-]{2,512})")
 
+# ------------------------------------------------------------------
+# Unified discovery vocabulary borrowed from ApiTracker, VideoLinkTracker,
+# and LinkTracker. These sets intentionally classify observed/public links;
+# they do not brute force private paths or attempt authorization bypasses.
+# ------------------------------------------------------------------
+
+API_EXTENSIONS = {
+    ".json", ".jsonp", ".ndjson", ".geojson", ".csv", ".tsv",
+    ".xml", ".rss", ".atom", ".yaml", ".yml",
+}
+
+DOC_EXTENSIONS = {
+    ".pdf", ".epub", ".mobi", ".djvu", ".doc", ".docx", ".ppt",
+    ".pptx", ".xls", ".xlsx", ".rtf", ".txt", ".md", ".csv", ".tsv",
+}
+
+VIDEO_EXTENSIONS = {
+    ".mp4", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv",
+    ".m4v", ".ogv", ".3gp", ".f4v", ".m3u8", ".mpd", ".ism", ".m4s", ".ts",
+}
+
+AUDIO_EXTENSIONS = {
+    ".mp3", ".m4a", ".aac", ".flac", ".wav", ".ogg", ".opus", ".aiff", ".alac",
+}
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico",
+}
+
+ARCHIVE_EXTENSIONS = {
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".iso",
+}
+
+API_PATH_MARKERS = (
+    "/api/", "/apis/", "/rest/", "/graphql", "/gql", "/query", "/ajax/",
+    "/rpc/", "/json/", "/data/", "/dataset/", "/datasets/", "/wp-json",
+    "/feed/", "/feeds/", "/rss", "/atom", "/oembed", "/metadata/",
+    "/advancedsearch.php", "/services/", "/v1/", "/v2/", "/v3/", "/v4/",
+)
+
+API_QUERY_MARKERS = (
+    "format=json", "output=json", "response=json", "type=json", "view=json",
+    "alt=json", "callback=", "jsonp=", "rest_route=", "page=", "per_page=",
+    "limit=", "offset=", "rows=", "q=", "query=", "search=", "filter=",
+)
+
+API_DOC_PATHS = (
+    "/openapi.json", "/swagger.json", "/api/openapi.json", "/api/swagger.json",
+    "/api-docs", "/api-docs.json", "/v1/openapi.json", "/v2/openapi.json",
+    "/v3/openapi.json", "/wp-json", "/wp-json/", "/graphql", "/gql",
+)
+
+API_DOC_HINTS = (
+    "openapi", "swagger", "redoc", "rapidoc", "api-docs", "graphql",
+    "graphiql", "playground", "postman", "insomnia", "wp-json",
+)
+
+STREAM_HINTS = (
+    "videoplayback", "hls", "dash", "manifest", "master.m3u8", "index.m3u8",
+    "playlist.m3u8", "chunklist.m3u8", "video.mpd", "stream", "transcode",
+    "mse", "media-source", "segment", "m4s", "init.mp4",
+)
+
+VIDEO_PLATFORM_HINTS = (
+    "youtube.com/embed/", "youtube-nocookie.com/embed/", "player.vimeo.com/video/",
+    "dailymotion.com/embed/video/", "rumble.com/embed/", "v.redd.it", "/player/",
+    "streamable.com/", "clips.twitch.tv/", "tiktok.com/embed/", "bilibili.com/player/",
+)
+
+DOC_HINTS = (
+    "/docs/", "/documentation/", "/download/", "/downloads/", "/files/", "/file/",
+    "/documents/", "/paper/", "/papers/", "/manual/", "/manuals/", "/assets/",
+)
+
+TRACKING_HINTS = (
+    "google-analytics", "googletagmanager", "doubleclick", "facebook.com/tr/",
+    "hotjar", "segment", "mixpanel", "scorecardresearch", "quantserve",
+    "cloudflareinsights", "sentry.io", "datadog", "newrelic", "bugsnag",
+    "/collect", "/beacon", "/pixel", "/analytics", "/telemetry", "/events",
+)
+
+LOW_VALUE_FILENAME_HINTS = (
+    "sprite", "favicon", "logo", "tracking", "pixel", "blank", "placeholder",
+    "analytics", "beacon", "ads", "advert", "captcha", "loader", "polyfill",
+)
+
+SAFE_PUBLIC_METADATA_PATHS = (
+    "/robots.txt", "/sitemap.xml", "/sitemap_index.xml", "/manifest.json",
+    "/site.webmanifest", "/asset-manifest.json", "/humans.txt",
+    "/.well-known/security.txt", "/.well-known/assetlinks.json",
+    "/.well-known/apple-app-site-association", "/opensearch.xml", "/feed", "/rss", "/atom",
+)
 
 def truthy(value, default=False):
     if value is None:
@@ -43890,36 +43989,145 @@ def write_jsonl(path: str, row: dict) -> None:
         pass
 
 
+def _url_path_ext(url: str) -> str:
+    try:
+        path = urlparse(str(url or "")).path.lower()
+        for ext_group in (API_EXTENSIONS, DOC_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, ARCHIVE_EXTENSIONS):
+            for ext in ext_group:
+                if path.endswith(ext):
+                    return ext
+    except Exception:
+        pass
+    return ""
+
+
+def _is_tracking_url(url: str) -> bool:
+    low = str(url or "").lower()
+    return any(h in low for h in TRACKING_HINTS)
+
+
 def classify_url(url: str, content_type: str = "", text: str = "") -> str:
     u = str(url or "").lower()
     ct = str(content_type or "").lower()
-    blob = f"{u} {ct} {str(text or '').lower()}"
+    hint = str(text or "").lower()
+    blob = f"{u} {ct} {hint}"
+    ext = _url_path_ext(u)
 
+    if not url and not text:
+        return "metadata"
+    if _is_tracking_url(u):
+        return "tracking/noise"
     if u.startswith(("ws://", "wss://")) or "websocket" in blob:
         return "websocket"
-    if "graphql" in blob:
-        return "graphql/api"
-    if "/api/" in u or "application/json" in ct or u.endswith(".json") or "json" in blob:
+
+    if "openapi" in blob or u.endswith("/openapi.json"):
+        return "api/openapi"
+    if "swagger" in blob or u.endswith("/swagger.json") or "/api-docs" in u:
+        return "api/swagger"
+    if "graphql" in blob or "/gql" in u:
+        return "api/graphql"
+    if "/wp-json" in u or "rest_route=" in u:
+        return "api/wordpress-rest"
+    if ext in {".json", ".jsonp", ".ndjson", ".geojson"}:
         return "api/json"
-    if "serviceworker" in blob or "service-worker" in blob or "sw.js" in u:
+    if ext in {".csv", ".tsv"} or "text/csv" in ct or "tab-separated" in ct:
+        return "api/table-data"
+    if ext in {".xml", ".rss", ".atom"} or "rss" in ct or "atom" in ct or "xml" in ct:
+        return "api/feed-xml"
+    if any(m in u for m in API_PATH_MARKERS) or any(m in u for m in API_QUERY_MARKERS) or "application/json" in ct:
+        return "api/endpoint"
+
+    if ext == ".m3u8" or "mpegurl" in ct:
+        return "video/hls-manifest"
+    if ext == ".mpd" or "dash+xml" in ct:
+        return "video/dash-manifest"
+    if ext in VIDEO_EXTENSIONS or ct.startswith("video/"):
+        return "video/file"
+    if ext in AUDIO_EXTENSIONS or ct.startswith("audio/"):
+        return "audio/file"
+    if any(x in blob for x in STREAM_HINTS) or any(x in u for x in VIDEO_PLATFORM_HINTS):
+        return "video/stream"
+
+    if ext in DOC_EXTENSIONS or any(x in u for x in DOC_HINTS):
+        return "document/file"
+    if ext in ARCHIVE_EXTENSIONS:
+        return "archive/file"
+    if ext in IMAGE_EXTENSIONS or ct.startswith("image/"):
+        return "image/asset"
+    if "serviceworker" in blob or "service-worker" in blob or u.endswith("sw.js"):
         return "service-worker"
     if "worker" in blob:
         return "worker"
-    if any(x in u for x in (".m3u8", ".mpd", ".mp4", ".m4s", ".ts", "segment", "chunk", "hls", "dash")):
-        return "media"
-    if u.endswith((".js", ".mjs")):
+    if u.endswith((".js", ".mjs", ".cjs")):
         return "script"
     if u.endswith((".css", ".scss")):
         return "css-url"
     if "indexeddb" in blob or "localstorage" in blob or "sessionstorage" in blob or "cache" in blob:
         return "browser-storage"
-    if "react" in blob or "__next_data__" in blob or "nuxt" in blob:
+    if "react" in blob or "__next_data__" in blob or "nuxt" in blob or "vite" in blob:
         return "react/spa"
+    if "shadow" in blob:
+        return "shadow-dom"
     if "hidden" in blob:
         return "hidden-dom"
     if url:
         return "url"
     return "metadata"
+
+
+def discovery_score(url: str, category: str = "", source: str = "", text: str = "", status=None, content_type: str = "") -> int:
+    low = str(url or "").lower()
+    cat = str(category or classify_url(url, content_type, text)).lower()
+    source_low = str(source or "").lower()
+    text_low = str(text or "").lower()
+    score = 0
+
+    weights = {
+        "api/openapi": 120, "api/swagger": 116, "api/graphql": 108,
+        "api/wordpress-rest": 104, "api/json": 98, "api/table-data": 90,
+        "api/feed-xml": 82, "api/endpoint": 78,
+        "video/hls-manifest": 112, "video/dash-manifest": 110,
+        "video/file": 100, "video/stream": 92, "audio/file": 84,
+        "document/file": 86, "archive/file": 72, "websocket": 66,
+        "browser-storage": 58, "react/spa": 54, "service-worker": 52,
+        "script": 34, "css-url": 26, "image/asset": 18,
+        "tracking/noise": -100,
+    }
+    score += weights.get(cat, 20)
+
+    if status:
+        try:
+            s = int(status)
+            if 200 <= s < 300:
+                score += 18
+            elif s in (301, 302, 303, 307, 308):
+                score += 6
+            elif s >= 400:
+                score -= 45
+        except Exception:
+            pass
+
+    if source_low in {"network", "network-response", "fetch.response", "xhr.done", "runtime-hook"}:
+        score += 18
+    if source_low in {"deep_scan", "manual_live_scan", "passive", "public-metadata"}:
+        score += 10
+    if any(x in low for x in API_DOC_HINTS):
+        score += 18
+    if any(x in low for x in STREAM_HINTS):
+        score += 16
+    if any(x in low for x in ("download", "metadata", "advancedsearch", "wp-json", "graphql")):
+        score += 10
+    if any(x in low for x in LOW_VALUE_FILENAME_HINTS):
+        score -= 30
+    if _is_tracking_url(low):
+        score -= 70
+    if "[redacted]" in low:
+        score -= 12
+    if text_low and any(x in text_low for x in ("openapi", "swagger", "m3u8", "mpd", "json", "pdf")):
+        score += 8
+
+    return max(-100, min(200, score))
+
 
 
 JS_BROWSER_HOOK = r"""
@@ -44728,6 +44936,8 @@ def build_sniffer_report_html(page_url: str, hits: list[dict], html_sources: dic
             break
 
     cards = []
+    rows.sort(key=lambda r: discovery_score(r[2], r[0], r[1], r[3], r[4]), reverse=True)
+
     for cat, src, u, title, status in rows[:1200]:
         link = f'<a href="{_html_escape(u)}">{_html_escape(u)}</a>' if u else '<span class="muted">no direct URL</span>'
         cards.append(f"""
@@ -44824,17 +45034,15 @@ async def collect_passive_http_candidates(http, page_url: str, html_text: str = 
 
     parsed = urlparse(page_url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
-    default_paths = [
-        "/robots.txt",
-        "/sitemap.xml",
-        "/sitemap_index.xml",
-        "/manifest.json",
-        "/site.webmanifest",
-        "/asset-manifest.json",
-        "/humans.txt",
-        "/.well-known/security.txt",
-        "/.well-known/assetlinks.json",
-        "/.well-known/apple-app-site-association",
+    default_paths = list(SAFE_PUBLIC_METADATA_PATHS) + [
+        "/openapi.json",
+        "/swagger.json",
+        "/api/openapi.json",
+        "/api/swagger.json",
+        "/api-docs",
+        "/wp-json",
+        "/graphql",
+        "/oembed",
     ]
     paths = list_from_param(cfg.get("passive_probe_paths")) or default_paths
     max_probes = int(cfg.get("passive_metadata_probe_limit") or 12)
@@ -45163,6 +45371,314 @@ async def playwright_deep_surface_scan(context, page_url: str, cfg: dict, emit_e
             pass
 
 
+# ------------------------------------------------------------------
+# Advanced API / video / document enrichment layer
+# ------------------------------------------------------------------
+
+async def advanced_http_probe(url: str, cfg: dict, *, max_bytes: int = 700000) -> dict:
+    """Small GET/HEAD probe for observed public candidates. Redacts auth-like query values."""
+    import aiohttp
+
+    headers = {
+        "User-Agent": str(cfg.get("user_agent") or "Mozilla/5.0 PromptChat/AdvancedInteractiveBrowser"),
+        "Accept": "application/json, application/xml, text/xml, text/csv, text/plain, video/*, audio/*, application/pdf, */*;q=0.3",
+    }
+    timeout = aiohttp.ClientTimeout(total=float(cfg.get("advanced_probe_timeout") or cfg.get("timeout") or 8))
+    out = {"url": redact_url(url), "status": None, "content_type": "", "text": "", "bytes": 0, "error": ""}
+    try:
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            async with session.get(url, allow_redirects=True, ssl=False if not truthy(cfg.get("http_verify_tls"), True) else None) as resp:
+                raw = await resp.content.read(max_bytes + 1)
+                if len(raw) > max_bytes:
+                    raw = raw[:max_bytes]
+                ct = resp.headers.get("content-type", "")
+                try:
+                    txt = raw.decode(resp.charset or "utf-8", errors="ignore")
+                except Exception:
+                    txt = raw.decode("utf-8", errors="ignore")
+                out.update({"url": redact_url(str(resp.url)), "status": resp.status, "content_type": ct, "text": txt, "bytes": len(raw)})
+    except Exception as e:
+        out["error"] = str(e)[:500]
+    return out
+
+
+def api_doc_variants_for_url(url: str, limit: int = 18) -> list[str]:
+    try:
+        p = urlparse(url)
+        if not p.scheme or not p.netloc:
+            return []
+        origin = f"{p.scheme}://{p.netloc}"
+        path = p.path or "/"
+        low = path.lower()
+        variants = []
+
+        def add(candidate: str):
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+
+        if any(marker in low for marker in ("/api", "/apis", "/rest", "/graphql", "/gql", "/swagger", "/openapi", "/docs", "/developer")):
+            for doc_path in API_DOC_PATHS:
+                add(origin + doc_path)
+
+        parts = [x for x in path.split("/") if x]
+        for idx in range(len(parts), 0, -1):
+            parent = "/" + "/".join(parts[:idx])
+            plow = parent.lower()
+            if any(marker in plow for marker in ("/api", "/apis", "/rest", "/v1", "/v2", "/v3")):
+                add(origin + parent)
+                add(origin + parent.rstrip("/") + "/openapi.json")
+                add(origin + parent.rstrip("/") + "/swagger.json")
+
+        if "/wp-content" in low or "/wp-includes" in low:
+            add(origin + "/wp-json")
+
+        return variants[:limit]
+    except Exception:
+        return []
+
+
+def parse_hls_manifest(manifest_text: str, manifest_url: str, limit: int = 180) -> list[dict]:
+    hits = []
+    seen = set()
+    last_meta = {}
+    for line in str(manifest_text or "").splitlines():
+        ln = line.strip()
+        if not ln:
+            continue
+        if ln.startswith("#EXT-X-STREAM-INF"):
+            last_meta = {"playlist_meta": safe_text(ln, 700), "stream_variant": True}
+            continue
+        if ln.startswith("#EXT-X-MEDIA"):
+            m = re.search(r'URI="([^"]+)"', ln)
+            if m:
+                u = absolute_url(manifest_url, m.group(1))
+                if u and u not in seen:
+                    seen.add(u)
+                    hits.append({"kind": "hls-media-rendition", "url": u, "text": safe_text(ln, 700), "category": classify_url(u, "", ln), "score": discovery_score(u, text=ln)})
+            continue
+        if ln.startswith("#"):
+            continue
+        u = absolute_url(manifest_url, ln)
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        cat = classify_url(u, "", ln)
+        hits.append({"kind": "hls-manifest-child", "url": u, "text": last_meta.get("playlist_meta", "HLS segment or child playlist"), "category": cat, "score": discovery_score(u, cat, "hls", ln), **last_meta})
+        last_meta = {}
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def parse_dash_manifest(manifest_text: str, manifest_url: str, limit: int = 180) -> list[dict]:
+    hits = []
+    seen = set()
+    for pattern, label in [
+        (r"<BaseURL[^>]*>(.*?)</BaseURL>", "dash-base-url"),
+        (r"(?:media|initialization|sourceURL)=['\"]([^'\"]+)['\"]", "dash-segment-url"),
+    ]:
+        for m in re.finditer(pattern, str(manifest_text or ""), re.I | re.S):
+            raw = _html.unescape(m.group(1).strip())
+            u = absolute_url(manifest_url, raw)
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            cat = classify_url(u, "", label)
+            hits.append({"kind": label, "url": u, "text": label, "category": cat, "score": discovery_score(u, cat, "dash", label)})
+            if len(hits) >= limit:
+                return hits
+    return hits
+
+
+def parse_openapi_document(text: str, doc_url: str, limit: int = 250) -> list[dict]:
+    try:
+        data = json.loads(str(text or ""))
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    if not ("openapi" in data or "swagger" in data or "paths" in data):
+        return []
+
+    base_urls = []
+    try:
+        for srv in data.get("servers") or []:
+            if isinstance(srv, dict) and srv.get("url"):
+                base_urls.append(absolute_url(doc_url, str(srv.get("url"))))
+    except Exception:
+        pass
+    if not base_urls:
+        p = urlparse(doc_url)
+        base_urls = [f"{p.scheme}://{p.netloc}"] if p.scheme and p.netloc else [doc_url]
+
+    hits = []
+    paths = data.get("paths") or {}
+    if isinstance(paths, dict):
+        for path, methods in list(paths.items())[:limit]:
+            for base in base_urls[:4]:
+                u = absolute_url(base.rstrip("/") + "/", str(path).lstrip("/"))
+                if not u:
+                    continue
+                method_names = []
+                if isinstance(methods, dict):
+                    method_names = [m.upper() for m in methods.keys() if str(m).lower() in {"get", "post", "put", "patch", "delete", "head", "options"}]
+                hits.append({
+                    "kind": "openapi-path",
+                    "url": u,
+                    "text": ",".join(method_names) or "OpenAPI path",
+                    "category": "api/openapi-path",
+                    "score": discovery_score(u, "api/openapi", "openapi", str(methods)[:700]),
+                    "methods": method_names,
+                    "source_doc": doc_url,
+                })
+                break
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def extract_candidate_urls_from_hits(page_url: str, hits: list[dict], html_sources: dict[str, str], limit: int = 1200) -> list[str]:
+    seen = set()
+    out = []
+
+    def push(raw):
+        u = absolute_url(page_url, raw) if not str(raw or "").startswith(("http://", "https://", "ws://", "wss://")) else redact_url(str(raw or ""))
+        if not u or u in seen:
+            return
+        seen.add(u)
+        out.append(u)
+
+    for h in hits or []:
+        if not isinstance(h, dict):
+            continue
+        for key in ("url", "href", "src", "action", "endpoint", "location", "scriptURL", "scope"):
+            v = h.get(key)
+            if isinstance(v, str) and v.strip():
+                push(v)
+        for key in ("urls", "links", "scripts", "sources"):
+            arr = h.get(key)
+            if isinstance(arr, list):
+                for v in arr[:80]:
+                    if isinstance(v, str):
+                        push(v)
+        for u in extract_urls_from_obj(h, page_url, limit=40):
+            push(u)
+        if len(out) >= limit:
+            return out[:limit]
+
+    for name, html_text in (html_sources or {}).items():
+        for u in extract_urls_from_text(html_text, page_url, limit=500):
+            push(u)
+            if len(out) >= limit:
+                return out[:limit]
+
+    return out[:limit]
+
+
+async def advanced_enrich_discoveries(http, page_url: str, hits: list[dict], html_sources: dict[str, str], cfg: dict, emit_event, log: list[str]) -> list[dict]:
+    if not truthy(cfg.get("enable_advanced_discovery"), True):
+        return []
+
+    candidates = extract_candidate_urls_from_hits(page_url, hits, html_sources, limit=int(cfg.get("advanced_candidate_limit") or 1200))
+    expanded = []
+    seen = set(candidates)
+
+    def add_hit(kind, url, text="", category="", source="advanced_discovery", **extra):
+        if not url:
+            return
+        clean = redact_url(url)
+        key = f"{kind}|{clean}|{text[:120]}"
+        if key in seen:
+            return
+        seen.add(key)
+        cat = category or classify_url(clean, extra.get("content_type", ""), text)
+        expanded.append({
+            "sniffer": source,
+            "source": source,
+            "kind": kind,
+            "url": clean,
+            "text": safe_text(text, 900),
+            "category": cat,
+            "score": discovery_score(clean, cat, source, text, extra.get("status"), extra.get("content_type", "")),
+            "evidence": extra.pop("evidence", "advanced ApiTracker/VideoLinkTracker/LinkTracker enrichment"),
+            **extra,
+        })
+
+    # Promote observed URLs into ranked advanced rows.
+    for u in candidates:
+        cat = classify_url(u)
+        if cat != "url" and cat != "tracking/noise":
+            add_hit("observed-advanced-candidate", u, cat, cat)
+
+    # ApiTracker-style doc root variants from observed API-ish URLs.
+    variant_cap = int(cfg.get("advanced_variant_limit") or 140)
+    variants = []
+    for u in candidates:
+        if len(variants) >= variant_cap:
+            break
+        if classify_url(u).startswith("api/") or any(h in u.lower() for h in API_DOC_HINTS + API_PATH_MARKERS):
+            for v in api_doc_variants_for_url(u):
+                if v not in seen and v not in variants:
+                    variants.append(v)
+    for v in variants[:variant_cap]:
+        add_hit("api-doc-variant", v, "safe public API doc/root variant", classify_url(v), source="api_doc_variant")
+
+    # Probe the highest-value candidates and parse API docs / stream manifests.
+    probe_limit = int(cfg.get("advanced_probe_limit") or 80)
+    probe_pool = []
+    for u in list(dict.fromkeys(candidates + variants)):
+        cat = classify_url(u)
+        if cat == "tracking/noise":
+            continue
+        if cat.startswith(("api/", "video/", "audio/", "document/", "archive/")) or any(x in u.lower() for x in API_DOC_HINTS + STREAM_HINTS):
+            probe_pool.append(u)
+    probe_pool = sorted(probe_pool, key=lambda u: discovery_score(u, classify_url(u)), reverse=True)[:probe_limit]
+
+    sem = asyncio.Semaphore(max(1, int(cfg.get("advanced_probe_concurrency") or 5)))
+
+    async def probe_one(u):
+        async with sem:
+            p = await advanced_http_probe(u, cfg, max_bytes=int(cfg.get("advanced_probe_max_bytes") or 700000))
+            cat = classify_url(p.get("url") or u, p.get("content_type") or "", p.get("text") or "")
+            add_hit(
+                "probed-public-candidate",
+                p.get("url") or u,
+                p.get("error") or f"HTTP {p.get('status')} {p.get('content_type')} bytes={p.get('bytes')}",
+                cat,
+                source="advanced_probe",
+                status=p.get("status"),
+                content_type=p.get("content_type") or "",
+                bytes=p.get("bytes") or 0,
+                ok=bool(p.get("status") and 200 <= int(p.get("status")) < 400),
+            )
+
+            txt = p.get("text") or ""
+            final_url = p.get("url") or u
+            if not txt:
+                return
+            if cat in {"api/openapi", "api/swagger"} or "\"paths\"" in txt[:5000]:
+                for h in parse_openapi_document(txt, final_url, limit=int(cfg.get("advanced_openapi_path_limit") or 250)):
+                    add_hit(h.get("kind", "openapi-path"), h.get("url"), h.get("text", ""), h.get("category", "api/openapi-path"), source="openapi_parser", **{k: v for k, v in h.items() if k not in {"kind", "url", "text", "category"}})
+            elif cat == "video/hls-manifest":
+                for h in parse_hls_manifest(txt, final_url, limit=int(cfg.get("advanced_manifest_links_limit") or 220)):
+                    add_hit(h.get("kind", "hls-child"), h.get("url"), h.get("text", ""), h.get("category", "video/stream"), source="hls_parser", **{k: v for k, v in h.items() if k not in {"kind", "url", "text", "category"}})
+            elif cat == "video/dash-manifest":
+                for h in parse_dash_manifest(txt, final_url, limit=int(cfg.get("advanced_manifest_links_limit") or 220)):
+                    add_hit(h.get("kind", "dash-child"), h.get("url"), h.get("text", ""), h.get("category", "video/stream"), source="dash_parser", **{k: v for k, v in h.items() if k not in {"kind", "url", "text", "category"}})
+
+    await asyncio.gather(*(probe_one(u) for u in probe_pool), return_exceptions=True)
+
+    expanded.sort(key=lambda h: int(h.get("score") or 0), reverse=True)
+    cap = int(cfg.get("advanced_output_limit") or 1500)
+    if expanded:
+        log.append(f"[advanced-discovery] candidates={len(candidates)} variants={len(variants)} probes={len(probe_pool)} hits={len(expanded)}")
+        try:
+            emit_event({"type": "advanced.discovery.finished", "candidates": len(candidates), "variants": len(variants), "probes": len(probe_pool), "hits": len(expanded)})
+        except Exception:
+            pass
+    return expanded[:cap]
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("Missing config path", file=sys.stderr)
@@ -45403,6 +45919,13 @@ def main() -> int:
 
                     if not needs_pw:
                         try:
+                            try:
+                                advanced_hits = await advanced_enrich_discoveries(http, page_url, all_hits, html_by_source, c, self.emit_event, log)
+                                if advanced_hits:
+                                    all_hits.extend(advanced_hits)
+                                    self.emit_hits("advanced_discovery", advanced_hits)
+                            except Exception as e:
+                                self.emit_event({"type": "advanced.discovery.error", "error": str(e)})
                             report_html = build_sniffer_report_html(page_url, all_hits, html_by_source, log)
                             html_by_source["sniffer_report"] = report_html
                             self.emit_html("sniffer_report", report_html)
@@ -45683,6 +46206,13 @@ def main() -> int:
                                 })
 
                         try:
+                            try:
+                                advanced_hits = await advanced_enrich_discoveries(http, page_url, all_hits, html_by_source, c, self.emit_event, log)
+                                if advanced_hits:
+                                    all_hits.extend(advanced_hits)
+                                    self.emit_hits("advanced_discovery", advanced_hits)
+                            except Exception as e:
+                                self.emit_event({"type": "advanced.discovery.error", "error": str(e)})
                             report_html = build_sniffer_report_html(page_url, all_hits, html_by_source, log)
                             html_by_source["sniffer_report"] = report_html
                             self.emit_html("sniffer_report", report_html)
@@ -45827,7 +46357,7 @@ def main() -> int:
                 self.sniffer_thread = None
                 self.sniffers_running = False
 
-                self.setWindowTitle(str(cfg.get("title") or "Advanced Enterprise Interactive Browser"))
+                self.setWindowTitle(str(cfg.get("title") or "Advanced API / Video / Docs Interactive Browser"))
                 self.resize(int(cfg.get("width") or 1620), int(cfg.get("height") or 1020))
                 self.setMinimumSize(1220, 780)
 
@@ -45879,7 +46409,7 @@ def main() -> int:
                 self.result_source_combo.currentTextChanged.connect(self.on_result_source_changed)
 
                 self.hit_filter = QLineEdit()
-                self.hit_filter.setPlaceholderText("Filter discoveries, APIs, workers, hidden DOM, media...")
+                self.hit_filter.setPlaceholderText("Filter APIs, OpenAPI, GraphQL, HLS/DASH, videos, docs, media, hidden DOM...")
                 self.hit_filter.textChanged.connect(self.apply_hit_filter)
 
                 self.status_label = QLabel("Ready")
@@ -47106,6 +47636,18 @@ if __name__ == "__main__":
             "sniffer_scroll_delay_ms": self._safe_int(params.get("sniffer_scroll_delay_ms"), 325),
             "extensions": params.get("extensions", ""),
             "query": str(params.get("query") or ""),
+
+            # Unified advanced discovery layer.
+            "enable_advanced_discovery": self._truthy(params.get("enable_advanced_discovery"), True),
+            "advanced_candidate_limit": self._safe_int(params.get("advanced_candidate_limit"), 1200),
+            "advanced_variant_limit": self._safe_int(params.get("advanced_variant_limit"), 140),
+            "advanced_probe_limit": self._safe_int(params.get("advanced_probe_limit"), 80),
+            "advanced_probe_concurrency": self._safe_int(params.get("advanced_probe_concurrency"), 5),
+            "advanced_probe_timeout": self._safe_float(params.get("advanced_probe_timeout"), 8.0),
+            "advanced_probe_max_bytes": self._safe_int(params.get("advanced_probe_max_bytes"), 700_000),
+            "advanced_manifest_links_limit": self._safe_int(params.get("advanced_manifest_links_limit"), 220),
+            "advanced_openapi_path_limit": self._safe_int(params.get("advanced_openapi_path_limit"), 250),
+            "advanced_output_limit": self._safe_int(params.get("advanced_output_limit"), 1500),
         }
 
         script_path = base_dir / "interactive_browser_child.py"
@@ -47329,6 +47871,18 @@ if __name__ == "__main__":
             "sniffer_scroll_delay_ms": 325,
             "extensions": "",
             "query": "",
+
+            "enable_advanced_discovery": True,
+            "advanced_candidate_limit": 1200,
+            "advanced_variant_limit": 140,
+            "advanced_probe_limit": 80,
+            "advanced_probe_concurrency": 5,
+            "advanced_probe_timeout": 8,
+            "advanced_probe_max_bytes": 700000,
+            "advanced_manifest_links_limit": 220,
+            "advanced_openapi_path_limit": 250,
+            "advanced_output_limit": 1500,
+
             "max_log_lines": 10000,
             "max_render_html_chars": 1800000,
         }
